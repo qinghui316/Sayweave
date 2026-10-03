@@ -1,0 +1,9 @@
+* { box-sizing: border-box; }
+body { margin: 0; font-family: var(--font-body); font-size: var(--text-body); line-height: var(--line-body); color: var(--text-primary); background: transparent; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; } button:disabled { cursor: not-allowed; }
+a { color: inherit; text-decoration: none; }
+h1,h2,h3,p { margin: 0; } button { border: 0; } img { display: block; }
+:focus-visible { outline: 2px solid var(--text-primary); outline-offset: 4px; }
+::selection { background: var(--signal); color: var(--text-primary); }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 1ms !important; transition-duration: var(--duration-reduced) !important; } }

@@ -1,0 +1,25 @@
+:root {
+  --base-white: #ffffff; --base-canvas: #f6f6f6; --base-gray: #cbcbcb; --base-ink: #000000; --base-signal: #75fb91;
+  --surface-content: var(--base-white); --surface-canvas: var(--base-canvas);
+  --surface-sidebar: rgb(203 203 203 / 24%); --surface-key: rgb(203 203 203 / 48%);
+  --surface-work: rgb(203 203 203 / 38%); --surface-hover: rgb(203 203 203 / 18%);
+  --text-primary: var(--base-ink); --text-secondary: rgb(0 0 0 / 64%); --text-inverse: var(--base-canvas);
+  --signal: var(--base-signal); --backdrop: rgb(0 0 0 / 28%);
+  --font-body: 'Noto Sans SC', sans-serif; --font-brand: 'Inter', sans-serif;
+  --text-home: 32px; --line-home: 44px; --text-page: 24px; --line-page: 32px;
+  --text-mode: 16px; --line-mode: 24px; --text-body: 14px; --line-body: 22px;
+  --text-small: 13px; --line-small: 20px; --text-meta: 12px; --line-meta: 18px;
+  --text-section: 16px; --line-section: 24px; --text-brand: 20px;
+  --text-usage: 40px; --line-usage: 52px; --text-stat: 16px; --line-stat: 24px;
+  --space-2: 2px; --space-4: 4px; --space-8: 8px; --space-10: 10px; --space-12: 12px;
+  --space-14: 14px; --space-16: 16px; --space-18: 18px; --space-20: 20px; --space-24: 24px;
+  --space-28: 28px; --space-32: 32px; --space-40: 40px; --space-48: 48px;
+  --radius-window: 20px; --radius-panel: 24px; --radius-card: 16px; --radius-control: 12px; --radius-pill: 999px;
+  --sidebar-width: 184px; --nav-width: 152px; --nav-height: 40px; --nav-icon: 18px;
+  --mode-height: 64px; --mode-icon: 20px; --key-width: 148px; --control-height: 36px;
+  --usage-width: 252px; --usage-height: 238px; --usage-back-height: 238px;
+  --duration-shape: 280ms; --duration-local: 50ms; --duration-reduced: 120ms; --ease-shape: cubic-bezier(.22,.8,.24,1);
+  --shadow-usage: 0 5px 16px rgb(0 0 0 / 7%); --shadow-panel: 0 16px 48px rgb(0 0 0 / 20%);
+  --shadow-voice: 0 4px 6px rgb(0 0 0 / 18%);
+  --usage-material: linear-gradient(180deg,rgb(255 255 255 / 24%),rgb(255 255 255 / 6%) 55%,rgb(255 255 255 / 0%)), linear-gradient(180deg,rgb(117 251 145 / 26%),rgb(117 251 145 / 40%)), linear-gradient(90deg,rgb(246 246 246 / 82%),rgb(246 246 246 / 82%));
+}

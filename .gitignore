@@ -19,3 +19,22 @@ design/figma/
 *.fig
 Thumbs.db
 Desktop.ini
+# Generated platform icons not used by this Windows skeleton
+src-tauri/icons/android/
+src-tauri/icons/ios/
+src-tauri/icons/Square*.png
+src-tauri/icons/StoreLogo.png
+src-tauri/icons/icon.icns
+src-tauri/gen/
+
+# Locally generated acceptance artifacts (reproducible from test sources)
+tests/visual/
+docs/evidence/
+docs/motion-performance.json
+docs/verification.json
+# User-owned design exploration remains a local reference
+design/candidates*.json
+design/prompts/
+design/figma-status.md
+design/flows.md
+design/product-surfaces.md

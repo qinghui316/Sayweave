@@ -1,0 +1,8 @@
+.icon { display: inline-flex; align-items: center; justify-content: center; flex: none; vertical-align: middle; }
+.spin { animation: spin 900ms linear infinite; }
+.feedback { display: inline-flex; align-items: center; gap: var(--space-8); min-height: var(--control-height); font-size: var(--text-small); line-height: var(--line-small); color: var(--text-secondary); }
+.badge { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: var(--surface-canvas); }
+.success { background: var(--signal); }
+.copy { min-width: 108px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
