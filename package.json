@@ -20,7 +20,7 @@
     "build": "tsc --noEmit && vite build",
     "desktop:build": "tauri build --no-bundle",
     "check": "npm run typecheck && npm run lint && npm run test:ui && npm run check:native && npm run build",
-    "doctor": "node scripts/doctor.mjs",
+    "check:distribution": "node scripts/check-distribution.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

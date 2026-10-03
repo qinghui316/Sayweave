@@ -1,5 +1,9 @@
 $ErrorActionPreference='Stop'
-. (Join-Path $PSScriptRoot 'environment.ps1')
+$projectRoot=Split-Path $PSScriptRoot -Parent
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
+$OutputEncoding=[Text.UTF8Encoding]::new($false)
+Set-Location -LiteralPath $projectRoot
+$null=New-Item -ItemType Directory -Force -Path (Join-Path $projectRoot '.local')
 $exe=Join-Path $projectRoot 'src-tauri/target/release/sayweave.exe'
 $instances=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $exe })
 if ($instances.Count -gt 1) { throw 'Multiple release instances; resolve before acceptance.' }

@@ -51,7 +51,7 @@ Tauri app_data_dir 下：普通发布版 `data/dictionary.sqlite`，开发版 `d
 
 ## 开发与验证
 
-先加载 `scripts/environment.ps1`。日常仍使用现有四个开发入口。
+环境准备见 [开发说明](development.md)，使用标准 npm／Cargo 命令。
 
 ```powershell
 npm.cmd run check
@@ -66,4 +66,4 @@ node scripts/test-dictionary-desktop.mjs --regular
 
 桌面词典脚本只连接自己启动的 WebView2 验收端口；端口占用则报错，不结束其他程序。测试进程启动时隐藏辅助窗口，应用窗口正常显示，结束后断开测试连接并结束本脚本所属进程。`--regular` 仅检查普通构建的可用性，不新增或删除用户词条。生产二进制没有开发组件路由及测试数据目录覆盖。无需安装包验证。
 
-证据与范围见 [本轮验证记录](local-data-verification.md)。后续优先模型配置／系统凭据，再接入识别与历史；应用场景、自动学习、同步独立设计和迁移。
+测试方法和覆盖边界见 [测试说明](testing.md)。模型配置、识别、历史、应用场景、自动学习与同步尚未实现。

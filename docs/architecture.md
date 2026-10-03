@@ -13,7 +13,7 @@ DictionaryPort、主窗限定命令及专用SQLite线程独立于Runtime，详�
 - dev：仅开发环境可达的组件和演示场景，生产构建不会引入。
 - src-tauri：内存协调器、窗口、托盘、调用者权限及独立数据线程／Repository。
 - tests：组件、合同、集成与 e2e；Rust 测试就近位于 coordinator 和 data。
-- scripts：工具、检查和开发进程所有权。
+- scripts：源码边界、编码与分发检查，以及可复现桌面测试。
 
 应用层组装功能；功能只读公共 UI/契约，UI 只依赖设计/文案/素材。功能不越界读取其他功能内部文件。AST 边界检查覆盖导入、重导出和动态导入，并检查循环。未创建插件/HTTP 服务或通用全局状态容器。
 
@@ -37,16 +37,10 @@ DesktopRuntimePort 提供 getSnapshot、subscribe、windowAction、demoAction、
 
 原生窗口包含 12px 外缘以容纳阴影：44×44 控件对应 68×68 窗口、84×40 对应 108×64、216×52 对应 240×76、失败 176×44 对应 200×68。尺寸提交校验 revision，迟到回调不能调整新状态。固定位置是初始演示选择，后续验证多显示器/工作区边界。
 
-## 版本与集成
-
-源码、配置、锁文件、测试与开发说明纳入Git。数据库、密钥、本机工具、依赖、构建、日志、运行报告和设计大文件不跟踪。完整本机验收及Change/Integration记录由独立Harness管理，不嵌入应用仓库。
-
-提交、Change完成、独立审查后的Integration与发布是不同步骤；实际交付版本以分支提交为准。发布资料范围见 [源码分发规则](publication.md)。
-
 ## 状态反馈与缩窗时序
 
-本地动效候选的 AnimatedIcon 不持有业务状态；CopyFeedbackButton 只隔离外部异步请求代次，AsyncStatusFeedback 纯受控展示。useMotion 结合窗口快照、页面可见、交叉观察和减少动态。VoiceControl 在处理/完成/失败之间保留 SVG 实例，波形在 CSS 内，不按帧 IPC。
+AnimatedIcon 不持有业务状态；CopyFeedbackButton 只隔离外部异步请求代次，AsyncStatusFeedback 纯受控展示。useMotion 结合窗口快照、页面可见、交叉观察和减少动态。VoiceControl 在处理/完成/失败之间保留 SVG 实例，波形在 CSS 内，不按帧 IPC。
 
-publish 在扩大前保留 current/target 各轴最大值；320ms 后仅当前 revision/session 可以缩到最终大小。无新增命令、权限、业务协议或持久化。完整规则与验证入口见 [motion.md](motion.md) 和 [motion-verification.md](motion-verification.md)。
+publish 在扩大前保留 current/target 各轴最大值；320ms 后仅当前 revision/session 可以缩到最终大小。无新增命令、权限、业务协议或持久化。完整规则与验证入口见 [motion.md](motion.md) 和 [测试说明](testing.md)。
 
 窗口显示由应用层通过级联 MotionScope 传入通用 UI；它只有布尔可用性，不存储或推进业务状态。设置前景仍可播放自身反馈，仅背景路由暂停。document可见但native窗口已隐藏时，复制/连接和通用加载指示也停止循环。

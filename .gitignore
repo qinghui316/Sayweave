@@ -38,3 +38,27 @@ design/prompts/
 design/figma-status.md
 design/flows.md
 design/product-surfaces.md
+
+# Owner-local workflow and private design/process references
+/AGENTS.md
+/CLAUDE.md
+/DESIGN.md
+/docs/design-map.md
+/docs/verification.md
+/docs/motion-verification.md
+/docs/local-data-verification.md
+/docs/publication.md
+/scripts/dev.ps1
+/scripts/doctor.mjs
+/scripts/environment.ps1
+/scripts/setup-tools.ps1
+/scripts/harness-skill-link.mjs
+/scripts/harness-skill-link.ps1
+/scripts/harness-skill-link.py
+/tests/launcher/ownership.ps1
+/启动开发版.cmd
+/停止开发版.cmd
+/重启开发版.cmd
+/查看开发日志.cmd
+/.impeccable/
+/design/

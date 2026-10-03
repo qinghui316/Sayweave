@@ -1,6 +1,6 @@
 # Sayweave 状态图标与交互动效
 
-2026-10-03，Change `sayweave-interaction-motion-v01`。本轮是现有前端候选的交互修订；不修改冻结 Figma，也不接入真实业务。
+状态图标表达操作反馈；语音控件仍为演示，不提供真实录音或模型连接。
 
 ## 视觉与节奏
 
@@ -48,10 +48,6 @@
 
 依赖精确锁定 morphicons 1.7.1（MIT）和 lucide 1.51.0（ISC）；许可证保留于 src/assets/licenses。许可获取来自安装包，版本可由 package-lock.json 复核。
 
-验证见 [motion-verification.md](motion-verification.md)。真实音量、跨应用输入、模型业务页、连续材质光效和其他显示器/缩放覆盖由后续 Change 处理。
+验证方法见 [测试说明](testing.md)。真实音量、跨应用输入、模型业务页、连续材质光效和其他显示器/缩放尚未完整实现或验证。
 
-## 检测例外：语音外壳形状转换
-
-2026-10-03 hook 复核：voice.module.css 第1行的 width/height 告警为同一有限状态转换的两条提示。用户已确认外壳约280ms在圆形与胶囊之间转换；直接缩放整个外壳会连同图标和点击区域变形，因此保留尺寸过渡。波形循环只改变 transform/opacity，隐藏与减少动态关闭尺寸过渡；原生先留画布、320ms后按版本及会话收拢。
-
-通过 hook-admin 持久化 layout-transition 规则的 src/ui/voice.module.css 文件范围例外，不关闭其他规则，也不忽略整个文件。该例外不代表消除布局成本或证明性能达标；原生录音 CPU 偏高仍列为性能专项。后续若增加其他布局动画，需要重新判断其合理性。
+外壳的有限状态width/height过渡保留280ms，以免图标和点击区域随整体缩放变形；循环波形只改变transform/opacity。尺寸转换仍有布局成本，需要实机测量；隐藏与减少动态停止过渡。
