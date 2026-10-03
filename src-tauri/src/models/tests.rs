@@ -1,6 +1,36 @@
 use super::*;
 use credentials::Credentials;
 
+#[cfg(target_os = "windows")]
+#[tokio::test]
+#[ignore = "cleanup only explicit credentials from a UUID-scoped native acceptance profile"]
+async fn model_desktop_cleanup() {
+    let id = std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID").unwrap();
+    uuid::Uuid::parse_str(&id).unwrap();
+    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../.local/data-acceptance")
+        .join(&id)
+        .join("data/dictionary.sqlite");
+    if !file.exists() {
+        return;
+    }
+    let c = rusqlite::Connection::open_with_flags(file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .unwrap();
+    let mut q = c.prepare("SELECT credential_ref FROM model_configs UNION SELECT credential_ref FROM credential_operations").unwrap();
+    let refs = q
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let vault = Vault::new(WindowsCredentials::new(format!(
+        "local.sayweave.skeleton.acceptance.{id}"
+    )));
+    for reference in refs {
+        uuid::Uuid::parse_str(&reference).unwrap();
+        vault.delete(reference).await.unwrap();
+    }
+}
+
 #[test]
 #[ignore = "explicit isolated native HTTPS fixture generation"]
 fn model_desktop_fixture() {
@@ -26,6 +56,7 @@ struct FakeVault {
     values: Arc<SyncMutex<HashMap<String, String>>>,
     fail_put: Arc<AtomicBool>,
     fail_delete: Arc<AtomicBool>,
+    after_put: Arc<SyncMutex<Option<Box<dyn FnOnce() + Send>>>>,
 }
 impl Credentials for FakeVault {
     fn get(&mut self, r: &str) -> Result<String, ModelError> {
@@ -41,6 +72,9 @@ impl Credentials for FakeVault {
             return Err(ModelError::new("credentialUnavailable"));
         }
         self.values.lock().unwrap().insert(r.into(), v.into());
+        if let Some(action) = self.after_put.lock().unwrap().take() {
+            action();
+        }
         Ok(())
     }
     fn delete(&mut self, r: &str) -> Result<(), ModelError> {
@@ -325,7 +359,7 @@ async fn save_failures_cleanup_and_recovery_are_durable() {
     s.status("main", true).await.unwrap();
     assert!(!fake.values.lock().unwrap().contains_key(&orphan));
     assert_eq!(fake.values.lock().unwrap().len(), 1);
-    // A stale transaction creates and then cleans its new ref; committed profile is unchanged.
+    // A pre-existing stale revision is rejected before a new credential is written.
     let stale = s
         .save(
             "main",
@@ -345,6 +379,153 @@ async fn save_failures_cleanup_and_recovery_are_durable() {
         s.overview("main").await.unwrap().configs[0].input.name,
         "updated"
     );
+}
+
+#[tokio::test]
+async fn conflict_after_vault_write_preserves_old_record_and_cleans_new_secret() {
+    let (root, s, fake) = service().await;
+    let view = s
+        .save("main", request("original", vec![Usage::Text]))
+        .await
+        .unwrap();
+    let id = view.configs[0].id.clone();
+    let expected = expect(&s, &id, &[Usage::Text]).await;
+    let file = root.path().join("dictionary.sqlite");
+    *fake.after_put.lock().unwrap() = Some(Box::new(move || {
+        let c = rusqlite::Connection::open(file).unwrap();
+        c.execute("UPDATE model_configs SET revision=revision+1", [])
+            .unwrap();
+    }));
+    let result = s
+        .save(
+            "main",
+            SaveRequest {
+                input: input("uncommitted", vec![Usage::Text]),
+                key: KeyChange::Replace {
+                    value: "replacement-fixture".into(),
+                },
+                id: Some(id),
+                revision: Some(1),
+                expectation: Some(expected),
+            },
+        )
+        .await;
+    assert_eq!(result.err().unwrap().code, "conflict");
+    assert_eq!(fake.values.lock().unwrap().len(), 1);
+    assert_eq!(
+        s.overview("main").await.unwrap().configs[0].input.name,
+        "original"
+    );
+    assert!(
+        matches!(s.db(DbOperation::Pending).await.unwrap(), DbOutput::Pending(v) if v.is_empty())
+    );
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test]
+#[ignore = "child process interrupted at explicit durable journal stages"]
+async fn model_crash_fixture() {
+    let id = std::env::var("SAYWEAVE_CRASH_TEST_ID").unwrap();
+    uuid::Uuid::parse_str(&id).unwrap();
+    let root = std::path::PathBuf::from(std::env::var("SAYWEAVE_CRASH_TEST_ROOT").unwrap());
+    let phase = std::env::var("SAYWEAVE_CRASH_TEST_PHASE").unwrap();
+    assert!(["prepared", "written", "committed"].contains(&phase.as_str()));
+    let vault = Vault::new(WindowsCredentials::new(format!(
+        "local.sayweave.skeleton.test.{id}"
+    )));
+    let s = ModelService::with_vault(
+        DataWorker::start(root.clone()).unwrap(),
+        vault,
+        Arc::new(Provider::new().unwrap()),
+    )
+    .unwrap();
+    s.status("main", true).await.unwrap();
+    let view = s
+        .save("main", request("old", vec![Usage::Text]))
+        .await
+        .unwrap();
+    let old = s.stored().await.unwrap().configs[0].credential_ref.clone();
+    let fresh = uuid::Uuid::new_v4().to_string();
+    std::fs::write(
+        root.join("references.json"),
+        serde_json::to_vec(&[old, fresh.clone()]).unwrap(),
+    )
+    .unwrap();
+    s.db(DbOperation::Prepare(fresh.clone())).await.unwrap();
+    if phase == "prepared" {
+        std::process::exit(0);
+    }
+    s.vault
+        .put(fresh.clone(), "interrupted-fixture-new-key".into())
+        .await
+        .unwrap();
+    if phase == "written" {
+        std::process::exit(0);
+    }
+    let id = view.configs[0].id.clone();
+    s.db(DbOperation::Commit {
+        input: input("new", vec![Usage::Text]),
+        id: Some(id.clone()),
+        revision: Some(1),
+        expectation: Some(expect(&s, &id, &[Usage::Text]).await),
+        credential_ref: fresh,
+    })
+    .await
+    .unwrap();
+    std::process::exit(0);
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test]
+async fn actual_process_interruption_recovers_each_journal_stage() {
+    use std::os::windows::process::CommandExt;
+    for phase in ["prepared", "written", "committed"] {
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let exit = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["models::tests::model_crash_fixture", "--exact", "--ignored"])
+            .env("SAYWEAVE_CRASH_TEST_ID", &id)
+            .env("SAYWEAVE_CRASH_TEST_ROOT", root.path())
+            .env("SAYWEAVE_CRASH_TEST_PHASE", phase)
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap();
+        assert!(exit.status.success());
+        let refs: Vec<String> =
+            serde_json::from_slice(&std::fs::read(root.path().join("references.json")).unwrap())
+                .unwrap();
+        let vault = Vault::new(WindowsCredentials::new(format!(
+            "local.sayweave.skeleton.test.{id}"
+        )));
+        let s = ModelService::with_vault(
+            DataWorker::start(root.path().to_path_buf()).unwrap(),
+            vault,
+            Arc::new(Provider::new().unwrap()),
+        )
+        .unwrap();
+        let recovered = s.status("main", true).await;
+        let overview = s.overview("main").await;
+        let old_exists = s.vault.get(refs[0].clone()).await.is_ok();
+        let new_exists = s.vault.get(refs[1].clone()).await.is_ok();
+        for reference in refs {
+            s.vault.delete(reference).await.unwrap();
+        }
+        recovered.unwrap();
+        let view = overview.unwrap();
+        assert_eq!(
+            view.configs[0].input.name,
+            if phase == "committed" { "new" } else { "old" }
+        );
+        assert_eq!(
+            (old_exists, new_exists),
+            if phase == "committed" {
+                (false, true)
+            } else {
+                (true, false)
+            }
+        );
+        assert!(!view.cleanup_pending);
+    }
 }
 #[tokio::test]
 async fn main_only_queue_shutdown_and_missing_credential() {

@@ -382,23 +382,6 @@ pub fn run() {
                 _ => base,
             };
             let root = data::profile_root(&base, cfg!(debug_assertions));
-            // Only our structured, whitelisted diagnostics reach disk; no external HTTP/debug targets.
-            let logger = tauri_plugin_log::Builder::new()
-                .targets([
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stderr),
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Folder {
-                        path: root.join("logs"),
-                        file_name: Some("sayweave".into()),
-                    }),
-                ])
-                .max_file_size(2 * 1024 * 1024)
-                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
-                .level(log::LevelFilter::Info)
-                .filter(|metadata| metadata.target() == "sayweave")
-                .build();
-            if app.handle().plugin(logger).is_err() {
-                eprintln!("SAYWEAVE_LOG unavailable");
-            }
             #[cfg(feature = "desktop-acceptance")]
             println!("SAYWEAVE_DATA_DIRECTORY {}", root.display());
             let namespace = format!(
@@ -431,6 +414,23 @@ pub fn run() {
                 Err(error) => {
                     return Err(format!("data worker initialization: {}", error.code).into());
                 }
+            }
+            // Only our structured, whitelisted diagnostics reach disk; no external HTTP/debug targets.
+            let logger = tauri_plugin_log::Builder::new()
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stderr),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Folder {
+                        path: root.join("logs"),
+                        file_name: Some("sayweave".into()),
+                    }),
+                ])
+                .max_file_size(2 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
+                .level(log::LevelFilter::Info)
+                .filter(|metadata| metadata.target() == "sayweave")
+                .build();
+            if app.handle().plugin(logger).is_err() {
+                eprintln!("SAYWEAVE_LOG unavailable");
             }
             // Acquire the per-profile lease before creating WebView2 or a second visible window.
             tauri::WebviewWindowBuilder::from_config(app, &app.config().app.windows[0])?.build()?;

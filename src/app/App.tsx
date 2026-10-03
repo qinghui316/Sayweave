@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useState, useSyncExternalStore, lazy, Suspense } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, lazy, Suspense } from 'react';
 import { HashRouter, Link, Route, Routes } from 'react-router-dom';
 import { createRuntime } from '../adapters/tauri';
 import { createDictionary } from '../adapters/dictionary-tauri';
+import { createModels } from '../adapters/models-tauri';
+import { ModelPanel } from '../features/models';
 import type { DemoAction, RuntimeErrorCode, WindowAction, Surface } from '../contracts/runtime';
 import { RuntimeError } from '../contracts/runtime';
 import { RuntimeStore } from './runtime-store';
@@ -22,6 +24,9 @@ const DevCatalogue = import.meta.env.DEV ? lazy(() => import('../dev/Catalogue')
 function RuntimeApp() {
   const [store] = useState(() => new RuntimeStore(createRuntime()));
   const [dictionary] = useState(createDictionary);
+  const [models] = useState(createModels);
+  const modelGuard=useRef<((action:()=>void)=>void)|null>(null);
+  const updateModelGuard=useCallback((guard:((action:()=>void)=>void)|null)=>{modelGuard.current=guard;},[]);
   const snapshot = useSyncExternalStore(store.subscribe,store.getSnapshot);
   const [error,setError]=useState<RuntimeErrorCode | null>(null);
   const [connection,setConnection]=useState(0);
@@ -50,7 +55,10 @@ function RuntimeApp() {
         <MotionScope enabled={!settingsOpen}><Routes><Route path="/" element={<Home motionEnabled={snapshot.windows.main && !settingsOpen} onShortcuts={()=>openSettings('device')} onModels={()=>openSettings('models')} phase={phase} start={()=>demo('start')} cancel={()=>demo('cancel')} finish={()=>demo('finish')}/>}/><Route path="/history" element={<History/>}/><Route path="/dictionary" element={<Dictionary port={dictionary}/>}/><Route path="/preferences" element={<Preferences/>}/><Route path="/onboarding" element={<Onboarding/>}/>{DevCatalogue && <Route path="/dev/components" element={<Suspense><DevCatalogue snapshot={snapshot} demo={demo} windowAction={windowAction} resync={()=>store.resync().catch(report)}/></Suspense>}/>}<Route path="*" element={<History/>}/></Routes></MotionScope>
       </main>
     </div>
-    <SettingsShell open={settingsOpen} tab={settingsTab} onTabChange={setSettingsTab} onOpenChange={setSettingsOpen}/>
+    <SettingsShell open={settingsOpen} tab={settingsTab}
+      onTabChange={tab=>{const action=()=>setSettingsTab(tab);if(modelGuard.current)modelGuard.current(action);else action();}}
+      onOpenChange={open=>{const action=()=>setSettingsOpen(open);if(!open&&modelGuard.current)modelGuard.current(action);else action();}}
+      modelContent={settingsOpen&&settingsTab==='models'?<ModelPanel port={models} onGuardChange={updateModelGuard}/>:undefined}/>
   </div></MotionScope>;
 }
 export function App() { return <ErrorBoundary><HashRouter><RuntimeApp/></HashRouter></ErrorBoundary>; }

@@ -43,6 +43,17 @@ node scripts/test-dictionary-desktop.mjs --regular
 
 ## 数据与性能
 
+模型配置原生闭环（隔离数据库、测试凭据与受控 HTTPS）：
+
+```powershell
+npm run desktop:build -- --features desktop-acceptance
+node scripts/test-models-desktop.mjs
+npm run desktop:build
+node scripts/test-models-desktop.mjs --regular
+```
+
+测试自行生成 UUID 范围的证书和凭据，最终清理显式记录的引用；截图、日志留在 `.local/`。普通构建检查只读，不改变个人配置。测试专用信任不编入普通构建。Rust 单元测试额外启动真实子进程，在凭据事务各阶段退出并验证恢复。供应商凭据未提供时不能用上述受控服务代替供应商实测。
+
 Rust数据测试覆盖Unicode、约束、版本冲突、事务、迁移拒绝、备份/恢复副本、锁与损坏。显式基准使用1k/10k/100k独立数据库，检查查询计划和耗时；10k常规查询/写入p95预算50ms，包含搜索100ms，100k仅压力观察。具体性能依赖机器和磁盘，不能把单次结果当作容量保证。
 
 ## 人工验证
