@@ -11,6 +11,9 @@ const directory=path.join(root,'.local','data-acceptance',id),data=path.join(dir
 mkdirSync(data,{recursive:true});
 const exe=path.join(root,'src-tauri','target','release','sayweave.exe'),port=9239;
 const regular=process.argv.includes('--regular'),key='isolated-test-key-'+randomUUID(),requests=[],report={id,checks:[],passed:false};
+const logFailure=process.argv.includes('--log-failure');
+if(logFailure&&regular)throw Error('Fault injection requires an isolated acceptance profile');
+if(logFailure)writeFileSync(path.join(data,'logs'),'isolated fixture prevents directory creation');
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
 let app,browser,server;
 
@@ -123,6 +126,7 @@ try{
   expect(requests.every(r=>r.authenticated)).toBe(true);expect(requests.filter(r=>r.path.endsWith('/chat/completions')).every(r=>r.budget===128)).toBe(true);
   const db=readFileSync(path.join(data,'dictionary.sqlite'));expect(db.includes(Buffer.from(key))).toBe(false);
   for(let round=1;round<=3;round++)for(const name of ['round-'+round+'.log','round-'+round+'-errors.log'])expect(readFileSync(path.join(directory,name),'utf8')).not.toContain(key);
+  if(logFailure){const stderr=readFileSync(path.join(directory,'round-1-errors.log'),'utf8');expect(stderr).toContain('SAYWEAVE_LOG unavailable');expect(stderr).toContain('operation=model_save');expect(stderr).not.toContain('stderr_unavailable');report.checks.push('unwritable log target keeps whitelisted stderr diagnostics and functional saves');}
   if(existsSync(path.join(data,'logs','sayweave.log')))expect(readFileSync(path.join(data,'logs','sayweave.log'),'utf8')).not.toContain(key);
   report.network=requests;report.checks.push('database, IPC and whitelisted logs contain no fixture API key; test configs removed via normal UI');
  }

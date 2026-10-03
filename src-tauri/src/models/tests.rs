@@ -51,12 +51,13 @@ fn model_desktop_fixture() {
     .unwrap();
 }
 use std::{collections::HashMap, sync::Mutex as SyncMutex};
+type AfterPut = Arc<SyncMutex<Option<Box<dyn FnOnce() + Send>>>>;
 #[derive(Clone, Default)]
 struct FakeVault {
     values: Arc<SyncMutex<HashMap<String, String>>>,
     fail_put: Arc<AtomicBool>,
     fail_delete: Arc<AtomicBool>,
-    after_put: Arc<SyncMutex<Option<Box<dyn FnOnce() + Send>>>>,
+    after_put: AfterPut,
 }
 impl Credentials for FakeVault {
     fn get(&mut self, r: &str) -> Result<String, ModelError> {

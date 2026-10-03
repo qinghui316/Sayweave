@@ -431,6 +431,17 @@ pub fn run() {
                 .build();
             if app.handle().plugin(logger).is_err() {
                 eprintln!("SAYWEAVE_LOG unavailable");
+                // Disk failure must not silently discard subsequent safe diagnostics.
+                let fallback = tauri_plugin_log::Builder::new()
+                    .targets([tauri_plugin_log::Target::new(
+                        tauri_plugin_log::TargetKind::Stderr,
+                    )])
+                    .level(log::LevelFilter::Info)
+                    .filter(|metadata| metadata.target() == "sayweave")
+                    .build();
+                if app.handle().plugin(fallback).is_err() {
+                    eprintln!("SAYWEAVE_LOG stderr_unavailable");
+                }
             }
             // Acquire the per-profile lease before creating WebView2 or a second visible window.
             tauri::WebviewWindowBuilder::from_config(app, &app.config().app.windows[0])?.build()?;
