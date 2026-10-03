@@ -2,16 +2,29 @@
 mod acceptance;
 mod coordinator;
 mod data;
+mod models;
 use coordinator::{Phase, RuntimeError, Snapshot, authorized_window, overlay_size};
 use data::{
     DataWorker, Operation, Output,
     model::{DataError, Input, Kind, Page, Query, Record, Status},
 };
+use models::commands::*;
 use std::{sync::Mutex, time::Duration};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, State, WebviewWindow};
 struct Runtime(Mutex<Snapshot>);
+#[cfg(feature = "desktop-acceptance")]
+#[tauri::command]
+fn acceptance_exit(app: tauri::AppHandle, window: WebviewWindow) -> Result<(), RuntimeError> {
+    if window.label() != "main"
+        || !std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID")
+            .is_ok_and(|id| uuid::Uuid::parse_str(&id).is_ok())
+    {
+        return Err(RuntimeError::new("forbidden"));
+    }
+    tray_action(&app, "exit")
+}
 fn read(app: &tauri::AppHandle) -> Result<Snapshot, RuntimeError> {
     app.state::<Runtime>()
         .0
@@ -189,7 +202,16 @@ fn tray_action(app: &tauri::AppHandle, id: &str) -> Result<(), RuntimeError> {
                 state.revision, state.session.phase
             );
             drop(state);
-            app.exit(0);
+            let service = app.state::<models::ModelService>();
+            service.begin_shutdown();
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let service = app.state::<models::ModelService>();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(5), service.finish_shutdown()).await;
+                log::logger().flush();
+                app.exit(0);
+            });
             Ok(())
         }
         _ => Err(RuntimeError::new("invalidAction")),
@@ -336,7 +358,17 @@ pub fn run() {
             dictionary_get,
             dictionary_create,
             dictionary_update,
-            dictionary_delete
+            dictionary_delete,
+            model_status,
+            model_overview,
+            model_save,
+            model_remove,
+            model_default,
+            model_fetch,
+            model_test,
+            model_cancel,
+            #[cfg(feature = "desktop-acceptance")]
+            acceptance_exit
         ])
         .setup(|app| {
             let base = app.path().app_data_dir()?;
@@ -350,9 +382,45 @@ pub fn run() {
                 _ => base,
             };
             let root = data::profile_root(&base, cfg!(debug_assertions));
+            // Only our structured, whitelisted diagnostics reach disk; no external HTTP/debug targets.
+            let logger = tauri_plugin_log::Builder::new()
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stderr),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Folder {
+                        path: root.join("logs"),
+                        file_name: Some("sayweave".into()),
+                    }),
+                ])
+                .max_file_size(2 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
+                .level(log::LevelFilter::Info)
+                .filter(|metadata| metadata.target() == "sayweave")
+                .build();
+            if app.handle().plugin(logger).is_err() {
+                eprintln!("SAYWEAVE_LOG unavailable");
+            }
+            #[cfg(feature = "desktop-acceptance")]
             println!("SAYWEAVE_DATA_DIRECTORY {}", root.display());
-            match DataWorker::start(root) {
+            let namespace = format!(
+                "local.sayweave.skeleton.{}",
+                if cfg!(debug_assertions) {
+                    "dev"
+                } else {
+                    "release"
+                }
+            );
+            #[cfg(feature = "desktop-acceptance")]
+            let namespace = match std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID") {
+                Ok(id) if uuid::Uuid::parse_str(&id).is_ok() => {
+                    format!("local.sayweave.skeleton.acceptance.{id}")
+                }
+                _ => namespace,
+            };
+            match DataWorker::start(root.clone()) {
                 Ok(worker) => {
+                    let service = models::ModelService::new(worker.clone(), namespace, &root)
+                        .map_err(|e| e.code)?;
+                    app.manage(service);
                     app.manage(worker);
                 }
                 Err(error) if error.code == "alreadyRunning" => {

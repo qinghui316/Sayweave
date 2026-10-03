@@ -155,7 +155,7 @@ fn migrations_backup_rollback_checksum_future_and_retention() {
             .query_row("SELECT count(*) FROM schema_migrations", [], |r| r
                 .get::<_, i32>(0))
             .unwrap(),
-        1
+        MIGRATIONS.len() as i32
     );
     drop(snapshot);
     // Restore only into an independent copy: the live upgraded database is untouched.
@@ -243,7 +243,7 @@ fn corrupt_unknown_and_backup_failure_preserve_source() {
         c.query_row("SELECT count(*) FROM schema_migrations", [], |r| r
             .get::<_, u32>(0))
             .unwrap(),
-        1
+        MIGRATIONS.len() as u32
     );
 }
 #[test]
@@ -295,6 +295,8 @@ fn worker_authorization_recovery_and_bounded_queue() {
         let fake = DataWorker {
             sender,
             status: worker.status.clone(),
+            stopping: Arc::new(AtomicBool::new(false)),
+            dispatch: Arc::new(Mutex::new(())),
         };
         for _ in 0..64 {
             let (response, _) = oneshot::channel();

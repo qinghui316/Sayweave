@@ -7,10 +7,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub const MIGRATIONS: &[(&str, &str)] = &[(
-    "dictionary_nfc_lower_v1",
-    include_str!("migrations/001_dictionary.sql"),
-)];
+pub const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "dictionary_nfc_lower_v1",
+        include_str!("migrations/001_dictionary.sql"),
+    ),
+    ("models_v1", include_str!("migrations/002_models.sql")),
+];
 pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -18,7 +21,7 @@ pub fn now() -> i64 {
         .as_millis() as i64
 }
 pub fn db_error(error: rusqlite::Error) -> DataError {
-    eprintln!("SAYWEAVE_DATA sqlite_code={:?}", error.sqlite_error_code());
+    log::warn!(target:"sayweave","SAYWEAVE_DATA sqlite_code={:?}", error.sqlite_error_code());
     match error.sqlite_error_code() {
         Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
             DataError::new("busy")
