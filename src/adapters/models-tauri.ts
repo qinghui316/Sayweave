@@ -14,4 +14,3 @@ class TauriModels implements ModelConfigPort {
  async cancelRequest(requestId:string){await this.call('model_cancel',{requestId});}
 }
 export function createModels():ModelConfigPort{return isTauri()?new TauriModels():new BrowserModels();}
-

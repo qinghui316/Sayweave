@@ -36,4 +36,3 @@ describe('model configuration memory contract',()=>{
   expect(()=>parseModelOverview({configs:[],defaults:[],cleanupPending:false})).toThrow();
  });
 });
-

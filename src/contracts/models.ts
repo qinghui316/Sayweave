@@ -63,4 +63,3 @@ export function parseModelOverview(value:unknown):ModelOverview {
 export function parseModelStatus(value:unknown):ModelStatus {const v=obj(value);if(!['preparing','ready','unavailable','stopping'].includes(String(v.state))||!num(v.schemaVersion)||typeof v.cleanupPending!=='boolean')throw new ModelError('protocol');return {state:v.state as ModelStatus['state'],schemaVersion:v.schemaVersion,cleanupPending:v.cleanupPending};}
 export function parseModelTest(value:unknown):ModelTestResult {const v=obj(value);if(!num(v.testedAt)||!num(v.elapsedMs))throw new ModelError('protocol');return {testedAt:v.testedAt,elapsedMs:v.elapsedMs};}
 export function parseModelIds(value:unknown):string[]{if(!Array.isArray(value)||!value.every(v=>typeof v==='string'&&v.length>0&&[...v].length<=256))throw new ModelError('protocol');return [...new Set(value)];}
-

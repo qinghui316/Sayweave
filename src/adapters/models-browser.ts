@@ -53,4 +53,3 @@ export class BrowserModels implements ModelConfigPort {
  async testTextModel(d:ModelDraft,id:string){if(!d.input.modelId.trim())throw new ModelError('invalid','modelId');return this.demo(d,id,{testedAt:Date.now(),elapsedMs:250});}
  async cancelRequest(id:string){this.requests.get(id)?.();}
 }
-

@@ -59,4 +59,3 @@ describe('inline model panel',()=>{
   fireEvent.click(screen.getByRole('button',{name:'保存配置'}));await screen.findByText('配置已保存。');
  });
 });
-

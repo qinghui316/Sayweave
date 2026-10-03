@@ -29,4 +29,3 @@ test('model panel scrolls at compact sizes with neutral text',async({page})=>{
   await page.screenshot({path:'tests/visual/models-'+size.width+'.png'});
  }
 });
-
