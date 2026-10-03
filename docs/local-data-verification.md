@@ -12,9 +12,10 @@
 
 ## 桌面复验
 
-准备环境并停止 Vite 后执行：
+准备环境并停止 Vite 后执行。先运行磁盘性能测试，生成桌面测试所需的10,000条独立快照；不能省略第一步：
 
 ```powershell
+cargo test --manifest-path src-tauri/Cargo.toml dictionary_query_benchmark -- --ignored --nocapture
 npm.cmd run desktop:build -- --features desktop-acceptance
 node scripts/test-dictionary-desktop.mjs
 npm.cmd run test:desktop
