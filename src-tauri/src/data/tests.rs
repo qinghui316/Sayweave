@@ -134,6 +134,84 @@ fn literal_contains_pagination_and_strict_constraints() {
     );
 }
 #[test]
+fn legacy_migration_newlines_preserve_ledger_and_data() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let mut repo = Repository::open(root.path()).unwrap();
+    let saved = repo.save(term("换行兼容词条"), None).unwrap();
+    let windows: Vec<_> = MIGRATIONS
+        .iter()
+        .map(|(name, sql)| (*name, sql.replace("\r\n", "\n").replace('\n', "\r\n")))
+        .collect();
+    for (i, (_, sql)) in windows.iter().enumerate().skip(3) {
+        repo.connection
+            .execute(
+                "UPDATE schema_migrations SET checksum=?1 WHERE version=?2",
+                rusqlite::params![
+                    format!("{:x}", Sha256::digest(sql.as_bytes())),
+                    i as i64 + 1
+                ],
+            )
+            .unwrap();
+    }
+    let ledger = |connection: &Connection| {
+        connection
+            .prepare("SELECT checksum FROM schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let before = ledger(&repo.connection);
+    migrate(&mut repo.connection, root.path(), MIGRATIONS).unwrap();
+    let windows: Vec<_> = windows
+        .iter()
+        .map(|(name, sql)| (*name, sql.as_str()))
+        .collect();
+    migrate(&mut repo.connection, root.path(), &windows).unwrap();
+    assert_eq!(ledger(&repo.connection), before);
+    assert_eq!(
+        repo.get(Kind::Term, &saved.id).unwrap().original,
+        "换行兼容词条"
+    );
+    assert!(!root.path().join("backups").exists());
+    let mut changed = MIGRATIONS.to_vec();
+    changed[4].1 = "SELECT 1;";
+    assert!(migrate(&mut repo.connection, root.path(), &changed).is_err());
+    assert_eq!(ledger(&repo.connection), before);
+}
+#[test]
+fn new_migration_checksums_are_stable_across_checkout_newlines() {
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap();
+    let mut connection = Connection::open(root.path().join("dictionary.sqlite")).unwrap();
+    let windows: Vec<_> = MIGRATIONS
+        .iter()
+        .map(|(name, sql)| (*name, sql.replace("\r\n", "\n").replace('\n', "\r\n")))
+        .collect();
+    let borrowed: Vec<_> = windows
+        .iter()
+        .map(|(name, sql)| (*name, sql.as_str()))
+        .collect();
+    migrate(&mut connection, root.path(), &borrowed).unwrap();
+    for (i, (_, sql)) in MIGRATIONS.iter().enumerate() {
+        let checksum: String = connection
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version=?1",
+                [i as i64 + 1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            checksum,
+            format!("{:x}", Sha256::digest(sql.replace("\r\n", "\n").as_bytes()))
+        );
+    }
+    migrate(&mut connection, root.path(), MIGRATIONS).unwrap();
+    assert!(!root.path().join("backups").exists());
+}
+#[test]
 fn migrations_backup_rollback_checksum_future_and_retention() {
     let root = tempfile::tempdir().unwrap();
     let mut repo = Repository::open(root.path()).unwrap();

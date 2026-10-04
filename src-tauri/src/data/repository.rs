@@ -61,6 +61,20 @@ pub fn verify(connection: &Connection) -> Result<(), DataError> {
         Err(DataError::new("unavailable"))
     }
 }
+fn migration_checksum(sql: &str) -> String {
+    format!("{:x}", Sha256::digest(sql.replace("\r\n", "\n").as_bytes()))
+}
+fn migration_checksum_matches(sql: &str, checksum: &str) -> bool {
+    // Older Windows builds stored CRLF hashes. Accept only these two exact
+    // newline representations; all other migration content remains frozen.
+    let canonical = sql.replace("\r\n", "\n");
+    checksum == migration_checksum(&canonical)
+        || checksum
+            == format!(
+                "{:x}",
+                Sha256::digest(canonical.replace('\n', "\r\n").as_bytes())
+            )
+}
 pub fn migrate(
     connection: &mut Connection,
     root: &Path,
@@ -102,7 +116,7 @@ pub fn migrate(
         };
         if *version != i as u32 + 1
             || name != expected_name
-            || checksum != &format!("{:x}", Sha256::digest(sql.as_bytes()))
+            || !migration_checksum_matches(sql, checksum)
         {
             return Err(DataError::new("unavailable"));
         }
@@ -139,12 +153,7 @@ pub fn migrate(
         tx.execute_batch(sql).map_err(db_error)?;
         tx.execute(
             "INSERT INTO schema_migrations VALUES(?1,?2,?3,?4)",
-            params![
-                i as u32 + 1,
-                name,
-                format!("{:x}", Sha256::digest(sql.as_bytes())),
-                now()
-            ],
+            params![i as u32 + 1, name, migration_checksum(sql), now()],
         )
         .map_err(db_error)?;
     }
