@@ -223,12 +223,15 @@ impl RecognitionSession {
         if pcm.len() > 32000 {
             return Err(Error::new("bufferOverflow"));
         }
-        self.audio
-            .try_send(Command::Audio(pcm.to_vec()))
-            .map_err(|e| match e {
-                mpsc::error::TrySendError::Full(_) => Error::new("bufferOverflow"),
-                mpsc::error::TrySendError::Closed(_) => Error::new("network"),
-            })
+        // A bounded burst after a disk checkpoint must let the transport drain its queue.
+        // Sustained backpressure still fails explicitly; capture never waits on this task.
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            self.audio.send(Command::Audio(pcm.to_vec())),
+        )
+        .await
+        .map_err(|_| Error::new("bufferOverflow"))?
+        .map_err(|_| Error::new("network"))
     }
     pub async fn finish(&self) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
@@ -320,6 +323,26 @@ mod tests {
             Event::Finished
         ));
         server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn bounded_burst_yields_to_transport_instead_of_reporting_false_overflow() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (_, events) = mpsc::channel(1);
+        let worker = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            for _ in 0..40 {
+                assert!(matches!(rx.recv().await, Some(Command::Audio(_))));
+            }
+        });
+        let session = RecognitionSession {
+            audio: tx,
+            events,
+            worker,
+        };
+        for _ in 0..40 {
+            session.send_pcm(&[1; 320]).await.unwrap();
+        }
+        drop(session);
     }
     #[tokio::test]
     async fn bounded_audio_backpressure_is_an_error_and_drop_stops_transport() {

@@ -32,6 +32,42 @@ pub struct Query {
     pub page: u32,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Cursor {
+    pub created_at: i64,
+    pub id: String,
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowseQuery {
+    pub search: String,
+    pub cursor: Option<Cursor>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Summary {
+    pub id: String,
+    pub created_at: i64,
+    pub duration_ms: u64,
+    pub status: String,
+    pub revision: i64,
+    pub display_attempt: Option<String>,
+    pub preview: String,
+    pub truncated: bool,
+    pub matched_old_version: bool,
+    pub latest_attempt: Option<String>,
+    pub latest_status: Option<String>,
+    pub latest_error: Option<String>,
+    pub audio: Option<Audio>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Feed {
+    pub records: Vec<Summary>,
+    pub total: u32,
+    pub next_cursor: Option<Cursor>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Attempt {
     pub id: String,
@@ -103,6 +139,7 @@ pub enum DbOperation {
     Preferences,
     SavePreferences(Preferences),
     List(Query),
+    Browse(BrowseQuery),
     Detail(String),
     Usage,
     Prepare(Prepare),
@@ -138,6 +175,7 @@ pub enum DbOperation {
 pub enum DbOutput {
     Preferences(Preferences),
     Page(Page),
+    Feed(Feed),
     Record(Record),
     Usage(Usage),
     Audio(Audio),

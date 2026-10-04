@@ -6,6 +6,141 @@ fn id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+fn browse(repo: &mut Repository, search: &str, cursor: Option<Cursor>) -> Feed {
+    match repo
+        .history_operation(DbOperation::Browse(BrowseQuery {
+            search: search.into(),
+            cursor,
+        }))
+        .unwrap()
+    {
+        DbOutput::Feed(page) => page,
+        _ => panic!("wrong output"),
+    }
+}
+
+#[test]
+fn summaries_bind_full_versions_and_keep_success_after_failed_retry() {
+    let root = tempfile::tempdir().unwrap();
+    let mut repo = Repository::open(root.path()).unwrap();
+    let (rid, first, resource) = prepare(&mut repo, true);
+    let text = "旧版本😀".repeat(100);
+    finish(&mut repo, &first, "success", &text);
+    let mut second = attempt(&rid, "retry");
+    second.created_at = first.created_at + 1;
+    repo.history_operation(DbOperation::Retry(second.clone()))
+        .unwrap();
+    finish(&mut repo, &second, "success", "新的完整文字");
+    let revision = record(&mut repo, &rid).revision;
+    let mut failed = attempt(&rid, "retry");
+    failed.created_at = second.created_at + 1;
+    repo.history_operation(DbOperation::Retry(failed.clone()))
+        .unwrap();
+    repo.history_operation(DbOperation::Finish {
+        attempt_id: failed.id.clone(),
+        status: "failed".into(),
+        text: "".into(),
+        error: Some("timeout".into()),
+        duration_ms: 0,
+        elapsed_ms: 30,
+    })
+    .unwrap();
+    let current = browse(&mut repo, "", None).records.remove(0);
+    assert_eq!(current.revision, revision);
+    assert_eq!(current.display_attempt, Some(second.id));
+    assert_eq!(current.preview, "新的完整文字");
+    assert_eq!(current.latest_attempt, Some(failed.id));
+    assert_eq!(current.latest_error.as_deref(), Some("timeout"));
+    let matched = browse(&mut repo, "旧版本", None).records.remove(0);
+    assert!(matched.matched_old_version);
+    assert!(matched.truncated);
+    assert_eq!(matched.preview.chars().count(), 240);
+    assert_eq!(matched.display_attempt, Some(first.id.clone()));
+    assert_eq!(
+        record(&mut repo, &rid)
+            .attempts
+            .iter()
+            .find(|a| a.id == first.id)
+            .unwrap()
+            .text,
+        text
+    );
+    let a = resource.unwrap();
+    repo.history_operation(DbOperation::AudioState {
+        id: a.id,
+        status: "expired".into(),
+        bytes: 0,
+    })
+    .unwrap();
+    assert_eq!(
+        browse(&mut repo, "", None).records[0]
+            .audio
+            .as_ref()
+            .unwrap()
+            .status,
+        "expired"
+    );
+    assert_eq!(browse(&mut repo, "%_", None).total, 0);
+    assert!(
+        repo.history_operation(DbOperation::Browse(BrowseQuery {
+            search: "\u{0}".into(),
+            cursor: None
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn cursor_survives_deleted_anchor_without_duplicate_or_missing_rows() {
+    let root = tempfile::tempdir().unwrap();
+    let mut repo = Repository::open(root.path()).unwrap();
+    for i in 0..115 {
+        let rid = id();
+        let mut a = attempt(&rid, "live");
+        a.created_at = 1000 + i / 3;
+        repo.history_operation(DbOperation::Prepare(Prepare {
+            record_id: rid,
+            attempt: a.clone(),
+            audio: None,
+        }))
+        .unwrap();
+        finish(&mut repo, &a, "success", "你好");
+    }
+    let page = browse(&mut repo, "你好", None);
+    assert_eq!(page.total, 115);
+    assert_eq!(page.records.len(), 50);
+    let cursor = page.next_cursor.clone().unwrap();
+    let deleted = record(&mut repo, &cursor.id);
+    repo.history_operation(DbOperation::MarkDelete {
+        id: cursor.id.clone(),
+        revision: deleted.revision,
+    })
+    .unwrap();
+    repo.history_operation(DbOperation::DeleteRecord(cursor.id.clone()))
+        .unwrap();
+    let expected = match repo
+        .history_operation(DbOperation::List(Query {
+            search: "你好".into(),
+            page: 2,
+        }))
+        .unwrap()
+    {
+        DbOutput::Page(p) => p.total,
+        _ => 0,
+    };
+    assert_eq!(expected, 114);
+    let mut ids: Vec<_> = page.records.into_iter().map(|r| r.id).collect();
+    let next = browse(&mut repo, "你好", Some(cursor));
+    assert_eq!(next.records.len(), 50);
+    ids.extend(next.records.into_iter().map(|r| r.id));
+    let last = browse(&mut repo, "你好", next.next_cursor);
+    assert!(last.next_cursor.is_none());
+    ids.extend(last.records.into_iter().map(|r| r.id));
+    let unique: std::collections::HashSet<_> = ids.iter().collect();
+    assert_eq!(unique.len(), 115);
+    assert_eq!(ids.len(), 115);
+}
+
 #[test]
 fn migration_v4_to_v5_preserves_configs_defaults_history_and_constraints() {
     use crate::data::repository::{MIGRATIONS, configure, migrate};
@@ -560,8 +695,8 @@ fn history_query_benchmark() {
                 .prepare("UPDATE speech_records SET current_attempt=?2 WHERE id=?1")
                 .unwrap();
             for n in 0..size {
-                let r = format!("record-{n:08}");
-                let a = format!("attempt-{n:08}");
+                let r = uuid::Uuid::from_u128(n as u128 + 1).to_string();
+                let a = uuid::Uuid::from_u128(n as u128 + size as u128 + 1).to_string();
                 records.execute(params![r, n as i64]).unwrap();
                 attempts
                     .execute(params![a, r, n as i64, format!("中文测试 english {n}")])
@@ -570,6 +705,9 @@ fn history_query_benchmark() {
             }
         }
         tx.commit().unwrap();
+        let plans=repo.connection.prepare("EXPLAIN QUERY PLAN SELECT id FROM speech_records ORDER BY created_at DESC,id ASC LIMIT 50").unwrap().query_map([],|row|row.get::<_,String>(3)).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        assert!(plans.iter().any(|p| p.contains("speech_records_recent")));
+        println!("history size={size} order_plan={plans:?}");
         for (label, search, page) in [
             ("recent", "", 1),
             ("last", "", u32::MAX),
@@ -593,6 +731,66 @@ fn history_query_benchmark() {
             if size == 10000 {
                 assert!(p95 < if search.is_empty() { 50.0 } else { 100.0 });
             }
+            let mut summaries = vec![];
+            for _ in 0..30 {
+                let started = Instant::now();
+                let cursor = if page == u32::MAX {
+                    Some(Cursor {
+                        created_at: 50,
+                        id: uuid::Uuid::from_u128(51).to_string(),
+                    })
+                } else {
+                    None
+                };
+                let _ = browse(&mut repo, search, cursor);
+                summaries.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            summaries.sort_by(f64::total_cmp);
+            let p95 = summaries[28];
+            println!("history_browse size={size} query={label} p95_ms={p95:.3}");
+            if size == 10000 {
+                assert!(p95 < if search.is_empty() { 50.0 } else { 100.0 });
+            }
         }
     }
+}
+
+#[test]
+#[ignore = "Populate only a UUID-scoped desktop acceptance directory while its app is stopped"]
+fn history_desktop_fixture() {
+    let token = std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID").unwrap();
+    uuid::Uuid::parse_str(&token).unwrap();
+    let project = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    let root = project
+        .join(".local/data-acceptance")
+        .join(token)
+        .join("data");
+    let mut repo = Repository::open(&root).unwrap();
+    assert_eq!(browse(&mut repo, "", None).total, 0);
+    let at = crate::data::repository::now();
+    let tx = repo.connection.transaction().unwrap();
+    {
+        let mut records=tx.prepare("INSERT INTO speech_records(id,created_at,status,current_attempt,duration_ms,ended_at) VALUES(?1,?2,'success',NULL,1000,?2)").unwrap();
+        let mut attempts=tx.prepare("INSERT INTO speech_attempts(id,record_id,kind,config_id,config_name,model_id,service_host,config_revision,created_at,status,text,search_key) VALUES(?1,?2,'live','fixture','模型','fixture','example.invalid',1,?3,'success',?4,?4)").unwrap();
+        let mut current = tx
+            .prepare("UPDATE speech_records SET current_attempt=?2 WHERE id=?1")
+            .unwrap();
+        for n in 0..10000 {
+            let r = id();
+            let a = id();
+            let created = at - n * 60000;
+            records.execute(params![r, created]).unwrap();
+            let text = if n == 0 {
+                "长中文识别文字，支持完整复制与展开。".repeat(50)
+            } else {
+                format!("历史验收 {n}：中文 english 文字。")
+            };
+            attempts.execute(params![a, r, created, text]).unwrap();
+            current.execute(params![r, a]).unwrap();
+        }
+    }
+    tx.commit().unwrap();
+    assert_eq!(browse(&mut repo, "", None).total, 10000);
 }

@@ -1,7 +1,7 @@
 import {invoke,isTauri} from '@tauri-apps/api/core';
 import {listen} from '@tauri-apps/api/event';
 import {speechError,parseSpeech,parseMeter,parseDevices,parsePreferences,type SpeechPort,type SpeechSnapshot,type SpeechMeter,type RecordingPreferences} from '../contracts/speech';
-import {parseHistory,parseRecord,parseUsage,parsePlayback,type HistoryPort} from '../contracts/history';
+import {parseFeed,parseHistory,parseRecord,parseUsage,parsePlayback,type HistoryPort,type HistoryCursor} from '../contracts/history';
 import {BrowserSpeech,BrowserHistory} from './speech-browser';
 async function call(command:string,args:Record<string,unknown>={}){try{return await invoke<unknown>(command,args);}catch(e){throw speechError(e);}}
 class TauriSpeech implements SpeechPort {
@@ -23,6 +23,7 @@ class TauriHistory implements HistoryPort {
  readonly mode='native' as const;
  async status(retry=false){const s=await call('history_status',{retry});if(typeof s!=='object'||s===null||!('state'in s)||typeof s.state!=='string')throw speechError({code:'protocol'});return {state:s.state};}
  async list(search:string,page:number){return parseHistory(await call('history_list',{query:{search,page}}));}
+ async browse(search:string,cursor:HistoryCursor|null=null){return parseFeed(await call('history_browse',{query:{search,cursor}}));}
  async detail(id:string){return parseRecord(await call('history_detail',{id}));}
  async usage(){return parseUsage(await call('history_usage'));}
  async remove(id:string,revision:number){await call('history_remove',{id,revision});}

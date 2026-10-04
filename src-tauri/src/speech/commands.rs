@@ -104,6 +104,20 @@ pub async fn history_list(
     }
 }
 #[tauri::command]
+pub async fn history_browse(
+    window: WebviewWindow,
+    service: State<'_, SpeechService>,
+    query: BrowseQuery,
+) -> Result<Feed, Error> {
+    main(&window)?;
+    let _operation = service.admit()?;
+    service.initialize().await?;
+    match service.history.db(DbOperation::Browse(query)).await? {
+        DbOutput::Feed(v) => Ok(v),
+        _ => Err(Error::new("unavailable")),
+    }
+}
+#[tauri::command]
 pub async fn history_detail(
     window: WebviewWindow,
     service: State<'_, SpeechService>,

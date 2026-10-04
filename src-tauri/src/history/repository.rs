@@ -34,6 +34,46 @@ fn insert_attempt(c: &Connection, a: &Attempt) -> Result<(), Error> {
 impl Repository {
     pub fn history_operation(&mut self, op: DbOperation) -> Result<DbOutput, Error> {
         match op {
+            DbOperation::Browse(q) => {
+                if q.search.chars().count() > 256 || q.search.chars().any(char::is_control)
+                    || q.cursor.as_ref().is_some_and(|c| c.created_at < 0 || uuid::Uuid::parse_str(&c.id).is_err()) {
+                    return Err(Error::new("invalid"));
+                }
+                let tx = self.connection.transaction().map_err(db_error)?;
+                let search = crate::data::model::key(&q.search);
+                let filter = "(?1='' OR EXISTS(SELECT 1 FROM speech_attempts a WHERE a.record_id=r.id AND instr(a.search_key,?1)>0))";
+                let total = tx.query_row(&format!("SELECT count(*) FROM speech_records r WHERE {filter}"), [&search], |r| r.get(0)).map_err(db_error)?;
+                let at = q.cursor.as_ref().map(|c| c.created_at);
+                let anchor = q.cursor.as_ref().map(|c| c.id.as_str()).unwrap_or("");
+                // Select only a bounded preview. Full attempt bodies stay behind detail().
+                let sql = format!("SELECT r.id,r.created_at,r.duration_ms,r.status,r.revision,r.current_attempt,
+                    COALESCE((SELECT a.id FROM speech_attempts a WHERE a.id=r.current_attempt AND (?1='' OR instr(a.search_key,?1)>0)),
+                    (SELECT a.id FROM speech_attempts a WHERE a.record_id=r.id AND (?1='' OR instr(a.search_key,?1)>0)
+                     ORDER BY a.created_at DESC,a.id ASC LIMIT 1))
+                    FROM speech_records r WHERE {filter} AND (?2 IS NULL OR r.created_at<?2 OR (r.created_at=?2 AND r.id>?3))
+                    ORDER BY r.created_at DESC,r.id ASC LIMIT 51");
+                let rows = tx.prepare(&sql).map_err(db_error)?.query_map(params![search,at,anchor], |r| Ok((
+                    r.get::<_,String>(0)?, r.get::<_,i64>(1)?, r.get::<_,i64>(2)?, r.get::<_,String>(3)?,
+                    r.get::<_,i64>(4)?, r.get::<_,Option<String>>(5)?, r.get::<_,Option<String>>(6)?
+                ))).map_err(db_error)?.collect::<Result<Vec<_>,_>>().map_err(db_error)?;
+                let more = rows.len() > 50;
+                let mut records = Vec::with_capacity(rows.len().min(50));
+                for (id,created_at,duration_ms,status,revision,current,display_attempt) in rows.into_iter().take(50) {
+                    let preview = if let Some(a) = &display_attempt {
+                        tx.query_row("SELECT substr(text,1,240),length(text)>240 FROM speech_attempts WHERE id=?1", [a], |r| Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?))).map_err(db_error)?
+                    } else { (String::new(),false) };
+                    let latest = tx.query_row("SELECT id,status,error_code FROM speech_attempts WHERE record_id=?1 ORDER BY created_at DESC,id ASC LIMIT 1", [&id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?))).optional().map_err(db_error)?;
+                    let audio = tx.query_row("SELECT id,record_id,file_key,status,bytes,expires_at FROM audio_assets WHERE record_id=?1", [&id], audio).optional().map_err(db_error)?;
+                    records.push(Summary {id,created_at,duration_ms:duration_ms as u64,status,revision,
+                        matched_old_version:!search.is_empty() && display_attempt != current,
+                        display_attempt,preview:preview.0,truncated:preview.1,
+                        latest_attempt:latest.as_ref().map(|a|a.0.clone()),latest_status:latest.as_ref().map(|a|a.1.clone()),
+                        latest_error:latest.and_then(|a|a.2),audio});
+                }
+                let next_cursor = if more { records.last().map(|r| Cursor {created_at:r.created_at,id:r.id.clone()}) } else {None};
+                tx.commit().map_err(db_error)?;
+                Ok(DbOutput::Feed(Feed {records,total,next_cursor}))
+            },
             DbOperation::Stage{attempt_id,status}=>{
                 if !["recording","processing"].contains(&status.as_str()){return Err(Error::new("invalid"));}
                 let tx=self.connection.transaction().map_err(db_error)?;

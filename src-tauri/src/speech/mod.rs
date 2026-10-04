@@ -555,6 +555,7 @@ impl SpeechService {
                     return Err(Error::new("timeout"));
                 }
                 tokio::select! {
+                                   biased;
                                    _=cancel.changed()=>{if *cancel.borrow()==1 {if let Some(c)=&capture{c.stop();}self.update(app,&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}},
                                    message=session.next_event()=>{match message? {
                                        recognition::Event::Update(value)=>{transcript=value;dirty=true;if !transcript.confirmed_text.is_empty()&&task.persistent&&checkpoint.elapsed()>Duration::from_secs(1){if self.history.db(DbOperation::Checkpoint{attempt_id:task.attempt_id.clone(),text:transcript.text(true)}).await.is_err(){save_error=true;}checkpoint=Instant::now();}},
@@ -569,7 +570,7 @@ impl SpeechService {
                                            if let Some(pcm)=&task.replay {
                                                let end=(replay_at+800).min(pcm.len());if replay_at<end {session.send_pcm(&pcm[replay_at..end]).await?;replay_at=end;duration=replay_at as u64/16;}else{sending=false;}
                                            } else if let Some(c)=capture.as_mut(){
-                                               while let Ok(packet)=c.packets.try_recv(){duration=packet.duration_ms;level=packet.level;session.send_pcm(&packet.pcm).await?;}
+                                               for _ in 0..16 {let Ok(packet)=c.packets.try_recv() else {break};duration=packet.duration_ms;level=packet.level;session.send_pcm(&packet.pcm).await?;}
                                                if c.packets.is_closed()&&c.packets.is_empty(){sending=false;}
                                            }
                                            if !sending {session.finish().await?;final_at=Some(Instant::now());self.update(app,&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}

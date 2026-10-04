@@ -29,6 +29,27 @@ fn acceptance_exit(app: tauri::AppHandle, window: WebviewWindow) -> Result<(), R
     }
     tray_action(&app, "exit")
 }
+#[cfg(feature = "desktop-acceptance")]
+#[tauri::command]
+fn acceptance_main_size(window: WebviewWindow, minimum: bool) -> Result<f64, RuntimeError> {
+    if window.label() != "main"
+        || !std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID")
+            .is_ok_and(|id| uuid::Uuid::parse_str(&id).is_ok())
+    {
+        return Err(RuntimeError::new("forbidden"));
+    }
+    let size = if minimum {
+        (960.0, 640.0)
+    } else {
+        (1120.0, 760.0)
+    };
+    window
+        .set_size(LogicalSize::new(size.0, size.1))
+        .map_err(|_| RuntimeError::new("unavailable"))?;
+    window
+        .scale_factor()
+        .map_err(|_| RuntimeError::new("unavailable"))
+}
 fn read(app: &tauri::AppHandle) -> Result<Snapshot, RuntimeError> {
     app.state::<Runtime>()
         .0
@@ -392,13 +413,16 @@ pub fn run() {
             speech_copy,
             history_status,
             history_list,
+            history_browse,
             history_detail,
             history_usage,
             history_remove,
             history_retry,
             history_play,
             #[cfg(feature = "desktop-acceptance")]
-            acceptance_exit
+            acceptance_exit,
+            #[cfg(feature = "desktop-acceptance")]
+            acceptance_main_size
         ])
         .setup(|app| {
             let base = app.path().app_data_dir()?;

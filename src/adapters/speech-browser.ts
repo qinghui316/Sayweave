@@ -1,5 +1,5 @@
 import {SpeechError,initialSpeech,type SpeechPort,type SpeechSnapshot,type SpeechMeter,type RecordingPreferences} from '../contracts/speech';
-import {historyText,type HistoryPort,type HistoryRecord,type PlaybackState} from '../contracts/history';
+import {historyText,summarizeHistory,type HistoryPort,type HistoryRecord,type HistoryCursor,type PlaybackState} from '../contracts/history';
 export class BrowserSpeech implements SpeechPort {
  readonly mode='simulation' as const;
  value=initialSpeech();settings:RecordingPreferences={deviceId:null,historyEnabled:true,audioEnabled:true,retentionDays:30,revision:1};
@@ -33,6 +33,12 @@ export class BrowserHistory implements HistoryPort {
  readonly mode='simulation' as const;private playbackState:PlaybackState={resourceId:null,playing:false,positionMs:0,durationMs:0};
  constructor(private speech:BrowserSpeech){}
  async status(){return {state:'ready'};}
+ async browse(search:string,cursor:HistoryCursor|null=null){
+  if([...search].length>256||[...search].some(c=>c.codePointAt(0)!<32||(c.codePointAt(0)!>=127&&c.codePointAt(0)!<=159)))throw new SpeechError('invalid');
+  const all=this.speech.records.map(r=>summarizeHistory(r,search)).filter(r=>r!==null).sort((a,b)=>b.createdAt-a.createdAt||(a.id<b.id?-1:1));
+  const remaining=all.filter(r=>!cursor||r.createdAt<cursor.createdAt||r.createdAt===cursor.createdAt&&r.id>cursor.id);
+  const records=remaining.slice(0,50);const last=records.at(-1);return {records,total:all.length,nextCursor:remaining.length>50&&last?{createdAt:last.createdAt,id:last.id}:null};
+ }
  async list(search:string,page:number){const records=this.speech.records.filter(r=>historyText(r).toLowerCase().includes(search.trim().toLowerCase()));const actual=Math.max(1,Math.min(page,Math.ceil(records.length/50)||1));return {records:structuredClone(records.slice((actual-1)*50,actual*50)),total:records.length,page:actual,pageSize:50 as const};}
  async detail(id:string){const r=this.speech.records.find(r=>r.id===id);if(!r)throw new SpeechError('notFound');return structuredClone(r);}
  async usage(){return {characters:this.speech.records.reduce((n,r)=>n+[...historyText(r)].filter(c=>!c.match(/\s/u)).length,0),durationMs:this.speech.records.reduce((n,r)=>n+r.durationMs,0),count:this.speech.records.length};}
