@@ -13,12 +13,13 @@ export class BrowserSpeech implements SpeechPort {
  async savePreferences(p:RecordingPreferences){if(p.revision!==this.settings.revision)throw new SpeechError('conflict');this.settings={...p,revision:p.revision+1};return this.preferences();}
  private emit(){this.value.sequence++;for(const fn of this.listeners)fn(structuredClone(this.value));}
  async start(){
-  clearTimeout(this.timer);if(this.active)throw new SpeechError('busy');this.active=true;
+  if(this.active)throw new SpeechError('busy');clearTimeout(this.timer);this.active=true;
   const prior=this.value;this.value={...initialSpeech(),sequence:prior.sequence+1,lifecycle:prior.lifecycle+1,taskId:crypto.randomUUID(),attemptId:crypto.randomUUID(),recordId:this.settings.historyEnabled?crypto.randomUUID():null,modelName:'模拟语音模型',deviceName:'模拟麦克风',phase:'connecting'};this.emit();
   this.timer=setTimeout(()=>{this.value.phase='recording';this.value.lifecycle++;this.value.text='这是浏览器模拟文字。';this.value.durationMs=1000;this.emit();},250);return this.snapshot();
  }
  async control(id:string,action:'finish'|'cancel'){
-  if(!this.active||id!==this.value.taskId)throw new SpeechError('staleSession');clearTimeout(this.timer);
+  if(!this.active||id!==this.value.taskId)throw new SpeechError('staleSession');
+  if(action==='finish'&&this.value.phase!=='recording')throw new SpeechError('invalid');clearTimeout(this.timer);
   if(action==='cancel'){this.active=false;this.value.phase='cancelled';this.value.text='';this.value.recordId=null;this.value.lifecycle++;this.emit();return;}
   if(this.value.phase!=='recording')throw new SpeechError('invalid');this.value.phase='processing';this.value.lifecycle++;this.emit();
   this.timer=setTimeout(()=>{this.active=false;this.value.phase='completed';this.value.text='这是浏览器模拟文字，未访问麦克风或语音服务。';this.value.lifecycle++;this.value.saved=this.settings.historyEnabled;

@@ -29,4 +29,7 @@ describe('speech renderer synchronization',()=>{
   expect(()=>parseSpeech({...initialSpeech(),segments:[{id:1,text:'missing fields'}]})).toThrow();
   expect(()=>parseRecord({id:'x',createdAt:0,durationMs:0,status:'success',revision:1,currentAttempt:null,endedAt:null,attempts:[],audio:{id:'x',recordId:'x',status:'outside',bytes:0,expiresAt:null}})).toThrow();
  });
+ it('rejected simulated actions do not cancel the accepted transition',async()=>{
+  vi.useFakeTimers();try{const port=new BrowserSpeech();const first=await port.start();await expect(port.start()).rejects.toMatchObject({code:'busy'});await expect(port.control(first.taskId!,'finish')).rejects.toMatchObject({code:'invalid'});await vi.advanceTimersByTimeAsync(250);expect(port.value.phase).toBe('recording');await port.control(first.taskId!,'cancel');}finally{vi.useRealTimers();}
+ });
 });

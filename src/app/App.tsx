@@ -25,6 +25,7 @@ import { VoiceSurface } from '../features/voice';
 import brand from '../assets/brand.svg';
 import s from './app.module.css';
 const DevCatalogue = import.meta.env.DEV ? lazy(() => import('../dev/Catalogue')) : null;
+const voiceDemo = import.meta.env.DEV && new URLSearchParams(window.location.search).get('voiceDemo')==='1';
 
 function RuntimeApp() {
   const navigate=useNavigate();const location=useLocation();
@@ -67,7 +68,7 @@ function RuntimeApp() {
   const windowAction=useCallback((surface: Surface,action: WindowAction) => { store.port.windowAction(surface,action).then(store.accept).catch(report); },[store,report]);
   const openSettings=(tab: SettingsTab) => { setSettingsTab(tab); setSettingsOpen(true); };
   const phase=speech.snapshot.phase;
-  if (store.port.surface==='overlay') return <MotionScope enabled={snapshot.windows.overlay}><VoiceSurface retry={speech.snapshot.retry} error={speechFailure||(speech.snapshot.error?speechMessages[speech.snapshot.error]:undefined)} level={speech.level} motionEnabled={snapshot.windows.overlay} phase={import.meta.env.DEV?snapshot.session.phase:phase} start={startSpeech} cancel={()=>controlSpeech('cancel')} finish={()=>controlSpeech('finish')}/></MotionScope>;
+  if (store.port.surface==='overlay') return <MotionScope enabled={snapshot.windows.overlay}><VoiceSurface retry={voiceDemo?false:speech.snapshot.retry} error={voiceDemo?undefined:speechFailure||(speech.snapshot.error?speechMessages[speech.snapshot.error]:undefined)} level={voiceDemo?undefined:speech.level} motionEnabled={snapshot.windows.overlay} phase={voiceDemo?snapshot.session.phase:phase} start={voiceDemo?()=>demo('start'):startSpeech} cancel={voiceDemo?()=>demo('cancel'):()=>controlSpeech('cancel')} finish={voiceDemo?()=>demo('finish'):()=>controlSpeech('finish')}/></MotionScope>;
   return <MotionScope enabled={snapshot.windows.main}><div className={s.window}>
     <aside className={s.sidebar}><div className={s.brand} data-tauri-drag-region><img src={brand} alt="" width={24} height={24}/><span>{zh.brand}</span></div>
       <nav className={s.navigation} aria-label={zh.navigation.home}><NavItem to="/" icon="house">{zh.navigation.home}</NavItem><NavItem to="/history" icon="clock">{zh.navigation.history}</NavItem><NavItem to="/dictionary" icon="book-open">{zh.navigation.dictionary}</NavItem><NavItem to="/preferences" icon="sliders-horizontal">{zh.navigation.preferences}</NavItem></nav>

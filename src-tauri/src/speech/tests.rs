@@ -104,3 +104,38 @@ fn stereo_and_integer_sample_formats_downmix_without_clipping() {
     assert!(audio::mono(&[u16::MAX, 32768u16]) > 0.49);
     assert!(audio::mono(&[i32::MAX, 0i32]) > 0.49);
 }
+
+#[tokio::test]
+async fn stopping_rejects_fresh_operations_but_drains_existing_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let worker = crate::data::DataWorker::start(root.path().to_path_buf()).unwrap();
+    let service =
+        super::SpeechService::new(crate::history::HistoryService::new(worker, root.path()));
+    let admitted = service.admit().unwrap();
+    service.shutdown();
+    assert_eq!(service.admit().err().unwrap().code, "stopping");
+    assert_eq!(service.play("unused").await.unwrap_err().code, "stopping");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(30), service.drain())
+            .await
+            .is_err()
+    );
+    // Work admitted before shutdown may still finish its database transaction.
+    service.history.preferences().await.unwrap();
+    drop(admitted);
+    tokio::time::timeout(std::time::Duration::from_secs(1), service.drain())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_clears_temporary_audio_even_if_database_is_unavailable() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("dictionary.sqlite"), b"invalid sqlite").unwrap();
+    let worker = crate::data::DataWorker::start(root.path().to_path_buf()).unwrap();
+    let service =
+        super::SpeechService::new(crate::history::HistoryService::new(worker, root.path()));
+    *service.last_audio.lock().unwrap() = Some(("cancelled-record".into(), vec![1, 2, 3]));
+    assert!(service.discard_new("cancelled-record", true).await);
+    assert!(service.last_audio.lock().unwrap().is_none());
+}

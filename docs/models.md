@@ -19,6 +19,8 @@
 
 ## 密钥与恢复
 
+语音协议迁移003在同一事务重建模型/默认关系并恢复约束，不修改002。自动填补及替代默认只选择当前可执行的协议：文字为 openai-chat，语音为 qwen-audio-streaming。迁移保留的旧 Chat 语音默认不能录音，需用户明确补充；不自动猜测或发送音频。认证协议变化也要求 replace，不能保留旧密钥。
+
 Windows 使用 keyring 3.6.3 的 windows-native 后端，没有明文降级。命名空间为 `local.sayweave.skeleton.dev` / `.release`；隔离验收为 `.acceptance.<UUID>`。数据位置沿用 [本地数据说明](local-data.md)，开发、发布与测试隔离。
 
 读取只返回 present / missing / unavailable，不返回密钥或凭据引用。编辑的空输入表示显式 keep；新输入表示 replace。显隐仅作用于本次草稿。密钥 trim 后为 1–1024 字节可见 ASCII，满足认证头限制。源站（协议、主机或端口）改变时 keep 被拒绝，保存、列表和测试规则一致。同源路径变更可以保留。

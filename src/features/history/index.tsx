@@ -17,6 +17,7 @@ export function History({port,speech,models,snapshot}:{port:HistoryPort;speech:S
  const [busy,setBusy]=useState(false),[notice,setNotice]=useState(''),[prefs,setPrefs]=useState<RecordingPreferences|null>(null);
  const [player,setPlayer]=useState<PlaybackState>({resourceId:null,playing:false,positionMs:0,durationMs:0});
  const generation=useRef(0),alive=useRef(false),mutation=useRef(0),inFlight=useRef(false);
+ const playbackGeneration=useRef(0);
  useEffect(()=>{alive.current=true;return()=>{alive.current=false;};},[]);
  useEffect(()=>{
   const current=++generation.current;let stopped=false;
@@ -27,7 +28,7 @@ export function History({port,speech,models,snapshot}:{port:HistoryPort;speech:S
   return()=>{stopped=true;clearTimeout(timer);};
  },[port,search,page,refresh,snapshot.lifecycle]);
  useEffect(()=>{let stopped=false;speech.preferences().then(p=>{if(!stopped)setPrefs(p);}).catch(()=>{});return()=>{stopped=true;};},[speech,refresh]);
- useEffect(()=>{let stopped=false;const timer=setInterval(()=>{port.playback('status').then(p=>{if(!stopped)setPlayer(p);}).catch(()=>{});},250);return()=>{stopped=true;clearInterval(timer);};},[port]);
+ useEffect(()=>{let stopped=false;const timer=setInterval(()=>{if(inFlight.current)return;const token=++playbackGeneration.current;port.playback('status').then(p=>{if(!stopped&&token===playbackGeneration.current)setPlayer(p);}).catch(()=>{});},250);return()=>{stopped=true;clearInterval(timer);};},[port]);
  const selectedId=record?.id;
  useEffect(()=>{if(selectedId&&snapshot.recordId===selectedId&&['completed','failed','cancelled','idle'].includes(snapshot.phase)){let stopped=false;port.detail(selectedId).then(r=>{if(!stopped)setRecord(r);}).catch(()=>{});return()=>{stopped=true;};}},[port,selectedId,snapshot.lifecycle,snapshot.recordId,snapshot.phase]);
  const reload=()=>{setPage(1);setRefresh(v=>v+1);};
@@ -36,7 +37,7 @@ export function History({port,speech,models,snapshot}:{port:HistoryPort;speech:S
  async function deleteRecord(){if(!record)return;await action(async()=>{try{await port.remove(record.id,record.revision);}catch(e){setRecord(await port.detail(record.id));throw e;}if(alive.current){setRecord(null);setDeleting(false);setNotice('记录与录音已删除。');reload();}});}
  async function prepareRetry(){await action(async()=>{await models.status();const v=await models.overview();const c=v.configs.find(c=>c.id===v.defaults.find(d=>d.usage==='speech')?.configId);if(!c)throw speechError({code:'notConfigured'});if(c.protocol!=='qwen-audio-streaming')throw speechError({code:'unsupported'});if(alive.current)setRetryModel(c);});}
  async function retry(){if(!record||!retryModel)return;await action(async()=>{await port.retry(record.id,retryModel.id,retryModel.revision);if(alive.current){setRetryModel(null);setNotice('正在重识别；取消只停止本次重试，原记录保留。');}});}
- async function play(actionName:'play'|'pause'|'resume'|'seek'|'stop',ms?:number){await action(async()=>{try{const p=actionName==='play'?await port.play(record!.audio!.id):await port.playback(actionName,ms);if(alive.current)setPlayer(p);}catch(e){if(record){const updated=await port.detail(record.id);if(alive.current)setRecord(updated);}throw e;}});}
+ async function play(actionName:'play'|'pause'|'resume'|'seek'|'stop',ms?:number){await action(async()=>{const token=++playbackGeneration.current;try{const p=actionName==='play'?await port.play(record!.audio!.id):await port.playback(actionName,ms);if(alive.current&&token===playbackGeneration.current)setPlayer(p);}catch(e){if(record){const updated=await port.detail(record.id);if(alive.current)setRecord(updated);}throw e;}});}
  async function savePreferences(){if(!prefs)return;await action(async()=>{const p=await speech.savePreferences(prefs);if(alive.current){setPrefs(p);setNotice('保存策略已更新，仅影响后续录音。');}});}
  const attempt=record?.attempts.find(a=>a.id===version)??record?.attempts.find(a=>a.id===record.currentAttempt)??record?.attempts[0];
  const active=snapshot.recordId===record?.id&&['connecting','recording','processing'].includes(snapshot.phase);

@@ -23,8 +23,12 @@ pub fn speech_snapshot(
     service.snapshot()
 }
 #[tauri::command]
-pub async fn speech_devices(window: WebviewWindow) -> Result<Vec<Device>, Error> {
+pub async fn speech_devices(
+    window: WebviewWindow,
+    service: State<'_, SpeechService>,
+) -> Result<Vec<Device>, Error> {
     main(&window)?;
+    let _operation = service.admit()?;
     tokio::task::spawn_blocking(super::audio::devices)
         .await
         .map_err(|_| Error::new("deviceAccess"))?
@@ -59,6 +63,7 @@ pub async fn speech_preferences(
     preferences: Option<Preferences>,
 ) -> Result<Preferences, Error> {
     main(&window)?;
+    let _operation = service.admit()?;
     match preferences {
         None => service.history.preferences().await,
         Some(p) => match service.history.db(DbOperation::SavePreferences(p)).await? {
@@ -75,6 +80,7 @@ pub async fn history_status(
     retry: bool,
 ) -> Result<crate::data::model::Status, Error> {
     main(&window)?;
+    let _operation = service.admit()?;
     if retry {
         data.request("main", Operation::Retry).await?;
     }
@@ -90,6 +96,7 @@ pub async fn history_list(
     query: Query,
 ) -> Result<Page, Error> {
     main(&window)?;
+    let _operation = service.admit()?;
     service.initialize().await?;
     match service.history.db(DbOperation::List(query)).await? {
         DbOutput::Page(v) => Ok(v),
@@ -103,6 +110,7 @@ pub async fn history_detail(
     id: String,
 ) -> Result<Record, Error> {
     main(&window)?;
+    let _operation = service.admit()?;
     service.history.detail(&id).await
 }
 #[tauri::command]
@@ -111,6 +119,7 @@ pub async fn history_usage(
     service: State<'_, SpeechService>,
 ) -> Result<Usage, Error> {
     main(&window)?;
+    let _operation = service.admit()?;
     match service.history.db(DbOperation::Usage).await? {
         DbOutput::Usage(v) => Ok(v),
         _ => Err(Error::new("unavailable")),
@@ -124,6 +133,7 @@ pub async fn history_remove(
     revision: i64,
 ) -> Result<(), Error> {
     main(&window)?;
+    let _operation = service.admit()?;
     if service.is_active() && service.snapshot()?.record_id.as_ref() == Some(&id) {
         return Err(Error::new("busy"));
     }
@@ -154,6 +164,7 @@ pub async fn history_play(
     position_ms: Option<u64>,
 ) -> Result<PlaybackState, Error> {
     main(&window)?;
+    let _operation = service.admit()?;
     if action == "play" {
         service
             .play(resource_id.as_deref().ok_or(Error::new("invalid"))?)
@@ -172,6 +183,7 @@ pub fn speech_copy(
     text: String,
 ) -> Result<(), Error> {
     main(&window)?;
+    let _operation = app.state::<SpeechService>().admit()?;
     if text.len() > 1024 * 1024 {
         return Err(Error::new("invalid"));
     }

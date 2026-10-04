@@ -11,8 +11,8 @@ use crate::{
 use serde::Serialize;
 use std::{
     sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -23,6 +23,8 @@ use tokio::sync::{Mutex as AsyncMutex, watch};
 pub struct Snapshot {
     #[serde(skip)]
     pub runtime_id: u64,
+    #[serde(skip)]
+    pub source_record_id: Option<String>,
     pub protocol: u8,
     pub sequence: u64,
     pub lifecycle: u64,
@@ -45,6 +47,7 @@ impl Default for Snapshot {
     fn default() -> Self {
         Self {
             runtime_id: 0,
+            source_record_id: None,
             protocol: 1,
             sequence: 1,
             lifecycle: 1,
@@ -95,6 +98,14 @@ pub struct SpeechService {
     ready: AtomicBool,
     init_gate: AsyncMutex<()>,
     last_audio: Mutex<Option<(String, Vec<i16>)>>,
+    operation_gate: Mutex<()>,
+    operations: Arc<AtomicUsize>,
+}
+pub struct FreshOperation(Arc<AtomicUsize>);
+impl Drop for FreshOperation {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 impl SpeechService {
     pub fn new(history: HistoryService) -> Self {
@@ -109,7 +120,20 @@ impl SpeechService {
             ready: AtomicBool::new(false),
             init_gate: AsyncMutex::new(()),
             last_audio: Mutex::new(None),
+            operation_gate: Mutex::new(()),
+            operations: Arc::new(AtomicUsize::new(0)),
         }
+    }
+    pub fn admit(&self) -> Result<FreshOperation, Error> {
+        let _guard = self
+            .operation_gate
+            .lock()
+            .map_err(|_| Error::new("unavailable"))?;
+        if self.is_stopping() {
+            return Err(Error::new("stopping"));
+        }
+        self.operations.fetch_add(1, Ordering::AcqRel);
+        Ok(FreshOperation(self.operations.clone()))
     }
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
         self.snapshot
@@ -122,6 +146,7 @@ impl SpeechService {
             || self.active.lock().map(|s| s.is_some()).unwrap_or(true)
     }
     pub async fn initialize(&self) -> Result<(), Error> {
+        let _operation = self.admit()?;
         let _guard = self.init_gate.lock().await;
         if !self.ready.load(Ordering::Acquire) {
             self.history.recover().await?;
@@ -184,7 +209,20 @@ impl SpeechService {
         retry_id: Option<String>,
         expected_config: Option<(String, i64)>,
     ) -> Result<Snapshot, Error> {
+        self.start_bound(app, retry_id, expected_config, None).await
+    }
+    async fn start_bound(
+        &self,
+        app: tauri::AppHandle,
+        retry_id: Option<String>,
+        expected_config: Option<(String, i64)>,
+        expected_task: Option<String>,
+    ) -> Result<Snapshot, Error> {
         let _gate = self.gate.try_lock().map_err(|_| Error::new("busy"))?;
+        let _operation = self.admit()?;
+        if expected_task.is_some() && self.snapshot()?.task_id != expected_task {
+            return Err(Error::new("staleSession"));
+        }
         if self.stopping.load(Ordering::Acquire) {
             return Err(Error::new("stopping"));
         }
@@ -369,6 +407,7 @@ impl SpeechService {
             .lock()
             .map_err(|_| Error::new("unavailable"))? = Snapshot {
             runtime_id,
+            source_record_id: Some(record_id.clone()),
             task_id: Some(task_id.clone()),
             attempt_id: Some(attempt_id.clone()),
             record_id: if persistent {
@@ -603,24 +642,12 @@ impl SpeechService {
             .err()
             .is_some_and(|e| e.code == "cancelled");
         if cancelled && !task.retry {
-            if task.persistent {
-                let record = self.history.detail(&task.record_id).await?;
-                if self
-                    .history
-                    .remove(&task.record_id, record.revision)
-                    .await
-                    .is_err()
-                {
-                    save_error = true;
-                }
-            }
-            if let Ok(mut last) = self.last_audio.lock() {
-                *last = None;
-            }
+            save_error |= self.discard_new(&task.record_id, task.persistent).await;
             self.update(app, &task.id, |s| {
                 s.text.clear();
                 s.segments.clear();
                 s.record_id = None;
+                s.source_record_id = None;
                 s.save_error = save_error;
                 s.phase = Phase::Cancelled;
             });
@@ -676,6 +703,21 @@ impl SpeechService {
         });
         Ok(())
     }
+    async fn discard_new(&self, record_id: &str, persistent: bool) -> bool {
+        let failed = persistent
+            && async {
+                let record = self.history.detail(record_id).await?;
+                self.history.remove(record_id, record.revision).await
+            }
+            .await
+            .is_err();
+        if let Ok(mut last) = self.last_audio.lock()
+            && last.as_ref().is_some_and(|(id, _)| id == record_id)
+        {
+            *last = None;
+        }
+        failed
+    }
     pub fn forget_audio(&self, app: &tauri::AppHandle, record_id: &str) {
         if let Ok(mut last) = self.last_audio.lock()
             && last.as_ref().is_some_and(|(id, _)| id == record_id)
@@ -718,22 +760,22 @@ impl SpeechService {
         });
     }
     pub async fn retry_current(&self, app: tauri::AppHandle) -> Result<Snapshot, Error> {
-        if !self.snapshot()?.can_retry {
+        let current = self.snapshot()?;
+        if !current.can_retry {
             return Err(Error::new("fileUnavailable"));
         }
-        let id = self
-            .last_audio
-            .lock()
-            .map_err(|_| Error::new("unavailable"))?
-            .as_ref()
-            .map(|(id, _)| id.clone())
+        let id = current
+            .source_record_id
             .ok_or(Error::new("fileUnavailable"))?;
-        self.start(app, Some(id), None).await
+        // Persistent replay and temporary audio must both refer to the displayed record.
+        // start_bound verifies the task under the admission gate before reading its resource.
+        self.start_bound(app, Some(id), None, current.task_id).await
     }
     pub fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::Acquire)
     }
     pub fn shutdown(&self) {
+        let _guard = self.operation_gate.lock().ok();
         self.stopping.store(true, Ordering::Release);
         if let Ok(a) = self.active.lock()
             && let Some((_, tx)) = a.as_ref()
@@ -742,12 +784,13 @@ impl SpeechService {
         }
     }
     pub async fn drain(&self) {
-        while self.is_active() {
+        while self.is_active() || self.operations.load(Ordering::Acquire) > 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let _ = self.playback.control("stop", None).await;
     }
     pub async fn play(&self, id: &str) -> Result<crate::history::playback::PlaybackState, Error> {
+        let _operation = self.admit()?;
         let _guard = self.gate.try_lock().map_err(|_| Error::new("busy"))?;
         if self.is_active() {
             return Err(Error::new("busy"));

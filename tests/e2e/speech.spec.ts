@@ -18,3 +18,6 @@ test('Qwen preset remains separate from fetched text models and cannot select te
  await dialog.getByLabel('配置名称',{exact:true}).fill('通义语音');await dialog.getByLabel('服务基址',{exact:true}).fill('https://workspace.cn-beijing.maas.aliyuncs.com');await dialog.getByLabel('API Key',{exact:true}).fill('fixture-key');await dialog.getByRole('button',{name:'保存配置'}).click();
  await expect(dialog.getByLabel('语音识别默认配置',{exact:true})).not.toHaveValue('');await expect(dialog.getByLabel('文字处理默认配置',{exact:true})).toHaveValue('');
 });
+test('default development overlay follows speech state and speech actions together',async({page})=>{
+ await page.goto('/?surface=overlay');await page.getByRole('button',{name:'开始录音',exact:true}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();await page.getByRole('button',{name:'结束录音',exact:true}).click();await expect(page.locator('[data-phase="completed"]')).toBeVisible();
+});

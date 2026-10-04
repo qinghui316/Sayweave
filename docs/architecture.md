@@ -45,6 +45,6 @@ DesktopRuntimePort 提供 getSnapshot、subscribe、windowAction、demoAction、
 
 AnimatedIcon 不持有业务状态；CopyFeedbackButton 只隔离外部异步请求代次，AsyncStatusFeedback 纯受控展示。useMotion 结合窗口快照、页面可见、交叉观察和减少动态。VoiceControl 在处理/完成/失败之间保留 SVG 实例，波形在 CSS 内，不按帧 IPC。
 
-publish 在扩大前保留 current/target 各轴最大值；320ms 后仅当前 revision/session 可以缩到最终大小。无新增命令、权限、业务协议或持久化。完整规则与验证入口见 [motion.md](motion.md) 和 [测试说明](testing.md)。
+publish 在扩大前保留 current/target 各轴最大值；320ms 后仅当前 revision/session 可以缩到最终大小。语音内容不改变此布局版本。真实语音接口和持久化与上述窗口协议分离，见 [speech.md](speech.md)。完整动效规则与验证入口见 [motion.md](motion.md) 和 [测试说明](testing.md)。
 
 窗口显示由应用层通过级联 MotionScope 传入通用 UI；它只有布尔可用性，不存储或推进业务状态。设置前景仍可播放自身反馈，仅背景路由暂停。document可见但native窗口已隐藏时，复制/连接和通用加载指示也停止循环。
