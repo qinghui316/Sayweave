@@ -11,12 +11,12 @@ test('simulated speech saves only completed sessions and real UI result is read-
  await dialog.getByRole('button',{name:'删除记录',exact:true}).click();await dialog.getByRole('button',{name:'确认删除'}).click();await expect(page.getByText('还没有识别记录')).toBeVisible();
  await page.getByRole('link',{name:'返回首页'}).click();await page.getByRole('button',{name:'开始录音',exact:true}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();await page.locator('[data-phase]').getByRole('button',{name:'取消并丢弃',exact:true}).click();await page.getByRole('link',{name:'历史记录',exact:true}).click();await expect(page.getByText('0 条',{exact:true})).toBeVisible();
 });
-test('Qwen preset remains separate from fetched text models and cannot select text use',async({page})=>{
+test('speech presets select concrete models and keep text fields independent',async({page})=>{
  await page.goto('/');await page.getByRole('button',{name:'配置模型',exact:true}).click();const dialog=page.getByRole('dialog');
  await expect(dialog.getByRole('tab',{name:'语音识别'})).toHaveAttribute('aria-selected','true');
- await expect(dialog.getByText('通义实时识别')).toBeVisible();await expect(dialog.getByRole('button',{name:'测试连接'})).toHaveCount(0);
- await dialog.getByRole('button',{name:'更多设置'}).click();await expect(dialog.getByLabel('模型',{exact:true})).toHaveValue('qwen-audio-3.1-asr-flash-streaming');
- await dialog.getByLabel('服务地址',{exact:true}).fill('https://workspace.cn-beijing.maas.aliyuncs.com');await dialog.getByLabel('API 密钥',{exact:true}).fill('fixture-key');await dialog.getByRole('button',{name:'保存',exact:true}).click();
+ await expect(dialog.getByRole('combobox',{name:'模型'})).toContainText('Qwen Audio 3.1 · 实时识别');await dialog.getByRole('combobox',{name:'模型'}).click();await page.getByRole('option',{name:'Qwen Audio 3.0 · 实时识别'}).click();await expect(dialog.getByRole('button',{name:'测试连接'})).toHaveCount(0);
+ await dialog.getByRole('button',{name:'更多设置'}).click();await expect(dialog.getByRole('combobox',{name:'模型'})).toContainText('Qwen Audio 3.0 · 实时识别');
+ await dialog.getByLabel('服务地址（URL）',{exact:true}).fill('https://workspace.cn-beijing.maas.aliyuncs.com');await dialog.getByLabel('API 密钥',{exact:true}).fill('fixture-key');await dialog.getByRole('button',{name:'保存',exact:true}).click();
  await expect(dialog.getByText('当前使用',{exact:true})).toBeVisible();await dialog.getByRole('tab',{name:'文字处理'}).click();await expect(dialog.getByLabel('API 密钥',{exact:true})).toHaveValue('');
 });
 test('default development overlay follows speech state and speech actions together',async({page})=>{

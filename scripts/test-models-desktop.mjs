@@ -49,7 +49,7 @@ const invoke=(page,command,args={})=>page.evaluate(({command,args})=>window.__TA
 async function fill(page,name,url,model,keyValue=key){
  const more=page.getByRole('button',{name:'更多设置'});if(await more.count())await more.click();
  await page.getByLabel('名称',{exact:true}).fill(name);
- await page.getByLabel('服务地址',{exact:true}).fill(url);
+ await page.getByLabel('服务地址（URL）',{exact:true}).fill(url);
  await page.getByLabel('API 密钥',{exact:true}).fill(keyValue);
  await page.getByLabel('模型',{exact:true}).fill(model);
 }
@@ -82,10 +82,9 @@ try{
  }else{
   await expect(page.getByLabel('API 密钥',{exact:true})).toBeVisible();
   await fill(page,'个人文字配置',base+'/v1','fixture-text-model');
-  // Listing is usable before a model/name is supplied.
-  await page.getByLabel('名称',{exact:true}).fill('');await page.getByLabel('模型',{exact:true}).fill('');
-  await page.getByRole('button',{name:'获取模型列表'}).click();await expect(page.getByText('模型列表已更新，也可以直接填写。')).toBeVisible();
-  await page.getByLabel('名称',{exact:true}).fill('个人文字配置');await page.getByLabel('模型',{exact:true}).fill('fixture-text-model');
+  // Keep the existing list contract regression below the simplified text form.
+  const listed=await invoke(page,'model_fetch',{draft:{input:{name:'',protocol:'openai-chat',baseUrl:base+'/v1',modelId:'',usages:['text']},id:null,revision:null,key:{action:'replace',value:key}},requestId:randomUUID()});
+  expect(listed).toEqual(['fixture-text-model','second-model']);
   await page.getByRole('button',{name:'测试连接'}).click();await expect(page.getByText(/连接成功/)).toBeVisible();
   // Category determines new configuration use; legacy usages are covered by contract tests.
   await page.getByRole('button',{name:'保存',exact:true}).click();await expect(page.getByText('已保存。')).toBeVisible();
@@ -95,9 +94,9 @@ try{
   const first=overview.configs[0];
   await page.locator('article').filter({hasText:'个人文字配置'}).getByRole('button',{name:'编辑',exact:true}).click();
   await expect(page.getByLabel('API 密钥',{exact:true})).toHaveValue('');
-  await page.getByLabel('服务地址',{exact:true}).fill('https://other.invalid/v1');
+  await page.getByLabel('服务地址（URL）',{exact:true}).fill('https://other.invalid/v1');
   await page.getByRole('button',{name:'测试连接'}).click();await expect(page.getByText(/服务地址已改变/)).toBeVisible();
-  await page.getByLabel('服务地址',{exact:true}).fill(base+'/compat');
+  await page.getByLabel('服务地址（URL）',{exact:true}).fill(base+'/compat');
   await page.getByRole('button',{name:'测试连接'}).click();await expect(page.getByText(/连接成功/)).toBeVisible();
   await page.getByRole('button',{name:'保存',exact:true}).click();await expect(page.getByText('已保存。')).toBeVisible();
   await page.getByRole('button',{name:'添加模型'}).click();await fill(page,'第二份文字配置',base+'/v1','second-model');
@@ -122,7 +121,7 @@ try{
   overview=await invoke(page,'model_overview');expect(overview.configs).toHaveLength(2);expect(overview.configs.every(c=>c.credentialStatus==='present')).toBe(true);
   expect(overview.defaults.find(d=>d.usage==='text').configId).toBe(second.id);
   await page.locator('article').filter({hasText:'个人文字配置'}).getByRole('button',{name:'编辑',exact:true}).click();await page.getByRole('button',{name:'测试连接'}).click();await expect(page.getByText(/连接成功/)).toBeVisible();
-  await page.getByLabel('服务地址',{exact:true}).fill(base+'/slow');await page.getByRole('button',{name:'测试连接'}).click();await page.getByRole('button',{name:'取消请求',exact:true}).click();await expect(page.getByText('请求已取消。')).toBeVisible();await delay(1300);await expect(page.getByText(/连接成功/)).toHaveCount(0);
+  await page.getByLabel('服务地址（URL）',{exact:true}).fill(base+'/slow');await page.getByRole('button',{name:'测试连接'}).click();await page.getByRole('button',{name:'取消请求',exact:true}).click();await expect(page.getByText('请求已取消。')).toBeVisible();await delay(1300);await expect(page.getByText(/连接成功/)).toHaveCount(0);
   await page.getByRole('button',{name:'取消编辑'}).click();await page.getByRole('button',{name:'放弃修改'}).click();
   await page.locator('article').filter({hasText:'个人文字配置'}).getByRole('button',{name:'删除',exact:true}).click();
   await expect(page.getByRole('alertdialog')).toContainText('删除');

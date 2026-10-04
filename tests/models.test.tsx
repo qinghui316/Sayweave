@@ -1,9 +1,13 @@
 import {act,fireEvent,render,screen,waitFor,within} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import {describe,it,expect,vi} from 'vitest';
+import {beforeAll,afterAll,describe,it,expect,vi} from 'vitest';
 import {ModelPanel} from '../src/features/models';
 import {BrowserModels} from '../src/adapters/models-browser';
 import {ModelError,type ModelConfigPort,type ModelTestResult} from '../src/contracts/models';
+// jsdom does not lay out/scroll elements; real viewport scrolling is checked by Playwright.
+const scrollIntoView = HTMLElement.prototype.scrollIntoView;
+beforeAll(()=>{HTMLElement.prototype.scrollIntoView=vi.fn();});
+afterAll(()=>{if(scrollIntoView) HTMLElement.prototype.scrollIntoView=scrollIntoView; else Reflect.deleteProperty(HTMLElement.prototype,'scrollIntoView');});
 async function panel(port:ModelConfigPort=new BrowserModels(),onGuardChange?:((guard:((action:()=>void)=>void)|null)=>void)){
  render(<ModelPanel port={port} onGuardChange={onGuardChange}/>);
  await screen.findByLabelText('API 密钥');
@@ -16,7 +20,7 @@ function fillText(){
  fireEvent.change(screen.getByLabelText('模型'),{target:{value:'test-model'}});
  fireEvent.click(screen.getByRole('button',{name:'更多设置'}));
  fireEvent.change(screen.getByLabelText('名称'),{target:{value:'个人配置'}});
- fireEvent.change(screen.getByLabelText('服务地址'),{target:{value:'https://example.invalid/v1'}});
+ fireEvent.change(screen.getByLabelText('服务地址（URL）'),{target:{value:'https://example.invalid/v1'}});
 }
 describe('task-based model settings',()=>{
  it('starts with a speech preset and closes an untouched form immediately',async()=>{
@@ -24,14 +28,14 @@ describe('task-based model settings',()=>{
   const p=new BrowserModels();await panel(p,value=>{guard=value;});
   expect(screen.getByRole('tab',{name:'语音识别'})).toHaveAttribute('aria-selected','true');
   expect(screen.queryByLabelText('名称')).not.toBeInTheDocument();
-  expect(screen.queryByLabelText('服务地址')).not.toBeInTheDocument();
+  expect(screen.queryByLabelText('服务地址（URL）')).not.toBeInTheDocument();
   const close=vi.fn();act(()=>guard!(close));expect(close).toHaveBeenCalledOnce();
  });
  it('saves a speech key using the preset, without list or test calls',async()=>{
   const p=new BrowserModels();const fetch=vi.spyOn(p,'fetchModels'),test=vi.spyOn(p,'testTextModel');await panel(p);
   fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'fixture-key'}});
   fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
-  const view=await p.overview();expect(view.configs[0]).toMatchObject({name:'通义语音',protocol:'qwen-audio-streaming',baseUrl:'https://dashscope.aliyuncs.com',usages:['speech']});
+  const view=await p.overview();expect(view.configs[0]).toMatchObject({name:'Qwen Audio 3.1 · 实时识别',protocol:'qwen-audio-streaming',baseUrl:'https://dashscope.aliyuncs.com',usages:['speech']});
   expect(view.defaults.find(d=>d.usage==='speech')?.configId).toBe(view.configs[0]!.id);
   expect(fetch).not.toHaveBeenCalled();expect(test).not.toHaveBeenCalled();
  });
@@ -69,16 +73,16 @@ describe('task-based model settings',()=>{
   expect(input).toHaveValue('a-secret');expect(input).toHaveAttribute('type','text');expect(toggle).toHaveFocus();
   await user.click(toggle);expect(input).toHaveAttribute('type','password');expect(toggle).toHaveFocus();
  });
- it('allows manual model entry and saving after a list failure',async()=>{
-  const p=new BrowserModels();vi.spyOn(p,'fetchModels').mockRejectedValue(new ModelError('protocol'));await panel(p);fillText();
-  fireEvent.click(screen.getByRole('button',{name:'获取模型列表'}));await screen.findByText('无法获取有效结果，可以手动填写模型。');
+ it('allows saving after a connection test fails',async()=>{
+  const p=new BrowserModels();vi.spyOn(p,'testTextModel').mockRejectedValue(new ModelError('protocol'));await panel(p);fillText();
+  fireEvent.click(screen.getByRole('button',{name:'测试连接'}));await screen.findByText('无法获取有效结果，可以手动填写模型。');
   fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
  });
  it('guards category switching and keeps both defaults independent',async()=>{
   const p=new BrowserModels();await panel(p);fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'speech-key'}});
   textTab();expect(screen.getByRole('alertdialog')).toBeInTheDocument();fireEvent.click(screen.getByRole('button',{name:'继续填写'}));expect(screen.getByRole('tab',{name:'语音识别'})).toHaveAttribute('aria-selected','true');
   fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
-  textTab();fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'text-key'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
+  textTab();fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'text-key'}});fireEvent.change(screen.getByLabelText('模型'),{target:{value:'text-model'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
   const view=await p.overview();expect(view.configs).toHaveLength(2);expect(view.defaults[0]!.configId).not.toBe(view.defaults[1]!.configId);
  });
  it('preserves legacy multi-use record usages and custom names during edits',async()=>{
@@ -93,4 +97,37 @@ describe('task-based model settings',()=>{
   fireEvent.click(screen.getByRole('button',{name:'编辑'}));fireEvent.change(screen.getByLabelText('模型'),{target:{value:'changed-model'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
   expect((await p.overview()).configs[0]).toMatchObject({name:'此前语音配置',usages:['speech'],modelId:'changed-model'});
  });
+ it('shows only the three required text fields and derives the saved name from the model',async()=>{
+  const p=new BrowserModels();await panel(p);textTab();
+  expect(screen.getByLabelText('服务地址（URL）')).toHaveValue('https://api.openai.com/v1');
+  expect(screen.getByLabelText('API 密钥')).toHaveValue('');expect(screen.getByLabelText('模型')).toHaveValue('');
+  expect(screen.getByLabelText('模型')).not.toHaveAttribute('list');
+  expect(screen.queryByRole('combobox')).not.toBeInTheDocument();expect(screen.queryByLabelText('名称')).not.toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'fixture-key'}});
+  fireEvent.change(screen.getByLabelText('模型'),{target:{value:'gpt-personal'}});
+  fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
+  expect((await p.overview()).configs[0]).toMatchObject({name:'gpt-personal',modelId:'gpt-personal',baseUrl:'https://api.openai.com/v1',usages:['text']});
+ });
+ it('keeps a custom speech model and stored key when explicitly switching to a built-in',async()=>{
+  const p=new BrowserModels();await p.save({id:null,revision:null,expectation:null,key:{action:'replace',value:'fixture-key'},input:{name:'我的语音',protocol:'qwen-audio-streaming',baseUrl:'https://workspace.example.invalid',modelId:'custom-streaming-id',usages:['speech']}});
+  const before=(await p.overview()).configs[0]!;
+  render(<ModelPanel port={p}/>);await screen.findByText('我的语音');fireEvent.click(screen.getByRole('button',{name:'编辑'}));
+  const select=screen.getByRole('combobox',{name:'模型'});
+  expect(select).toHaveTextContent('当前自定义模型 · custom-streaming-id');
+  const user=userEvent.setup();select.focus();await user.keyboard('{Enter}{End}{Enter}');
+  expect(select).toHaveTextContent('Qwen Audio 3.0 · 实时识别');
+  fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
+  expect((await p.overview()).configs[0]).toMatchObject({id:before.id,name:'我的语音',baseUrl:before.baseUrl,modelId:'qwen-audio-3.0-asr-flash-streaming',usages:['speech'],credentialStatus:'present',revision:before.revision+1});
+ });
+ it('saves the selected3.0 model without overwriting it with the initial preset',async()=>{
+  const p=new BrowserModels();await panel(p);const user=userEvent.setup();screen.getByRole('combobox',{name:'模型'}).focus();await user.keyboard('{Enter}{End}{Enter}');
+  fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'fixture-key'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
+  expect((await p.overview()).configs[0]).toMatchObject({name:'Qwen Audio 3.0 · 实时识别',modelId:'qwen-audio-3.0-asr-flash-streaming'});
+ });
+ it('focuses an invalid directly visible text model without opening more settings',async()=>{
+  const p=new BrowserModels();vi.spyOn(p,'save').mockRejectedValue(new ModelError('invalid','modelId'));await panel(p);textTab();
+  fireEvent.click(screen.getByRole('button',{name:'保存'}));await waitFor(()=>expect(screen.getByLabelText('模型')).toHaveFocus());
+  expect(screen.queryByLabelText('名称')).not.toBeInTheDocument();
+ });
+
 });

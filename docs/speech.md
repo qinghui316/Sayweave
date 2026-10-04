@@ -4,7 +4,9 @@
 
 ## 配置与使用
 
-添加「通义语音 · Qwen Audio Streaming」，填写 HTTPS 源站、API Key、模型 ID，选择语音默认。内置预设为 `qwen-audio-3.1-asr-flash-streaming`，并非服务器模型列表。北京源站形如 `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com`，兼容源站可明确填写 `https://dashscope.aliyuncs.com`。不要附加 Chat 的 `/v1` 路径。客户端生成 WSS `/api-ws/v1/inference`，正常校验证书，不跟随重定向。
+设置 → 模型 → 语音识别，选择 Qwen Audio3.1或3.0的实时识别模型、填写 API 密钥并保存，再回首页试说。内置模型 ID 分别为 `qwen-audio-3.1-asr-flash-streaming` 和 `qwen-audio-3.0-asr-flash-streaming`，并非服务器模型列表；它们共用现有协议。名称和源站可在更多设置调整，既有自定义模型原样保留。
+
+协议的部署地址要求：北京源站形如 `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com`，兼容源站可明确填写 `https://dashscope.aliyuncs.com`。不要附加 Chat 的 `/v1` 路径。客户端生成 WSS `/api-ws/v1/inference`，正常校验证书，不跟随重定向。
 
 保存不发请求；主动录音/确认重识别才上传音频，可能产生费用。取消不能保证撤销服务端费用。官方资料：[接入](https://help.aliyun.com/zh/model-studio/qwen-audio-asr-streaming-websocket-api)、[客户端事件](https://help.aliyun.com/zh/model-studio/qwen-audio-asr-streaming-client-events)、[服务端事件](https://help.aliyun.com/zh/model-studio/qwen-audio-asr-streaming-server-events)。
 
