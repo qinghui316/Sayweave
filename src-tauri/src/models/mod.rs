@@ -18,6 +18,7 @@ pub struct ModelService {
     data: DataWorker,
     vault: Vault,
     pub provider: Arc<Provider>,
+    pub requests: Arc<crate::network::RequestCoordinator>,
     gate: Mutex<()>,
     ready: AtomicBool,
     cleanup_pending: AtomicBool,
@@ -28,21 +29,23 @@ impl ModelService {
         data: DataWorker,
         namespace: String,
         root: &std::path::Path,
+        requests: Arc<crate::network::RequestCoordinator>,
     ) -> Result<Self, ModelError> {
         let _ = root;
-        let provider = Provider::new()?;
+        let provider = Provider::new(requests.clone())?;
         #[cfg(feature = "desktop-acceptance")]
         let provider = if std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID")
             .is_ok_and(|id| uuid::Uuid::parse_str(&id).is_ok())
         {
             match std::fs::read(root.join("fixture-ca.der")) {
-                Ok(cert) => Provider::with_client(
+                Ok(cert) => Provider::with_requests(
                     Provider::builder()
                         .no_proxy()
                         .tls_certs_only([reqwest::Certificate::from_der(&cert)
                             .map_err(|_| ModelError::new("unavailable"))?])
                         .build()
                         .map_err(|_| ModelError::new("unavailable"))?,
+                    requests,
                 )?,
                 Err(_) => provider,
             }
@@ -63,6 +66,7 @@ impl ModelService {
         Ok(Self {
             data,
             vault,
+            requests: provider.requests.clone(),
             provider,
             gate: Mutex::new(()),
             ready: AtomicBool::new(false),
@@ -303,7 +307,7 @@ impl ModelService {
         let _guard = self.gate.try_lock().map_err(|_| ModelError::new("busy"))?;
         self.check(caller)?;
         let mut input = req.input;
-        if input.protocol != "openai-chat" {
+        if !capabilities(&input.protocol).is_some_and(|c| c.text_test) {
             return Err(ModelError::field("protocol"));
         }
         input.base_url = base_url(&input.base_url)?;
@@ -319,7 +323,7 @@ impl ModelService {
         id: String,
     ) -> Result<Vec<String>, ModelError> {
         self.check(caller)?;
-        let mut guard = self.provider.register(&id)?;
+        let mut guard = self.requests.register(&id)?;
         guard
             .run(15, async {
                 let (input, key) = self.draft(caller, req).await?;
@@ -334,7 +338,7 @@ impl ModelService {
         id: String,
     ) -> Result<TestResult, ModelError> {
         self.check(caller)?;
-        let mut guard = self.provider.register(&id)?;
+        let mut guard = self.requests.register(&id)?;
         guard
             .run(30, async {
                 let (mut input, key) = self.draft(caller, req).await?;
@@ -346,7 +350,7 @@ impl ModelService {
     pub fn begin_shutdown(&self) {
         self.data.begin_shutdown();
         self.stopping.store(true, Ordering::Release);
-        self.provider.shutdown();
+        self.requests.shutdown();
     }
     // Internal task snapshot. Never Serialize/Debug or expose to a renderer.
     pub async fn speech_config(&self) -> Result<SpeechConfiguration, ModelError> {

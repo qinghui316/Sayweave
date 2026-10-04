@@ -216,11 +216,10 @@ impl Repository {
                     .optional()
                     .map_err(error)?;
                 if applicable != Some(true)
-                    || protocol.as_deref()
-                        != Some(match req.usage {
-                            Usage::Speech => "qwen-audio-streaming",
-                            Usage::Text => "openai-chat",
-                        })
+                    || !protocol
+                        .as_deref()
+                        .and_then(capabilities)
+                        .is_some_and(|c| c.usages.contains(&req.usage))
                 {
                     return Err(ModelError::new("invalid"));
                 }

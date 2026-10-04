@@ -1,4 +1,8 @@
 use super::*;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::{
     io::{Read, Write},
     net::{TcpListener, TcpStream},
@@ -270,14 +274,18 @@ async fn status_json_size_empty_response_and_redirect() {
 }
 #[tokio::test]
 async fn request_capacity_cancel_before_start_and_deadline() {
-    let provider = Arc::new(Provider::new().unwrap());
+    let provider =
+        Arc::new(Provider::new(Arc::new(crate::network::RequestCoordinator::default())).unwrap());
     let ids: Vec<_> = (0..5).map(|_| uuid::Uuid::new_v4().to_string()).collect();
     let mut guards: Vec<_> = ids[..4]
         .iter()
-        .map(|id| provider.register(id).unwrap())
+        .map(|id| provider.requests.register(id).unwrap())
         .collect();
-    assert_eq!(provider.register(&ids[4]).err().unwrap().code, "busy");
-    provider.cancel(&ids[0]).unwrap();
+    assert_eq!(
+        provider.requests.register(&ids[4]).err().unwrap().code,
+        "busy"
+    );
+    provider.requests.cancel(&ids[0]).unwrap();
     assert_eq!(
         guards[0]
             .run(1, async { Ok::<_, ModelError>(()) })
@@ -290,9 +298,12 @@ async fn request_capacity_cancel_before_start_and_deadline() {
     let first = guards.remove(0);
     drop(first);
     let id = uuid::Uuid::new_v4().to_string();
-    provider.cancel(&id).unwrap();
-    assert_eq!(provider.register(&id).err().unwrap().code, "cancelled");
-    let mut guard = provider.register(&ids[4]).unwrap();
+    provider.requests.cancel(&id).unwrap();
+    assert_eq!(
+        provider.requests.register(&id).err().unwrap().code,
+        "cancelled"
+    );
+    let mut guard = provider.requests.register(&ids[4]).unwrap();
     assert_eq!(
         guard
             .run(0, async {
@@ -305,9 +316,10 @@ async fn request_capacity_cancel_before_start_and_deadline() {
             .code,
         "timeout"
     );
-    provider.shutdown();
+    provider.requests.shutdown();
     assert_eq!(
         provider
+            .requests
             .register(&uuid::Uuid::new_v4().to_string())
             .err()
             .unwrap()
@@ -327,6 +339,7 @@ async fn actual_cancel_stops_https_result_and_fallback_shares_deadline() {
     let fixture = Fixture::start(vec![first, second]);
     let mut guard = fixture
         .provider
+        .requests
         .register(&uuid::Uuid::new_v4().to_string())
         .unwrap();
     let result = guard
@@ -337,11 +350,11 @@ async fn actual_cancel_stops_https_result_and_fallback_shares_deadline() {
     reply.delay = Duration::from_millis(150);
     let fixture = Fixture::start(vec![reply]);
     let id = uuid::Uuid::new_v4().to_string();
-    let mut guard = fixture.provider.register(&id).unwrap();
+    let mut guard = fixture.provider.requests.register(&id).unwrap();
     let provider = fixture.provider.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(40)).await;
-        provider.cancel(&id).unwrap();
+        provider.requests.cancel(&id).unwrap();
     });
     assert_eq!(
         guard
@@ -356,7 +369,7 @@ async fn actual_cancel_stops_https_result_and_fallback_shares_deadline() {
 #[tokio::test]
 async fn normal_tls_verification_rejects_untrusted_fixture() {
     let fixture = Fixture::start(vec![Reply::json(200, r#"{"data":[]}"#)]);
-    let provider = Provider::new().unwrap();
+    let provider = Provider::new(Arc::new(crate::network::RequestCoordinator::default())).unwrap();
     assert_eq!(
         provider
             .models(&fixture.input(), "dummy")

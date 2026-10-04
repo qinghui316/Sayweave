@@ -4,23 +4,38 @@ import {chromium,expect} from '@playwright/test';
 import {spawn} from 'node:child_process';
 import {randomUUID,createHash} from 'node:crypto';
 import {createServer} from 'node:https';
+import {gzipSync,gunzipSync} from 'node:zlib';
 import {createWriteStream,mkdirSync,readFileSync,writeFileSync,unlinkSync,existsSync} from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),id=randomUUID();
 const directory=path.join(root,'.local','data-acceptance',id),data=path.join(directory,'data');mkdirSync(data,{recursive:true});
 const exe=path.join(root,'src-tauri','target','release','sayweave.exe'),port=9241,key='fixture-'+randomUUID();
-const report={id,passed:false,checks:[],connections:[]},delay=ms=>new Promise(r=>setTimeout(r,ms));
-let app,browser,server,mode='normal',expectedModel='qwen-audio-3.1-asr-flash-streaming';const sockets=new Set();
+const report={id,passed:false,checks:[],connections:[],handshakes:[]},delay=ms=>new Promise(r=>setTimeout(r,ms));
+let app,browser,server,mode='normal',expectedProtocol='qwen',expectedModel='qwen-audio-3.1-asr-flash-streaming';const sockets=new Set();
 async function command(args){const child=spawn('cargo',args,{cwd:root,windowsHide:true,env:{...process.env,SAYWEAVE_DATA_ACCEPTANCE_ID:id},stdio:['ignore','pipe','pipe']});const log=createWriteStream(path.join(directory,'fixture.log'),{flags:'a'});child.stdout.pipe(log);child.stderr.pipe(log);if(await new Promise((r,j)=>{child.on('exit',r);child.on('error',j);})!==0)throw Error('Fixture operation failed');}
 function frame(value,opcode=1){const payload=Buffer.isBuffer(value)?value:Buffer.from(JSON.stringify(value));const header=Buffer.alloc(payload.length<126?2:4);header[0]=0x80|opcode;header[1]=payload.length<126?payload.length:126;if(payload.length>=126)header.writeUInt16BE(payload.length,2);return Buffer.concat([header,payload]);}
 function websocket(req,socket,head){
- if(mode==='auth'||req.url!=='/api-ws/v1/inference'||req.headers.authorization!=='Bearer '+key){socket.end('HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n');return;}
+ const doubao=expectedProtocol==='doubao';
+ report.handshakes.push({protocol:expectedProtocol,mode,path:req.url,resource:req.headers['x-api-resource-id']??null});
+ if(mode==='auth'||req.url!==(doubao?'/api/v3/sauc/bigmodel_async':'/api-ws/v1/inference')||(doubao?req.headers['x-api-key']!==key:req.headers.authorization!=='Bearer '+key)){socket.end('HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n');return;}
+ if(doubao&&mode==='resource-denied'&&req.headers['x-api-resource-id']==='volc.seedasr.sauc.duration'){socket.end('HTTP/1.1 403 Forbidden\r\nX-Api-Status-Code: 45000030\r\nContent-Length: 0\r\n\r\n');return;}
+ if(doubao){expect(req.headers['x-api-resource-id']).toBe(mode==='resource-denied'?'volc.seedasr.sauc.concurrent':'volc.seedasr.sauc.duration');expect(req.headers['x-api-request-id']).toMatch(/^[a-f0-9-]{36}$/);expect(req.headers.authorization).toBeUndefined();}
+
  const accept=createHash('sha1').update(req.headers['sec-websocket-key']+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '+accept+'\r\n\r\n');sockets.add(socket);socket.on('close',()=>sockets.delete(socket));socket.on('error',()=>{});
- const connection={mode,model:null,frames:0,bytes:0,started:false,finished:false};report.connections.push(connection);let task,buffer=head,fragment=Buffer.alloc(0),fragmentOpcode=0;
+ const connection={protocol:expectedProtocol,mode,model:null,frames:0,bytes:0,started:false,finished:false};report.connections.push(connection);let task,buffer=head,fragment=Buffer.alloc(0),fragmentOpcode=0;
  const send=(event,payload={})=>socket.write(frame({header:{task_id:task,event},payload}));
  const result=(text,end)=>send('result-generated',{output:{sentence:{sentence_id:1,sentence_end:end,text,begin_time:0,end_time:end?connection.bytes/32:null}}});
+ const binaryResult=(text,end,last=false)=>{const bytes=gzipSync(Buffer.from(JSON.stringify({code:20000000,result:{text,utterances:text?[{text,definite:end,start_time:0,end_time:Math.round(connection.bytes/32)}]:[]}})));const header=Buffer.alloc(8);header.set([0x11,last?0x92:0x90,0x11,0]);header.writeUInt32BE(bytes.length,4);socket.write(frame(Buffer.concat([header,bytes]),2));};
  function consume(opcode,payload){
+  if(doubao&&opcode===2){
+   const kind=payload[1]>>4,flags=payload[1]&15;expect(payload.readUInt32BE(4)).toBe(payload.length-8);const body=gunzipSync(payload.subarray(8));
+   if(kind===1){const value=JSON.parse(body.toString());expect(value.audio).toMatchObject({format:'pcm',rate:16000,bits:16,channel:1});expect(value.request).toMatchObject({model_name:'bigmodel',result_type:'full',show_utterances:true});connection.model='Doubao-Seed-ASR-2.0';connection.started=true;binaryResult('',false);return;}
+   expect(kind).toBe(2);expect(connection.started).toBe(true);
+   if(flags&2){connection.finished=true;if(connection.mode==='pending')return;if(connection.mode==='empty'){binaryResult('',true,true);return;}binaryResult('原生受控识别完成。',true);binaryResult('旧暂定不能覆盖。',false);binaryResult('原生受控识别完成。',true,true);return;}
+   connection.frames++;connection.bytes+=body.length;if(connection.frames===1)binaryResult('正在识别',false);return;
+  }
+
   if(opcode===8){socket.end(frame(payload,8));return;}if(opcode===9){socket.write(frame(payload,10));return;}
   if(opcode===2){if(!connection.started)throw Error('Audio arrived before task-started');connection.frames++;connection.bytes+=payload.length;if(connection.frames===1){if(connection.mode==='failure'){socket.write(frame({header:{task_id:task,event:'task-failed',error_code:'SERVICE_ERROR',error_message:'PRIVATE FIXTURE ERROR'}}));return;}result('正在识别',false);}return;}
   if(opcode!==1)return;const value=JSON.parse(payload.toString());if(value.header.action==='run-task'){task=value.header.task_id;expect(value.payload.parameters.sample_rate).toBe(16000);expect(value.payload.parameters.format).toBe('pcm');expect(value.payload.model).toBe(expectedModel);connection.model=value.payload.model;connection.started=true;send('task-started');}
@@ -77,9 +92,25 @@ try{
  expect(report.connections.some(c=>c.model==='qwen-audio-3.1-asr-flash-streaming'&&c.finished)).toBe(true);expect(report.connections.some(c=>c.model==='qwen-audio-3.0-asr-flash-streaming'&&c.finished)).toBe(true);
  await stop(page);page=await start(3);await invoke(page,'model_status',{retry:false});const reopened=(await invoke(page,'model_overview')).configs[0];expect(reopened.id).toBe(config.id);expect(reopened.modelId).toBe(expectedModel);expect(reopened.credentialStatus).toBe('present');
  report.checks.push('3.1 and3.0 selected in UI map to run-task model; custom origin/name/key retained;3.0 choice survives restart');
+ // Exercise the second protocol through the actual model editor, vault and microphone.
+ expectedProtocol='doubao';mode='normal';await page.getByRole('button',{name:'配置模型',exact:true}).click();
+ const doubaoSettings=page.getByRole('dialog');await doubaoSettings.getByRole('button',{name:'编辑',exact:true}).click();
+ await doubaoSettings.getByRole('combobox',{name:'模型',exact:true}).click();await page.getByRole('option',{name:'豆包 Seed-ASR 2.0 · 实时识别',exact:true}).click();
+ await expect(doubaoSettings.getByLabel('API 密钥')).toHaveValue('');await expect(doubaoSettings.getByLabel('API 密钥')).toHaveAttribute('placeholder','粘贴 API 密钥');
+ await doubaoSettings.getByRole('button',{name:'更多设置'}).click();await doubaoSettings.getByLabel('服务地址（URL）').fill(base);await doubaoSettings.getByLabel('API 密钥').fill(key);await doubaoSettings.getByRole('button',{name:'保存',exact:true}).click();await expect(doubaoSettings.getByText('已保存。')).toBeVisible();await page.keyboard.press('Escape');
+ const doubaoConfig=(await invoke(page,'model_overview')).configs[0];expect(doubaoConfig.protocol).toBe('doubao-asr-streaming');expect(doubaoConfig.id).toBe(config.id);expect(doubaoConfig.modelId).toBe('Doubao-Seed-ASR-2.0');
+ const prefs=await invoke(page,'speech_preferences',{preferences:null});await invoke(page,'speech_preferences',{preferences:{...prefs,historyEnabled:true,audioEnabled:true}});
+ const doubaoTask=await invoke(page,'speech_start');await waitPhase(page,'recording');await expect(page.getByRole('region',{name:'识别文字',exact:true})).toContainText('正在识别');await delay(200);await invoke(page,'speech_control',{taskId:doubaoTask.taskId,action:'finish'});const doubaoDone=await waitPhase(page,'completed');expect(doubaoDone.text).toBe('原生受控识别完成。');expect(doubaoDone.saved).toBe(true);
+ const doubaoRecord=await invoke(page,'history_detail',{id:doubaoDone.recordId});expect(doubaoRecord.audio.status).toBe('ready');
+ mode='resource-denied';const handshakes=report.handshakes.length;await invoke(page,'history_retry',{id:doubaoRecord.id,configId:doubaoConfig.id,configRevision:doubaoConfig.revision});await waitPhase(page,'completed');expect(report.handshakes.slice(handshakes).map(h=>h.resource)).toEqual(['volc.seedasr.sauc.duration','volc.seedasr.sauc.concurrent']);
+ mode='auth';const authHandshakes=report.handshakes.length;await invoke(page,'speech_start');await waitPhase(page,'failed');expect((await invoke(page,'speech_snapshot')).error).toBe('auth');expect(report.handshakes.length-authHandshakes).toBe(1);
+ mode='pending';const doubaoCancel=await invoke(page,'history_retry',{id:doubaoRecord.id,configId:doubaoConfig.id,configRevision:doubaoConfig.revision});await waitPhase(page,'processing');await invoke(page,'speech_control',{taskId:doubaoCancel.taskId,action:'cancel'});await waitPhase(page,'cancelled');
+ report.checks.push('Doubao model UI mapping, cross-service key reset, native binary/gzip stream, partial/final deduplication, WAV persistence and retry; explicit resource-only fallback; auth does not retry; cancellation preserves history');
+ await stop(page);page=await start(4);await invoke(page,'model_status',{retry:false});const doubaoReopened=(await invoke(page,'model_overview')).configs[0];expect(doubaoReopened.protocol).toBe('doubao-asr-streaming');expect(doubaoReopened.credentialStatus).toBe('present');expect((await invoke(page,'history_detail',{id:doubaoRecord.id})).audio.status).toBe('ready');
+ report.checks.push('Doubao selection, credential and history survive a real process restart');
 for(const r of (await invoke(page,'history_list',{query:{search:'',page:1}})).records)await invoke(page,'history_remove',{id:r.id,revision:r.revision});expect((await invoke(page,'history_list',{query:{search:'',page:1}})).total).toBe(0);
  expect(report.connections.every(c=>c.started)).toBe(true);expect(report.protocolError).toBeUndefined();report.checks.push('auth/empty/service errors, content updates never invalidate native shrink; service failure retains recoverable recording; revision-guarded delete cleans registered files');
- await stop(page);expect(readFileSync(path.join(data,'dictionary.sqlite')).includes(Buffer.from(key))).toBe(false);for(let round=1;round<=3;round++)for(const suffix of ['.log','-errors.log'])expect(readFileSync(path.join(directory,'round-'+round+suffix),'utf8')).not.toContain(key);report.passed=true;
+ await stop(page);expect(readFileSync(path.join(data,'dictionary.sqlite')).includes(Buffer.from(key))).toBe(false);for(let round=1;round<=4;round++)for(const suffix of ['.log','-errors.log'])expect(readFileSync(path.join(directory,'round-'+round+suffix),'utf8')).not.toContain(key);report.passed=true;
 }catch(e){report.error=String(e).replaceAll(key,'[redacted]');process.exitCode=1;}finally{
  if(browser){const page=browser.contexts().flatMap(c=>c.pages()).find(p=>!p.url().includes('surface=overlay'));await stop(page).catch(()=>stop(null,false));}else await stop(null,false);for(const socket of sockets)socket.destroy();if(server)await new Promise(r=>server.close(r));
  try{await command(['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_cleanup','--','--ignored']);report.credentialCleanup=true;}catch{report.credentialCleanup=false;report.passed=false;process.exitCode=1;}

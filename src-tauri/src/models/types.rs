@@ -31,6 +31,29 @@ impl From<DataError> for ModelError {
         Self::new(&e.code)
     }
 }
+pub struct ProtocolCapabilities {
+    pub usages: &'static [Usage],
+    pub live_text: bool,
+    pub text_test: bool,
+    pub origin_only: bool,
+}
+pub fn capabilities(protocol: &str) -> Option<ProtocolCapabilities> {
+    match protocol {
+        "openai-chat" => Some(ProtocolCapabilities {
+            usages: &[Usage::Text],
+            live_text: false,
+            text_test: true,
+            origin_only: false,
+        }),
+        "qwen-audio-streaming" | "doubao-asr-streaming" => Some(ProtocolCapabilities {
+            usages: &[Usage::Speech],
+            live_text: true,
+            text_test: false,
+            origin_only: true,
+        }),
+        _ => None,
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum Usage {
@@ -58,11 +81,9 @@ impl ConfigInput {
     pub fn validate(mut self) -> Result<Self, ModelError> {
         self.name = text(&self.name, 64, "name")?;
         self.model_id = text(&self.model_id, 256, "modelId")?;
-        if !matches!(
-            self.protocol.as_str(),
-            "openai-chat" | "qwen-audio-streaming"
-        ) {
-            return Err(ModelError::field("protocol"));
+        let capability = capabilities(&self.protocol).ok_or(ModelError::field("protocol"))?;
+        if self.protocol == "doubao-asr-streaming" && self.model_id != "Doubao-Seed-ASR-2.0" {
+            return Err(ModelError::field("modelId"));
         }
         self.base_url = base_url(&self.base_url)?;
         if self.usages.is_empty()
@@ -72,7 +93,7 @@ impl ConfigInput {
             return Err(ModelError::field("usages"));
         }
         self.usages.sort_by_key(Usage::key);
-        if self.protocol == "qwen-audio-streaming" {
+        if capability.origin_only {
             if self.usages != vec![Usage::Speech] {
                 return Err(ModelError::field("usages"));
             }
@@ -87,10 +108,7 @@ impl ConfigInput {
 }
 pub fn executable(input: &ConfigInput, usage: &Usage) -> bool {
     input.usages.contains(usage)
-        && match usage {
-            Usage::Speech => input.protocol == "qwen-audio-streaming",
-            Usage::Text => input.protocol == "openai-chat",
-        }
+        && capabilities(&input.protocol).is_some_and(|c| c.usages.contains(usage))
 }
 pub fn text(raw: &str, max: usize, field: &str) -> Result<String, ModelError> {
     if raw

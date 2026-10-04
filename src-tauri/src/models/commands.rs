@@ -7,6 +7,7 @@ fn help_url(caller: &str, help: &str) -> Result<&'static str, ModelError> {
         return Err(ModelError::new("forbidden"));
     }
     match help {
+        "doubao-api-key" => Ok("https://console.volcengine.com/speech/app"),
         "qwen-api-key" => Ok("https://help.aliyun.com/zh/model-studio/get-api-key"),
         _ => Err(ModelError::field("help")),
     }
@@ -141,5 +142,5 @@ pub fn model_cancel(
     request_id: String,
 ) -> Result<(), ModelError> {
     authorize(window.label())?;
-    state.provider.cancel(&request_id)
+    state.requests.cancel(&request_id)
 }

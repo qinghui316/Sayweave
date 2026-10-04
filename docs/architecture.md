@@ -6,7 +6,7 @@ DictionaryPort、主窗限定命令及专用SQLite线程独立于Runtime，详�
 
 ## 目录与依赖
 
-SpeechPort/HistoryPort 与 Runtime 分离，原生 SpeechService 管理录音/重试、固定配置快照、采集、供应商和历史服务，见 [speech.md](speech.md)。Runtime 只投影阶段；音量/字幕有独立内容序号，不改变布局版本。业务历史持久化、窗口快照仍为内存。生产入口为真实语音，演示仅开发/专用验收构建可用。
+SpeechPort/HistoryPort 与 Runtime 分离，原生 SpeechService 管理录音/重试、固定配置快照、采集和历史服务，通过统一 RecognitionSession 使用千问或豆包适配器，见 [speech.md](speech.md)。Runtime 只投影阶段；音量/字幕有独立内容序号，不改变布局版本。业务历史持久化、窗口快照仍为内存。生产入口为真实语音，演示仅开发/专用验收构建可用。
 
 - app：入口、Hash 路由、错误边界、适配装配、跨功能协调。
 - features：home / history / dictionary / preferences / settings / onboarding / voice；内部实现由模块 index 导出。
@@ -20,6 +20,8 @@ SpeechPort/HistoryPort 与 Runtime 分离，原生 SpeechService 管理录音/�
 - scripts：源码边界、编码与分发检查，以及可复现桌面测试。
 
 应用层组装功能；功能只读公共 UI/契约，UI 只依赖设计/文案/素材。功能不越界读取其他功能内部文件。AST 边界检查覆盖导入、重导出和动态导入，并检查循环。未创建插件/HTTP 服务或通用全局状态容器。
+
+协议能力在前后端契约集中定义，固定JSON样例验证一致。独立 network::RequestCoordinator 由启动层创建，供文字与语音共用请求名额、取消及退出信号。业务会话和字幕类型不依赖某个供应商的原始数据，新增协议不改采集、历史或窗口。
 
 ## 状态协议
 

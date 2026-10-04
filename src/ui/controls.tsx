@@ -1,4 +1,4 @@
-import { useId, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type Ref } from 'react';
+import { useId, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type Ref, type CSSProperties } from 'react';
 import { AnimatedIcon } from './AnimatedIcon';
 import { useMotion } from './useMotion';
 import * as SelectPrimitive from '@radix-ui/react-select';
@@ -37,7 +37,7 @@ export function Switch({ checked, onCheckedChange, label }: { checked: boolean; 
   return <SwitchPrimitive.Root className={s.switch} checked={checked} onCheckedChange={onCheckedChange} aria-label={label}><SwitchPrimitive.Thumb className={s.thumb} /></SwitchPrimitive.Root>;
 }
 export function Tabs({ value, onValueChange, options, children, label, className, contentClassName, disabled, activationMode = 'automatic', variant = 'control' }: { value: string; onValueChange: (value: string) => void; options: {value: string; label: string}[]; children: ReactNode; label: string; className?: string; contentClassName?: string; disabled?: boolean; activationMode?: 'automatic'|'manual'; variant?: 'control'|'navigation' }) {
-  return <TabsPrimitive.Root className={className} value={value} onValueChange={onValueChange} activationMode={activationMode}><TabsPrimitive.List className={`${s.tabs} ${variant === 'navigation' ? s.navigationTabs : ''}`} aria-label={label}>{options.map(o => <TabsPrimitive.Trigger disabled={disabled} key={o.value} value={o.value} className={s.tab}>{o.label}</TabsPrimitive.Trigger>)}</TabsPrimitive.List><TabsPrimitive.Content className={contentClassName} value={value}>{children}</TabsPrimitive.Content></TabsPrimitive.Root>;
+  return <TabsPrimitive.Root className={className} value={value} onValueChange={onValueChange} activationMode={activationMode}><TabsPrimitive.List className={`${s.tabs} ${variant === 'navigation' ? s.navigationTabs : ''}`} aria-label={label} style={variant==='navigation'?{'--selected-tab':Math.max(0,options.findIndex(o=>o.value===value))} as CSSProperties:undefined}>{options.map(o => <TabsPrimitive.Trigger disabled={disabled} key={o.value} value={o.value} className={s.tab}>{o.label}</TabsPrimitive.Trigger>)}</TabsPrimitive.List><TabsPrimitive.Content className={`${contentClassName ?? ''} ${variant === 'navigation' ? s.navigationContent : ''}`} value={value}>{children}</TabsPrimitive.Content></TabsPrimitive.Root>;
 }
 export function InlineMessage({ children, status = 'info' }: { children: ReactNode; status?: 'info'|'error'|'success' }) {
   return <p className={s.message} role={status === 'error' ? 'alert' : 'status'}><span aria-hidden="true" className={status === 'success' ? s.confirm : ''}>{status === 'error' ? '!' : status === 'success' ? '✓' : 'i'}</span>{children}</p>;

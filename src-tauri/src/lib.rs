@@ -4,6 +4,7 @@ mod coordinator;
 mod data;
 mod history;
 mod models;
+mod network;
 mod speech;
 use coordinator::{Phase, RuntimeError, Snapshot, authorized_window, overlay_size};
 use data::{
@@ -430,8 +431,13 @@ pub fn run() {
             };
             match DataWorker::start(root.clone()) {
                 Ok(worker) => {
-                    let service = models::ModelService::new(worker.clone(), namespace, &root)
-                        .map_err(|e| e.code)?;
+                    let service = models::ModelService::new(
+                        worker.clone(),
+                        namespace,
+                        &root,
+                        std::sync::Arc::new(network::RequestCoordinator::default()),
+                    )
+                    .map_err(|e| e.code)?;
                     app.manage(service);
                     app.manage(speech::SpeechService::new(history::HistoryService::new(
                         worker.clone(),

@@ -3,7 +3,7 @@ import {Link} from 'react-router-dom';
 import {Button,CopyFeedbackButton,Dialog,EmptyState,Field,InlineMessage,TextInput} from '../../ui';
 import {historyText,type HistoryPort,type HistoryRecord,type HistoryPage,type PlaybackState} from '../../contracts/history';
 import {speechError,type RecordingPreferences,type SpeechPort,type SpeechSnapshot} from '../../contracts/speech';
-import type {ModelConfigPort,ModelRecord} from '../../contracts/models';
+import {modelExecutable,type ModelConfigPort,type ModelRecord} from '../../contracts/models';
 import {speechMessages} from '../../locales/speech';
 import s from './history.module.css';
 const statusLabel:Record<string,string>={preparing:'准备中',recording:'录音中',processing:'处理中',success:'识别完成',failed:'识别失败',cancelled:'已取消',interrupted:'意外中断',delete_pending:'等待删除'};
@@ -35,7 +35,7 @@ export function History({port,speech,models,snapshot}:{port:HistoryPort;speech:S
  async function action(work:()=>Promise<void>){if(inFlight.current)return;inFlight.current=true;setBusy(true);setError('');const token=++mutation.current;try{await work();}catch(e){if(alive.current&&mutation.current===token)setError(speechMessages[speechError(e).code]);}finally{inFlight.current=false;if(alive.current&&mutation.current===token)setBusy(false);}}
  async function open(id:string){await action(async()=>{const r=await port.detail(id);if(alive.current){setRecord(r);setVersion(r.currentAttempt??r.attempts[0]?.id??'');setNotice('');}});}
  async function deleteRecord(){if(!record)return;await action(async()=>{try{await port.remove(record.id,record.revision);}catch(e){setRecord(await port.detail(record.id));throw e;}if(alive.current){setRecord(null);setDeleting(false);setNotice('记录与录音已删除。');reload();}});}
- async function prepareRetry(){await action(async()=>{await models.status();const v=await models.overview();const c=v.configs.find(c=>c.id===v.defaults.find(d=>d.usage==='speech')?.configId);if(!c)throw speechError({code:'notConfigured'});if(c.protocol!=='qwen-audio-streaming')throw speechError({code:'unsupported'});if(alive.current)setRetryModel(c);});}
+ async function prepareRetry(){await action(async()=>{await models.status();const v=await models.overview();const c=v.configs.find(c=>c.id===v.defaults.find(d=>d.usage==='speech')?.configId);if(!c)throw speechError({code:'notConfigured'});if(!modelExecutable(c,'speech'))throw speechError({code:'unsupported'});if(alive.current)setRetryModel(c);});}
  async function retry(){if(!record||!retryModel)return;await action(async()=>{await port.retry(record.id,retryModel.id,retryModel.revision);if(alive.current){setRetryModel(null);setNotice('正在重识别；取消只停止本次重试，原记录保留。');}});}
  async function play(actionName:'play'|'pause'|'resume'|'seek'|'stop',ms?:number){await action(async()=>{const token=++playbackGeneration.current;try{const p=actionName==='play'?await port.play(record!.audio!.id):await port.playback(actionName,ms);if(alive.current&&token===playbackGeneration.current)setPlayer(p);}catch(e){if(record){const updated=await port.detail(record.id);if(alive.current)setRecord(updated);}throw e;}});}
  async function savePreferences(){if(!prefs)return;await action(async()=>{const p=await speech.savePreferences(prefs);if(alive.current){setPrefs(p);setNotice('保存策略已更新，仅影响后续录音。');}});}

@@ -5,6 +5,98 @@ use rusqlite::{Connection, params};
 fn id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+
+#[test]
+fn migration_v4_to_v5_preserves_configs_defaults_history_and_constraints() {
+    use crate::data::repository::{MIGRATIONS, configure, migrate};
+    let root = tempfile::tempdir().unwrap();
+    let mut c = Connection::open(root.path().join("dictionary.sqlite")).unwrap();
+    configure(&c).unwrap();
+    migrate(&mut c, root.path(), &MIGRATIONS[..4]).unwrap();
+    c.execute("INSERT INTO model_configs VALUES('q','千问','qwen-audio-streaming','https://example.invalid','qwen-model',1,0,'vault-ref',3,10,20)",[]).unwrap();
+    c.execute(
+        "UPDATE model_defaults SET config_id='q',revision=7 WHERE usage='speech'",
+        [],
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO speech_records(id,created_at,status) VALUES('history',10,'success')",
+        [],
+    )
+    .unwrap();
+    migrate(&mut c, root.path(), MIGRATIONS).unwrap();
+    let saved: (String, String, i64) = c
+        .query_row(
+            "SELECT credential_ref,model_id,revision FROM model_configs WHERE id='q'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(saved, ("vault-ref".into(), "qwen-model".into(), 3));
+    assert_eq!(
+        c.query_row(
+            "SELECT revision FROM model_defaults WHERE usage='speech'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        7
+    );
+    assert_eq!(
+        c.query_row("SELECT count(*) FROM speech_records", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        c.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
+            .get::<_, i64>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    c.execute("INSERT INTO model_configs VALUES('d','豆包','doubao-asr-streaming','https://openspeech.bytedance.com','Doubao-Seed-ASR-2.0',1,0,'doubao-ref',1,30,30)",[]).unwrap();
+    assert!(
+        c.execute("UPDATE model_configs SET text=1 WHERE id='d'", [])
+            .is_err()
+    );
+    assert!(
+        c.execute(
+            "UPDATE model_defaults SET config_id='d' WHERE usage='text'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        c.execute(
+            "UPDATE model_defaults SET config_id='missing' WHERE usage='speech'",
+            []
+        )
+        .is_err()
+    );
+    let backup = std::fs::read_dir(root.path().join("backups"))
+        .unwrap()
+        .map(|f| f.unwrap().path())
+        .find(|p| {
+            Connection::open(p)
+                .unwrap()
+                .query_row("SELECT max(version) FROM schema_migrations", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+                == 4
+        })
+        .unwrap();
+    assert_eq!(
+        Connection::open(backup)
+            .unwrap()
+            .query_row("SELECT count(*) FROM model_configs", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
 fn attempt(record: &str, kind: &str) -> Attempt {
     Attempt {
         id: id(),

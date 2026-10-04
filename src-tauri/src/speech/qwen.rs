@@ -1,22 +1,10 @@
+use super::recognition::Segment;
+use super::transport::Socket;
 use crate::history::types::Error;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, time::Duration};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream,
-    tungstenite::{Message, client::IntoClientRequest, protocol::WebSocketConfig},
-};
-pub type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
-#[derive(Clone, Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Segment {
-    pub id: u64,
-    pub sequence: u64,
-    pub text: String,
-    pub confirmed: bool,
-    pub begin_ms: Option<u64>,
-    pub end_ms: Option<u64>,
-}
+use std::collections::BTreeMap;
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 #[derive(Default)]
 pub struct Transcript {
     segments: BTreeMap<u64, Segment>,
@@ -24,7 +12,7 @@ pub struct Transcript {
 }
 pub enum Event {
     Started,
-    Segment(Segment),
+    Segment,
     Finished,
     Heartbeat,
 }
@@ -89,7 +77,7 @@ impl Transcript {
                 if self.text(false).len() > 1024 * 1024 {
                     return Err(Error::new("responseTooLarge"));
                 }
-                Ok(Event::Segment(seg))
+                Ok(Event::Segment)
             }
             _ => Err(Error::new("protocol")),
         }
@@ -132,28 +120,7 @@ pub async fn connect(base: &str, key: &str, model: &str, task: &str) -> Result<S
             .parse()
             .map_err(|_| Error::new("invalid"))?,
     );
-    let config = WebSocketConfig::default()
-        .max_message_size(Some(1024 * 1024))
-        .max_frame_size(Some(1024 * 1024));
-    let connection = async {
-        #[cfg(feature = "desktop-acceptance")]
-        if let Some(connector) = acceptance_connector(base)? {
-            return tokio_tungstenite::connect_async_tls_with_config(
-                request,
-                Some(config),
-                false,
-                Some(connector),
-            )
-            .await
-            .map_err(connection_error);
-        }
-        tokio_tungstenite::connect_async_with_config(request, Some(config), false)
-            .await
-            .map_err(connection_error)
-    };
-    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), connection)
-        .await
-        .map_err(|_| Error::new("timeout"))??;
+    let mut socket = super::transport::connect(base, request).await?;
     socket.send(Message::Text(json!({"header":{"action":"run-task","task_id":task,"streaming":"duplex"},"payload":{"task_group":"audio","task":"asr","function":"recognition","model":model,"parameters":{"format":"pcm","sample_rate":16000,"heartbeat":true},"input":{}}}).to_string().into())).await.map_err(|_|Error::new("network"))?;
     Ok(socket)
 }
@@ -171,59 +138,4 @@ pub async fn receive(socket: &mut Socket) -> Result<Value, Error> {
             _ => return Err(Error::new("network")),
         }
     }
-}
-pub async fn audio(socket: &mut Socket, pcm: &[i16]) -> Result<(), Error> {
-    let bytes = pcm.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<_>>();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        socket.send(Message::Binary(bytes.into())),
-    )
-    .await
-    .map_err(|_| Error::new("timeout"))?
-    .map_err(|_| Error::new("network"))
-}
-pub async fn finish(socket: &mut Socket, task: &str) -> Result<(), Error> {
-    tokio::time::timeout(Duration::from_secs(5),socket.send(Message::Text(json!({"header":{"action":"finish-task","task_id":task,"streaming":"duplex"},"payload":{"input":{}}}).to_string().into()))).await.map_err(|_|Error::new("timeout"))?.map_err(|_|Error::new("network"))
-}
-
-fn connection_error(e: tokio_tungstenite::tungstenite::Error) -> Error {
-    match e {
-        tokio_tungstenite::tungstenite::Error::Http(r) => Error::new(match r.status().as_u16() {
-            401 | 403 => "auth",
-            429 => "rateLimit",
-            _ => "protocol",
-        }),
-        _ => Error::new("network"),
-    }
-}
-#[cfg(feature = "desktop-acceptance")]
-fn acceptance_connector(base: &str) -> Result<Option<tokio_tungstenite::Connector>, Error> {
-    let id = match std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID") {
-        Ok(id) if uuid::Uuid::parse_str(&id).is_ok() => id,
-        _ => return Ok(None),
-    };
-    if reqwest::Url::parse(base)
-        .ok()
-        .and_then(|u| u.host_str().map(String::from))
-        .as_deref()
-        != Some("localhost")
-    {
-        return Ok(None);
-    }
-    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../.local/data-acceptance")
-        .join(id)
-        .join("data/fixture-ca.der");
-    let certificate = std::fs::read(file).map_err(|_| Error::new("protocol"))?;
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(rustls::pki_types::CertificateDer::from(certificate))
-        .map_err(|_| Error::new("protocol"))?;
-    Ok(Some(tokio_tungstenite::Connector::Rustls(
-        std::sync::Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        ),
-    )))
 }

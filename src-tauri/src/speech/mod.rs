@@ -1,8 +1,11 @@
 pub mod audio;
 pub mod commands;
+mod doubao;
 pub mod qwen;
+mod recognition;
 #[cfg(test)]
 mod tests;
+mod transport;
 use crate::{
     coordinator::Phase,
     history::{HistoryService, playback::Playback, types::*},
@@ -33,7 +36,7 @@ pub struct Snapshot {
     pub record_id: Option<String>,
     pub phase: Phase,
     pub text: String,
-    pub segments: Vec<qwen::Segment>,
+    pub segments: Vec<recognition::Segment>,
     pub model_name: Option<String>,
     pub device_name: Option<String>,
     pub duration_ms: u64,
@@ -356,7 +359,7 @@ impl SpeechService {
         // Reserve the shared network slot before starting persistence or capture.
         let mut admission = app
             .state::<ModelService>()
-            .provider
+            .requests
             .register(&task_id)
             .map_err(|e| Error::new(&e.code))?;
         let runtime_id = {
@@ -486,27 +489,16 @@ impl SpeechService {
         task: &Task,
         cfg: &crate::models::SpeechConfiguration,
         cancel: &mut watch::Receiver<u8>,
-        admission: &mut crate::models::provider::RequestGuard,
+        admission: &mut crate::network::RequestGuard,
     ) -> Result<(), Error> {
         let began = Instant::now();
-        let mut transcript = qwen::Transcript::default();
+        let mut transcript = recognition::Transcript::default();
         let mut capture: Option<audio::Capture> = None;
         let mut duration = 0;
         let mut save_error = false;
         let mut abort = cancel.clone();
         let work = async {
-            let mut socket =
-                qwen::connect(&cfg.input.base_url, &cfg.key, &cfg.input.model_id, &task.id).await?;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    let v = qwen::receive(&mut socket).await?;
-                    if matches!(transcript.event(&v, &task.id)?, qwen::Event::Started) {
-                        return Ok::<_, Error>(());
-                    }
-                }
-            })
-            .await
-            .map_err(|_| Error::new("timeout"))??;
+            let mut session = recognition::RecognitionSession::open(cfg, &task.id).await?;
             if *cancel.borrow() >= 2 {
                 return Err(Error::new("cancelled"));
             }
@@ -564,23 +556,23 @@ impl SpeechService {
                 }
                 tokio::select! {
                                    _=cancel.changed()=>{if *cancel.borrow()==1 {if let Some(c)=&capture{c.stop();}self.update(app,&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}},
-                                   message=qwen::receive(&mut socket)=>{match transcript.event(&message?,&task.id)? {
-                                       qwen::Event::Segment(s)=>{dirty=true;if s.confirmed&&task.persistent&&checkpoint.elapsed()>Duration::from_secs(1){if self.history.db(DbOperation::Checkpoint{attempt_id:task.attempt_id.clone(),text:transcript.text(true)}).await.is_err(){save_error=true;}checkpoint=Instant::now();}},
-                                       qwen::Event::Finished=>{if sending{return Err(Error::new("protocol"));}
+                                   message=session.next_event()=>{match message? {
+                                       recognition::Event::Update(value)=>{transcript=value;dirty=true;if !transcript.confirmed_text.is_empty()&&task.persistent&&checkpoint.elapsed()>Duration::from_secs(1){if self.history.db(DbOperation::Checkpoint{attempt_id:task.attempt_id.clone(),text:transcript.text(true)}).await.is_err(){save_error=true;}checkpoint=Instant::now();}},
+                                       recognition::Event::Finished=>{if sending{return Err(Error::new("protocol"));}
                 if transcript.text(true).trim().is_empty(){return Err(Error::new("emptyText"));}break;},
-                                       qwen::Event::Started=>return Err(Error::new("protocol")),qwen::Event::Heartbeat=>{}
+                                       recognition::Event::Heartbeat=>{}
                                    }},
                                    _=tick.tick()=>{
                                        if began.elapsed()>Duration::from_secs(650){return Err(Error::new("timeout"));}
                                        let mut level=0.0;
                                        if sending {
                                            if let Some(pcm)=&task.replay {
-                                               let end=(replay_at+800).min(pcm.len());if replay_at<end {qwen::audio(&mut socket,&pcm[replay_at..end]).await?;replay_at=end;duration=replay_at as u64/16;}else{sending=false;}
+                                               let end=(replay_at+800).min(pcm.len());if replay_at<end {session.send_pcm(&pcm[replay_at..end]).await?;replay_at=end;duration=replay_at as u64/16;}else{sending=false;}
                                            } else if let Some(c)=capture.as_mut(){
-                                               while let Ok(packet)=c.packets.try_recv(){duration=packet.duration_ms;level=packet.level;qwen::audio(&mut socket,&packet.pcm).await?;}
+                                               while let Ok(packet)=c.packets.try_recv(){duration=packet.duration_ms;level=packet.level;session.send_pcm(&packet.pcm).await?;}
                                                if c.packets.is_closed()&&c.packets.is_empty(){sending=false;}
                                            }
-                                           if !sending {qwen::finish(&mut socket,&task.id).await?;final_at=Some(Instant::now());self.update(app,&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}
+                                           if !sending {session.finish().await?;final_at=Some(Instant::now());self.update(app,&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}
                                        }
                                        meter_seq+=1;let meter=Meter{task_id:task.id.clone(),sequence:meter_seq,level,duration_ms:duration};let _=app.emit_to("main","speech:meter",&meter);let _=app.emit_to("voice-overlay","speech:meter",&meter);
                                        if published.elapsed()>=Duration::from_millis(100)&&(dirty||sending){self.update(app,&task.id,|s|{s.text=transcript.text(false);s.segments=transcript.segments();s.duration_ms=duration;});published=Instant::now();dirty=false;}
@@ -589,7 +581,7 @@ impl SpeechService {
             }
             Ok::<_, Error>(())
         };
-        // The existing provider registry gives speech and model tests the same four slots and shutdown signal.
+        // The request coordinator gives speech and model tests the same four slots and shutdown signal.
         let mut outcome=admission.run(660,async {tokio::select!{
             result=work=>result.map_err(|e|crate::models::types::ModelError::new(&e.code)),
             _=async {loop{if *abort.borrow()>=2{break;}

@@ -23,6 +23,19 @@ function fillText(){
  fireEvent.change(screen.getByLabelText('服务地址（URL）'),{target:{value:'https://example.invalid/v1'}});
 }
 describe('task-based model settings',()=>{
+ it('maps both services, keeps a same-service draft key and clears it on a service change',async()=>{
+  const p=new BrowserModels(),help=vi.fn().mockResolvedValue(undefined);render(<ModelPanel port={p} onHelp={help}/>);await screen.findByLabelText('API 密钥');
+  fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'qwen-fixture-key'}});
+  const user=userEvent.setup(),select=screen.getByRole('combobox',{name:'模型'});
+  select.focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('option',{name:'Qwen Audio 3.0 · 实时识别'}));
+  expect(screen.getByLabelText('API 密钥')).toHaveValue('qwen-fixture-key');
+  select.focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('option',{name:'豆包 Seed-ASR 2.0 · 实时识别'}));
+  expect(screen.getByLabelText('API 密钥')).toHaveValue('');
+  await user.click(screen.getByRole('button',{name:'获取 API 密钥'}));expect(help).toHaveBeenCalledWith('doubao-api-key');
+  fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'doubao-fixture-key'}});
+  fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
+  expect((await p.overview()).configs[0]).toMatchObject({protocol:'doubao-asr-streaming',baseUrl:'https://openspeech.bytedance.com',modelId:'Doubao-Seed-ASR-2.0',name:'豆包 Seed-ASR 2.0 · 实时识别',usages:['speech']});
+ });
  it('starts with a speech preset and closes an untouched form immediately',async()=>{
   let guard:((action:()=>void)=>void)|null=null;
   const p=new BrowserModels();await panel(p,value=>{guard=value;});
@@ -114,13 +127,13 @@ describe('task-based model settings',()=>{
   render(<ModelPanel port={p}/>);await screen.findByText('我的语音');fireEvent.click(screen.getByRole('button',{name:'编辑'}));
   const select=screen.getByRole('combobox',{name:'模型'});
   expect(select).toHaveTextContent('当前自定义模型 · custom-streaming-id');
-  const user=userEvent.setup();select.focus();await user.keyboard('{Enter}{End}{Enter}');
+  const user=userEvent.setup();select.focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('option',{name:'Qwen Audio 3.0 · 实时识别'}));
   expect(select).toHaveTextContent('Qwen Audio 3.0 · 实时识别');
   fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
   expect((await p.overview()).configs[0]).toMatchObject({id:before.id,name:'我的语音',baseUrl:before.baseUrl,modelId:'qwen-audio-3.0-asr-flash-streaming',usages:['speech'],credentialStatus:'present',revision:before.revision+1});
  });
  it('saves the selected3.0 model without overwriting it with the initial preset',async()=>{
-  const p=new BrowserModels();await panel(p);const user=userEvent.setup();screen.getByRole('combobox',{name:'模型'}).focus();await user.keyboard('{Enter}{End}{Enter}');
+  const p=new BrowserModels();await panel(p);const user=userEvent.setup();screen.getByRole('combobox',{name:'模型'}).focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('option',{name:'Qwen Audio 3.0 · 实时识别'}));
   fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'fixture-key'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
   expect((await p.overview()).configs[0]).toMatchObject({name:'Qwen Audio 3.0 · 实时识别',modelId:'qwen-audio-3.0-asr-flash-streaming'});
  });

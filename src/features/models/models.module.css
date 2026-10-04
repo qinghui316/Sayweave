@@ -1,7 +1,7 @@
 .panel { display: flex; flex-direction: column; min-width: 0; min-height: 0; width: 100%; flex: 1; }
 .panel>[role="tablist"] { flex: none; margin-bottom: var(--space-24); }
-.tabContent { min-width: 0; min-height: 0; display: flex; flex-direction: column; flex: 1; }
-.scroll { flex: 1; min-height: 0; min-width: 0; overflow-y: auto; overflow-x: hidden; padding: var(--space-8); margin: 0 calc(-1 * var(--space-8)); scrollbar-gutter: stable; }
+.tabContent { min-width: 0; min-height: 0; display: flex; flex-direction: column; flex: 0 1 auto; }
+.scroll { flex: 0 1 auto; min-height: 0; min-width: 0; overflow-y: auto; overflow-x: hidden; padding: var(--space-8); margin: 0 calc(-1 * var(--space-8)); scrollbar-gutter: stable; }
 .form,.fields { display: flex; flex-direction: column; gap: var(--space-16); min-width: 0; }
 .fields { border: 0; padding: 0; margin: 0; }
 .fields>div>button[role="combobox"] { width: 100%; }

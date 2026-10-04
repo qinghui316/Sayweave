@@ -23,7 +23,7 @@ function fromRecord(c:ModelRecord):Editor {
  const input = {name:c.name, protocol:c.protocol, baseUrl:c.baseUrl, modelId:c.modelId, usages:[...c.usages]};
  return {input, initial:structuredClone(input), key:'', record:c, automaticName:false};
 }
-export interface ModelPanelProps {port:ModelConfigPort; onSpeech?:()=>void; onHelp?:()=>Promise<void>; onGuardChange?:(guard:((action:()=>void)=>void)|null)=>void}
+export interface ModelPanelProps {port:ModelConfigPort; onSpeech?:()=>void; onHelp?:(help:import('../../contracts/models').ModelHelp)=>Promise<void>; onGuardChange?:(guard:((action:()=>void)=>void)|null)=>void}
 export function ModelPanel({port, onSpeech, onHelp, onGuardChange}: ModelPanelProps) {
  const [usage, setUsage] = useState<ModelUsage>('speech');
  const [view, setView] = useState<ModelOverview|null>(null);
@@ -100,6 +100,13 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange}: ModelPanelPr
   if(!editor) throw new Error('No model draft');
   return {input:structuredClone(editor.input), key:editor.key.trim() ? {action:'replace', value:editor.key} : {action:'keep'}, id:editor.record?.id ?? null, revision:editor.record?.revision ?? null};
  }
+ function selectSpeechPreset(modelId:string) {
+  const preset=speechPresets.find(p=>p.modelId===modelId);
+  if(!preset || !editor) return;
+  const baseUrl=editor.input.protocol===preset.protocol?editor.input.baseUrl:preset.baseUrl;
+  const changedService=editor.input.protocol!==preset.protocol || !modelSameOrigin(editor.input.baseUrl,baseUrl);
+  modify({protocol:preset.protocol,baseUrl,modelId},changedService?'':undefined);
+ }
  async function check() {
   if(!editor || network || saving) return;
   cancel(); setTested(null); setNetworkError(null); setNotice('');
@@ -167,10 +174,10 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange}: ModelPanelPr
    {editor && <form id={formId} ref={form} className={s.form} onSubmit={e => {e.preventDefault(); void save();}}>
     {usage === 'speech' && view?.configs.some(c => c.id === selected && !modelExecutable(c,'speech')) && <p className={s.meta}>此前的语音配置仍在“文字处理”中保留。选择模型并填写密钥后，即可试说。</p>}
     <fieldset disabled={saving} className={s.fields}>
-     {usage === 'speech' ? <Field label="模型" error={fieldError('modelId')}>{props => <Select {...props} disabled={saving} label="模型" value={editor.input.modelId} onValueChange={value => modify({modelId:value})} options={speechOptions}/>}</Field> : addressField}
+     {usage === 'speech' ? <Field label="模型" error={fieldError('modelId')}>{props => <Select {...props} disabled={saving} label="模型" value={editor.input.modelId} onValueChange={selectSpeechPreset} options={speechOptions}/>}</Field> : addressField}
      <div className={s.keyGroup}>
-      <Field label="API 密钥" error={fieldError('key')} description={originChanged ? '地址已改变，请填写这个服务的密钥。' : editor.record?.credentialStatus === 'present' ? '已保存；留空即可继续使用。' : undefined}>{props => <PasswordInput {...props} value={editor.key} placeholder={editor.record?.credentialStatus === 'present' ? '密钥已保存' : '粘贴 API 密钥'} autoComplete="off" onChange={e => modify({},e.target.value)}/>}</Field>
-      {usage === 'speech' && <Button variant="quiet" disabled={saving} onClick={() => {if(onHelp) void onHelp().catch(() => setNotice('无法打开帮助，请稍后重试。'));}}>获取 API 密钥</Button>}
+      <Field label="API 密钥" error={fieldError('key')} description={originChanged ? '请填写这个服务的密钥。' : editor.record?.credentialStatus === 'present' ? '已保存；留空即可继续使用。' : undefined}>{props => <PasswordInput {...props} value={editor.key} placeholder={!originChanged && editor.record?.credentialStatus === 'present' ? '密钥已保存' : '粘贴 API 密钥'} autoComplete="off" onChange={e => modify({},e.target.value)}/>}</Field>
+      {usage === 'speech' && <Button variant="quiet" disabled={saving} onClick={() => {if(onHelp) void onHelp(editor.input.protocol==='doubao-asr-streaming'?'doubao-api-key':'qwen-api-key').catch(() => setNotice('无法打开帮助，请稍后重试。'));}}>获取 API 密钥</Button>}
      </div>
      {usage === 'text' && <Field label="模型" error={fieldError('modelId')}>{props => <TextInput {...props} value={editor.input.modelId} placeholder="填写模型名称" autoComplete="off" spellCheck={false} onChange={e => modify({modelId:e.target.value})}/>}</Field>}
      <Button variant="quiet" className={s.more} aria-expanded={advanced} aria-controls={formId+'-advanced'} onClick={() => setAdvanced(value => !value)}>{advanced ? '收起设置' : '更多设置'}</Button>

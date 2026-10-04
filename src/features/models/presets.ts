@@ -3,6 +3,7 @@ import type {ModelInput, ModelUsage} from '../../contracts/models';
 export const speechPresets = [
  {label:'Qwen Audio 3.1 · 实时识别', modelId:'qwen-audio-3.1-asr-flash-streaming', protocol:'qwen-audio-streaming', baseUrl:'https://dashscope.aliyuncs.com'},
  {label:'Qwen Audio 3.0 · 实时识别', modelId:'qwen-audio-3.0-asr-flash-streaming', protocol:'qwen-audio-streaming', baseUrl:'https://dashscope.aliyuncs.com'},
+ {label:'豆包 Seed-ASR 2.0 · 实时识别', modelId:'Doubao-Seed-ASR-2.0', protocol:'doubao-asr-streaming', baseUrl:'https://openspeech.bytedance.com'},
 ] as const;
 
 export function modelName(modelId:string, usage:ModelUsage):string {

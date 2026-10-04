@@ -14,8 +14,8 @@ class TauriModels implements ModelConfigPort {
  async cancelRequest(requestId:string){await this.call('model_cancel',{requestId});}
 }
 export function createModels():ModelConfigPort{return isTauri()?new TauriModels():new BrowserModels();}
-export async function openModelHelp():Promise<void>{
+export async function openModelHelp(help:import('../contracts/models').ModelHelp):Promise<void>{
  if(isTauri()){
-  try{await invoke('model_help',{help:'qwen-api-key'});}catch(e){throw modelError(e);}
- }else window.open('https://help.aliyun.com/zh/model-studio/get-api-key','_blank','noopener,noreferrer');
+  try{await invoke('model_help',{help});}catch(e){throw modelError(e);}
+ }else window.open(help==='doubao-api-key'?'https://console.volcengine.com/speech/app':'https://help.aliyun.com/zh/model-studio/get-api-key','_blank','noopener,noreferrer');
 }

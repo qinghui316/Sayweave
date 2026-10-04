@@ -16,6 +16,7 @@ Direct dependencies added for model configuration are pinned in Cargo.toml / Car
 | hound | 3.5.1 | Apache-2.0 | https://github.com/ruuda/hound |
 | rodio | 0.22.2 | MIT OR Apache-2.0 | https://github.com/RustAudio/rodio |
 | tokio-tungstenite | 0.30.0 | MIT | https://github.com/snapview/tokio-tungstenite |
+| flate2 | 1.1.10 | MIT OR Apache-2.0 | https://github.com/rust-lang/flate2-rs |
 | tauri-plugin-clipboard-manager | 2.4.1 | Apache-2.0 OR MIT | https://github.com/tauri-apps/plugins-workspace |
 
 License identifiers and source URLs above were checked against the resolved crate manifests. Cargo.lock also records transitive dependencies; the table is not an exhaustive distribution notice. A distributable installer will require an audit of all resolved runtime dependencies and their complete notices. Sayweave's own license remains undecided as described in the repository LICENSE.

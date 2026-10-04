@@ -76,3 +76,16 @@ test('model category tabs are lightweight, fixed and keyboard accessible',async(
  await hitVisible(dialog.getByLabel('服务地址（URL）'));await expect(dialog.getByLabel('模型',{exact:true})).toHaveValue('');
  await page.keyboard.press('Escape');await expect(dialog).toHaveCount(0);
 });
+
+test('compact actions, selected surface and reduced motion remain clear',async({page})=>{
+ await page.setViewportSize({width:960,height:640});await page.emulateMedia({reducedMotion:'reduce'});
+ const dialog=await open(page),tabs=dialog.getByRole('tablist',{name:'模型类别'});
+ expect(await tabs.evaluate(el=>getComputedStyle(el,'::before').transitionDuration)).toBe('0s');
+ expect(await tabs.evaluate(el=>getComputedStyle(el,'::before').backgroundColor)).toBe('rgb(255, 255, 255)');
+ await dialog.getByRole('tab',{name:'文字处理'}).click();
+ expect(await dialog.getByRole('tab',{name:'文字处理'}).evaluate(el=>getComputedStyle(el,'::before').opacity)).toBe('1');
+ const more=(await dialog.getByRole('button',{name:'更多设置'}).boundingBox())!,save=(await dialog.getByRole('button',{name:'保存',exact:true}).boundingBox())!;
+ expect(save.y-(more.y+more.height)).toBeLessThan(80);await hitVisible(dialog.getByLabel('模型',{exact:true}));
+ await page.screenshot({path:'tests/visual/settings-compact-960.png'});
+ await page.keyboard.press('Escape');await expect(dialog).toHaveCount(0);
+});

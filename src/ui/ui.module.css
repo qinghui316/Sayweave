@@ -34,6 +34,12 @@
 .confirmationDescription { color: var(--text-secondary); font-size: var(--text-body); line-height: var(--line-body); }
 .srOnly { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
 
-.navigationTabs { gap: var(--space-24); }
-.navigationTabs .tab { width: 96px; height: var(--control-height); padding: 0; text-align: left; border-radius: 0; color: var(--text-secondary); font-weight: 400; }
-.navigationTabs .tab[data-state="active"] { background: transparent; color: var(--text-primary); font-weight: 500; }
+.navigationTabs { position: relative; align-self: flex-start; display: inline-flex; gap: 0; padding: 4px; background: var(--surface-sidebar); border-radius: var(--radius-control); }
+.navigationTabs::before { content: ''; position: absolute; inset: 4px auto 4px 4px; width: 128px; background: var(--surface-content); border-radius: 8px; box-shadow: 0 1px 4px rgb(0 0 0 / 6%); transform: translateX(calc(var(--selected-tab, 0) * 100%)); transition: transform 200ms ease; pointer-events: none; }
+.navigationTabs .tab { position: relative; z-index: 1; flex: none; width: 128px; height: 36px; padding: 0 12px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; color: var(--text-secondary); font-weight: 500; background: transparent; }
+.navigationTabs .tab::before { content: ''; width: 6px; height: 6px; flex: none; border-radius: 50%; background: var(--signal); opacity: 0; transition: opacity 120ms ease; }
+.navigationTabs .tab[data-state="active"] { color: var(--text-primary); background: transparent; }
+.navigationTabs .tab[data-state="active"]::before { opacity: 1; }
+.navigationContent { animation: tab-enter 120ms ease; }
+@keyframes tab-enter { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .navigationTabs::before,.navigationTabs .tab::before { transition: none !important; } .navigationContent { animation: none !important; } }

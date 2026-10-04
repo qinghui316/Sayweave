@@ -1,0 +1,5 @@
+{
+  "openai-chat": {"usages":["text"],"liveText":false,"textTest":true,"originOnly":false},
+  "qwen-audio-streaming": {"usages":["speech"],"liveText":true,"textTest":false,"originOnly":true},
+  "doubao-asr-streaming": {"usages":["speech"],"liveText":true,"textTest":false,"originOnly":true}
+}

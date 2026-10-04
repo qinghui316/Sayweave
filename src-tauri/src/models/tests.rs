@@ -113,7 +113,7 @@ async fn service() -> (tempfile::TempDir, ModelService, FakeVault) {
     let service = ModelService::with_vault(
         data,
         Vault::new(fake.clone()),
-        Arc::new(Provider::new().unwrap()),
+        Arc::new(Provider::new(Arc::new(crate::network::RequestCoordinator::default())).unwrap()),
     )
     .unwrap();
     assert_eq!(service.status("main", true).await.unwrap().state, "ready");
@@ -440,7 +440,7 @@ async fn model_crash_fixture() {
     let s = ModelService::with_vault(
         DataWorker::start(root.clone()).unwrap(),
         vault,
-        Arc::new(Provider::new().unwrap()),
+        Arc::new(Provider::new(Arc::new(crate::network::RequestCoordinator::default())).unwrap()),
     )
     .unwrap();
     s.status("main", true).await.unwrap();
@@ -504,7 +504,9 @@ async fn actual_process_interruption_recovers_each_journal_stage() {
         let s = ModelService::with_vault(
             DataWorker::start(root.path().to_path_buf()).unwrap(),
             vault,
-            Arc::new(Provider::new().unwrap()),
+            Arc::new(
+                Provider::new(Arc::new(crate::network::RequestCoordinator::default())).unwrap(),
+            ),
         )
         .unwrap();
         let recovered = s.status("main", true).await;
@@ -624,7 +626,7 @@ fn actual_001_upgrade_backup_contains_no_new_tables() {
             .query_row("SELECT max(version) FROM schema_migrations", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        4
+        MIGRATIONS.len() as i64
     );
     let backup = std::fs::read_dir(root.path().join("backups"))
         .unwrap()
@@ -639,4 +641,29 @@ fn actual_001_upgrade_backup_contains_no_new_tables() {
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn protocol_capabilities_match_frontend_contract_samples() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/contracts/model-capabilities.json"
+    ))
+    .unwrap();
+    for (protocol, expected) in fixture.as_object().unwrap() {
+        let capability = types::capabilities(protocol).unwrap();
+        assert_eq!(
+            serde_json::json!({"usages":capability.usages,"liveText":capability.live_text,"textTest":capability.text_test,"originOnly":capability.origin_only}),
+            *expected
+        );
+        for usage in [Usage::Speech, Usage::Text] {
+            let mut input = input("fixture", vec![usage.clone()]);
+            input.protocol = protocol.clone();
+            input.usages = vec![usage.clone()];
+            assert_eq!(
+                types::executable(&input, &usage),
+                capability.usages.contains(&usage)
+            );
+        }
+    }
+    assert!(types::capabilities("unknown").is_none());
 }

@@ -3,7 +3,7 @@ export class BrowserModels implements ModelConfigPort {
  readonly mode='simulation' as const;
  private view:ModelOverview={configs:[],defaults:[{usage:'speech',configId:null,revision:1},{usage:'text',configId:null,revision:1}],cleanupPending:false};
  private requests=new Map<string,()=>void>();
- async status(){return {state:'ready' as const,schemaVersion:4,cleanupPending:false};}
+ async status(){return {state:'ready' as const,schemaVersion:5,cleanupPending:false};}
  async overview(){return structuredClone(this.view);}
  private old(d:ModelDraft){
   const old=d.id?this.view.configs.find(c=>c.id===d.id):undefined;
