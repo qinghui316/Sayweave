@@ -7,7 +7,9 @@ export function modelError(e:unknown):ModelError {
  if(typeof e==='object'&&e!==null&&'code' in e&&modelErrorCodes.includes(e.code as ModelErrorCode))return new ModelError(e.code as ModelErrorCode,'field' in e&&typeof e.field==='string'?e.field:undefined,'requestId' in e&&typeof e.requestId==='string'?e.requestId:undefined);
  return new ModelError('unavailable');
 }
-export interface ModelInput {name:string;protocol:'openai-chat';baseUrl:string;modelId:string;usages:ModelUsage[]}
+export type ModelProtocol='openai-chat'|'qwen-audio-streaming';
+export interface ModelInput {name:string;protocol:ModelProtocol;baseUrl:string;modelId:string;usages:ModelUsage[]}
+export function modelExecutable(c:ModelInput,u:ModelUsage){return c.usages.includes(u)&&c.protocol===(u==='speech'?'qwen-audio-streaming':'openai-chat');}
 export interface ModelRecord extends ModelInput {id:string;credentialStatus:'present'|'missing'|'unavailable';revision:number;createdAt:number;updatedAt:number}
 export interface ModelDefault {usage:ModelUsage;configId:string|null;revision:number}
 export interface ModelReplacement {usage:ModelUsage;configId:string|null}
@@ -32,15 +34,17 @@ export interface ModelConfigPort {
  cancelRequest(requestId:string):Promise<void>;
 }
 export function modelExpectation(view:ModelOverview,id:string,usages:ModelUsage[]):ModelExpectation {
- return {defaults:view.defaults.map(d=>({...d})),replacements:view.defaults.filter(d=>d.configId===id&&!usages.includes(d.usage)).map(d=>({usage:d.usage,configId:view.configs.find(c=>c.id!==id&&c.usages.includes(d.usage))?.id??null}))};
+ return {defaults:view.defaults.map(d=>({...d})),replacements:view.defaults.filter(d=>d.configId===id&&!usages.includes(d.usage)).map(d=>({usage:d.usage,configId:view.configs.find(c=>c.id!==id&&modelExecutable(c,d.usage))?.id??null}))};
 }
 export function validateModelInput(input:ModelInput):ModelInput {
  const field=(raw:string,max:number,key:string)=>{const v=raw.trim();if(!v||[...v].length>max||/[\p{Cc}\u2028\u2029]/u.test(raw))throw new ModelError('invalid',key);return v;};
  const name=field(input.name,64,'name'),modelId=field(input.modelId,256,'modelId');
  let url:URL;try{url=new URL(input.baseUrl.trim());}catch{throw new ModelError('invalid','baseUrl');}
  if(input.baseUrl.trim().length>2048||url.protocol!=='https:'||url.username||url.password||url.search||url.hash||/[\p{Cc}]/u.test(input.baseUrl))throw new ModelError('invalid','baseUrl');
- if(input.protocol!=='openai-chat')throw new ModelError('invalid','protocol');
+ if(!['openai-chat','qwen-audio-streaming'].includes(input.protocol))throw new ModelError('invalid','protocol');
  if(!input.usages.length||input.usages.length>2||new Set(input.usages).size!==input.usages.length||input.usages.some(u=>!['speech','text'].includes(u)))throw new ModelError('invalid','usages');
+ if(input.protocol==='qwen-audio-streaming'&&(input.usages.length!==1||input.usages[0]!=='speech'))throw new ModelError('invalid','usages');
+ if(input.protocol==='qwen-audio-streaming'&&url.pathname!=='/')throw new ModelError('invalid','baseUrl');
  return {...input,name,modelId,baseUrl:url.href.replace(/\/+$/u,''),usages:[...input.usages].sort()};
 }
 export function modelSameOrigin(a:string,b:string){try{return new URL(a).origin===new URL(b).origin;}catch{return false;}}
@@ -51,7 +55,7 @@ const usage=(v:unknown):v is ModelUsage=>v==='speech'||v==='text';
 export function parseModelOverview(value:unknown):ModelOverview {
  const v=obj(value);if(!Array.isArray(v.configs)||!Array.isArray(v.defaults)||typeof v.cleanupPending!=='boolean')throw new ModelError('protocol');
  const configs=v.configs.map(raw=>{const c=obj(raw);
-  if(typeof c.id!=='string'||typeof c.name!=='string'||c.protocol!=='openai-chat'||typeof c.baseUrl!=='string'||typeof c.modelId!=='string'||!Array.isArray(c.usages)||!c.usages.length||c.usages.length>2||!c.usages.every(usage)||new Set(c.usages).size!==c.usages.length||!['present','missing','unavailable'].includes(String(c.credentialStatus))||!num(c.revision,1)||!num(c.createdAt)||!num(c.updatedAt))throw new ModelError('protocol');
+  if(typeof c.id!=='string'||typeof c.name!=='string'||!['openai-chat','qwen-audio-streaming'].includes(String(c.protocol))||typeof c.baseUrl!=='string'||typeof c.modelId!=='string'||!Array.isArray(c.usages)||!c.usages.length||c.usages.length>2||!c.usages.every(usage)||new Set(c.usages).size!==c.usages.length||!['present','missing','unavailable'].includes(String(c.credentialStatus))||!num(c.revision,1)||!num(c.createdAt)||!num(c.updatedAt))throw new ModelError('protocol');
   const record={id:c.id,name:c.name,protocol:c.protocol,baseUrl:c.baseUrl,modelId:c.modelId,usages:c.usages,credentialStatus:c.credentialStatus,revision:c.revision,createdAt:c.createdAt,updatedAt:c.updatedAt} as ModelRecord;
   try{validateModelInput(record);}catch{throw new ModelError('protocol');}
   return record;

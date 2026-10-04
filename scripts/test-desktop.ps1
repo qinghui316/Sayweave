@@ -6,8 +6,7 @@ Set-Location -LiteralPath $projectRoot
 $null=New-Item -ItemType Directory -Force -Path (Join-Path $projectRoot '.local')
 $exe=Join-Path $projectRoot 'src-tauri/target/release/sayweave.exe'
 $instances=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $exe })
-if ($instances.Count -gt 1) { throw 'Multiple release instances; resolve before acceptance.' }
-foreach ($instance in $instances) { $process=Get-Process -Id $instance.ProcessId; if ($process.Path -eq $exe) { Stop-Process -Id $process.Id } }
+if ($instances.Count -gt 0) { throw 'An existing release instance is running. Save and exit it before acceptance; this test only owns the instance it starts.' }
 $ErrorActionPreference='Continue'
 & npm.cmd run desktop:build -- --features desktop-acceptance *> (Join-Path $projectRoot '.local/desktop-acceptance-build.log')
 $buildExit=$LASTEXITCODE

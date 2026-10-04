@@ -184,24 +184,27 @@ async fn defaults_independent_stable_replacement_and_revision_guards() {
         .await
         .unwrap();
     let id = one.configs[0].id.clone();
-    assert!(
-        one.defaults
-            .iter()
-            .all(|d| d.config_id.as_deref() == Some(&id))
-    );
+    assert!(one.defaults.iter().all(|d| d.config_id.as_deref()
+        == if d.usage == Usage::Text {
+            Some(&id)
+        } else {
+            None
+        }));
     let two = s
         .save("main", request("same", vec![Usage::Text]))
         .await
         .unwrap();
     let next = two.configs.iter().find(|c| c.id != id).unwrap().id.clone();
-    assert!(
-        two.defaults
-            .iter()
-            .all(|d| d.config_id.as_deref() == Some(&id))
-    );
+    assert!(two.defaults.iter().all(|d| d.config_id.as_deref()
+        == if d.usage == Usage::Text {
+            Some(&id)
+        } else {
+            None
+        }));
     let expected = expect(&s, &id, &[]).await;
-    assert_eq!(expected.replacements[0].config_id, None);
-    assert_eq!(expected.replacements[1].config_id, Some(next.clone()));
+    assert_eq!(expected.replacements.len(), 1);
+    assert_eq!(expected.replacements[0].usage, Usage::Text);
+    assert_eq!(expected.replacements[0].config_id, Some(next.clone()));
     let d = two
         .defaults
         .iter()
@@ -621,7 +624,7 @@ fn actual_001_upgrade_backup_contains_no_new_tables() {
             .query_row("SELECT max(version) FROM schema_migrations", [], |r| r
                 .get::<_, i64>(0))
             .unwrap(),
-        2
+        4
     );
     let backup = std::fs::read_dir(root.path().join("backups"))
         .unwrap()

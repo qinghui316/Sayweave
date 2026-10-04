@@ -8,14 +8,11 @@ test('settings stays in one modal and restores focus',async({page})=>{
 });
 test('navigation geometry is stable and feature routes are explicit',async({page})=>{
   await page.goto('/');const link=page.getByRole('link',{name:'历史记录',exact:true});const before=await link.boundingBox();
-  await link.click();expect(await link.boundingBox()).toEqual(before);await expect(page.getByText('模块入口已建立，完整界面和业务将在后续阶段实现。')).toBeVisible();
+  await link.click();expect(await link.boundingBox()).toEqual(before);await expect(page.getByText('还没有识别记录')).toBeVisible();
   await page.getByRole('link',{name:'返回首页'}).click();await expect(page.getByRole('heading',{name:'随言 — 随口表达，文字随言而来'})).toBeVisible();
 });
-test('demo finish, cancellation and failure are recoverable',async({page})=>{
-  await page.goto('/');await page.getByRole('button',{name:'开始预设演示'}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();
-  await page.getByRole('button',{name:'完成演示'}).click();await expect(page.locator('[data-phase="completed"]')).toBeVisible();await expect(page.locator('[data-phase="idle"]')).toBeVisible();
-  await page.getByRole('button',{name:'开始预设演示'}).click();await page.getByRole('button',{name:'取消演示'}).click();await expect(page.locator('[data-phase="cancelled"]')).toBeVisible();
-  await page.getByRole('link',{name:'组件展示'}).click();await page.getByRole('button',{name:'开始预设演示'}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();await page.getByRole('button',{name:'触发演示失败'}).click();await expect(page.locator('[data-phase="failed"]')).toBeVisible();await page.getByRole('button',{name:'重试演示'}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();
+test('developer demo remains isolated from production speech entry',async({page})=>{
+  await page.goto('/');await page.getByRole('link',{name:'组件展示'}).click();await page.getByRole('button',{name:'开始预设演示'}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();await page.getByRole('button',{name:'触发演示失败'}).click();await expect(page.locator('[data-phase="failed"]')).toBeVisible();await page.getByRole('button',{name:'重试演示'}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();
 });
 test('home fits baseline/smaller layout; neutral text and local assets',async({page})=>{
   await page.goto('/');await page.evaluate(()=>document.fonts.ready);await page.screenshot({path:'tests/visual/home-1440.png'});
@@ -24,7 +21,7 @@ test('home fits baseline/smaller layout; neutral text and local assets',async({p
   const rows=page.getByRole('heading',{level:3});const styles=await rows.evaluateAll(ns=>ns.map(n=>({size:getComputedStyle(n).fontSize,weight:getComputedStyle(n).fontWeight})));expect(new Set(styles.map(x=>JSON.stringify(x))).size).toBe(1);
   await page.setViewportSize({width:1280,height:800});await page.screenshot({path:'tests/visual/home-1280.png'});expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
   await page.setViewportSize({width:1120,height:760});await page.screenshot({path:'tests/visual/home-1120.png'});expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
-  const trialButton=await page.getByRole('button',{name:'开始预设演示'}).boundingBox();expect(trialButton).not.toBeNull();expect(trialButton!.y+trialButton!.height).toBeLessThan(760);
+  const trialButton=await page.getByRole('button',{name:'开始录音'}).boundingBox();expect(trialButton).not.toBeNull();expect(trialButton!.y+trialButton!.height).toBeLessThan(760);
   expect(await page.getByRole('heading',{level:1}).evaluate(n=>getComputedStyle(n).fontSize)).toBe('32px');
   await page.getByRole('button',{name:'配置模型',exact:true}).click();await page.screenshot({path:'tests/visual/settings-models-1120.png'});await page.keyboard.press('Escape');
   await page.setViewportSize({width:960,height:640});expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);

@@ -6,6 +6,8 @@ DictionaryPort、主窗限定命令及专用SQLite线程独立于Runtime，详�
 
 ## 目录与依赖
 
+SpeechPort/HistoryPort 与 Runtime 分离，原生 SpeechService 管理录音/重试、固定配置快照、采集、供应商和历史服务，见 [speech.md](speech.md)。Runtime 只投影阶段；音量/字幕有独立内容序号，不改变布局版本。业务历史持久化、窗口快照仍为内存。生产入口为真实语音，演示仅开发/专用验收构建可用。
+
 - app：入口、Hash 路由、错误边界、适配装配、跨功能协调。
 - features：home / history / dictionary / preferences / settings / onboarding / voice；内部实现由模块 index 导出。
 - ui：无业务数据和原生调用的按钮、字段、导航、模式行、Dialog、VoiceControl。

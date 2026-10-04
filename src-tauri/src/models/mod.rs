@@ -215,7 +215,9 @@ impl ModelService {
             KeyChange::Replace { value } => secret(&value),
             KeyChange::Keep => {
                 let old = old.ok_or(ModelError::new("credentialMissing"))?;
-                if !same_origin(&old.input.base_url, &input.base_url) {
+                if old.input.protocol != input.protocol
+                    || !same_origin(&old.input.base_url, &input.base_url)
+                {
                     return Err(ModelError::new("originChanged"));
                 }
                 self.vault
@@ -346,8 +348,42 @@ impl ModelService {
         self.stopping.store(true, Ordering::Release);
         self.provider.shutdown();
     }
+    // Internal task snapshot. Never Serialize/Debug or expose to a renderer.
+    pub async fn speech_config(&self) -> Result<SpeechConfiguration, ModelError> {
+        self.status("main", false).await?;
+        self.check("main")?;
+        let _guard = self.gate.try_lock().map_err(|_| ModelError::new("busy"))?;
+        let view = self.stored().await?;
+        let id = view
+            .defaults
+            .iter()
+            .find(|d| d.usage == Usage::Speech)
+            .and_then(|d| d.config_id.as_deref())
+            .ok_or(ModelError::new("notConfigured"))?;
+        let config = view
+            .configs
+            .iter()
+            .find(|c| c.id == id)
+            .ok_or(ModelError::new("notConfigured"))?;
+        if !executable(&config.input, &Usage::Speech) {
+            return Err(ModelError::new("unsupported"));
+        }
+        let key = self.vault.get(config.credential_ref.clone()).await?;
+        Ok(SpeechConfiguration {
+            id: config.id.clone(),
+            input: config.input.clone(),
+            revision: config.revision,
+            key,
+        })
+    }
     pub async fn finish_shutdown(&self) {
         let _guard = self.gate.lock().await;
         self.data.shutdown().await;
     }
+}
+pub struct SpeechConfiguration {
+    pub id: String,
+    pub input: ConfigInput,
+    pub revision: i64,
+    pub key: String,
 }

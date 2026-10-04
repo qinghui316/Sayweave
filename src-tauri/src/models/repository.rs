@@ -171,6 +171,9 @@ impl Repository {
                 };
                 // Fill only vacant applicable defaults, including a newly added use.
                 for usage in &input.usages {
+                    if !executable(&input, usage) {
+                        continue;
+                    }
                     tx.execute("UPDATE model_defaults SET config_id=?2,revision=revision+1 WHERE usage=?1 AND config_id IS NULL",params![usage.key(),id]).map_err(error)?;
                 }
                 tx.execute(
@@ -204,7 +207,21 @@ impl Repository {
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(error)?;
                 let applicable:Option<bool>=tx.query_row("SELECT CASE WHEN ?2='speech' THEN speech ELSE text END FROM model_configs WHERE id=?1",params![req.config_id,req.usage.key()],|r|r.get(0)).optional().map_err(error)?;
-                if applicable != Some(true) {
+                let protocol: Option<String> = tx
+                    .query_row(
+                        "SELECT protocol FROM model_configs WHERE id=?1",
+                        [&req.config_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(error)?;
+                if applicable != Some(true)
+                    || protocol.as_deref()
+                        != Some(match req.usage {
+                            Usage::Speech => "qwen-audio-streaming",
+                            Usage::Text => "openai-chat",
+                        })
+                {
                     return Err(ModelError::new("invalid"));
                 }
                 let changed=tx.execute("UPDATE model_defaults SET config_id=?2,revision=revision+1 WHERE usage=?1 AND revision=?3",params![req.usage.key(),req.config_id,req.revision]).map_err(error)?;

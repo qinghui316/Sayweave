@@ -1,6 +1,6 @@
 import {useCallback,useEffect,useRef,useState} from 'react';
 import {Button,Field,TextInput,PasswordInput,Select,InlineMessage,AsyncStatusFeedback} from '../../ui';
-import {modelError,modelExpectation,modelSameOrigin,type ModelConfigPort,type ModelOverview,type ModelInput,type ModelRecord,type ModelDraft,type ModelExpectation,type ModelTestResult,type ModelErrorCode} from '../../contracts/models';
+import {modelError,modelExecutable,modelExpectation,modelSameOrigin,type ModelConfigPort,type ModelOverview,type ModelInput,type ModelRecord,type ModelDraft,type ModelExpectation,type ModelTestResult,type ModelErrorCode} from '../../contracts/models';
 import s from './models.module.css';
 const empty=():ModelInput=>({name:'',protocol:'openai-chat',baseUrl:'',modelId:'',usages:['text']});
 const errors:Record<ModelErrorCode,string>={
@@ -14,8 +14,8 @@ const errors:Record<ModelErrorCode,string>={
 const usageLabel=(usage:string)=>usage==='speech'?'语音识别':'文字处理';
 interface Editor {input:ModelInput;key:string;record:ModelRecord|null}
 const fromRecord=(c:ModelRecord):Editor=>({input:{name:c.name,protocol:c.protocol,baseUrl:c.baseUrl,modelId:c.modelId,usages:[...c.usages]},key:'',record:c});
-export interface ModelPanelProps {port:ModelConfigPort;onGuardChange?:(guard:((action:()=>void)=>void)|null)=>void}
-export function ModelPanel({port,onGuardChange}:ModelPanelProps){
+export interface ModelPanelProps {port:ModelConfigPort;onSpeech?:()=>void;onGuardChange?:(guard:((action:()=>void)=>void)|null)=>void}
+export function ModelPanel({port,onSpeech,onGuardChange}:ModelPanelProps){
  const [view,setView]=useState<ModelOverview|null>(null);
  const [editor,setEditor]=useState<Editor|null>(null);
  const [loading,setLoading]=useState(true),[saving,setSaving]=useState(false);
@@ -107,23 +107,23 @@ export function ModelPanel({port,onGuardChange}:ModelPanelProps){
   guard(()=>{setEditor(record?fromRecord(record):{input:empty(),key:'',record:null});setError(null);setNotice('');setTested(null);setModels([]);setConfirmation(null);setNetworkError(null);});
  }
  function discard(){cancel();setEditor(null);setLeaving(false);setConfirmation(null);const action=nextAction.current;nextAction.current=null;action?.();}
- const originChanged=!!editor?.record&&!modelSameOrigin(editor.record.baseUrl,editor.input.baseUrl);
+ const originChanged=!!editor?.record&&(editor.record.protocol!==editor.input.protocol||!modelSameOrigin(editor.record.baseUrl,editor.input.baseUrl));
  const fieldError=(key:string)=>error?.field===key?error.text:undefined;
  const editorForm=editor&&<form className={s.form} onSubmit={e=>{e.preventDefault();void save();}}>
     <h3>{editor.record?'编辑配置':'添加 API 模型'}</h3>
     <fieldset disabled={saving} className={s.fields}>
      <Field label="配置名称" error={fieldError('name')}>{props=><TextInput {...props} value={editor.input.name} maxLength={128} autoComplete="off" onChange={e=>modify({name:e.target.value})}/>}</Field>
-     <Field label="接口类型">{props=><Select {...props} label="接口类型" value="openai-chat" onValueChange={()=>{}} options={[{value:'openai-chat',label:'OpenAI 兼容 · Chat Completions'}]}/>}</Field>
-     <Field label="服务基址" error={fieldError('baseUrl')} description="填写完整 HTTPS 基址，例如 https://api.openai.com/v1。">{props=><TextInput {...props} value={editor.input.baseUrl} placeholder="https://api.openai.com/v1" autoComplete="off" spellCheck={false} onChange={e=>modify({baseUrl:e.target.value})}/>}</Field>
+     <Field label="接口类型">{props=><Select {...props} label="接口类型" value={editor.input.protocol} onValueChange={value=>modify(value==='qwen-audio-streaming'?{protocol:'qwen-audio-streaming',usages:['speech'],modelId:'qwen-audio-3.1-asr-flash-streaming',baseUrl:''}:{protocol:'openai-chat',usages:['text'],modelId:'',baseUrl:''})} options={[{value:'openai-chat',label:'OpenAI 兼容 · Chat Completions'},{value:'qwen-audio-streaming',label:'通义语音 · Qwen Audio Streaming'}]}/>}</Field>
+     <Field label="服务基址" error={fieldError('baseUrl')} description={editor.input.protocol==='qwen-audio-streaming'?'填写北京业务空间 HTTPS 源站，如 https://业务空间ID.cn-beijing.maas.aliyuncs.com；无版本路径。兼容入口可明确填写 https://dashscope.aliyuncs.com。':'填写完整 HTTPS 基址，例如 https://api.openai.com/v1。'}>{props=><TextInput {...props} value={editor.input.baseUrl} placeholder={editor.input.protocol==='qwen-audio-streaming'?'https://业务空间ID.cn-beijing.maas.aliyuncs.com':'https://api.openai.com/v1'} autoComplete="off" spellCheck={false} onChange={e=>modify({baseUrl:e.target.value})}/>}</Field>
      <Field label="API Key" error={fieldError('key')} description={originChanged?'服务源站已改变，必须重新填写密钥。':editor.record?'留空保留已保存的密钥；显隐只显示本次输入。':'密钥保存在 Windows 凭据存储，不写入数据库。'}>{props=><PasswordInput {...props} value={editor.key} placeholder={editor.record?.credentialStatus==='present'?'密钥已保存':''} autoComplete="off" onChange={e=>modify({},e.target.value)}/>}</Field>
-     <div className={s.tools}><Button loading={network==='list'} disabled={network!==null&&network!=='list'} onClick={()=>void check('list')}>获取模型列表</Button></div>
+     <div className={s.tools}>{editor.input.protocol==='qwen-audio-streaming'?<span className={s.meta}>内置模型预设，非服务器列表：qwen-audio-3.1-asr-flash-streaming</span>:<Button loading={network==='list'} disabled={network!==null&&network!=='list'} onClick={()=>void check('list')}>获取模型列表</Button>}</div>
      <Field label="模型 ID" error={fieldError('modelId')} description="列表获取失败时可手动填写，不影响保存。">{props=><TextInput {...props} list="sayweave-model-ids" value={editor.input.modelId} autoComplete="off" spellCheck={false} onChange={e=>modify({modelId:e.target.value})}/>}</Field>
-     <datalist id="sayweave-model-ids">{models.map(id=><option value={id} key={id}/>)}</datalist>
-     <div className={s.usages}><span>用途</span>{(['speech','text'] as const).map(u=><label key={u}><input type="checkbox" checked={editor.input.usages.includes(u)} onChange={e=>modify({usages:e.target.checked?[...editor.input.usages,u]:editor.input.usages.filter(v=>v!==u)})}/>{usageLabel(u)}</label>)}</div>
+     <datalist id="sayweave-model-ids">{(editor.input.protocol==='qwen-audio-streaming'?['qwen-audio-3.1-asr-flash-streaming']:models).map(id=><option value={id} key={id}/>)}</datalist>
+     <div className={s.usages}><span>用途</span>{(editor.input.protocol==='qwen-audio-streaming'?['speech'] as const:['speech','text'] as const).map(u=><label key={u}><input type="checkbox" checked={editor.input.usages.includes(u)} onChange={e=>modify({usages:e.target.checked?[...editor.input.usages,u]:editor.input.usages.filter(v=>v!==u)})}/>{usageLabel(u)}</label>)}</div>
      {fieldError('usages')&&<InlineMessage status="error">{fieldError('usages')}</InlineMessage>}
-     {editor.input.usages.includes('speech')&&<p className={s.meta}>语音用途可保存和设为默认，识别能力尚未验证；本轮不发送音频。</p>}
+     {editor.input.usages.includes('speech')&&<p className={s.meta}>{editor.input.protocol==='qwen-audio-streaming'?'保存后选择此语音默认配置，再在首页主动试说；会发送真实音频并可能产生费用。':'Chat 协议的旧语音用途会保留，但不能启动识别。请选择通义流式协议。'}</p>}
      <p className={s.meta}>{port.mode==='native'?'测试会发送一次短请求，可能产生少量费用。保存不会自动测试。':'测试仅演示状态反馈，不代表服务可用。'}</p>
-     <div className={s.tools}><Button disabled={!editor.input.usages.includes('text')||(network!==null&&network!=='test')} loading={network==='test'} onClick={()=>void check('test')}>测试文字模型</Button>{network&&<Button variant="quiet" onClick={()=>{cancel();setNetworkError('请求已取消。');}}>取消请求</Button>}</div>
+     <div className={s.tools}><Button disabled={editor.input.protocol!=='openai-chat'||!editor.input.usages.includes('text')||(network!==null&&network!=='test')} loading={network==='test'} onClick={()=>void check('test')}>测试文字模型</Button>{network&&<Button variant="quiet" onClick={()=>{cancel();setNetworkError('请求已取消。');}}>取消请求</Button>}</div>
      <AsyncStatusFeedback status={network?'pending':networkError?'error':tested?'success':'idle'} message={network?(network==='list'?'正在获取列表':'正在测试文字模型'):networkError??(tested?(port.mode==='native'?'本次文字测试通过':'模拟测试完成')+' · '+tested.elapsedMs+' ms':'尚未测试')}/>
     </fieldset>
     <div className={s.actions}><Button variant="primary" loading={saving} onClick={()=>void save()}>保存配置</Button><Button disabled={saving} onClick={()=>guard(()=>setEditor(null))}>取消编辑</Button></div>
@@ -136,7 +136,7 @@ export function ModelPanel({port,onGuardChange}:ModelPanelProps){
   {!view&&!loading&&<Button onClick={()=>void load(true)}>重试读取配置</Button>}
   {view&&<>
    <div className={s.defaults}>
-    {view.defaults.map(d=><Field key={d.usage} label={usageLabel(d.usage)+'默认配置'} description={d.usage==='speech'?'用途由你声明，识别能力尚未验证。':undefined}>{props=><select {...props} className={s.select} value={d.configId??''} disabled={saving||!view.configs.some(c=>c.usages.includes(d.usage))} onChange={e=>void setDefault(d.usage,e.target.value)}><option value="" disabled>尚未选择默认配置</option>{view.configs.filter(c=>c.usages.includes(d.usage)).map(c=><option key={c.id} value={c.id}>{c.name} · {c.modelId}</option>)}</select>}</Field>)}
+    {view.defaults.map(d=><Field key={d.usage} label={usageLabel(d.usage)+'默认配置'} description={d.usage==='speech'?'语音录音使用通义流式配置；旧 Chat 默认需要重新选择。':undefined}>{props=><select {...props} className={s.select} value={d.configId??''} disabled={saving||!view.configs.some(c=>modelExecutable(c,d.usage))} onChange={e=>void setDefault(d.usage,e.target.value)}><option value="" disabled>尚未选择默认配置</option>{view.configs.filter(c=>modelExecutable(c,d.usage)||c.id===d.configId).map(c=><option key={c.id} value={c.id}>{c.name} · {c.modelId}</option>)}</select>}</Field>)}
    </div>
    {view.cleanupPending&&<InlineMessage>配置可用，但凭据清理尚未完成。<Button disabled={saving} onClick={()=>void load(true)}>重试清理</Button></InlineMessage>}
    <div className={s.listHeader}><h3>已保存配置 <span>{view.configs.length}</span></h3><Button disabled={saving} onClick={()=>open(null)}>添加模型</Button></div>
@@ -153,6 +153,6 @@ export function ModelPanel({port,onGuardChange}:ModelPanelProps){
   </>}
   {leaving&&<div ref={confirmFocus} className={s.confirmation} role="alertdialog" aria-label="未保存修改"><h3>有未保存的修改</h3><p>继续编辑，或放弃本次修改。</p><div className={s.actions}><Button variant="primary" onClick={()=>{setLeaving(false);nextAction.current=null;}}>继续编辑</Button><Button onClick={discard}>放弃修改</Button></div></div>}
   {notice&&<InlineMessage>{notice}</InlineMessage>}
-  <p className={s.meta}>本地模型的下载、导入和运行尚未实现。</p>
+  {onSpeech&&<Button onClick={()=>guard(onSpeech)}>去首页试说</Button>}<p className={s.meta}>本地模型的下载、导入和运行尚未实现。</p>
  </div>;
 }

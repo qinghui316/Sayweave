@@ -1,0 +1,18 @@
+.page {display:flex;flex-direction:column;gap:20px;}
+.heading h1 {font-size:24px;line-height:34px;font-weight:500;}
+.heading p,.meta,.record span,.heading a {color:var(--text-secondary);font-size:12px;line-height:20px;}
+.heading a {display:inline-block;margin-top:8px;}
+.toolbar,.actions {display:flex;align-items:center;gap:12px;flex-wrap:wrap;}
+.toolbar input {flex:1;min-width:180px;}.toolbar span {font-size:12px;color:var(--text-secondary);}
+.preferences {background:var(--surface-content);padding:16px;border-radius:12px;}.preferences summary {cursor:pointer;font-size:14px;}
+.settings {display:grid;gap:14px;padding-top:16px;max-width:420px;}.settings label {display:flex;gap:8px;align-items:center;}.settings p {font-size:12px;color:var(--text-secondary);}
+.settings select,.detail select {min-height:36px;padding:6px 10px;border-radius:8px;background:var(--surface-canvas);color:var(--text-primary);width:100%;}
+.list {display:flex;flex-direction:column;gap:8px;}
+.record {display:flex;flex-direction:column;gap:8px;background:var(--surface-content);padding:18px 20px;border-radius:12px;text-align:left;width:100%;}
+.record strong {font-size:14px;font-weight:400;line-height:24px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere;}
+.record:hover {background:var(--surface-canvas);}
+.dialog {width:min(720px,calc(100vw - 64px));max-height:calc(100vh - 64px);overflow:auto;}
+.detail {padding:24px;display:flex;flex-direction:column;gap:16px;}.detail h2 {font-size:20px;font-weight:500;}.detail h3 {font-size:14px;font-weight:500;}.detail>p,.player p {font-size:12px;color:var(--text-secondary);}
+.text {white-space:pre-wrap;overflow-wrap:anywhere;max-height:260px;overflow:auto;min-height:80px;line-height:24px;font-size:14px;user-select:text;}
+.player {background:var(--surface-canvas);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:12px;}.player input {width:100%;accent-color:var(--text-primary);}
+.confirm {padding:16px;background:var(--surface-canvas);border-radius:12px;display:flex;flex-direction:column;gap:12px;}

@@ -58,7 +58,10 @@ impl ConfigInput {
     pub fn validate(mut self) -> Result<Self, ModelError> {
         self.name = text(&self.name, 64, "name")?;
         self.model_id = text(&self.model_id, 256, "modelId")?;
-        if self.protocol != "openai-chat" {
+        if !matches!(
+            self.protocol.as_str(),
+            "openai-chat" | "qwen-audio-streaming"
+        ) {
             return Err(ModelError::field("protocol"));
         }
         self.base_url = base_url(&self.base_url)?;
@@ -69,8 +72,25 @@ impl ConfigInput {
             return Err(ModelError::field("usages"));
         }
         self.usages.sort_by_key(Usage::key);
+        if self.protocol == "qwen-audio-streaming" {
+            if self.usages != vec![Usage::Speech] {
+                return Err(ModelError::field("usages"));
+            }
+            let url =
+                reqwest::Url::parse(&self.base_url).map_err(|_| ModelError::field("baseUrl"))?;
+            if url.path() != "/" {
+                return Err(ModelError::field("baseUrl"));
+            }
+        }
         Ok(self)
     }
+}
+pub fn executable(input: &ConfigInput, usage: &Usage) -> bool {
+    input.usages.contains(usage)
+        && match usage {
+            Usage::Speech => input.protocol == "qwen-audio-streaming",
+            Usage::Text => input.protocol == "openai-chat",
+        }
 }
 pub fn text(raw: &str, max: usize, field: &str) -> Result<String, ModelError> {
     if raw
@@ -252,7 +272,7 @@ pub fn replacements(view: &StoredOverview, id: &str, usages: &[Usage]) -> Vec<Re
             config_id: view
                 .configs
                 .iter()
-                .find(|c| c.id != id && c.input.usages.contains(&d.usage))
+                .find(|c| c.id != id && executable(&c.input, &d.usage))
                 .map(|c| c.id.clone()),
         })
         .collect()

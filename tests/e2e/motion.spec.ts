@@ -27,7 +27,7 @@ test('native visibility snapshot pauses all development feedback without requiri
 });
 
 for (const reducedMotion of ['no-preference', 'reduce'] as const) test(`voice state geometry, SVG continuity and visibility: ${reducedMotion}`, async ({ page }) => {
-  await page.emulateMedia({ reducedMotion }); await page.setViewportSize({ width: 1120, height: 760 }); await page.goto('/');
+  await page.emulateMedia({ reducedMotion }); await page.setViewportSize({ width: 1120, height: 760 }); await page.goto('/#/dev/components');
   const control = page.locator('[data-phase]');
   await page.getByRole('button', { name: '开始预设演示' }).click(); await expect(page.locator('[data-phase="recording"]')).toBeVisible();
   await expect.poll(async () => (await control.boundingBox())?.width).toBe(216);
@@ -50,6 +50,6 @@ for (const reducedMotion of ['no-preference', 'reduce'] as const) test(`voice st
   await page.getByRole('button', { name: '开始预设演示' }).click(); await page.getByRole('button', { name: '取消演示' }).click();
   await expect(page.locator('[data-phase="cancelled"]')).toBeVisible();
   await page.getByRole('button', { name: '开始预设演示' }).click(); await expect(page.locator('[data-phase="recording"]')).toBeVisible();
-  await page.getByRole('button', { name: '配置模型', exact: true }).click(); await expect(control).toHaveAttribute('data-motion', 'static');
+  await page.getByRole('button', { name: '设置', exact: true }).click(); await expect(control).toHaveAttribute('data-motion', 'static');
   await page.keyboard.press('Escape'); await expect(control).toHaveAttribute('data-motion', reducedMotion === 'reduce' ? 'static' : 'active');
 });

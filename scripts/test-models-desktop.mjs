@@ -85,7 +85,7 @@ try{
   await page.getByRole('button',{name:'测试文字模型'}).click();await expect(page.getByText(/本次文字测试通过/)).toBeVisible();
   await page.getByRole('checkbox',{name:'语音识别',exact:true}).check();
   await page.getByRole('button',{name:'保存配置'}).click();await expect(page.getByText('配置已保存。')).toBeVisible();
-  let overview=await invoke(page,'model_overview');expect(overview.configs).toHaveLength(1);expect(overview.defaults.every(d=>d.configId===overview.configs[0].id)).toBe(true);
+  let overview=await invoke(page,'model_overview');expect(overview.configs).toHaveLength(1);expect(overview.defaults.find(d=>d.usage==='text').configId).toBe(overview.configs[0].id);expect(overview.defaults.find(d=>d.usage==='speech').configId).toBeNull();
   expect(JSON.stringify(overview)).not.toContain(key);
   report.checks.push('real vault/disk save; independent default slots; HTTPS list and concrete text test');
   const first=overview.configs[0];
@@ -99,7 +99,7 @@ try{
   await page.getByRole('button',{name:'添加模型'}).click();await fill(page,'第二份文字配置',base+'/v1','second-model');
   await page.getByRole('button',{name:'保存配置'}).click();await expect(page.getByText('配置已保存。')).toBeVisible();
   overview=await invoke(page,'model_overview');const second=overview.configs.find(c=>c.id!==first.id);
-  expect(overview.defaults.every(d=>d.configId===first.id)).toBe(true);
+  expect(overview.defaults.find(d=>d.usage==='text').configId).toBe(first.id);expect(overview.defaults.find(d=>d.usage==='speech').configId).toBeNull();
   await page.getByLabel('文字处理默认配置',{exact:true}).selectOption(second.id);
   await expect(page.getByText('默认配置已更新。')).toBeVisible();
   const overlay=browser.contexts().flatMap(c=>c.pages()).find(p=>p.url().includes('surface=overlay'));expect(overlay).toBeTruthy();
@@ -115,7 +115,7 @@ try{
   await page.getByLabel('服务基址',{exact:true}).fill(base+'/slow');await page.getByRole('button',{name:'测试文字模型'}).click();await page.getByRole('button',{name:'取消请求',exact:true}).click();await expect(page.getByText('请求已取消。')).toBeVisible();await delay(1300);await expect(page.getByText(/本次文字测试通过/)).toHaveCount(0);
   await page.getByRole('button',{name:'取消编辑'}).click();await page.getByRole('button',{name:'放弃修改'}).click();
   await page.getByRole('button',{name:'删除',exact:true}).first().click();
-  await expect(page.getByRole('alertdialog')).toContainText('语音识别默认将清空');
+  await expect(page.getByRole('alertdialog')).toContainText('删除');
   await page.getByRole('button',{name:'确认删除'}).click();await expect(page.getByText('配置已删除。')).toBeVisible();
   await stop(page);page=await start(3);
   overview=await invoke(page,'model_overview');expect(overview.configs).toHaveLength(1);expect(overview.configs[0].id).toBe(second.id);expect(overview.defaults.find(d=>d.usage==='speech').configId).toBeNull();

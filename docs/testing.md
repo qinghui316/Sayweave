@@ -20,7 +20,7 @@ E2E前运行 `npx playwright install chromium`。截图、报告、运行数据�
 npm run test:desktop
 ```
 
-脚本构建专用 desktop-acceptance 二进制并检查窗口/托盘调用、隐藏恢复、共享会话、旧缩窗拒绝和退出清理。它可能关闭该项目路径下已有的发布实例，应先保存个人工作。只清理核验为本次所有的进程，不按名称或端口批量结束应用。日志写入 `.local/`。
+脚本构建专用 desktop-acceptance 二进制并检查窗口/托盘调用、隐藏恢复、共享会话、旧缩窗拒绝和退出清理。已有发布实例运行时拒绝启动，应先保存并退出。只清理核验为本次所有的进程，不按名称或端口批量结束应用。日志写入 `.local/`。
 
 词典真实磁盘流程：
 
@@ -42,6 +42,20 @@ node scripts/test-dictionary-desktop.mjs --regular
 关闭Vite后检查普通二进制独立运行、本地字体、原生接口和无开发组件入口。`--regular`不修改用户词典内容。
 
 ## 数据与性能
+
+录音/历史原生闭环（实际默认麦克风、独立凭据和受控 WSS，未调用通义）：
+
+```powershell
+npm run desktop:build -- --features desktop-acceptance
+node scripts/test-speech-desktop.mjs
+cargo test --manifest-path src-tauri/Cargo.toml history_query_benchmark -- --ignored --nocapture
+npm run desktop:build
+node scripts/test-models-desktop.mjs --regular
+```
+
+使用 Tauri CLI 构建以启用本地资源协议；直接 `cargo build --release` 不能替代该步骤。语音脚本连接自己启动的 WebView2，验证麦克风 PCM、等待 task-started、双窗/权限、WAV/回放、重启、取消与结果版本、认证/空结果/服务错误及删除。它保存原尺寸预览、受控首字/结束耗时、渲染帧间隔和内存指标，最后清理本测试 UUID 凭据和证书。测试会录制几秒当前默认麦克风，PCM 发给 localhost 夹具，不发送给供应商。个人录音和报告留在 `.local/`。
+
+基准在独立库测试 1k/10k/100k 的第一页、末页、中英文包含及无结果搜索。记录 DB 执行 p95，队列和 IPC 是另外的诊断项。10k 普通查询预算 50ms、包含 100ms，100k 仅压力观察，不能承诺容量。真实原生检查不能替代通义识别质量；供应商凭据需在应用内填写，再检查中文、中英混合、停顿、静音和重试。
 
 模型配置原生闭环（隔离数据库、测试凭据与受控 HTTPS）：
 

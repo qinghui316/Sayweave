@@ -7,12 +7,12 @@ describe('model configuration memory contract',()=>{
  it('fills vacant defaults only, guards replacement preview and revisions',async()=>{
   const p=new BrowserModels(),a=await p.save(create()),id=a.configs[0]!.id;
   const b=await p.save(create('two')),next=b.configs.find(c=>c.id!==id)!;
-  expect(b.defaults.every(d=>d.configId===id)).toBe(true);
+  expect(b.defaults.every(d=>d.configId===(d.usage==='text'?id:null))).toBe(true);
   const pending={id,revision:1,expectation:modelExpectation(b,id,[])};
   await p.setDefault({usage:'text',configId:next.id,revision:b.defaults[1]!.revision});
   await expect(p.remove(pending)).rejects.toMatchObject({code:'conflict'});
   const c=await p.overview(),deleted=await p.remove({id,revision:1,expectation:modelExpectation(c,id,[])});
-  expect(deleted.defaults.every(d=>d.configId===next.id)).toBe(true);
+  expect(deleted.defaults.every(d=>d.configId===(d.usage==='text'?next.id:null))).toBe(true);
   const cleared=await p.remove({id:next.id,revision:1,expectation:modelExpectation(deleted,next.id,[])});
   expect(cleared.defaults.every(d=>d.configId===null)).toBe(true);
  });

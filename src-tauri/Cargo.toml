@@ -15,9 +15,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "=2.7.1", features = [] }
 
 [features]
-desktop-acceptance = []
+desktop-acceptance = ["dep:rustls"]
 
 [dependencies]
+rustls = { version = "0.23", optional = true }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 tauri = { version = "=2.12.1", features = ["tray-icon", "image-png"] }
@@ -30,6 +31,14 @@ keyring = { version = "=3.6.3", features = ["windows-native"] }
 reqwest = { version = "=0.13.5", features = ["json"] }
 tauri-plugin-log = "=2.8.0"
 log = "0.4"
+cpal = "=0.18.2"
+rubato = "=5.0.1"
+rtrb = "=0.4.0"
+hound = "=3.5.1"
+rodio = "=0.22.2"
+tokio-tungstenite = { version = "=0.30.0", features = ["rustls-tls-native-roots"] }
+futures-util = { version = "0.3", features = ["sink"] }
+tauri-plugin-clipboard-manager = "=2.4.1"
 
 [dev-dependencies]
 tempfile = "3"

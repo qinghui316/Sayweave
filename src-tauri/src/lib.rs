@@ -2,13 +2,16 @@
 mod acceptance;
 mod coordinator;
 mod data;
+mod history;
 mod models;
+mod speech;
 use coordinator::{Phase, RuntimeError, Snapshot, authorized_window, overlay_size};
 use data::{
     DataWorker, Operation, Output,
     model::{DataError, Input, Kind, Page, Query, Record, Status},
 };
 use models::commands::*;
+use speech::commands::*;
 use std::{sync::Mutex, time::Duration};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -97,6 +100,11 @@ fn runtime_demo(
     action: String,
     session_id: u64,
 ) -> Result<Snapshot, RuntimeError> {
+    if (!cfg!(debug_assertions) && !cfg!(feature = "desktop-acceptance"))
+        || app.state::<speech::SpeechService>().is_active()
+    {
+        return Err(RuntimeError::new("forbidden"));
+    }
     if !["main", "voice-overlay"].contains(&window.label()) {
         return Err(RuntimeError::new("forbidden"));
     }
@@ -203,12 +211,16 @@ fn tray_action(app: &tauri::AppHandle, id: &str) -> Result<(), RuntimeError> {
             );
             drop(state);
             let service = app.state::<models::ModelService>();
+            app.state::<speech::SpeechService>().shutdown();
             service.begin_shutdown();
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 let service = app.state::<models::ModelService>();
-                let _ =
-                    tokio::time::timeout(Duration::from_secs(5), service.finish_shutdown()).await;
+                let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    app.state::<speech::SpeechService>().drain().await;
+                    service.finish_shutdown().await;
+                })
+                .await;
                 log::logger().flush();
                 app.exit(0);
             });
@@ -348,6 +360,7 @@ fn already_running() {
 }
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
         .manage(Runtime(Mutex::new(Snapshot::default())))
         .invoke_handler(tauri::generate_handler![
             runtime_snapshot,
@@ -367,6 +380,20 @@ pub fn run() {
             model_fetch,
             model_test,
             model_cancel,
+            speech_snapshot,
+            speech_devices,
+            speech_start,
+            speech_retry_current,
+            speech_control,
+            speech_preferences,
+            speech_copy,
+            history_status,
+            history_list,
+            history_detail,
+            history_usage,
+            history_remove,
+            history_retry,
+            history_play,
             #[cfg(feature = "desktop-acceptance")]
             acceptance_exit
         ])
@@ -404,7 +431,31 @@ pub fn run() {
                     let service = models::ModelService::new(worker.clone(), namespace, &root)
                         .map_err(|e| e.code)?;
                     app.manage(service);
+                    app.manage(speech::SpeechService::new(history::HistoryService::new(
+                        worker.clone(),
+                        &root,
+                    )));
                     app.manage(worker);
+                    let handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        // Recover before accepting speech; a data fault does not prevent the window opening.
+                        loop {
+                            let service = handle.state::<speech::SpeechService>();
+                            if service.is_stopping() {
+                                break;
+                            }
+                            let result = service.initialize().await.map(|_| ());
+                            if result.is_ok() {
+                                let _ = service.history.cleanup().await;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(if result.is_ok() {
+                                86400
+                            } else {
+                                60
+                            }))
+                            .await;
+                        }
+                    });
                 }
                 Err(error) if error.code == "alreadyRunning" => {
                     already_running();
@@ -469,7 +520,7 @@ pub fn run() {
                 "voice-overlay",
                 tauri::WebviewUrl::App("index.html?surface=overlay".into()),
             )
-            .title("Sayweave · 语音演示")
+            .title("Sayweave · 语音控件")
             .inner_size(68.0, 68.0)
             .decorations(false)
             .transparent(true)
@@ -490,8 +541,8 @@ pub fn run() {
                 ))?;
             }
             let open = MenuItem::with_id(app, "open", "打开 Sayweave", true, None::<&str>)?;
-            let voice = MenuItem::with_id(app, "voice", "显示语音演示", true, None::<&str>)?;
-            let hide = MenuItem::with_id(app, "hide", "隐藏语音演示", true, None::<&str>)?;
+            let voice = MenuItem::with_id(app, "voice", "显示语音控件", true, None::<&str>)?;
+            let hide = MenuItem::with_id(app, "hide", "隐藏语音控件", true, None::<&str>)?;
             let exit = MenuItem::with_id(app, "exit", "退出 Sayweave", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &voice, &hide, &exit])?;
             TrayIconBuilder::with_id("sayweave-tray")

@@ -24,6 +24,7 @@ pub enum Operation {
     Update(Input, String, i64),
     Delete(Kind, String, i64),
     Models(crate::models::types::DbOperation),
+    History(crate::history::types::DbOperation),
     Drain,
 }
 #[derive(Debug)]
@@ -33,6 +34,7 @@ pub enum Output {
     Record(Record),
     Deleted,
     Models(Result<crate::models::types::DbOutput, crate::models::types::ModelError>),
+    History(crate::history::types::DbOutput),
 }
 struct Request {
     operation: Operation,
@@ -100,6 +102,7 @@ impl DataWorker {
                         Operation::Update(_, _, _) => "update",
                         Operation::Delete(_, _, _) => "delete",
                         Operation::Models(_) => "models",
+                        Operation::History(_) => "history",
                         Operation::Drain => "drain",
                     };
                     let result = if matches!(request.operation, Operation::Retry) {
@@ -134,6 +137,9 @@ impl DataWorker {
                                     repo.delete(kind, &id, revision).map(|_| Output::Deleted)
                                 }
                                 Operation::Retry => unreachable!(),
+                                Operation::History(op) => {
+                                    repo.history_operation(op).map(Output::History)
+                                }
                                 Operation::Models(op) => match repo.model_operation(op) {
                                     Err(e) if e.code == "unavailable" => {
                                         Err(DataError::new("unavailable"))

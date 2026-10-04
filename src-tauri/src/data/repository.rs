@@ -13,6 +13,14 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         include_str!("migrations/001_dictionary.sql"),
     ),
     ("models_v1", include_str!("migrations/002_models.sql")),
+    (
+        "speech_protocol_v1",
+        include_str!("migrations/003_speech_protocol.sql"),
+    ),
+    (
+        "speech_history_v1",
+        include_str!("migrations/004_speech_history.sql"),
+    ),
 ];
 pub fn now() -> i64 {
     SystemTime::now()
@@ -135,6 +143,14 @@ pub fn migrate(
             ],
         )
         .map_err(db_error)?;
+    }
+    let violations: i64 = tx
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+            r.get(0)
+        })
+        .map_err(db_error)?;
+    if violations != 0 {
+        return Err(DataError::new("unavailable"));
     }
     tx.commit().map_err(db_error)?;
     verify(connection)?;

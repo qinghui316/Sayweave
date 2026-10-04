@@ -1,9 +1,9 @@
-import {ModelError,modelExpectation,modelSameOrigin,validateModelInput,validateModelKey,type ModelConfigPort,type ModelOverview,type ModelSave,type ModelRemove,type ModelDefaultRequest,type ModelDraft,type ModelRecord} from '../contracts/models';
+import {ModelError,modelExecutable,modelExpectation,modelSameOrigin,validateModelInput,validateModelKey,type ModelConfigPort,type ModelOverview,type ModelSave,type ModelRemove,type ModelDefaultRequest,type ModelDraft,type ModelRecord} from '../contracts/models';
 export class BrowserModels implements ModelConfigPort {
  readonly mode='simulation' as const;
  private view:ModelOverview={configs:[],defaults:[{usage:'speech',configId:null,revision:1},{usage:'text',configId:null,revision:1}],cleanupPending:false};
  private requests=new Map<string,()=>void>();
- async status(){return {state:'ready' as const,schemaVersion:2,cleanupPending:false};}
+ async status(){return {state:'ready' as const,schemaVersion:4,cleanupPending:false};}
  async overview(){return structuredClone(this.view);}
  private old(d:ModelDraft){
   const old=d.id?this.view.configs.find(c=>c.id===d.id):undefined;
@@ -11,7 +11,7 @@ export class BrowserModels implements ModelConfigPort {
   if(old?.revision!==d.revision && (old||d.revision!==null))throw new ModelError('conflict');
   if(d.key.action==='keep'){
    if(!old)throw new ModelError('credentialMissing');
-   if(!modelSameOrigin(old.baseUrl,d.input.baseUrl))throw new ModelError('originChanged');
+   if(old.protocol!==d.input.protocol||!modelSameOrigin(old.baseUrl,d.input.baseUrl))throw new ModelError('originChanged');
   }else validateModelKey(d.key.value);
   return old;
  }
@@ -28,7 +28,7 @@ export class BrowserModels implements ModelConfigPort {
   const record:ModelRecord={...input,id:old?.id??crypto.randomUUID(),revision:(old?.revision??0)+1,createdAt:old?.createdAt??time,updatedAt:time,credentialStatus:'present'};
   this.view.configs=old?this.view.configs.map(c=>c.id===old.id?record:c):[...this.view.configs,record];
   this.view.configs.sort((a,b)=>a.createdAt-b.createdAt||a.id.localeCompare(b.id));
-  for(const d of this.view.defaults)if(!d.configId&&record.usages.includes(d.usage)){d.configId=record.id;d.revision++;}
+  for(const d of this.view.defaults)if(!d.configId&&modelExecutable(record,d.usage)){d.configId=record.id;d.revision++;}
   return this.overview();
  }
  async remove(req:ModelRemove){
@@ -37,7 +37,7 @@ export class BrowserModels implements ModelConfigPort {
  }
  async setDefault(req:ModelDefaultRequest){
   const d=this.view.defaults.find(d=>d.usage===req.usage),c=this.view.configs.find(c=>c.id===req.configId);
-  if(!c?.usages.includes(req.usage)||!d)throw new ModelError('invalid');if(d.revision!==req.revision)throw new ModelError('conflict');
+  if(!c||!modelExecutable(c,req.usage)||!d)throw new ModelError('invalid');if(d.revision!==req.revision)throw new ModelError('conflict');
   d.configId=c.id;d.revision++;return this.overview();
  }
  private async demo<T>(draft:ModelDraft,id:string,result:T):Promise<T>{
