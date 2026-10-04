@@ -62,7 +62,18 @@ async function stop(page,graceful=true){
  if(app?.exitCode===null&&page&&graceful){await invoke(page,'acceptance_exit').catch(()=>{});for(let n=0;n<60&&app.exitCode===null;n++)await delay(100);if(app.exitCode===null)throw Error('Exit did not drain');}
  if(browser){await browser.close().catch(()=>{});browser=null;}if(app?.exitCode===null){const owned=app;owned.kill();await new Promise(r=>owned.exitCode!==null?r():owned.once('exit',r));}app=null;await delay(600);
 }
-async function waitPhase(page,phase){await expect.poll(async()=>(await invoke(page,'speech_snapshot')).phase,{timeout:15000}).toBe(phase);return invoke(page,'speech_snapshot');}
+async function waitPhase(page,phase){
+ let timeout=15000;
+ if(phase==='completed'){
+  const snapshot=await invoke(page,'speech_snapshot');
+  if(snapshot.retry){
+   // Replay sends at real-time speed; preparation and final-result waits have separate budgets.
+   const duration=snapshot.recordId?(await invoke(page,'history_detail',{id:snapshot.recordId})).durationMs:snapshot.durationMs;
+   timeout=duration+15000+30000;
+  }
+ }
+ await expect.poll(async()=>(await invoke(page,'speech_snapshot')).phase,{timeout}).toBe(phase);return invoke(page,'speech_snapshot');
+}
 try{
  await command(['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_fixture','--','--ignored']);server=createServer({cert:readFileSync(path.join(data,'fixture-ca.pem')),key:readFileSync(path.join(data,'fixture-key.pem'))});server.on('upgrade',websocket);await new Promise(r=>server.listen(0,'127.0.0.1',r));const base='https://localhost:'+server.address().port;
  let page=await start(1);await expect(page.getByRole('link',{name:'组件展示'})).toHaveCount(0);await page.getByRole('button',{name:'配置模型',exact:true}).click();const dialog=page.getByRole('dialog');await delay(250);await page.screenshot({path:path.join(directory,'settings-speech-native.png')});await dialog.getByRole('button',{name:'更多设置'}).click();await dialog.getByLabel('名称',{exact:true}).fill('隔离语音验收');await dialog.getByLabel('服务地址（URL）',{exact:true}).fill(base);await dialog.getByLabel('API 密钥',{exact:true}).fill(key);await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(dialog.getByText('已保存。')).toBeVisible();await page.keyboard.press('Escape');
