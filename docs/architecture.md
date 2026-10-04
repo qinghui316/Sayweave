@@ -143,6 +143,8 @@ Tauri invoke 成功时 resolve 具体结果，Rust Result 的 Err 由 Promise re
 
 ### 启动、配置、数据与日志入口
 
+历史列表使用独立的轻量游标读取接口。应用层持有阅读缓存和跨页面修改保护，行组件按需读取详情；菜单、复制反馈等公共组件不保存历史业务数据。接口、缓存更新和播放生命周期见 [history.md](history.md)。
+
 安装和启动使用 [development.md](development.md) 的 npm ci、npm run desktop:dev；Vite 固定为 127.0.0.1:5173，仅服务前端开发。普通 EXE 不依赖它。后端没有另一个监听端口或 REST 健康接口，状态检查通过 dictionary_status、model_status、history_status 和 speech_snapshot。
 
 配置来自 SQLite 中已保存资料与 Windows 系统凭据；不从前端 .env 保存 API 密钥。数据位于 Tauri app_data_dir 下的 data-dev/ 或 data/，日志位于对应数据目录 logs/sayweave.log；专用验收使用独立 UUID 目录及凭据命名空间。迁移、备份和恢复入口见功能文档。

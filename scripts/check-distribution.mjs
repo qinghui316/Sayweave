@@ -7,7 +7,7 @@ const roots = new Set(['.gitattributes', '.gitignore', 'README.md', 'LICENSE',
   'CONTRIBUTING.md', 'SECURITY.md', 'CHANGELOG.md', 'package.json', 'package-lock.json',
   'eslint.config.js', 'index.html', 'playwright.config.ts', 'rust-toolchain.toml',
   'tsconfig.json', 'vite.config.ts']);
-const docs = new Set(['architecture.md', 'development.md', 'design.md', 'testing.md', 'local-data.md', 'motion.md', 'models.md', 'speech.md']);
+const docs = new Set(['architecture.md', 'development.md', 'design.md', 'testing.md', 'local-data.md', 'motion.md', 'models.md', 'speech.md', 'history.md']);
 const scripts = new Set(['check-boundaries.mjs', 'check-text.mjs', 'check-distribution.mjs',
   'test-desktop.ps1', 'test-dictionary-desktop.mjs', 'test-models-desktop.mjs', 'test-speech-desktop.mjs']);
 const testRoots = new Set(['contracts', 'e2e']);

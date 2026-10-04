@@ -78,6 +78,8 @@ try{
   const overview=await invoke(page,'model_overview');expect(overview.defaults).toHaveLength(2);
   const acceptanceCommand=await page.evaluate(async()=>{try{await window.__TAURI_INTERNALS__.invoke('acceptance_exit');return null;}catch(e){return String(e);}});
   expect(acceptanceCommand).toContain('not found');
+  const sizingCommand=await page.evaluate(async()=>{try{await window.__TAURI_INTERNALS__.invoke('acceptance_main_size',{minimum:true});return null;}catch(e){return String(e);}});
+  expect(sizingCommand).toContain('not found');
   report.checks.push('ordinary release native models usable; DEV catalogue and acceptance overrides absent');
  }else{
   await expect(page.getByLabel('API 密钥',{exact:true})).toBeVisible();
