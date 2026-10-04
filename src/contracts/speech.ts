@@ -12,7 +12,7 @@ export interface SpeechPort {
  readonly mode:'native'|'simulation';snapshot():Promise<SpeechSnapshot>;
  subscribe(snapshot:(value:SpeechSnapshot)=>void,meter:(value:SpeechMeter)=>void):Promise<()=>void>;
  devices():Promise<Microphone[]>;preferences():Promise<RecordingPreferences>;savePreferences(value:RecordingPreferences):Promise<RecordingPreferences>;
- retryCurrent():Promise<SpeechSnapshot>;start():Promise<SpeechSnapshot>;control(taskId:string,action:'finish'|'cancel'):Promise<void>;copy(text:string):Promise<void>;
+ retryCurrent(taskId:string):Promise<SpeechSnapshot>;start():Promise<SpeechSnapshot>;control(taskId:string,action:'finish'|'cancel'):Promise<void>;copy(text:string):Promise<void>;
 }
 export const initialSpeech=():SpeechSnapshot=>({protocol:1,sequence:1,lifecycle:1,taskId:null,attemptId:null,recordId:null,phase:'idle',text:'',segments:[],modelName:null,deviceName:null,durationMs:0,error:null,saveError:false,saved:false,retry:false,canRetry:false});
 const object=(v:unknown):Record<string,unknown>=>{if(typeof v!=='object'||v===null||Array.isArray(v))throw new SpeechError('protocol');return v as Record<string,unknown>;};

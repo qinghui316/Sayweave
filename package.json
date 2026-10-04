@@ -21,7 +21,8 @@
     "desktop:build": "tauri build --no-bundle",
     "check": "npm run typecheck && npm run lint && npm run test:ui && npm run check:native && npm run build",
     "check:distribution": "node scripts/check-distribution.mjs",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:input": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-input.ps1"
   },
   "dependencies": {
     "@fontsource/inter": "5.3.0",

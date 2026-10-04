@@ -34,27 +34,25 @@ pub async fn speech_devices(
         .map_err(|_| Error::new("deviceAccess"))?
 }
 #[tauri::command]
-pub async fn speech_start(
-    app: tauri::AppHandle,
-    window: WebviewWindow,
-    service: State<'_, SpeechService>,
-) -> Result<Snapshot, Error> {
+pub async fn speech_start(app: tauri::AppHandle, window: WebviewWindow) -> Result<Snapshot, Error> {
     speech_caller(&window)?;
-    let result = service.start(app.clone(), None, None).await;
-    if let Err(e) = &result {
-        service.start_error(&app, e);
-    }
-    result
+    app.state::<crate::dictation::DictationCoordinator>()
+        .start(app.clone(), "trial", 0, None, None, None)
+        .await
 }
 #[tauri::command]
-pub fn speech_control(
-    window: WebviewWindow,
-    service: State<'_, SpeechService>,
-    task_id: String,
-    action: String,
-) -> Result<(), Error> {
+pub fn speech_control(window: WebviewWindow, task_id: String, action: String) -> Result<(), Error> {
     speech_caller(&window)?;
-    service.control(&task_id, &action)
+    let app = window.app_handle();
+    if action == "cancel" {
+        app.state::<crate::dictation::DictationCoordinator>()
+            .cancel_bound(Some(&task_id))
+    } else if action == "finish" {
+        app.state::<crate::dictation::DictationCoordinator>()
+            .finish_bound(app, &task_id)
+    } else {
+        Err(Error::new("invalid"))
+    }
 }
 #[tauri::command]
 pub async fn speech_preferences(
@@ -128,6 +126,23 @@ pub async fn history_detail(
     service.history.detail(&id).await
 }
 #[tauri::command]
+pub async fn history_delivery(
+    window: WebviewWindow,
+    service: State<'_, crate::shortcuts::ShortcutService>,
+    speech: State<'_, SpeechService>,
+    id: String,
+) -> Result<Vec<crate::shortcuts::types::DeliveryReport>, Error> {
+    main(&window)?;
+    let _operation = speech.admit()?;
+    match service
+        .db(crate::shortcuts::types::DbOperation::Deliveries(id))
+        .await?
+    {
+        crate::shortcuts::types::DbOutput::Deliveries(rows) => Ok(rows),
+        _ => Err(Error::new("unavailable")),
+    }
+}
+#[tauri::command]
 pub async fn history_usage(
     window: WebviewWindow,
     service: State<'_, SpeechService>,
@@ -148,7 +163,12 @@ pub async fn history_remove(
 ) -> Result<(), Error> {
     main(&window)?;
     let _operation = service.admit()?;
-    if service.is_active() && service.snapshot()?.record_id.as_ref() == Some(&id) {
+    if window
+        .app_handle()
+        .state::<crate::dictation::DictationCoordinator>()
+        .busy()
+        && service.snapshot()?.record_id.as_ref() == Some(&id)
+    {
         return Err(Error::new("busy"));
     }
     service.history.remove(&id, revision).await?;
@@ -165,8 +185,16 @@ pub async fn history_retry(
     config_revision: i64,
 ) -> Result<Snapshot, Error> {
     main(&window)?;
-    service
-        .start(app, Some(id), Some((config_id, config_revision)))
+    let _ = service;
+    app.state::<crate::dictation::DictationCoordinator>()
+        .start(
+            app.clone(),
+            "history",
+            0,
+            None,
+            Some(id),
+            Some((config_id, config_revision)),
+        )
         .await
 }
 #[tauri::command]
@@ -180,6 +208,13 @@ pub async fn history_play(
     main(&window)?;
     let _operation = service.admit()?;
     if action == "play" {
+        if window
+            .app_handle()
+            .state::<crate::dictation::DictationCoordinator>()
+            .busy()
+        {
+            return Err(Error::new("busy"));
+        }
         service
             .play(resource_id.as_deref().ok_or(Error::new("invalid"))?)
             .await
@@ -191,7 +226,7 @@ pub async fn history_play(
     }
 }
 #[tauri::command]
-pub fn speech_copy(
+pub async fn speech_copy(
     app: tauri::AppHandle,
     window: WebviewWindow,
     text: String,
@@ -201,10 +236,9 @@ pub fn speech_copy(
     if text.len() > 1024 * 1024 {
         return Err(Error::new("invalid"));
     }
-    use tauri_plugin_clipboard_manager::ClipboardExt;
-    app.clipboard()
-        .write_text(text)
-        .map_err(|_| Error::new("copyFailed"))
+    app.state::<crate::windows_input::WindowsInputService>()
+        .copy(text)
+        .await
 }
 
 #[tauri::command]
@@ -212,7 +246,24 @@ pub async fn speech_retry_current(
     app: tauri::AppHandle,
     window: WebviewWindow,
     service: State<'_, SpeechService>,
+    task_id: String,
 ) -> Result<Snapshot, Error> {
     main(&window)?;
-    service.retry_current(app).await
+    let current = service.snapshot()?;
+    if current.task_id.as_deref() != Some(task_id.as_str()) {
+        return Err(Error::new("staleSession"));
+    }
+    if !current.can_retry {
+        return Err(Error::new("fileUnavailable"));
+    }
+    let id = current
+        .source_record_id
+        .ok_or_else(|| Error::new("fileUnavailable"))?;
+    app.state::<crate::dictation::DictationCoordinator>()
+        .retry_displayed(
+            app.clone(),
+            id,
+            current.task_id.ok_or_else(|| Error::new("staleSession"))?,
+        )
+        .await
 }

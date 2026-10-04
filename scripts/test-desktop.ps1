@@ -4,16 +4,22 @@ $projectRoot=Split-Path $PSScriptRoot -Parent
 $OutputEncoding=[Text.UTF8Encoding]::new($false)
 Set-Location -LiteralPath $projectRoot
 $null=New-Item -ItemType Directory -Force -Path (Join-Path $projectRoot '.local')
-$exe=Join-Path $projectRoot 'src-tauri/target/release/sayweave.exe'
+$exe=Join-Path $projectRoot 'src-tauri/target/release/desktop-acceptance.exe'
 $instances=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $exe })
 if ($instances.Count -gt 0) { throw 'An existing release instance is running. Save and exit it before acceptance; this test only owns the instance it starts.' }
 $ErrorActionPreference='Continue'
-& npm.cmd run desktop:build -- --features desktop-acceptance *> (Join-Path $projectRoot '.local/desktop-acceptance-build.log')
+& npm.cmd run build *> (Join-Path $projectRoot '.local/desktop-acceptance-build.log')
+$buildExit=$LASTEXITCODE
+if($buildExit -eq 0){
+  & cargo build --manifest-path src-tauri/Cargo.toml --release --features desktop-acceptance,tauri/custom-protocol --bin desktop-acceptance *>> (Join-Path $projectRoot '.local/desktop-acceptance-build.log')
+}
 $buildExit=$LASTEXITCODE
 $ErrorActionPreference='Stop'
 if ($buildExit -ne 0) { throw 'Acceptance build failed. See .local/desktop-acceptance-build.log.' }
 $oldFlag=$env:SAYWEAVE_DESKTOP_ACCEPTANCE
-try { $env:SAYWEAVE_DESKTOP_ACCEPTANCE='1'; $app=Start-Process $exe -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $projectRoot '.local/desktop-acceptance.log') -RedirectStandardError (Join-Path $projectRoot '.local/desktop-acceptance-errors.log') } finally { $env:SAYWEAVE_DESKTOP_ACCEPTANCE=$oldFlag }
+$oldDataId=$env:SAYWEAVE_DATA_ACCEPTANCE_ID
+$env:SAYWEAVE_DATA_ACCEPTANCE_ID=[guid]::NewGuid().ToString()
+try { $env:SAYWEAVE_DESKTOP_ACCEPTANCE='1'; $app=Start-Process $exe -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $projectRoot '.local/desktop-acceptance.log') -RedirectStandardError (Join-Path $projectRoot '.local/desktop-acceptance-errors.log') } finally { $env:SAYWEAVE_DESKTOP_ACCEPTANCE=$oldFlag; $env:SAYWEAVE_DATA_ACCEPTANCE_ID=$oldDataId }
 $started=$app.StartTime
 $null=$app.Handle
 $children=@{}

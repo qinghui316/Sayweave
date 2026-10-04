@@ -1,1 +1,3 @@
-.surface { display: grid; place-items: center; min-height: 100vh; padding: var(--space-12); overflow: hidden; }
+.surface { display: flex; align-items: center; justify-content: flex-end; min-height: 100vh; padding: var(--space-12); overflow: hidden; box-sizing: border-box; }
+
+.caption{width:min(360px,calc(100vw - 24px));padding:10px 12px;margin-bottom:8px;border-radius:12px;background:var(--surface,#fff);color:var(--text-primary,#171717);box-shadow:0 4px 16px #0002;font-size:14px;line-height:22px;overflow:hidden;box-sizing:border-box}.caption>div{display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;overflow-wrap:anywhere}.caption p{font-size:12px;line-height:18px;margin:6px 0 0}.surface{flex-direction:column;}

@@ -11,6 +11,15 @@ import {SaveSettings,type DepartureGuard} from '../src/features/history/SaveSett
 function record(n=1,text='完整的识别文字'):HistoryRecord {const id=`record-${n}`,a=`attempt-${n}`;return {id,createdAt:1000+n,endedAt:2000+n,durationMs:1000,status:'success',currentAttempt:a,revision:1,audio:null,attempts:[{id:a,recordId:id,kind:'live',configId:'fixture',configName:'模型',configRevision:1,modelId:'fixture',serviceHost:'example.invalid',createdAt:1000+n,endedAt:2000+n,status:'success',text,errorCode:null,elapsedMs:1}]};}
 function fixture(records:HistoryRecord[]){const speech=new BrowserSpeech();speech.records.push(...records);return {speech,port:new BrowserHistory(speech),models:new BrowserModels()};}
 function deferred<T>(){let resolve!:(value:T)=>void;const promise=new Promise<T>(r=>resolve=r);return {promise,resolve};}
+it('refreshes late delivery confirmation without changing the recognition record',async()=>{
+ const r=record(),f=fixture([r]);let state='delivering';
+ const port=Object.assign(Object.create(f.port) as import('../src/contracts/history').HistoryPort,{delivery:vi.fn(async()=>[{attemptId:r.currentAttempt!,state,error:null,updatedAt:1}])});
+ const view=render(<MemoryRouter><History port={port} speech={f.speech} models={f.models} snapshot={initialSpeech()} deliveryRevision="working"/></MemoryRouter>);
+ await screen.findByText('完整的识别文字');const user=userEvent.setup();screen.getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('menuitem',{name:'识别版本'}));
+ await screen.findByText('填入未完成');state='confirmed';
+ view.rerender(<MemoryRouter><History port={port} speech={f.speech} models={f.models} snapshot={initialSpeech()} deliveryRevision="confirmed"/></MemoryRouter>);
+ expect(await screen.findByText('已填入')).toBeVisible();
+});
 it('loads 1,000 summaries by cursor, survives deletion of an anchor, and retains reading state',async()=>{
  const f=fixture(Array.from({length:1000},(_,n)=>record(n)));const store=new HistoryFeedStore(f.port);
  await store.refresh();expect(store.getSnapshot().records).toHaveLength(50);const cursor=store.getSnapshot().cursor!;

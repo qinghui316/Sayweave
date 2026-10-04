@@ -1,7 +1,7 @@
 import {invoke,isTauri} from '@tauri-apps/api/core';
 import {listen} from '@tauri-apps/api/event';
 import {speechError,parseSpeech,parseMeter,parseDevices,parsePreferences,type SpeechPort,type SpeechSnapshot,type SpeechMeter,type RecordingPreferences} from '../contracts/speech';
-import {parseFeed,parseHistory,parseRecord,parseUsage,parsePlayback,type HistoryPort,type HistoryCursor} from '../contracts/history';
+import {parseDeliveryReports,parseFeed,parseHistory,parseRecord,parseUsage,parsePlayback,type HistoryPort,type HistoryCursor} from '../contracts/history';
 import {BrowserSpeech,BrowserHistory} from './speech-browser';
 async function call(command:string,args:Record<string,unknown>={}){try{return await invoke<unknown>(command,args);}catch(e){throw speechError(e);}}
 class TauriSpeech implements SpeechPort {
@@ -14,7 +14,7 @@ class TauriSpeech implements SpeechPort {
  async devices(){return parseDevices(await call('speech_devices'));}
  async preferences(){return parsePreferences(await call('speech_preferences',{preferences:null}));}
  async savePreferences(preferences:RecordingPreferences){return parsePreferences(await call('speech_preferences',{preferences}));}
- async retryCurrent(){return parseSpeech(await call('speech_retry_current'));}
+ async retryCurrent(taskId:string){return parseSpeech(await call('speech_retry_current',{taskId}));}
  async start(){return parseSpeech(await call('speech_start'));}
  async control(taskId:string,action:'finish'|'cancel'){await call('speech_control',{taskId,action});}
  async copy(text:string){await call('speech_copy',{text});}
@@ -25,6 +25,7 @@ class TauriHistory implements HistoryPort {
  async list(search:string,page:number){return parseHistory(await call('history_list',{query:{search,page}}));}
  async browse(search:string,cursor:HistoryCursor|null=null){return parseFeed(await call('history_browse',{query:{search,cursor}}));}
  async detail(id:string){return parseRecord(await call('history_detail',{id}));}
+ async delivery(id:string){return parseDeliveryReports(await call('history_delivery',{id}));}
  async usage(){return parseUsage(await call('history_usage'));}
  async remove(id:string,revision:number){await call('history_remove',{id,revision});}
  async retry(id:string,configId:string,configRevision:number){return parseSpeech(await call('history_retry',{id,configId,configRevision}));}

@@ -90,6 +90,22 @@ struct Task {
     preferences: Preferences,
     replay: Option<Vec<i16>>,
 }
+pub struct NativeTerminal {
+    pub snapshot: Snapshot,
+    pub persistent: bool,
+}
+impl std::ops::Deref for NativeTerminal {
+    type Target = Snapshot;
+    fn deref(&self) -> &Snapshot {
+        &self.snapshot
+    }
+}
+pub struct NativeStart {
+    pub id: String,
+    pub expected_task: Option<String>,
+    pub cancel: watch::Sender<u8>,
+    pub terminal: tokio::sync::oneshot::Sender<NativeTerminal>,
+}
 pub struct SpeechService {
     pub history: HistoryService,
     pub playback: Playback,
@@ -197,29 +213,21 @@ impl SpeechService {
             }
         }
     }
-    pub fn control(&self, id: &str, action: &str) -> Result<(), Error> {
-        let active = self.active.lock().map_err(|_| Error::new("unavailable"))?;
-        let (current, tx) = active.as_ref().ok_or(Error::new("staleSession"))?;
-        if current != id {
-            return Err(Error::new("staleSession"));
-        }
-        let value = match action {
-            "finish" if self.snapshot()?.phase == Phase::Recording => 1,
-            "cancel" => 2,
-            _ => return Err(Error::new("invalid")),
-        };
-        if *tx.borrow() >= 2 || (value == 1 && *tx.borrow() != 0) {
-            return Err(Error::new("busy"));
-        }
-        tx.send(value).map_err(|_| Error::new("staleSession"))
-    }
-    pub async fn start(
+    pub async fn start_native(
         &self,
         app: tauri::AppHandle,
         retry_id: Option<String>,
         expected_config: Option<(String, i64)>,
+        context: NativeStart,
     ) -> Result<Snapshot, Error> {
-        self.start_bound(app, retry_id, expected_config, None).await
+        self.start_bound(
+            app,
+            retry_id,
+            expected_config,
+            context.expected_task.clone(),
+            Some(context),
+        )
+        .await
     }
     async fn start_bound(
         &self,
@@ -227,6 +235,7 @@ impl SpeechService {
         retry_id: Option<String>,
         expected_config: Option<(String, i64)>,
         expected_task: Option<String>,
+        context: Option<NativeStart>,
     ) -> Result<Snapshot, Error> {
         let _gate = self.gate.try_lock().map_err(|_| Error::new("busy"))?;
         let _operation = self.admit()?;
@@ -247,6 +256,9 @@ impl SpeechService {
             }
         }
         let _preparing = Preparing(&self.preparing);
+        if context.as_ref().is_some_and(|c| *c.cancel.borrow() >= 2) {
+            return Err(Error::new("cancelled"));
+        }
         self.initialize().await?;
         let cfg = app
             .state::<ModelService>()
@@ -258,6 +270,9 @@ impl SpeechService {
             .is_some_and(|(id, revision)| id != &cfg.id || *revision != cfg.revision)
         {
             return Err(Error::new("conflict"));
+        }
+        if context.as_ref().is_some_and(|c| *c.cancel.borrow() >= 2) {
+            return Err(Error::new("cancelled"));
         }
         let mut preferences = self.history.preferences().await?;
         self.playback.control("stop", None).await?;
@@ -278,7 +293,13 @@ impl SpeechService {
         if let Some(device) = device {
             preferences.device_id = Some(device.id.clone());
         }
-        let task_id = uuid::Uuid::new_v4().to_string();
+        let task_id = context
+            .as_ref()
+            .map(|c| c.id.clone())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if context.as_ref().is_some_and(|c| *c.cancel.borrow() >= 2) {
+            return Err(Error::new("cancelled"));
+        }
         let attempt_id = uuid::Uuid::new_v4().to_string();
         let record_id = retry_id
             .clone()
@@ -405,11 +426,17 @@ impl SpeechService {
             }
             return Err(e);
         }
-        let (tx, rx) = watch::channel(if self.stopping.load(Ordering::Acquire) {
-            3u8
+        let (tx, rx, terminal) = if let Some(c) = context {
+            let rx = c.cancel.subscribe();
+            (c.cancel, rx, Some(c.terminal))
         } else {
-            0u8
-        });
+            let (tx, rx) = watch::channel(if self.stopping.load(Ordering::Acquire) {
+                3u8
+            } else {
+                0u8
+            });
+            (tx, rx, None)
+        };
         *self.active.lock().map_err(|_| Error::new("unavailable"))? = Some((task_id.clone(), tx));
         let old = self.snapshot()?;
         *self
@@ -464,6 +491,14 @@ impl SpeechService {
                 service.update(&app, &id, |s| {
                     s.error = Some(e.code);
                     s.phase = Phase::Failed;
+                });
+            }
+            if let Some(terminal) = terminal
+                && let Ok(snapshot) = service.snapshot()
+            {
+                let _ = terminal.send(NativeTerminal {
+                    snapshot,
+                    persistent: task.persistent,
                 });
             }
             if let Ok(mut a) = service.active.lock()
@@ -636,7 +671,11 @@ impl SpeechService {
             save_error = true;
         }
         if *cancel.borrow() >= 2 {
-            outcome = Err(Error::new("cancelled"));
+            outcome = Err(Error::new(if *cancel.borrow() == 2 {
+                "cancelled"
+            } else {
+                "interrupted"
+            }));
         }
         let cancelled = outcome
             .as_ref()
@@ -662,6 +701,12 @@ impl SpeechService {
         if task.persistent {
             let status = if cancelled {
                 "cancelled"
+            } else if outcome
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.code == "interrupted")
+            {
+                "interrupted"
             } else if outcome.is_ok() {
                 "success"
             } else {
@@ -736,14 +781,13 @@ impl SpeechService {
             });
         }
     }
-    pub fn start_error(&self, app: &tauri::AppHandle, error: &Error) {
+    pub fn start_error(&self, app: &tauri::AppHandle, id: &str, error: &Error) {
         let Ok(_gate) = self.gate.try_lock() else {
             return;
         };
         if self.is_active() || self.is_stopping() || error.code == "busy" {
             return;
         }
-        let id = uuid::Uuid::new_v4().to_string();
         let runtime_id = if let Ok(mut r) = app.state::<crate::Runtime>().0.lock() {
             r.session.id += 1;
             r.session.id
@@ -751,26 +795,16 @@ impl SpeechService {
             return;
         };
         if let Ok(mut s) = self.snapshot.lock() {
-            s.task_id = Some(id.clone());
+            let sequence = s.sequence + 1;
+            *s = Snapshot::default();
+            s.task_id = Some(id.into());
             s.runtime_id = runtime_id;
-            s.sequence += 1;
+            s.sequence = sequence;
         }
-        self.update(app, &id, |s| {
+        self.update(app, id, |s| {
             s.error = Some(error.code.clone());
             s.phase = Phase::Failed;
         });
-    }
-    pub async fn retry_current(&self, app: tauri::AppHandle) -> Result<Snapshot, Error> {
-        let current = self.snapshot()?;
-        if !current.can_retry {
-            return Err(Error::new("fileUnavailable"));
-        }
-        let id = current
-            .source_record_id
-            .ok_or(Error::new("fileUnavailable"))?;
-        // Persistent replay and temporary audio must both refer to the displayed record.
-        // start_bound verifies the task under the admission gate before reading its resource.
-        self.start_bound(app, Some(id), None, current.task_id).await
     }
     pub fn is_stopping(&self) -> bool {
         self.stopping.load(Ordering::Acquire)

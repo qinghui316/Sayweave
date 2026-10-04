@@ -5,7 +5,7 @@ import {speechMessages} from '../../locales/speech';
 import type { Phase } from '../../contracts/runtime';
 import { zh } from '../../locales/zh-CN';
 import s from './home.module.css';
-export function Home({ onShortcuts, onModels, phase, start, cancel, finish, motionEnabled = true,speech,level,usage,copy,simulation=false,retryCurrent,readyModel,readyDevice }: { onShortcuts: () => void; onModels: () => void; phase: Phase; start: () => void; cancel: () => void; finish: () => void; motionEnabled?: boolean;speech?:SpeechSnapshot;level?:number;usage?:Usage|null;copy?:(text:string)=>Promise<void>;simulation?:boolean;retryCurrent?:()=>void;readyModel?:string|null;readyDevice?:string|null }) {
+export function Home({ onShortcuts, onModels, phase, start, cancel, finish, motionEnabled = true,speech,level,usage,copy,simulation=false,retryCurrent,readyModel,readyDevice,shortcut }: { onShortcuts: () => void; onModels: () => void; phase: Phase; start: () => void; cancel: () => void; finish: () => void; motionEnabled?: boolean;speech?:SpeechSnapshot;level?:number;usage?:Usage|null;copy?:(text:string)=>Promise<void>;simulation?:boolean;retryCurrent?:()=>void;readyModel?:string|null;readyDevice?:string|null;shortcut?:string }) {
   const h = zh.home;
   const active=['connecting','recording','processing'].includes(phase);
   const sentence = speech?.text||'点击麦克风开始，识别文字会出现在这里。';
@@ -14,7 +14,7 @@ export function Home({ onShortcuts, onModels, phase, start, cancel, finish, moti
     <div className={s.top}>
       <section className={s.shortcuts} aria-labelledby="shortcuts-title">
         <div className={s.shortcutHeader}><h2 id="shortcuts-title">{h.shortcuts}</h2><p>{h.globalKeys}</p></div>
-        <ModeRow icon="mic" title={h.dictation} description={h.dictationDescription} buttonLabel={h.setKey} onClick={onShortcuts}/>
+        <ModeRow icon="mic" title={h.dictation} description={h.dictationDescription} buttonLabel={shortcut||h.setKey} onClick={onShortcuts}/>
         <ModeRow icon="languages" title={h.translation} description={h.translationDescription} buttonLabel={h.setKey} onClick={onShortcuts}/>
         <ModeRow icon="square-pen" title={h.edit} description={h.editDescription} buttonLabel={h.setKey} onClick={onShortcuts}/>
       </section>

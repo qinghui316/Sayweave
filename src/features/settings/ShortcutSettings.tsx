@@ -1,0 +1,20 @@
+import {useEffect,useRef,useState} from 'react';
+import {Button,Field,InlineMessage,Dialog} from '../../ui';
+import {inputMessage,shortcutLabel,type ShortcutConfigPort,type ShortcutConfig,type ShortcutStatus} from '../../contracts/dictation';
+import s from './settings.module.css';
+type Guard=(action:()=>void)=>void;
+export function ShortcutSettings({port,onGuardChange}:{port:ShortcutConfigPort;onGuardChange?:(guard:Guard|null)=>void}){
+ const [status,setStatus]=useState<ShortcutStatus|null>(null),[draft,setDraft]=useState<ShortcutConfig|null>(null),[busy,setBusy]=useState(false),[error,setError]=useState(''),[confirm,setConfirm]=useState(false);
+ const saved=useRef<ShortcutConfig|null>(null),changed=useRef(false),pending=useRef<(()=>void)|null>(null),mounted=useRef(true),captured=useRef<string|null>(null);
+ useEffect(()=>{mounted.current=true;let release:(()=>void)|undefined;let alive=true;const accept=(v:ShortcutStatus)=>{if(!alive)return;setStatus(v);if(!saved.current||v.saved.revision>saved.current.revision){saved.current=v.saved;if(!changed.current)setDraft(v.saved);}if(v.capturing)captured.current=null;if(v.capturedBinding&&v.capturedBinding!==captured.current){captured.current=v.capturedBinding;setDraft(d=>d?{...d,binding:v.capturedBinding!}:d);changed.current=v.capturedBinding!==saved.current?.binding;}};void port.subscribe(accept).then(r=>{if(alive)release=r;else r();}).catch(()=>{if(alive)setError('快捷键暂不可用，请重新打开设置。');});void port.status().then(accept).catch(()=>setError('快捷键暂不可用，请重新打开设置。'));return()=>{alive=false;mounted.current=false;release?.();void port.capture(false).catch(()=>{});};},[port]);
+ const dirty=!!draft&&!!status&&(draft.binding!==status.saved.binding||draft.mode!==status.saved.mode);
+ useEffect(()=>{changed.current=dirty;},[dirty]);
+ useEffect(()=>{onGuardChange?.(action=>{void port.capture(false).catch(()=>{});if(changed.current){pending.current=action;setConfirm(true);}else{action();}});return()=>onGuardChange?.(null);},[onGuardChange,port]);
+ async function save(){if(!draft||busy)return;setBusy(true);setError('');try{const v=await port.save(draft);if(mounted.current){saved.current=v.saved;setStatus(v);setDraft(v.saved);changed.current=false;}}catch(e){if(mounted.current)setError(inputMessage(typeof e==='object'&&e&&'code'in e?String(e.code):null));}finally{if(mounted.current)setBusy(false);}}
+ return <section><h3>口述快捷键</h3>{port.mode==='simulation'&&<p>浏览器仅模拟键位设置。</p>}<div className={s.settingRow}><div><strong>{draft?shortcutLabel(draft.binding):'正在读取'}</strong><p>{status?.capturing?'按下要使用的单键或组合键，Esc 取消。':'在其他软件中按下口述键，即可开始。'}</p></div><Button disabled={busy||!status} onClick={()=>void port.capture(!status?.capturing).then(setStatus).catch(()=>setError('暂时无法录入，请重试。'))}>{status?.capturing?'取消录入':'更改快捷键'}</Button></div>
+ {draft&&<Field label="录音方式">{props=><select {...props} value={draft.mode} disabled={busy} onChange={e=>setDraft({...draft,mode:e.target.value as ShortcutConfig['mode']})}><option value="toggle">按一次开始，再按一次结束</option><option value="hold">按住说话，松开结束</option></select>}</Field>}
+ {status?.pending&&<p role="status">已保存，本次口述结束后生效。</p>}{status?.error&&<InlineMessage status="error">{inputMessage(status.error)}</InlineMessage>}{status?.active&&!status.pending&&<p role="status">已启用：{shortcutLabel(status.active.binding)}</p>}{error&&<InlineMessage status="error">{error}</InlineMessage>}
+ <Button disabled={busy||!dirty||status?.capturing} onClick={()=>void save()}>{busy?'正在保存':'保存快捷键'}</Button>
+ <Dialog confirmation open={confirm} onOpenChange={setConfirm} title="快捷键尚未保存" description="选择继续填写或放弃这次修改。"><Button autoFocus onClick={()=>{setConfirm(false);pending.current=null;}}>继续填写</Button><Button onClick={()=>{setDraft(status?.saved??null);changed.current=false;setConfirm(false);void port.capture(false).catch(()=>{});const action=pending.current;pending.current=null;action?.();}}>放弃修改</Button></Dialog>
+ </section>;
+}

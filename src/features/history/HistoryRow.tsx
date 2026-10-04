@@ -1,7 +1,8 @@
 import {memo,useEffect,useRef,useState} from 'react';
 import {ActionIcon,ActionMenu,Button,CopyFeedbackButton,Field,IconButton,InlineMessage} from '../../ui';
 import {SpeechError,speechError,type SpeechPort,type SpeechSnapshot} from '../../contracts/speech';
-import type {HistoryPort,HistoryRecord,HistorySummary,PlaybackState} from '../../contracts/history';
+import {inputMessage} from '../../contracts/dictation';
+import type {DeliveryReport,HistoryPort,HistoryRecord,HistorySummary,PlaybackState} from '../../contracts/history';
 import {modelExecutable,type ModelConfigPort,type ModelRecord} from '../../contracts/models';
 import {speechMessages} from '../../locales/speech';
 import s from './history.module.css';
@@ -11,9 +12,10 @@ const message=(code:string|null)=>code?speechMessages[speechError({code}).code]:
 const audioLabels:Record<string,string>={prepared:'录音未完成',ready:'录音可用',delete_pending:'录音等待清理',expire_pending:'录音到期待清理',expired:'录音已到期',missing:'录音文件缺失',corrupt:'录音损坏'};
 export const audioLabel=(r:Pick<HistoryRecord,'audio'|'durationMs'>)=>r.audio?.status==='missing'&&!r.audio.bytes&&!r.durationMs?'没有录下音频':r.audio?audioLabels[r.audio.status]:'未保留录音';
 export type ExpandMode='text'|'versions'|'retry'|'delete'|'play';
-type Props={summary:HistorySummary;expanded:boolean;mode:ExpandMode;activation:number;port:HistoryPort;speech:SpeechPort;models:ModelConfigPort;snapshot:SpeechSnapshot;player:PlaybackState;playBusy:boolean;expand:(id:string,mode:ExpandMode)=>Promise<boolean>;collapse:()=>void;play:(action:'play'|'pause'|'resume'|'seek'|'stop',resource?:string,ms?:number)=>Promise<void>;changed:(id:string,removed?:boolean)=>void;onRecord:()=>void;copyFull:(id:string,attemptId:string|null,current:()=>boolean)=>Promise<boolean>};
-export const HistoryRow=memo(function HistoryRow({summary:r,expanded,mode,activation,port,speech,models,snapshot,player,playBusy,expand,collapse,play,changed,onRecord,copyFull}:Props){
+type Props={deliveryRevision?:string;summary:HistorySummary;expanded:boolean;mode:ExpandMode;activation:number;port:HistoryPort;speech:SpeechPort;models:ModelConfigPort;snapshot:SpeechSnapshot;player:PlaybackState;playBusy:boolean;expand:(id:string,mode:ExpandMode)=>Promise<boolean>;collapse:()=>void;play:(action:'play'|'pause'|'resume'|'seek'|'stop',resource?:string,ms?:number)=>Promise<void>;changed:(id:string,removed?:boolean)=>void;onRecord:()=>void;copyFull:(id:string,attemptId:string|null,current:()=>boolean)=>Promise<boolean>};
+export const HistoryRow=memo(function HistoryRow({deliveryRevision='',summary:r,expanded,mode,activation,port,speech,models,snapshot,player,playBusy,expand,collapse,play,changed,onRecord,copyFull}:Props){
  const [record,setRecord]=useState<HistoryRecord|null>(null),[version,setVersion]=useState(''),[loading,setLoading]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState(''),[retryModel,setRetryModel]=useState<ModelRecord|null>(null),[confirm,setConfirm]=useState<'retry'|'delete'|null>(null),[menuOpen,setMenuOpen]=useState(false),[overflow,setOverflow]=useState(false);
+ const [deliveries,setDeliveries]=useState<DeliveryReport[]>([]);
  const alive=useRef(false),request=useRef(0),actionGeneration=useRef(0),working=useRef(false),preview=useRef<HTMLParagraphElement>(null),confirmRef=useRef<HTMLDivElement>(null),article=useRef<HTMLElement>(null);
  const selection=useRef({version,display:r.displayAttempt,generation:0});useEffect(()=>{selection.current={version,display:r.displayAttempt,generation:selection.current.generation+1};},[version,r.displayAttempt]);
  const signature=JSON.stringify([r.revision,r.latestAttempt,r.latestStatus,r.audio]);
@@ -26,6 +28,10 @@ export const HistoryRow=memo(function HistoryRow({summary:r,expanded,mode,activa
   port.detail(r.id).then(value=>{if(disposed||token!==request.current)return;setRecord(value);setVersion(previous=>value.attempts.some(a=>a.id===previous)?previous:r.displayAttempt??value.currentAttempt??value.attempts[0]?.id??'');setLoading(false);}).catch(e=>{if(!disposed&&token===request.current){setLoading(false);setError(message(speechError(e).code));}});
   return()=>{disposed=true;};
  },[expanded,port,r.id,r.displayAttempt,signature]);
+ useEffect(()=>{let disposed=false;if(!expanded){setDeliveries([]);return;}
+  if(port.delivery)void port.delivery(r.id).then(rows=>{if(!disposed)setDeliveries(rows);}).catch(()=>{if(!disposed)setError('填入状态暂不可用。');});
+  return()=>{disposed=true;};
+ },[expanded,port,r.id,signature,deliveryRevision]);
  async function act(operation:()=>Promise<void>){if(working.current)return;const token=actionGeneration.current;working.current=true;setBusy(true);setError('');try{await operation();}catch(e){if(alive.current&&token===actionGeneration.current)setError(message(speechError(e).code));}finally{working.current=false;if(alive.current)setBusy(false);}}
  useEffect(()=>{
   const token=++actionGeneration.current;if(!expanded)return;
@@ -41,6 +47,7 @@ export const HistoryRow=memo(function HistoryRow({summary:r,expanded,mode,activa
  async function operation(action:'pause'|'resume'|'seek'|'stop',ms?:number){await act(async()=>{await play(action,undefined,ms);});}
  async function remove(){if(!record)return;await act(async()=>{try{await port.remove(record.id,record.revision);if(alive.current)changed(r.id,true);}catch(e){changed(r.id);throw e;}});}
  async function retry(){if(!record||!retryModel)return;await act(async()=>{await port.retry(record.id,retryModel.id,retryModel.revision);if(alive.current){setConfirm(null);changed(r.id);}});}
+ const delivery=deliveries.find(d=>d.attemptId===version);
  const attempt=record?.attempts.find(a=>a.id===version);const selected=record??r;
  const active=snapshot.recordId===r.id&&['connecting','recording','processing'].includes(snapshot.phase);
  const failure=r.latestStatus&&['failed','cancelled','interrupted'].includes(r.latestStatus);
@@ -59,6 +66,7 @@ export const HistoryRow=memo(function HistoryRow({summary:r,expanded,mode,activa
     {record.attempts.length>1&&<Field label="识别版本">{props=><select {...props} disabled={busy} value={version} onChange={e=>setVersion(e.target.value)}>{record.attempts.map(a=><option key={a.id} value={a.id}>{new Date(a.createdAt).toLocaleString('zh-CN')} · {a.kind==='retry'?'重识别':'首次识别'} · {states[a.status]??a.status}{a.id===record.currentAttempt?' · 当前':''}</option>)}</select>}</Field>}
     <div className={s.fullText} role="region" aria-label="历史识别文字" tabIndex={0}>{attempt?.text||message(attempt?.errorCode??null)||'未识别到文字'}</div>
     <div className={s.versionMeta}><span>{attempt?.configName} · {attempt?.modelId}</span><CopyFeedbackButton key={attempt?.id} compact disabled={!attempt?.text||busy} onCopy={()=>copy(attempt?.id??null,true)}/></div>
+    {delivery&&<p role="status" className={s.meta}>{delivery.state==='confirmed'?'已填入':delivery.state==='unconfirmed'?'请确认输入结果':delivery.state==='copy'?'待复制':'填入未完成'}{delivery.error?' · '+inputMessage(delivery.error):''}</p>}
     {attempt?.text&&attempt.errorCode&&<InlineMessage status="error">{message(attempt.errorCode)}</InlineMessage>}
     {selected.audio?.status==='ready'?<div className={s.player}><div className={s.actions}><IconButton label={player.resourceId===selected.audio.id?(player.playing?'暂停':'继续'):'播放录音'} disabled={active||playBusy||busy} onClick={()=>void playAudio()}><ActionIcon name={player.resourceId===selected.audio.id&&player.playing?'pause':'play'}/></IconButton><input type="range" aria-label="录音播放位置" min={0} max={player.durationMs||1} value={Math.min(player.positionMs,player.durationMs)} disabled={player.resourceId!==selected.audio.id||busy||playBusy} onChange={e=>void operation('seek',Number(e.target.value))}/><span className={s.meta}>{duration(player.resourceId===selected.audio.id?player.positionMs:0)} / {duration(player.resourceId===selected.audio.id?player.durationMs:r.durationMs)}</span><IconButton label="停止播放" disabled={player.resourceId!==selected.audio.id||busy||playBusy} onClick={()=>void operation('stop')}><ActionIcon name="close"/></IconButton></div>{selected.audio.expiresAt&&<p className={s.meta}>录音保留至 {new Date(selected.audio.expiresAt).toLocaleDateString('zh-CN')}</p>}</div>:<div className={s.unavailable}><span className={s.meta}>{audioLabel(selected)}</span><Button variant="quiet" onClick={onRecord}>重新录音</Button></div>}
     {active&&<div className={s.actions}><span role="status" className={s.meta}>正在重新识别 · {duration(snapshot.durationMs)}</span><Button onClick={()=>void act(()=>speech.control(snapshot.taskId!,'cancel'))}>取消本次重识别</Button></div>}

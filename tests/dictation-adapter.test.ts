@@ -1,0 +1,20 @@
+import {test,expect,vi} from 'vitest';
+import {invoke} from '@tauri-apps/api/core';
+import {createDictationPorts} from '../src/adapters/dictation-tauri';
+import {createSpeechPorts} from '../src/adapters/speech-tauri';
+import {initialSpeech} from '../src/contracts/speech';
+vi.mock('@tauri-apps/api/core',()=>({invoke:vi.fn(),isTauri:()=>true}));
+test('native actions carry the displayed task identity and reject stale operations without retry',async()=>{
+ const call=vi.mocked(invoke);call.mockResolvedValue(undefined);
+ const dictation=createDictationPorts().dictation!;
+ await dictation.control('displayed-A','cancel');
+ expect(call).toHaveBeenLastCalledWith('dictation_control',{taskId:'displayed-A',action:'cancel'});
+ await dictation.copy('displayed-A');
+ expect(call).toHaveBeenLastCalledWith('dictation_copy',{taskId:'displayed-A'});
+ const speech=createSpeechPorts().speech;call.mockResolvedValue(initialSpeech());
+ await speech.retryCurrent('displayed-A');
+ expect(call).toHaveBeenLastCalledWith('speech_retry_current',{taskId:'displayed-A'});
+ call.mockClear();call.mockRejectedValue({code:'staleSession'});
+ await expect(dictation.control('displayed-A','finish')).rejects.toMatchObject({code:'staleSession'});
+ expect(call).toHaveBeenCalledTimes(1);
+});

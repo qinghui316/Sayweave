@@ -2,10 +2,16 @@
 mod acceptance;
 mod coordinator;
 mod data;
+mod dictation;
 mod history;
 mod models;
 mod network;
+mod shortcuts;
 mod speech;
+mod windows_input;
+use dictation::*;
+use shortcuts::commands::*;
+static OVERLAY_VISIBILITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use coordinator::{Phase, RuntimeError, Snapshot, authorized_window, overlay_size};
 use data::{
     DataWorker, Operation, Output,
@@ -18,6 +24,10 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, State, WebviewWindow};
 struct Runtime(Mutex<Snapshot>);
+#[cfg(feature = "desktop-acceptance")]
+pub fn input_acceptance(fixture: &std::path::Path) -> Result<(), String> {
+    windows_input::native_checks(fixture)
+}
 #[cfg(feature = "desktop-acceptance")]
 #[tauri::command]
 fn acceptance_exit(app: tauri::AppHandle, window: WebviewWindow) -> Result<(), RuntimeError> {
@@ -57,18 +67,69 @@ fn read(app: &tauri::AppHandle) -> Result<Snapshot, RuntimeError> {
         .map(|s| s.clone())
         .map_err(|_| RuntimeError::new("unavailable"))
 }
+fn voice_size(app: &tauri::AppHandle, phase: Phase) -> (f64, f64) {
+    if app
+        .try_state::<dictation::DictationCoordinator>()
+        .is_some_and(|c| {
+            c.snapshot().is_ok_and(|s| {
+                s.source == "external"
+                    && s.stage != "idle"
+                    && (!s.text.is_empty()
+                        || matches!(s.stage.as_str(), "preparing" | "recognizing" | "delivering"))
+            })
+        })
+    {
+        let recovery = app
+            .state::<dictation::DictationCoordinator>()
+            .snapshot()
+            .is_ok_and(|s| s.delivery.is_some_and(|d| d.restore_error));
+        (384.0, if recovery { 284.0 } else { 220.0 })
+    } else {
+        overlay_size(phase)
+    }
+}
+fn place_voice(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("voice-overlay")
+        && let (Ok(Some(monitor)), Ok(position), Ok(size), Ok(scale)) = (
+            window.current_monitor(),
+            window.outer_position(),
+            window.outer_size(),
+            window.scale_factor(),
+        )
+    {
+        let origin = monitor.work_area().position.to_logical::<f64>(scale);
+        let area = monitor.work_area().size.to_logical::<f64>(scale);
+        let p = position.to_logical::<f64>(scale);
+        let size = size.to_logical::<f64>(scale);
+        let x =
+            p.x.clamp(origin.x, (origin.x + area.width - size.width).max(origin.x));
+        let y = p.y.clamp(
+            origin.y,
+            (origin.y + area.height - size.height).max(origin.y),
+        );
+        if x != p.x || y != p.y {
+            let _ = window.set_position(LogicalPosition::new(x, y));
+        }
+    }
+}
+fn refresh_voice(app: &tauri::AppHandle) {
+    if let Ok(snapshot) = read(app) {
+        publish(app, snapshot);
+    }
+}
 fn publish(app: &tauri::AppHandle, snapshot: Snapshot) {
     if !read(app).is_ok_and(|current| coordinator::resize_is_current(&current, &snapshot)) {
         return;
     }
     // Reserve the larger canvas before either the event or command response reaches the renderer.
     if let Some(window) = app.get_webview_window("voice-overlay") {
-        let (w, h) = overlay_size(snapshot.session.phase);
+        let (w, h) = voice_size(app, snapshot.session.phase);
         if let (Ok(size), Ok(scale)) = (window.inner_size(), window.scale_factor()) {
             let current = size.to_logical::<f64>(scale);
             let (width, height) =
                 coordinator::reserve_size((current.width, current.height), (w, h));
             let _ = window.set_size(LogicalSize::new(width, height));
+            place_voice(app);
         }
     }
     let _ = app.emit_to("main", "runtime:snapshot", &snapshot);
@@ -82,8 +143,9 @@ fn publish(app: &tauri::AppHandle, snapshot: Snapshot) {
                 .is_ok_and(|current| coordinator::resize_is_current(&current, &snapshot))
                 && let Some(window) = handle.get_webview_window("voice-overlay")
             {
-                let (w, h) = overlay_size(snapshot.session.phase);
+                let (w, h) = voice_size(&handle, snapshot.session.phase);
                 let _ = window.set_size(LogicalSize::new(w, h));
+                place_voice(&handle);
             }
         });
     });
@@ -124,6 +186,7 @@ fn runtime_demo(
 ) -> Result<Snapshot, RuntimeError> {
     if (!cfg!(debug_assertions) && !cfg!(feature = "desktop-acceptance"))
         || app.state::<speech::SpeechService>().is_active()
+        || app.state::<dictation::DictationCoordinator>().busy()
     {
         return Err(RuntimeError::new("forbidden"));
     }
@@ -168,7 +231,32 @@ fn runtime_demo(
     }
     Ok(snapshot)
 }
-fn window_action(
+fn overlay_visibility(window: &WebviewWindow, visible: bool) -> tauri::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        let handle = window.hwnd()?.0 as usize;
+        // Tao's initial non-focus marker is removed after creation. Its subsequent show uses
+        // SW_SHOW, which emits a foreground transition even for a non-focusable window.
+        // Keep both visibility operations native; sizing/positioning remain non-activating.
+        // Do not mutate overlay WindowFlags (focusable/decorations/topmost/maximized) after build:
+        // Tao's private VISIBLE stays false; its flag updates would hide the native window.
+        window.run_on_main_thread(move || unsafe {
+            use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::*};
+            // ShowWindow returns previous visibility, not an operation error.
+            let _ = ShowWindow(
+                HWND(handle as *mut _),
+                if visible { SW_SHOWNOACTIVATE } else { SW_HIDE },
+            );
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    if visible {
+        window.show()
+    } else {
+        window.hide()
+    }
+}
+fn window_action_internal(
     app: &tauri::AppHandle,
     surface: &str,
     action: &str,
@@ -182,6 +270,8 @@ fn window_action(
         .get_webview_window(label)
         .ok_or(RuntimeError::new("unavailable"))?;
     let result = match action {
+        "show" if surface == "overlay" => overlay_visibility(&window, true),
+        "hide" if surface == "overlay" => overlay_visibility(&window, false),
         "show" => window.show().and_then(|_| {
             if surface == "main" {
                 window.unminimize().and_then(|_| window.set_focus())
@@ -215,6 +305,16 @@ fn window_action(
     publish(app, snapshot.clone());
     Ok(snapshot)
 }
+fn window_action(
+    app: &tauri::AppHandle,
+    surface: &str,
+    action: &str,
+) -> Result<Snapshot, RuntimeError> {
+    if surface == "overlay" && ["show", "hide"].contains(&action) {
+        OVERLAY_VISIBILITY.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+    window_action_internal(app, surface, action)
+}
 fn tray_action(app: &tauri::AppHandle, id: &str) -> Result<(), RuntimeError> {
     match id {
         "open" => window_action(app, "main", "show").map(|_| ()),
@@ -233,13 +333,21 @@ fn tray_action(app: &tauri::AppHandle, id: &str) -> Result<(), RuntimeError> {
             );
             drop(state);
             let service = app.state::<models::ModelService>();
+            app.state::<shortcuts::ShortcutService>().shutdown(app);
+            app.state::<dictation::DictationCoordinator>().shutdown();
             app.state::<speech::SpeechService>().shutdown();
+            app.state::<windows_input::WindowsInputService>().shutdown();
             service.begin_shutdown();
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
                 let service = app.state::<models::ModelService>();
                 let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                    app.state::<shortcuts::ShortcutService>().drain(&app).await;
                     app.state::<speech::SpeechService>().drain().await;
+                    app.state::<dictation::DictationCoordinator>().drain().await;
+                    app.state::<windows_input::WindowsInputService>()
+                        .drain()
+                        .await;
                     service.finish_shutdown().await;
                 })
                 .await;
@@ -384,8 +492,37 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if let Some(service) = app.try_state::<shortcuts::ShortcutService>() {
+                        service.plugin_event(event.state);
+                    }
+                })
+                .build(),
+        )
+        .manage(dictation::DictationCoordinator::default())
+        .manage(windows_input::WindowsInputService::new())
         .manage(Runtime(Mutex::new(Snapshot::default())))
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main"
+                && payload.event() == tauri::webview::PageLoadEvent::Started
+                && let Some(service) = webview
+                    .app_handle()
+                    .try_state::<shortcuts::ShortcutService>()
+            {
+                let _ = service.capture(webview.app_handle(), false);
+            }
+        })
         .invoke_handler(tauri::generate_handler![
+            shortcut_status,
+            shortcut_save,
+            shortcut_capture,
+            dictation_snapshot,
+            dictation_start,
+            dictation_control,
+            dictation_copy,
+            dictation_restore,
             runtime_snapshot,
             runtime_demo,
             runtime_window,
@@ -415,6 +552,7 @@ pub fn run() {
             history_list,
             history_browse,
             history_detail,
+            history_delivery,
             history_usage,
             history_remove,
             history_retry,
@@ -467,6 +605,7 @@ pub fn run() {
                         worker.clone(),
                         &root,
                     )));
+                    app.manage(shortcuts::ShortcutService::new(worker.clone()));
                     app.manage(worker);
                     let handle = app.handle().clone();
                     tauri::async_runtime::spawn(async move {
@@ -524,7 +663,9 @@ pub fn run() {
                 }
             }
             // Acquire the per-profile lease before creating WebView2 or a second visible window.
-            tauri::WebviewWindowBuilder::from_config(app, &app.config().app.windows[0])?.build()?;
+            tauri::WebviewWindowBuilder::from_config(app, &app.config().app.windows[0])?
+                .data_directory(root.join("webview2"))
+                .build()?;
             if let Some(main) = app.get_webview_window("main")
                 && let Some(monitor) = main.primary_monitor()?
             {
@@ -549,6 +690,7 @@ pub fn run() {
                 "voice-overlay",
                 tauri::WebviewUrl::App("index.html?surface=overlay".into()),
             )
+            .data_directory(root.join("webview2"))
             .title("Sayweave · 语音控件")
             .inner_size(68.0, 68.0)
             .decorations(false)
@@ -559,7 +701,20 @@ pub fn run() {
             .skip_taskbar(true)
             .visible(false)
             .focused(false)
+            .focusable(false)
             .build()?;
+            app.state::<windows_input::WindowsInputService>()
+                .set_owner(overlay.hwnd()?.0 as usize);
+            let startup = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = startup
+                    .state::<shortcuts::ShortcutService>()
+                    .initialize(&startup)
+                    .await
+                {
+                    log::warn!(target:"sayweave","operation=shortcut_initialize error={}",e.code);
+                }
+            });
             if let Some(monitor) = overlay.primary_monitor()? {
                 let scale = monitor.scale_factor();
                 let size = monitor.work_area().size.to_logical::<f64>(scale);

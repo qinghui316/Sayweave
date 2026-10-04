@@ -25,6 +25,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "speech_adapters_v1",
         include_str!("migrations/005_speech_adapters.sql"),
     ),
+    (
+        "windows_dictation_v1",
+        include_str!("migrations/006_dictation.sql"),
+    ),
 ];
 pub fn now() -> i64 {
     SystemTime::now()

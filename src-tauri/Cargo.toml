@@ -2,6 +2,7 @@
 name = "sayweave"
 version = "0.1.0"
 description = "Sayweave desktop frontend skeleton"
+default-run = "sayweave"
 edition = "2024"
 rust-version = "1.99"
 
@@ -10,6 +11,21 @@ rust-version = "1.99"
 [lib]
 name = "sayweave_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "input-fixture"
+path = "src/input_fixture.rs"
+required-features = ["desktop-acceptance"]
+
+[[bin]]
+name = "input-acceptance"
+path = "src/input_acceptance.rs"
+required-features = ["desktop-acceptance"]
+
+[[bin]]
+name = "desktop-acceptance"
+path = "src/desktop_acceptance.rs"
+required-features = ["desktop-acceptance"]
 
 [build-dependencies]
 tauri-build = { version = "=2.7.1", features = [] }
@@ -41,6 +57,11 @@ futures-util = { version = "0.3", features = ["sink"] }
 flate2 = "=1.1.10"
 tauri-plugin-clipboard-manager = "=2.4.1"
 tauri-plugin-opener = "=2.7.0"
+
+[target.'cfg(windows)'.dependencies]
+tauri-plugin-global-shortcut = "=2.4.0"
+windows-core = "=0.62.2"
+windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Variant", "Win32_Security", "Win32_UI_Accessibility", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Input_Ime", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_RemoteDesktop", "Win32_System_Power", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,0 +1,32 @@
+import {invoke,isTauri} from '@tauri-apps/api/core';
+import {listen} from '@tauri-apps/api/event';
+import {parseSpeech} from '../contracts/speech';
+import {parseDictation,parseShortcut,initialDictation,type DictationPort,type DictationSnapshot,type ShortcutConfigPort,type ShortcutConfig,type ShortcutStatus} from '../contracts/dictation';
+class NativeShortcuts implements ShortcutConfigPort {
+ readonly mode='native' as const;
+ async status(){return parseShortcut(await invoke('shortcut_status'));}
+ async save(config:ShortcutConfig){return parseShortcut(await invoke('shortcut_save',{config}));}
+ async capture(begin:boolean){return parseShortcut(await invoke('shortcut_capture',{begin}));}
+ async subscribe(callback:(s:ShortcutStatus)=>void){return listen<unknown>('shortcut:status',e=>callback(parseShortcut(e.payload)));}
+}
+class NativeDictation implements DictationPort {
+ async snapshot(){return parseDictation(await invoke('dictation_snapshot'));}
+ async subscribe(callback:(s:DictationSnapshot)=>void){return listen<unknown>('dictation:snapshot',e=>callback(parseDictation(e.payload)));}
+ async start(){return parseSpeech(await invoke('dictation_start'));}
+ async control(taskId:string,action:'finish'|'cancel'){await invoke('dictation_control',{taskId,action});}
+ async copy(taskId:string){await invoke('dictation_copy',{taskId});}
+ async restoreClipboard(){await invoke('dictation_restore');}
+}
+export class BrowserShortcuts implements ShortcutConfigPort {
+ readonly mode='simulation' as const;
+ private value:ShortcutStatus={saved:{binding:'AltRight',mode:'toggle',revision:1},active:{binding:'AltRight',mode:'toggle',revision:1},capturing:false,pending:false,error:null,capturedBinding:null};
+ private listeners=new Set<(s:ShortcutStatus)=>void>();
+ private key=(e:KeyboardEvent)=>{if(!this.value.capturing)return;e.preventDefault();if(e.key==='Escape'){void this.capture(false);return;}if(e.repeat)return;const modifier=/^(Alt|Control|Shift)(Left|Right)$/.test(e.code);const mods=modifier?[]:[e.ctrlKey?'Control':'',e.altKey?'Alt':'',e.shiftKey?'Shift':'',e.metaKey?'Super':''].filter(Boolean);this.value={...this.value,capturedBinding:[...mods,e.code].join('+'),capturing:false};window.removeEventListener('keydown',this.key,true);this.emit();};
+ private emit(){for(const listener of this.listeners)listener(structuredClone(this.value));}
+ async status(){return structuredClone(this.value);}
+ async subscribe(listener:(s:ShortcutStatus)=>void){this.listeners.add(listener);return()=>{this.listeners.delete(listener);};}
+ async save(config:ShortcutConfig){if(config.revision!==this.value.saved.revision)throw {code:'conflict'};const saved={...config,revision:config.revision+1};this.value={...this.value,saved,active:saved};this.emit();return this.status();}
+ async capture(begin:boolean){this.value={...this.value,capturing:begin,capturedBinding:begin?null:this.value.capturedBinding};window.removeEventListener('keydown',this.key,true);if(begin)window.addEventListener('keydown',this.key,true);this.emit();return this.status();}
+}
+export function createDictationPorts():{shortcuts:ShortcutConfigPort;dictation:DictationPort|null}{return isTauri()?{shortcuts:new NativeShortcuts(),dictation:new NativeDictation()}:{shortcuts:new BrowserShortcuts(),dictation:null};}
+export {initialDictation};
