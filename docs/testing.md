@@ -11,6 +11,7 @@
 | npm run check:native | Rust格式、check、Clippy和单元测试 |
 | npm run test:e2e | 浏览器导航、弹窗、动效与词典流程 |
 | npm run check:distribution | Git跟踪文件的明确源码分发范围 |
+| npm run test:input | Windows 隔离编辑器实际输入、选区、剪贴板及故障恢复 |
 
 E2E前运行 `npx playwright install chromium`。截图、报告、运行数据不跟踪到Git。浏览器内存词典不证明磁盘持久化。
 
@@ -20,7 +21,7 @@ E2E前运行 `npx playwright install chromium`。截图、报告、运行数据�
 npm run test:desktop
 ```
 
-脚本构建专用 desktop-acceptance 二进制并检查窗口/托盘调用、隐藏恢复、共享会话、旧缩窗拒绝和退出清理。已有发布实例运行时拒绝启动，应先保存并退出。只清理核验为本次所有的进程，不按名称或端口批量结束应用。日志写入 `.local/`。
+脚本构建独立 desktop-acceptance 二进制，使用 UUID 数据、凭据及 WebView2 目录检查窗口/托盘调用、隐藏恢复、共享会话、旧缩窗拒绝和退出清理。已存在相同验收二进制的实例时拒绝启动。只清理核验为本次所有的进程，不按名称或端口批量结束应用。日志写入 `.local/`。
 
 词典真实磁盘流程：
 
@@ -46,7 +47,7 @@ node scripts/test-dictionary-desktop.mjs --regular
 录音/历史原生闭环（实际默认麦克风、独立凭据和受控 WSS，未调用供应商）：
 
 ```powershell
-npm run desktop:build -- --features desktop-acceptance
+npm run test:desktop
 node scripts/test-speech-desktop.mjs
 cargo test --manifest-path src-tauri/Cargo.toml history_query_benchmark -- --ignored --nocapture
 npm run desktop:build
@@ -83,3 +84,9 @@ Rust数据测试覆盖Unicode、约束、版本冲突、事务、迁移拒绝、
 检查默认1120×760和收缩窗口的中文排版、焦点、导航几何、中性文字、白色主体及语音状态。正常/减少动态、隐藏恢复和快速取消分别观察。原生自动化覆盖命令与窗口状态，不能替代物理任务栏操作、所有DPI、多显示器、掉电、安装/卸载、签名及真实语音服务验证。
 
 源码分发检查使用显式文件范围；新模块、构建脚本或文档需同时审核其用途并更新检查器。可用 `node scripts/check-distribution.mjs --tree REV` 审核某个提交，或 `--snapshot DIRECTORY` 检查解压源码。
+
+## 跨应用口述分支验证
+
+职责、输入策略及恢复边界见 [Windows 口述](dictation.md)。`npm run test:input` 构建两个仅测试特性启用的编辑器夹具，验证实际文字与选区、常见剪贴板格式、延迟渲染及故障恢复。`npm run test:desktop` 后执行 `node scripts/test-speech-desktop.mjs`，使用独立验收 EXE、受控 TLS 服务和实际麦克风验证配置、录音、历史以及原生编辑器/Chromium 的交付路径。脚本记录各控件是确认填入、无法确认还是提供复制；受控文字不能证明供应商识别质量。
+
+发布检查使用 `npm run desktop:build`（无安装包），验收特性及夹具不进入该构建。需要并行保留运行中的本机版本时，可使用标准 `--target x86_64-pc-windows-msvc` 生成到独立 Cargo 目标目录。Windows 150% 以外的缩放、实际物理快捷键、个人常用应用版本及真实供应商短录音分别留证。
