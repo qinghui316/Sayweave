@@ -139,3 +139,37 @@ async fn cancellation_clears_temporary_audio_even_if_database_is_unavailable() {
     assert!(service.discard_new("cancelled-record", true).await);
     assert!(service.last_audio.lock().unwrap().is_none());
 }
+
+#[tokio::test]
+async fn shutdown_waits_for_admitted_background_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let worker = crate::data::DataWorker::start(root.path().to_path_buf()).unwrap();
+    let service = Arc::new(super::SpeechService::new(
+        crate::history::HistoryService::new(worker, root.path()),
+    ));
+    service.initialize().await.unwrap();
+    // Pause the actual cleanup query with another SQLite connection, not a fake counter.
+    let lock = rusqlite::Connection::open(root.path().join("dictionary.sqlite")).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    let pending = service.clone();
+    let cleanup = tokio::spawn(async move { pending.maintain().await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while service.operations.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    service.shutdown();
+    assert_eq!(service.maintain().await.unwrap_err().code, "stopping");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), service.drain())
+            .await
+            .is_err()
+    );
+    lock.execute_batch("ROLLBACK").unwrap();
+    cleanup.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(1), service.drain())
+        .await
+        .unwrap();
+}

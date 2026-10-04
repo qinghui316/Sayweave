@@ -154,6 +154,13 @@ impl SpeechService {
         }
         Ok(())
     }
+    pub async fn maintain(&self) -> Result<(), Error> {
+        // Hold admission across the whole cycle, including file cleanup after initialization.
+        // The daily sleep belongs to the caller and must not keep shutdown waiting.
+        let _operation = self.admit()?;
+        self.initialize().await?;
+        self.history.cleanup().await
+    }
     fn update(&self, app: &tauri::AppHandle, id: &str, change: impl FnOnce(&mut Snapshot)) {
         let update = if let Ok(mut s) = self.snapshot.lock() {
             if s.task_id.as_deref() != Some(id) {

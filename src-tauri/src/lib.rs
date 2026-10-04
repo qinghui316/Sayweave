@@ -444,10 +444,7 @@ pub fn run() {
                             if service.is_stopping() {
                                 break;
                             }
-                            let result = service.initialize().await.map(|_| ());
-                            if result.is_ok() {
-                                let _ = service.history.cleanup().await;
-                            }
+                            let result = service.maintain().await;
                             tokio::time::sleep(std::time::Duration::from_secs(if result.is_ok() {
                                 86400
                             } else {
