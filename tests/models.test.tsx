@@ -23,6 +23,10 @@ function fillText(){
  fireEvent.change(screen.getByLabelText('服务地址（URL）'),{target:{value:'https://example.invalid/v1'}});
 }
 describe('task-based model settings',()=>{
+ it('waits for a transient read lock before presenting the model editor',async()=>{
+  const p=new BrowserModels();const overview=vi.spyOn(p,'overview').mockRejectedValueOnce(new ModelError('busy'));
+  await panel(p);expect(overview).toHaveBeenCalledTimes(2);expect(screen.queryByText('另一个操作正在进行，请稍后再试。')).not.toBeInTheDocument();
+ });
  it('maps both services, keeps a same-service draft key and clears it on a service change',async()=>{
   const p=new BrowserModels(),help=vi.fn().mockResolvedValue(undefined);render(<ModelPanel port={p} onHelp={help}/>);await screen.findByLabelText('API 密钥');
   fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'qwen-fixture-key'}});

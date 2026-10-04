@@ -57,9 +57,16 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged}: M
   const version = ++loadVersion.current;
   setLoading(true); setError(null);
   try {
-   const status = await port.status(retry);
-   if(status.state !== 'ready') throw {code:status.state === 'preparing' ? 'preparing' : 'unavailable'};
-   const overview = await port.overview();
+   let overview:ModelOverview|null=null;
+   for(let attempt=0;attempt<10;attempt++){
+    if(!alive.current||loadVersion.current!==version)return;
+    try{
+     const status=await port.status(retry);
+     if(status.state!=='ready')throw {code:status.state==='preparing'?'preparing':'unavailable'};
+     overview=await port.overview();break;
+    }catch(e){const code=modelError(e).code;if(attempt===9||!['busy','preparing'].includes(code))throw e;await new Promise(resolve=>setTimeout(resolve,100));}
+   }
+   if(!overview)return;
    if(!alive.current || loadVersion.current !== version) return;
    setView(overview);
    setEditor(recordsFor(overview, 'speech').length ? null : newEditor('speech'));

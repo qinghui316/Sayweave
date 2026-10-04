@@ -510,6 +510,7 @@ impl SpeechService {
                             .as_ref()
                             .map(|a| self.history.files.clone().map(|f| (f, a.file_key.clone())))
                             .transpose()?,
+                        cancel.clone(),
                     )
                     .await?,
                 );

@@ -17,7 +17,8 @@
 .mode { display: flex; align-items: center; gap: var(--space-16); height: var(--mode-height); }
 .modeCopy { flex: 1; min-width: 0; }.modeCopy h3 { font-size: var(--text-mode); line-height: var(--line-mode); font-weight: 500; }.modeCopy p { margin-top: var(--space-4); color: var(--text-secondary); font-size: var(--text-small); line-height: var(--line-small); }
 .keyButton { width: var(--key-width); flex: none; background: var(--surface-key); }
-.input { width: 100%; height: var(--control-height); background: var(--surface-canvas); border: 0; border-radius: var(--radius-control); padding: var(--space-10) var(--space-16); font-size: var(--text-body); }
+.input { width: 100%; min-width: 0; height: var(--control-height); background: var(--surface-canvas); border: 0; border-radius: var(--radius-control); padding: 0 var(--space-16); font-size: var(--text-body); line-height: var(--line-body); }
+.input:focus-visible { outline-offset: -2px; }
 .input[aria-invalid="true"] { box-shadow: inset 0 0 0 2px var(--text-primary); }.input:disabled { opacity: .48; }
 .field { display: flex; flex-direction: column; gap: var(--space-8); }.field label { font-weight: 500; }.meta { color: var(--text-secondary); font-size: var(--text-small); line-height: var(--line-small); }
 .password { position: relative; }.password input { padding-right: var(--space-48); }.password button { position: absolute; top: 0; right: 0; }

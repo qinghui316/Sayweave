@@ -31,7 +31,7 @@
 .unavailable { display: flex; align-items: center; gap: 12px; }
 .confirm { padding: 12px 0; display: flex; flex-direction: column; gap: 8px; }
 .confirm h3 { font-size: var(--text-body); font-weight: 500; }
-.preferences { display: flex; flex-direction: column; gap: 12px; padding: 12px 0; max-height: 260px; overflow-y: auto; }
+.preferences { display: flex; flex-direction: column; gap: 12px; padding: 12px 0; }
 .preferenceRow { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .preferenceRow strong { font-size: var(--text-body); font-weight: 500; }
 .preferenceRow input { width: 20px; height: 20px; accent-color: var(--text-primary); }

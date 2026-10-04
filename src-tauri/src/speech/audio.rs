@@ -11,7 +11,21 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
+fn watch_stop(
+    stop: Arc<AtomicBool>,
+    mut signal: watch::Receiver<u8>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let finished = *signal.borrow() >= 1;
+            if finished || signal.changed().await.is_err() {
+                stop.store(true, Ordering::Release);
+                break;
+            }
+        }
+    })
+}
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Device {
@@ -135,12 +149,14 @@ pub struct CaptureResult {
 }
 pub struct Capture {
     stop: Arc<AtomicBool>,
+    stop_watcher: tokio::task::JoinHandle<()>,
     pub packets: mpsc::Receiver<Packet>,
     pub done: oneshot::Receiver<CaptureResult>,
 }
 impl Drop for Capture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.stop_watcher.abort();
     }
 }
 impl Capture {
@@ -150,6 +166,7 @@ impl Capture {
     pub async fn start(
         device_id: Option<String>,
         file: Option<(AudioFiles, String)>,
+        signal: watch::Receiver<u8>,
     ) -> Result<Self, Error> {
         let stop = Arc::new(AtomicBool::new(false));
         let stopper = stop.clone();
@@ -338,6 +355,7 @@ impl Capture {
             .map_err(|_| Error::new("deviceAccess"))?;
         ready.await.map_err(|_| Error::new("deviceAccess"))??;
         Ok(Self {
+            stop_watcher: watch_stop(stop.clone(), signal),
             stop,
             packets,
             done,
@@ -346,4 +364,25 @@ impl Capture {
 }
 mod supported_config {
     pub type Config = cpal::StreamConfig;
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn finish_stops_capture_while_the_audio_sender_is_blocked() {
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(()).await.unwrap();
+        let blocked = tokio::spawn(async move { tx.send(()).await });
+        let (control, signal) = watch::channel(0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let watcher = watch_stop(stop.clone(), signal);
+        control.send(1).unwrap();
+        tokio::time::timeout(Duration::from_millis(100), watcher)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stop.load(Ordering::Acquire));
+        assert!(!blocked.is_finished());
+        blocked.abort();
+    }
 }

@@ -70,7 +70,7 @@ function RuntimeApp() {
     void readUsage();return()=>{stopped=true;clearTimeout(timer);};
   },[ports,store,speech.snapshot.saved,speech.snapshot.attemptId,dataRevision,location.pathname]);
   useEffect(()=>{
-    if(store.port.surface==='overlay')return;
+    if(store.port.surface==='overlay'||settingsOpen)return;
     let stopped=false;let sequence=0;let timer:ReturnType<typeof setTimeout>|undefined;
     async function read(){const token=++sequence;try{
       const status=await models.status();if(stopped||token!==sequence)return;if(status.state==='preparing'){timer=setTimeout(()=>void read(),100);return;}
