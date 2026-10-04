@@ -55,7 +55,7 @@ export function Dictionary({port}:{port:DictionaryPort}) {
     finally{inFlight.current=false;if(token===mutation.current)setBusy(false);}
   }
   return <section className={s.page}>
-    <header className={s.heading}><h1>{t.title}</h1><p>{t.description}</p>{port.persistence==='memory'&&<p className={s.meta}>{t.memory}</p>}</header>
+    <header className={s.heading}><h1>{t.title}</h1>{port.persistence==='memory'&&<p className={s.meta}>{t.memory}</p>}</header>
     <Tabs value={kind} label={t.tabs} onValueChange={v=>{setKind(v as DictionaryKind);setPage(1);setSearch('');setLoading(true);setFeedback('');}} options={[{value:'term',label:t.terms},{value:'correction',label:t.corrections}]}>
       <div className={s.panel}><div className={s.toolbar}><TextInput aria-label={t.search} placeholder={t.search} value={search} maxLength={256} onChange={e=>{setSearch(e.target.value);setPage(1);setLoading(true);}}/><span className={s.meta}>{t.total(result.total)}</span><Button variant="primary" onClick={()=>open(null)} disabled={!!error||loading}>{kind==='term'?t.addTerm:t.addCorrection}</Button></div>
         {feedback&&<InlineMessage status="success">{feedback}</InlineMessage>}
@@ -64,7 +64,7 @@ export function Dictionary({port}:{port:DictionaryPort}) {
       </div>
     </Tabs>
     <Dialog open={editor!==null} onOpenChange={v=>{if(!v)close();}} title={editor?.record?t.editTitle:t.newTitle} description={t.formDescription} className={s.modal}>
-      {editor&&<form className={s.form} onSubmit={save}><h2>{editor.record?t.editTitle:t.newTitle}</h2><p className={s.meta}>{t.formDescription}</p>
+      {editor&&<form className={s.form} onSubmit={save}><h2>{editor.record?t.editTitle:t.newTitle}</h2>
         <Field label={kind==='term'?t.original:t.heard}>{p=><TextInput {...p} disabled={busy} value={editor.original} onChange={e=>setEditor({...editor,original:e.target.value})}/>}</Field>
         <Field label={kind==='term'?t.category:t.replacement}>{p=><TextInput {...p} disabled={busy} value={kind==='term'?editor.category:editor.replacement} onChange={e=>setEditor({...editor,[kind==='term'?'category':'replacement']:e.target.value})}/>}</Field>
         {formError&&<InlineMessage status="error">{t.errors[formError.code]}</InlineMessage>}

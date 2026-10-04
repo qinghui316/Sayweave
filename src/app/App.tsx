@@ -3,6 +3,7 @@ import { HashRouter, Link, Route, Routes,useNavigate,useLocation } from 'react-r
 import {createSpeechPorts} from '../adapters/speech-tauri';
 import {SpeechStore} from './speech-store';
 import {speechError} from '../contracts/speech';
+import {modelExecutable} from '../contracts/models';
 import {speechMessages} from '../locales/speech';
 import type {Usage} from '../contracts/history';
 import { createRuntime } from '../adapters/tauri';
@@ -17,7 +18,7 @@ import { zh } from '../locales/zh-CN';
 import { Button, Icon, IconButton, InlineMessage, NavItem, MotionScope } from '../ui';
 import { Home } from '../features/home';
 import { SettingsShell, type SettingsTab } from '../features/settings';
-import { History } from '../features/history';
+import { History, HistoryFeedStore } from '../features/history';
 import { Dictionary } from '../features/dictionary';
 import { Preferences } from '../features/preferences';
 import { Onboarding } from '../features/onboarding';
@@ -30,6 +31,7 @@ const voiceDemo = import.meta.env.DEV && new URLSearchParams(window.location.sea
 function RuntimeApp() {
   const navigate=useNavigate();const location=useLocation();
   const [ports]=useState(createSpeechPorts);
+  const [reading]=useState(()=>new HistoryFeedStore(ports.history));
   const [speechStore]=useState(()=>new SpeechStore(ports.speech));
   const speech=useSyncExternalStore(speechStore.subscribe,speechStore.getSnapshot);
   const [speechFailure,setSpeechFailure]=useState('');
@@ -37,6 +39,11 @@ function RuntimeApp() {
   const [store] = useState(() => new RuntimeStore(createRuntime()));
   const [dictionary] = useState(createDictionary);
   const [models] = useState(createModels);
+  const historyGuard=useRef<((action:()=>void)=>void)|null>(null);
+  const updateHistoryGuard=useCallback((guard:((action:()=>void)=>void)|null)=>{historyGuard.current=guard;},[]);
+  const [dataRevision,setDataRevision]=useState(0);
+  const dataChanged=useCallback(()=>setDataRevision(value=>value+1),[]);
+  const [ready,setReady]=useState({model:'',device:''});
   const modelGuard=useRef<((action:()=>void)=>void)|null>(null);
   const updateModelGuard=useCallback((guard:((action:()=>void)=>void)|null)=>{modelGuard.current=guard;},[]);
   const snapshot = useSyncExternalStore(store.subscribe,store.getSnapshot);
@@ -61,28 +68,42 @@ function RuntimeApp() {
   useEffect(()=>{if(store.port.surface==='overlay')return;let stopped=false;let timer:ReturnType<typeof setTimeout>|undefined;
     async function readUsage(){try{const status=await ports.history.status();if(status.state==='preparing'){timer=setTimeout(()=>void readUsage(),100);return;}const value=await ports.history.usage();if(!stopped)setUsage(value);}catch{if(!stopped)setUsage(null);}}
     void readUsage();return()=>{stopped=true;clearTimeout(timer);};
-  },[ports,store,speech.snapshot.lifecycle,location.pathname]);
+  },[ports,store,speech.snapshot.saved,speech.snapshot.attemptId,dataRevision,location.pathname]);
+  useEffect(()=>{
+    if(store.port.surface==='overlay')return;
+    let stopped=false;let sequence=0;let timer:ReturnType<typeof setTimeout>|undefined;
+    async function read(){const token=++sequence;try{
+      const status=await models.status();if(stopped||token!==sequence)return;if(status.state==='preparing'){timer=setTimeout(()=>void read(),100);return;}
+      const [overview,prefs,devices]=await Promise.all([models.overview(),ports.speech.preferences(),ports.speech.devices()]);
+      const model=overview.configs.find(c=>c.id===overview.defaults.find(d=>d.usage==='speech')?.configId);
+      const device=prefs.deviceId?devices.find(d=>d.id===prefs.deviceId):devices.find(d=>d.isDefault);
+      if(!stopped&&token===sequence)setReady({model:model&&modelExecutable(model,'speech')?model.modelId:'',device:device?.name??(prefs.deviceId?'麦克风不可用':'系统默认麦克风')});
+    }catch{if(!stopped&&token===sequence)setReady({model:'',device:''});}}
+    void read();const focus=()=>{if(!document.hidden)void read();};window.addEventListener('focus',focus);
+    return()=>{stopped=true;clearTimeout(timer);window.removeEventListener('focus',focus);};
+  },[ports,store,models,dataRevision,settingsOpen]);
   const startSpeech=()=>{setSpeechFailure('');void ports.speech.start().then(speechStore.accept).catch(e=>setSpeechFailure(speechMessages[speechError(e).code]));};
   const controlSpeech=(action:'finish'|'cancel')=>{const id=speech.snapshot.taskId;if(id)void ports.speech.control(id,action).catch(e=>setSpeechFailure(speechMessages[speechError(e).code]));};
   const demo=useCallback((action: DemoAction) => { setError(null); store.port.demo(action,store.getSnapshot().session.id).then(store.accept).catch(report); },[store,report]);
   const windowAction=useCallback((surface: Surface,action: WindowAction) => { store.port.windowAction(surface,action).then(store.accept).catch(report); },[store,report]);
-  const openSettings=(tab: SettingsTab) => { setSettingsTab(tab); setSettingsOpen(true); };
+  const openSettings=(tab: SettingsTab) => { const action=()=>{setSettingsTab(tab);setSettingsOpen(true);};if(historyGuard.current)historyGuard.current(action);else action(); };
+  const navigation=(event:React.MouseEvent<HTMLAnchorElement>,to:string)=>{if(historyGuard.current){event.preventDefault();historyGuard.current(()=>navigate(to));}};
   const phase=speech.snapshot.phase;
   if (store.port.surface==='overlay') return <MotionScope enabled={snapshot.windows.overlay}><VoiceSurface mode={voiceDemo?'demo':'speech'} retry={voiceDemo?false:speech.snapshot.retry} error={voiceDemo?undefined:speechFailure||(speech.snapshot.error?speechMessages[speech.snapshot.error]:undefined)} level={voiceDemo?undefined:speech.level} motionEnabled={snapshot.windows.overlay} phase={voiceDemo?snapshot.session.phase:phase} start={voiceDemo?()=>demo('start'):startSpeech} cancel={voiceDemo?()=>demo('cancel'):()=>controlSpeech('cancel')} finish={voiceDemo?()=>demo('finish'):()=>controlSpeech('finish')}/></MotionScope>;
   return <MotionScope enabled={snapshot.windows.main}><div className={s.window}>
     <aside className={s.sidebar}><div className={s.brand} data-tauri-drag-region><img src={brand} alt="" width={24} height={24}/><span>{zh.brand}</span></div>
-      <nav className={s.navigation} aria-label={zh.navigation.home}><NavItem to="/" icon="house">{zh.navigation.home}</NavItem><NavItem to="/history" icon="clock">{zh.navigation.history}</NavItem><NavItem to="/dictionary" icon="book-open">{zh.navigation.dictionary}</NavItem><NavItem to="/preferences" icon="sliders-horizontal">{zh.navigation.preferences}</NavItem></nav>
+      <nav className={s.navigation} aria-label={zh.navigation.home}><NavItem to="/" onClick={event=>navigation(event,'/')} icon="house">{zh.navigation.home}</NavItem><NavItem to="/history" onClick={event=>navigation(event,'/history')} icon="clock">{zh.navigation.history}</NavItem><NavItem to="/dictionary" onClick={event=>navigation(event,'/dictionary')} icon="book-open">{zh.navigation.dictionary}</NavItem><NavItem to="/preferences" onClick={event=>navigation(event,'/preferences')} icon="sliders-horizontal">{zh.navigation.preferences}</NavItem></nav>
       <footer className={s.sidebarFooter}>{import.meta.env.DEV && <Link to="/dev/components" className={s.devEntry}>{zh.dev.component}</Link>}<div className={s.utility}><button onClick={()=>openSettings('device')}><Icon name="settings" size={18}/>{zh.navigation.settings}</button><IconButton label={zh.navigation.about} onClick={()=>openSettings('about')}><Icon name="info" size={18}/></IconButton></div></footer>
     </aside>
     <div className={s.body}><header className={s.titlebar} data-tauri-drag-region><IconButton label={zh.window.minimize} onClick={()=>windowAction('main','minimize')}><Icon name="minus" size={16}/></IconButton><IconButton label={zh.window.maximize} onClick={()=>windowAction('main','toggleMaximize')}><Icon name="square" size={16}/></IconButton><IconButton label={zh.window.close} onClick={()=>windowAction('main','hide')}><Icon name="x" size={16}/></IconButton></header>
-      <main className={s.content}>{speechFailure&&!speech.snapshot.error&&<InlineMessage status="error">{speechFailure}</InlineMessage>}{error && <div className={s.error}><InlineMessage status="error">{zh.error[error]}</InlineMessage><Button onClick={()=>{setError(null);setConnection(x=>x+1);}}>{zh.error.retry}</Button></div>}
-        <MotionScope enabled={!settingsOpen}><Routes><Route path="/" element={<Home motionEnabled={snapshot.windows.main && !settingsOpen} onShortcuts={()=>openSettings('device')} onModels={()=>openSettings('models')} retryCurrent={()=>{setSpeechFailure('');void ports.speech.retryCurrent().then(speechStore.accept).catch(e=>setSpeechFailure(speechMessages[speechError(e).code]));}} speech={speech.snapshot} level={speech.level} usage={usage} simulation={ports.speech.mode==='simulation'} copy={text=>ports.speech.copy(text)} phase={phase} start={startSpeech} cancel={()=>controlSpeech('cancel')} finish={()=>controlSpeech('finish')}/>}/><Route path="/history" element={<History port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/><Route path="/dictionary" element={<Dictionary port={dictionary}/>}/><Route path="/preferences" element={<Preferences/>}/><Route path="/onboarding" element={<Onboarding/>}/>{DevCatalogue && <Route path="/dev/components" element={<Suspense><DevCatalogue snapshot={snapshot} demo={demo} windowAction={windowAction} resync={()=>store.resync().catch(report)}/></Suspense>}/>}<Route path="*" element={<History port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/></Routes></MotionScope>
+      <main className={`${s.content} ${location.pathname==='/history'?s.historyContent:''}`}>{speechFailure&&!speech.snapshot.error&&<InlineMessage status="error">{speechFailure}</InlineMessage>}{error && <div className={s.error}><InlineMessage status="error">{zh.error[error]}</InlineMessage><Button onClick={()=>{setError(null);setConnection(x=>x+1);}}>{zh.error.retry}</Button></div>}
+        <MotionScope enabled={!settingsOpen}><Routes><Route path="/" element={<Home readyModel={ready.model} readyDevice={ready.device} motionEnabled={snapshot.windows.main && !settingsOpen} onShortcuts={()=>openSettings('device')} onModels={()=>openSettings('models')} retryCurrent={()=>{setSpeechFailure('');void ports.speech.retryCurrent().then(speechStore.accept).catch(e=>setSpeechFailure(speechMessages[speechError(e).code]));}} speech={speech.snapshot} level={speech.level} usage={usage} simulation={ports.speech.mode==='simulation'} copy={text=>ports.speech.copy(text)} phase={phase} start={startSpeech} cancel={()=>controlSpeech('cancel')} finish={()=>controlSpeech('finish')}/>}/><Route path="/history" element={<History reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} onGuardChange={updateHistoryGuard} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/><Route path="/dictionary" element={<Dictionary port={dictionary}/>}/><Route path="/preferences" element={<Preferences/>}/><Route path="/onboarding" element={<Onboarding/>}/>{DevCatalogue && <Route path="/dev/components" element={<Suspense><DevCatalogue snapshot={snapshot} demo={demo} windowAction={windowAction} resync={()=>store.resync().catch(report)}/></Suspense>}/>}<Route path="*" element={<History reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} onGuardChange={updateHistoryGuard} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/></Routes></MotionScope>
       </main>
     </div>
     <SettingsShell speechPort={ports.speech} open={settingsOpen} tab={settingsTab}
       onTabChange={tab=>{const action=()=>setSettingsTab(tab);if(modelGuard.current)modelGuard.current(action);else action();}}
       onOpenChange={open=>{const action=()=>setSettingsOpen(open);if(!open&&modelGuard.current)modelGuard.current(action);else action();}}
-      modelContent={settingsOpen&&settingsTab==='models'?<ModelPanel onHelp={openModelHelp} onSpeech={()=>{setSettingsOpen(false);navigate('/');}} port={models} onGuardChange={updateModelGuard}/>:undefined}/>
+      modelContent={settingsOpen&&settingsTab==='models'?<ModelPanel onChanged={dataChanged} onHelp={openModelHelp} onSpeech={()=>{setSettingsOpen(false);navigate('/');}} port={models} onGuardChange={updateModelGuard}/>:undefined}/>
   </div></MotionScope>;
 }
 export function App() { return <ErrorBoundary><HashRouter><RuntimeApp/></HashRouter></ErrorBoundary>; }

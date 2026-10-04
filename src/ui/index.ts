@@ -6,4 +6,5 @@ export * from './VoiceControl';
 export * from './AnimatedIcon';
 export * from './CopyFeedbackButton';
 export * from './AsyncStatusFeedback';
+export * from './ActionMenu';
 export { MotionScope } from './useMotion';

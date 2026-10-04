@@ -8,8 +8,8 @@ test('settings stays in one modal and restores focus',async({page})=>{
 });
 test('navigation geometry is stable and feature routes are explicit',async({page})=>{
   await page.goto('/');const link=page.getByRole('link',{name:'历史记录',exact:true});const before=await link.boundingBox();
-  await link.click();expect(await link.boundingBox()).toEqual(before);await expect(page.getByText('还没有识别记录')).toBeVisible();
-  await page.getByRole('link',{name:'返回首页'}).click();await expect(page.getByRole('heading',{name:'随言 — 随口表达，文字随言而来'})).toBeVisible();
+  await link.click();expect(await link.boundingBox()).toEqual(before);await expect(page.getByText('还没有历史记录')).toBeVisible();
+  await page.getByRole('link',{name:'首页',exact:true}).click();await expect(page.getByRole('heading',{name:'随言 — 随口表达，文字随言而来'})).toBeVisible();
 });
 test('developer demo remains isolated from production speech entry',async({page})=>{
   await page.goto('/');await page.getByRole('link',{name:'组件展示'}).click();await page.getByRole('button',{name:'开始预设演示'}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();await page.getByRole('button',{name:'触发演示失败'}).click();await expect(page.locator('[data-phase="failed"]')).toBeVisible();await page.getByRole('button',{name:'重试演示'}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();

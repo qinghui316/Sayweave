@@ -5,11 +5,12 @@ test('simulated speech saves only completed sessions and real UI result is read-
  await expect(page.getByRole('region',{name:'识别文字',exact:true})).toContainText('未访问麦克风或语音服务');
  await expect(page.getByRole('region',{name:'识别文字',exact:true})).not.toHaveAttribute('contenteditable');
  await page.getByRole('link',{name:'历史记录',exact:true}).click();await expect(page.getByText('1 条',{exact:true})).toBeVisible();
- await page.getByRole('button',{name:/这是浏览器模拟文字/}).click();const dialog=page.getByRole('dialog');await expect(dialog.getByRole('region',{name:'历史识别文字'})).toContainText('浏览器模拟');
- await expect(dialog.getByRole('button',{name:'重新识别',exact:true})).toBeDisabled();
- await dialog.getByRole('button',{name:'删除记录',exact:true}).click();await dialog.getByRole('button',{name:'取消',exact:true}).click();await expect(dialog).toBeVisible();
- await dialog.getByRole('button',{name:'删除记录',exact:true}).click();await dialog.getByRole('button',{name:'确认删除'}).click();await expect(page.getByText('还没有识别记录')).toBeVisible();
- await page.getByRole('link',{name:'返回首页'}).click();await page.getByRole('button',{name:'开始录音',exact:true}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();await page.locator('[data-phase]').getByRole('button',{name:'取消并丢弃',exact:true}).click();await page.getByRole('link',{name:'历史记录',exact:true}).click();await expect(page.getByText('0 条',{exact:true})).toBeVisible();
+ const row=page.getByRole('listitem').first();await row.hover();await row.getByRole('button',{name:'更多操作'}).click();await page.getByRole('menuitem',{name:'识别版本'}).click();
+ await expect(row.getByRole('region',{name:'历史识别文字'})).toContainText('浏览器模拟');await expect(page.getByRole('dialog')).toHaveCount(0);
+ await row.getByRole('button',{name:'更多操作'}).click();await expect(page.getByRole('menuitem',{name:'重新识别'})).toHaveAttribute('aria-disabled','true');await page.keyboard.press('Escape');
+ await row.getByRole('button',{name:'更多操作'}).click();await page.getByRole('menuitem',{name:'删除记录'}).click();await row.getByRole('button',{name:'取消',exact:true}).click();await expect(row).toBeVisible();
+ await row.getByRole('button',{name:'更多操作'}).click();await page.getByRole('menuitem',{name:'删除记录'}).click();await row.getByRole('button',{name:'确认删除'}).click();await expect(page.getByText('还没有历史记录')).toBeVisible();
+ await page.getByRole('link',{name:'首页',exact:true}).click();await page.getByRole('button',{name:'开始录音',exact:true}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();await page.locator('[data-phase]').getByRole('button',{name:'取消并丢弃',exact:true}).click();await page.getByRole('link',{name:'历史记录',exact:true}).click();await expect(page.getByText('0 条',{exact:true})).toBeVisible();
 });
 test('speech presets select concrete models and keep text fields independent',async({page})=>{
  await page.goto('/');await page.getByRole('button',{name:'配置模型',exact:true}).click();const dialog=page.getByRole('dialog');

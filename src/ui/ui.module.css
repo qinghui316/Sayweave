@@ -5,6 +5,11 @@
 .button:disabled { opacity: .48; }.button:not(:disabled):hover { filter: brightness(.94); }
 .iconButton { background: transparent; display: inline-flex; align-items: center; justify-content: center; width: var(--control-height); height: var(--control-height); border-radius: var(--radius-control); flex: none; }
 .iconButton:hover { background: var(--surface-hover); }
+.iconButton:disabled { opacity: .4; cursor: not-allowed; }
+.actionMenu { z-index: 100; min-width: 144px; max-height: var(--radix-dropdown-menu-content-available-height); overflow: auto; background: var(--surface-content); border-radius: var(--radius-control); padding: 6px; box-shadow: 0 6px 24px rgb(0 0 0 / 14%); }
+.menuItem { padding: 8px 12px; font-size: var(--text-small); line-height: var(--line-small); border-radius: 6px; cursor: pointer; outline: none; }
+.menuItem[data-highlighted] { background: var(--surface-sidebar); }
+.menuItem[data-disabled] { opacity: .4; cursor: not-allowed; }
 .icon { display: inline-block; flex: none; background: var(--text-primary); mask: var(--icon-url) center / contain no-repeat; }
 .signal { background: var(--signal); }
 .nav { width: var(--nav-width); height: var(--nav-height); display: flex; align-items: center; gap: var(--space-12); padding: var(--space-12); border-radius: var(--radius-control); font-size: var(--text-body); font-weight: 400; line-height: var(--line-body); }

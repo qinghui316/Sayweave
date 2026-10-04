@@ -23,8 +23,8 @@ function fromRecord(c:ModelRecord):Editor {
  const input = {name:c.name, protocol:c.protocol, baseUrl:c.baseUrl, modelId:c.modelId, usages:[...c.usages]};
  return {input, initial:structuredClone(input), key:'', record:c, automaticName:false};
 }
-export interface ModelPanelProps {port:ModelConfigPort; onSpeech?:()=>void; onHelp?:(help:import('../../contracts/models').ModelHelp)=>Promise<void>; onGuardChange?:(guard:((action:()=>void)=>void)|null)=>void}
-export function ModelPanel({port, onSpeech, onHelp, onGuardChange}: ModelPanelProps) {
+export interface ModelPanelProps {port:ModelConfigPort; onSpeech?:()=>void; onChanged?:()=>void; onHelp?:(help:import('../../contracts/models').ModelHelp)=>Promise<void>; onGuardChange?:(guard:((action:()=>void)=>void)|null)=>void}
+export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged}: ModelPanelProps) {
  const [usage, setUsage] = useState<ModelUsage>('speech');
  const [view, setView] = useState<ModelOverview|null>(null);
  const [editor, setEditor] = useState<Editor|null>(null);
@@ -124,7 +124,7 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange}: ModelPanelPr
   try {
    const result = await port.save({...draft(), expectation:editor.record ? modelExpectation(view, editor.record.id, editor.input.usages) : null});
    if(!alive.current) return;
-   setView(result); setEditor(null); setTested(null);
+   setView(result); setEditor(null); setTested(null); onChanged?.();
    setNotice(result.cleanupPending ? '已保存，密钥清理稍后重试。' : '已保存。');
   } catch(e) {if(alive.current) report(e, usage);} finally {if(alive.current) setSaving(false);}
  }
@@ -134,7 +134,7 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange}: ModelPanelPr
   try {
    const result = await port.remove({id:confirmation.record.id, revision:confirmation.record.revision, expectation:confirmation.expectation});
    if(!alive.current) return;
-   setView(result); setEditor(recordsFor(result, usage).length ? null : newEditor(usage)); setConfirmation(null);
+   setView(result); setEditor(recordsFor(result, usage).length ? null : newEditor(usage)); setConfirmation(null); onChanged?.();
    setNotice(result.cleanupPending ? '已删除，密钥清理稍后重试。' : '已删除。');
   } catch(e) {if(alive.current) {setConfirmation(null); report(e);}} finally {if(alive.current) setSaving(false);}
  }
@@ -144,7 +144,7 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange}: ModelPanelPr
   try {
    const current = view.defaults.find(d => d.usage === usage)!;
    const result = await port.setDefault({usage, configId:id, revision:current.revision});
-   if(alive.current) {setView(result); setNotice('当前模型已更新。');}
+   if(alive.current) {setView(result); setNotice('当前模型已更新。'); onChanged?.();}
   } catch(e) {if(alive.current) report(e);} finally {if(alive.current) setSaving(false);}
  }
  function continueEditing() {setLeaving(false); nextAction.current = null;}
@@ -166,7 +166,7 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange}: ModelPanelPr
     <div className={s.listHeader}><h3>已保存模型</h3><Button disabled={saving} onClick={() => open(null)}>添加模型</Button></div>
     {!current && <p className={s.meta}>请选择用于{label(usage)}的模型。</p>}
     <div className={s.list}>{[...records].sort((a,b) => Number(b.id === selected) - Number(a.id === selected)).map(c => <article className={s.summary} key={c.id}>
-     <div className={s.summaryCopy}><div className={s.name}><strong>{c.name}</strong>{c.id === selected && <span className={s.current}>当前使用</span>}</div><p>{c.modelId}</p><small>{new URL(c.baseUrl).host}{c.credentialStatus !== 'present' ? ' · 请重新填写密钥' : ''}</small></div>
+     <div className={s.summaryCopy}><div className={s.name}><strong>{c.name}</strong>{c.id === selected && <span className={s.current}>当前使用</span>}</div>{c.name!==c.modelId&&<p>{c.modelId}</p>}<small>{new URL(c.baseUrl).host}{c.credentialStatus !== 'present' ? ' · 请重新填写密钥' : ''}</small></div>
      {!modelExecutable(c, usage) && <p className={s.meta}>此前保存的语音配置，可以继续编辑或删除。实时识别请在“语音识别”中选择模型。</p>}
      <div className={s.rowActions}>{c.id !== selected && modelExecutable(c, usage) && <Button disabled={saving} onClick={() => void selectModel(c.id)}>使用此模型</Button>}<Button variant="quiet" disabled={saving} onClick={() => open(c)}>编辑</Button><Button variant="quiet" disabled={saving} onClick={() => guard(() => {setConfirmation({record:c, expectation:modelExpectation(view,c.id,[])}); setError(null);})}>删除</Button></div>
     </article>)}</div>
