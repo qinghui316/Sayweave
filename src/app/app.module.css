@@ -1,4 +1,4 @@
-.window { display: flex; width: 100%; height: 100vh; overflow: hidden; background: var(--surface-canvas); border-radius: var(--radius-window); }
+.window { display: flex; width: 100%; height: 100%; overflow: hidden; background: var(--surface-canvas); }
 .sidebar { width: var(--sidebar-width); flex: none; padding: var(--space-16); display: flex; flex-direction: column; gap: var(--space-16); background: var(--surface-sidebar); }
 .brand { height: 52px; display: flex; align-items: center; gap: var(--space-8); font-family: var(--font-brand); font-size: var(--text-brand); font-weight: 600; line-height: 28px; }.brand img { pointer-events: none; }
 .navigation { display: flex; flex-direction: column; gap: var(--space-8); }.sidebarFooter { margin-top: auto; display: flex; flex-direction: column; gap: var(--space-20); }

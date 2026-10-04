@@ -7,7 +7,7 @@ import {speechMessages} from '../locales/speech';
 import type {Usage} from '../contracts/history';
 import { createRuntime } from '../adapters/tauri';
 import { createDictionary } from '../adapters/dictionary-tauri';
-import { createModels } from '../adapters/models-tauri';
+import { createModels, openModelHelp } from '../adapters/models-tauri';
 import { ModelPanel } from '../features/models';
 import type { DemoAction, RuntimeErrorCode, WindowAction, Surface } from '../contracts/runtime';
 import { RuntimeError } from '../contracts/runtime';
@@ -82,7 +82,7 @@ function RuntimeApp() {
     <SettingsShell speechPort={ports.speech} open={settingsOpen} tab={settingsTab}
       onTabChange={tab=>{const action=()=>setSettingsTab(tab);if(modelGuard.current)modelGuard.current(action);else action();}}
       onOpenChange={open=>{const action=()=>setSettingsOpen(open);if(!open&&modelGuard.current)modelGuard.current(action);else action();}}
-      modelContent={settingsOpen&&settingsTab==='models'?<ModelPanel onSpeech={()=>{setSettingsOpen(false);navigate('/');}} port={models} onGuardChange={updateModelGuard}/>:undefined}/>
+      modelContent={settingsOpen&&settingsTab==='models'?<ModelPanel onHelp={openModelHelp} onSpeech={()=>{setSettingsOpen(false);navigate('/');}} port={models} onGuardChange={updateModelGuard}/>:undefined}/>
   </div></MotionScope>;
 }
 export function App() { return <ErrorBoundary><HashRouter><RuntimeApp/></HashRouter></ErrorBoundary>; }

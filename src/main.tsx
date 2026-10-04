@@ -8,4 +8,5 @@ import './design/tokens.css';
 import './design/base.css';
 import { App } from './app/App';
 
+document.documentElement.dataset.surface = new URLSearchParams(location.search).get('surface') === 'overlay' ? 'overlay' : 'main';
 ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>);

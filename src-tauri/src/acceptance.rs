@@ -50,6 +50,27 @@ async fn verify(app: &tauri::AppHandle, menu_ids: Vec<String>) -> Result<(), Str
         )
     })
     .await?;
+    step(app, "main-minimum-size", |app| {
+        let main = app.get_webview_window("main").ok_or("missing main")?;
+        main.set_size(tauri::LogicalSize::new(960.0, 640.0))
+            .map_err(|e| e.to_string())
+    })
+    .await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    step(app, "main-minimum-size-verified", |app| {
+        let main = app.get_webview_window("main").ok_or("missing main")?;
+        let size = main
+            .inner_size()
+            .map_err(|e| e.to_string())?
+            .to_logical::<f64>(main.scale_factor().map_err(|e| e.to_string())?);
+        require(
+            (size.width - 960.0).abs() < 1.0 && (size.height - 640.0).abs() < 1.0,
+            "minimum main viewport differs",
+        )?;
+        main.set_size(tauri::LogicalSize::new(1120.0, 760.0))
+            .map_err(|e| e.to_string())
+    })
+    .await?;
     step(app, "hide-recover-no-duplicate", |app| {
         let main = app.get_webview_window("main").ok_or("missing main")?;
         window_action(app, "main", "hide").map_err(|e| format!("{e:?}"))?;

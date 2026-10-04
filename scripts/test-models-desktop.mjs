@@ -35,6 +35,7 @@ async function start(round){
  if(!page)throw Error('Main page missing');await page.waitForFunction(()=>window.__TAURI_INTERNALS__?.invoke);
  await page.getByRole('button',{name:'配置模型',exact:true}).click();
  await expect(page.getByRole('heading',{name:'模型',exact:true})).toBeVisible();
+ await page.getByRole('tab',{name:'文字处理'}).click();
  return page;
 }
 async function stop(page,graceful=true){
@@ -46,10 +47,11 @@ async function stop(page,graceful=true){
 }
 const invoke=(page,command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
 async function fill(page,name,url,model,keyValue=key){
- await page.getByLabel('配置名称',{exact:true}).fill(name);
- await page.getByLabel('服务基址',{exact:true}).fill(url);
- await page.getByLabel('API Key',{exact:true}).fill(keyValue);
- await page.getByLabel('模型 ID',{exact:true}).fill(model);
+ const more=page.getByRole('button',{name:'更多设置'});if(await more.count())await more.click();
+ await page.getByLabel('名称',{exact:true}).fill(name);
+ await page.getByLabel('服务地址',{exact:true}).fill(url);
+ await page.getByLabel('API 密钥',{exact:true}).fill(keyValue);
+ await page.getByLabel('模型',{exact:true}).fill(model);
 }
 try{
  let base;
@@ -74,53 +76,61 @@ try{
  if(regular){
   const status=await invoke(page,'model_status',{retry:false});expect(status.state).toBe('ready');
   const overview=await invoke(page,'model_overview');expect(overview.defaults).toHaveLength(2);
+  const acceptanceCommand=await page.evaluate(async()=>{try{await window.__TAURI_INTERNALS__.invoke('acceptance_exit');return null;}catch(e){return String(e);}});
+  expect(acceptanceCommand).toContain('not found');
   report.checks.push('ordinary release native models usable; DEV catalogue and acceptance overrides absent');
  }else{
-  await expect(page.getByRole('heading',{name:'添加 API 模型'})).toBeVisible();
+  await expect(page.getByLabel('API 密钥',{exact:true})).toBeVisible();
   await fill(page,'个人文字配置',base+'/v1','fixture-text-model');
   // Listing is usable before a model/name is supplied.
-  await page.getByLabel('配置名称',{exact:true}).fill('');await page.getByLabel('模型 ID',{exact:true}).fill('');
-  await page.getByRole('button',{name:'获取模型列表'}).click();await expect(page.getByText('列表已获取；选择或手动填写模型 ID。')).toBeVisible();
-  await page.getByLabel('配置名称',{exact:true}).fill('个人文字配置');await page.getByLabel('模型 ID',{exact:true}).fill('fixture-text-model');
-  await page.getByRole('button',{name:'测试文字模型'}).click();await expect(page.getByText(/本次文字测试通过/)).toBeVisible();
-  await page.getByRole('checkbox',{name:'语音识别',exact:true}).check();
-  await page.getByRole('button',{name:'保存配置'}).click();await expect(page.getByText('配置已保存。')).toBeVisible();
+  await page.getByLabel('名称',{exact:true}).fill('');await page.getByLabel('模型',{exact:true}).fill('');
+  await page.getByRole('button',{name:'获取模型列表'}).click();await expect(page.getByText('模型列表已更新，也可以直接填写。')).toBeVisible();
+  await page.getByLabel('名称',{exact:true}).fill('个人文字配置');await page.getByLabel('模型',{exact:true}).fill('fixture-text-model');
+  await page.getByRole('button',{name:'测试连接'}).click();await expect(page.getByText(/连接成功/)).toBeVisible();
+  // Category determines new configuration use; legacy usages are covered by contract tests.
+  await page.getByRole('button',{name:'保存',exact:true}).click();await expect(page.getByText('已保存。')).toBeVisible();
   let overview=await invoke(page,'model_overview');expect(overview.configs).toHaveLength(1);expect(overview.defaults.find(d=>d.usage==='text').configId).toBe(overview.configs[0].id);expect(overview.defaults.find(d=>d.usage==='speech').configId).toBeNull();
   expect(JSON.stringify(overview)).not.toContain(key);
   report.checks.push('real vault/disk save; independent default slots; HTTPS list and concrete text test');
   const first=overview.configs[0];
-  await page.getByRole('button',{name:/个人文字配置.*fixture-text-model/}).click();
-  await expect(page.getByLabel('API Key',{exact:true})).toHaveValue('');
-  await page.getByLabel('服务基址',{exact:true}).fill('https://other.invalid/v1');
-  await page.getByRole('button',{name:'测试文字模型'}).click();await expect(page.getByText(/服务主机或端口已变化/)).toBeVisible();
-  await page.getByLabel('服务基址',{exact:true}).fill(base+'/compat');
-  await page.getByRole('button',{name:'测试文字模型'}).click();await expect(page.getByText(/本次文字测试通过/)).toBeVisible();
-  await page.getByRole('button',{name:'保存配置'}).click();await expect(page.getByText('配置已保存。')).toBeVisible();
+  await page.locator('article').filter({hasText:'个人文字配置'}).getByRole('button',{name:'编辑',exact:true}).click();
+  await expect(page.getByLabel('API 密钥',{exact:true})).toHaveValue('');
+  await page.getByLabel('服务地址',{exact:true}).fill('https://other.invalid/v1');
+  await page.getByRole('button',{name:'测试连接'}).click();await expect(page.getByText(/服务地址已改变/)).toBeVisible();
+  await page.getByLabel('服务地址',{exact:true}).fill(base+'/compat');
+  await page.getByRole('button',{name:'测试连接'}).click();await expect(page.getByText(/连接成功/)).toBeVisible();
+  await page.getByRole('button',{name:'保存',exact:true}).click();await expect(page.getByText('已保存。')).toBeVisible();
   await page.getByRole('button',{name:'添加模型'}).click();await fill(page,'第二份文字配置',base+'/v1','second-model');
-  await page.getByRole('button',{name:'保存配置'}).click();await expect(page.getByText('配置已保存。')).toBeVisible();
+  await page.getByRole('button',{name:'保存',exact:true}).click();await expect(page.getByText('已保存。')).toBeVisible();
   overview=await invoke(page,'model_overview');const second=overview.configs.find(c=>c.id!==first.id);
   expect(overview.defaults.find(d=>d.usage==='text').configId).toBe(first.id);expect(overview.defaults.find(d=>d.usage==='speech').configId).toBeNull();
-  await page.getByLabel('文字处理默认配置',{exact:true}).selectOption(second.id);
-  await expect(page.getByText('默认配置已更新。')).toBeVisible();
+  await page.locator('article').filter({hasText:'第二份文字配置'}).getByRole('button',{name:'使用此模型'}).click();
+  await expect(page.getByText('当前模型已更新。')).toBeVisible();
   const overlay=browser.contexts().flatMap(c=>c.pages()).find(p=>p.url().includes('surface=overlay'));expect(overlay).toBeTruthy();
   const denied=await overlay.evaluate(async()=>{try{await window.__TAURI_INTERNALS__.invoke('model_overview');return null;}catch(e){return e;}});
   expect(denied).toMatchObject({code:'forbidden'});report.checks.push('stored key never revealed; origin guard; one bounded max_tokens compatibility retry; overlay denied');
+  const helpDenied=await overlay.evaluate(async()=>{try{await window.__TAURI_INTERNALS__.invoke('model_help',{help:'qwen-api-key'});return null;}catch(e){return e;}});
+  expect(helpDenied).toMatchObject({code:'forbidden'});
+  const unknownHelp=await page.evaluate(async()=>{try{await window.__TAURI_INTERNALS__.invoke('model_help',{help:'https://example.invalid'});return null;}catch(e){return e;}});
+  expect(unknownHelp).toMatchObject({code:'invalid',field:'help'});
+  const openerDenied=await page.evaluate(async()=>{try{await window.__TAURI_INTERNALS__.invoke('plugin:opener|open_url',{url:'https://example.invalid'});return null;}catch(e){return String(e);}});
+  expect(openerDenied).toContain('not allowed');report.checks.push('help rejects overlay and arbitrary URL; renderer cannot use generic opener');
   const green=await page.locator('body *').evaluateAll(nodes=>nodes.filter(n=>Array.from(n.childNodes).some(c=>c.nodeType===3&&c.textContent?.trim())&&getComputedStyle(n).color==='rgb(117, 251, 145)').length);expect(green).toBe(0);
   report.viewport=await page.evaluate(()=>({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,overflow:document.documentElement.scrollWidth>innerWidth}));expect(report.viewport.overflow).toBe(false);
   await page.screenshot({path:path.join(directory,'models-saved.png')});
   await stop(page);page=await start(2);
   overview=await invoke(page,'model_overview');expect(overview.configs).toHaveLength(2);expect(overview.configs.every(c=>c.credentialStatus==='present')).toBe(true);
   expect(overview.defaults.find(d=>d.usage==='text').configId).toBe(second.id);
-  await page.getByRole('button',{name:/个人文字配置.*fixture-text-model/}).click();await page.getByRole('button',{name:'测试文字模型'}).click();await expect(page.getByText(/本次文字测试通过/)).toBeVisible();
-  await page.getByLabel('服务基址',{exact:true}).fill(base+'/slow');await page.getByRole('button',{name:'测试文字模型'}).click();await page.getByRole('button',{name:'取消请求',exact:true}).click();await expect(page.getByText('请求已取消。')).toBeVisible();await delay(1300);await expect(page.getByText(/本次文字测试通过/)).toHaveCount(0);
+  await page.locator('article').filter({hasText:'个人文字配置'}).getByRole('button',{name:'编辑',exact:true}).click();await page.getByRole('button',{name:'测试连接'}).click();await expect(page.getByText(/连接成功/)).toBeVisible();
+  await page.getByLabel('服务地址',{exact:true}).fill(base+'/slow');await page.getByRole('button',{name:'测试连接'}).click();await page.getByRole('button',{name:'取消请求',exact:true}).click();await expect(page.getByText('请求已取消。')).toBeVisible();await delay(1300);await expect(page.getByText(/连接成功/)).toHaveCount(0);
   await page.getByRole('button',{name:'取消编辑'}).click();await page.getByRole('button',{name:'放弃修改'}).click();
-  await page.getByRole('button',{name:'删除',exact:true}).first().click();
+  await page.locator('article').filter({hasText:'个人文字配置'}).getByRole('button',{name:'删除',exact:true}).click();
   await expect(page.getByRole('alertdialog')).toContainText('删除');
-  await page.getByRole('button',{name:'确认删除'}).click();await expect(page.getByText('配置已删除。')).toBeVisible();
+  await page.getByRole('button',{name:'确认删除'}).click();await expect(page.getByText('已删除。')).toBeVisible();
   await stop(page);page=await start(3);
   overview=await invoke(page,'model_overview');expect(overview.configs).toHaveLength(1);expect(overview.configs[0].id).toBe(second.id);expect(overview.defaults.find(d=>d.usage==='speech').configId).toBeNull();
-  await page.getByRole('button',{name:'删除',exact:true}).click();await expect(page.getByRole('alertdialog')).toContainText('文字处理默认将清空');
-  await page.getByRole('button',{name:'确认删除'}).click();await expect(page.getByText('配置已删除。')).toBeVisible();
+  await page.getByRole('button',{name:'删除',exact:true}).click();await expect(page.getByRole('alertdialog')).toContainText('文字处理将清空');
+  await page.getByRole('button',{name:'确认删除'}).click();await expect(page.getByText('已删除。')).toBeVisible();
   report.checks.push('three real process launches with graceful exits, retained credentials/defaults, cancellation and physical deletion');
   await stop(page);page=null;
   expect(requests.every(r=>r.authenticated)).toBe(true);expect(requests.filter(r=>r.path.endsWith('/chat/completions')).every(r=>r.budget===128)).toBe(true);

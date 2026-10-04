@@ -361,6 +361,7 @@ fn already_running() {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(Runtime(Mutex::new(Snapshot::default())))
         .invoke_handler(tauri::generate_handler![
             runtime_snapshot,
@@ -380,6 +381,7 @@ pub fn run() {
             model_fetch,
             model_test,
             model_cancel,
+            model_help,
             speech_snapshot,
             speech_devices,
             speech_start,

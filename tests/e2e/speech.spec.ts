@@ -13,10 +13,11 @@ test('simulated speech saves only completed sessions and real UI result is read-
 });
 test('Qwen preset remains separate from fetched text models and cannot select text use',async({page})=>{
  await page.goto('/');await page.getByRole('button',{name:'配置模型',exact:true}).click();const dialog=page.getByRole('dialog');
- await dialog.getByLabel('接口类型').click();await page.getByRole('option',{name:'通义语音 · Qwen Audio Streaming'}).click();await expect(dialog.getByLabel('模型 ID',{exact:true})).toHaveValue('qwen-audio-3.1-asr-flash-streaming');
- await expect(dialog.getByRole('button',{name:'测试文字模型'})).toBeDisabled();await expect(dialog.getByRole('checkbox',{name:'文字处理',exact:true})).toHaveCount(0);
- await dialog.getByLabel('配置名称',{exact:true}).fill('通义语音');await dialog.getByLabel('服务基址',{exact:true}).fill('https://workspace.cn-beijing.maas.aliyuncs.com');await dialog.getByLabel('API Key',{exact:true}).fill('fixture-key');await dialog.getByRole('button',{name:'保存配置'}).click();
- await expect(dialog.getByLabel('语音识别默认配置',{exact:true})).not.toHaveValue('');await expect(dialog.getByLabel('文字处理默认配置',{exact:true})).toHaveValue('');
+ await expect(dialog.getByRole('tab',{name:'语音识别'})).toHaveAttribute('aria-selected','true');
+ await expect(dialog.getByText('通义实时识别')).toBeVisible();await expect(dialog.getByRole('button',{name:'测试连接'})).toHaveCount(0);
+ await dialog.getByRole('button',{name:'更多设置'}).click();await expect(dialog.getByLabel('模型',{exact:true})).toHaveValue('qwen-audio-3.1-asr-flash-streaming');
+ await dialog.getByLabel('服务地址',{exact:true}).fill('https://workspace.cn-beijing.maas.aliyuncs.com');await dialog.getByLabel('API 密钥',{exact:true}).fill('fixture-key');await dialog.getByRole('button',{name:'保存',exact:true}).click();
+ await expect(dialog.getByText('当前使用',{exact:true})).toBeVisible();await dialog.getByRole('tab',{name:'文字处理'}).click();await expect(dialog.getByLabel('API 密钥',{exact:true})).toHaveValue('');
 });
 test('default development overlay follows speech state and speech actions together',async({page})=>{
  await page.goto('/?surface=overlay');await page.getByRole('button',{name:'开始录音',exact:true}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();await page.getByRole('button',{name:'结束录音',exact:true}).click();await expect(page.locator('[data-phase="completed"]')).toBeVisible();

@@ -9,6 +9,7 @@ Direct dependencies added for model configuration are pinned in Cargo.toml / Car
 | keyring | 3.6.3 | MIT OR Apache-2.0 | https://github.com/hwchen/keyring-rs |
 | reqwest | 0.13.5 | MIT OR Apache-2.0 | https://github.com/seanmonstar/reqwest |
 | tauri-plugin-log | 2.8.0 | Apache-2.0 OR MIT | https://github.com/tauri-apps/plugins-workspace |
+| tauri-plugin-opener | 2.7.0 | Apache-2.0 OR MIT | https://github.com/tauri-apps/plugins-workspace |
 | cpal | 0.18.2 | Apache-2.0 | https://github.com/RustAudio/cpal |
 | rubato | 5.0.1 | MIT OR Apache-2.0 | https://github.com/HEnquist/rubato |
 | rtrb | 0.4.0 | MIT OR Apache-2.0 | https://github.com/mgeier/rtrb |

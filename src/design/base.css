@@ -1,4 +1,6 @@
 * { box-sizing: border-box; }
+html, body, #root { width: 100%; height: 100%; }
+html[data-surface="main"], html[data-surface="main"] body, html[data-surface="main"] #root { background: var(--surface-canvas); }
 body { margin: 0; font-family: var(--font-body); font-size: var(--text-body); line-height: var(--line-body); color: var(--text-primary); background: transparent; }
 button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; } button:disabled { cursor: not-allowed; }

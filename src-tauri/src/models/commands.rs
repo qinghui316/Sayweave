@@ -1,5 +1,49 @@
 use super::{ModelService, provider::TestResult, types::*};
 use tauri::{State, WebviewWindow};
+use tauri_plugin_opener::OpenerExt;
+
+fn help_url(caller: &str, help: &str) -> Result<&'static str, ModelError> {
+    if caller != "main" {
+        return Err(ModelError::new("forbidden"));
+    }
+    match help {
+        "qwen-api-key" => Ok("https://help.aliyun.com/zh/model-studio/get-api-key"),
+        _ => Err(ModelError::field("help")),
+    }
+}
+
+#[tauri::command]
+pub fn model_help(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    help: String,
+) -> Result<(), ModelError> {
+    let url = help_url(window.label(), &help)?;
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|_| ModelError::new("unavailable"))
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+    #[test]
+    fn fixed_help_is_main_only() {
+        assert!(
+            help_url("main", "qwen-api-key")
+                .unwrap()
+                .starts_with("https://help.aliyun.com/")
+        );
+        assert_eq!(
+            help_url("voice-overlay", "qwen-api-key").unwrap_err().code,
+            "forbidden"
+        );
+        assert_eq!(
+            help_url("main", "https://example.com").unwrap_err().code,
+            "invalid"
+        );
+    }
+}
 async fn observed<T>(
     operation: &'static str,
     request: Option<&str>,
