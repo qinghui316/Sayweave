@@ -57,6 +57,7 @@ struct Response {
     sequence: Option<i32>,
 }
 fn service_error(code: u64) -> Error {
+    log::warn!(target:"sayweave","SAYWEAVE_ASR protocol=doubao stage=service code={code}");
     Error::new(match code {
         45000030 => "resourceUnavailable",
         45000002 => "emptyText",
@@ -90,9 +91,6 @@ fn decode(bytes: &[u8]) -> Result<Response, Error> {
     } else {
         None
     };
-    if sequence.is_some_and(|s| s == 0 || (s < 0) != (flags & 2 != 0)) {
-        return Err(Error::new("protocol"));
-    }
     let offset = header
         + if kind == 15 || sequence.is_some() {
             4
@@ -129,15 +127,20 @@ fn decode(bytes: &[u8]) -> Result<Response, Error> {
         return Err(Error::new("protocol"));
     }
     let value: Value = serde_json::from_slice(&decoded).map_err(|_| Error::new("protocol"))?;
-    if let Some(code) = value.get("code").and_then(Value::as_u64)
-        && code != 0
-        && code != 20000000
-    {
-        return Err(service_error(code));
+    if !value.is_object() {
+        return Err(Error::new("protocol"));
+    }
+    if let Some(code) = value.get("code") {
+        let code = code.as_u64().ok_or(Error::new("protocol"))?;
+        if code != 0 && code != 20000000 {
+            return Err(service_error(code));
+        }
     }
     Ok(Response {
         value,
-        last: flags & 2 != 0,
+        // The last-package flag is authoritative; a negative sequence also marks completion.
+        // A final positive sequence or a terminal sentinel is not an ordinary update ordinal.
+        last: flags & 2 != 0 || sequence.is_some_and(|s| s < 0),
         sequence,
     })
 }
@@ -154,40 +157,64 @@ impl Transcript {
         let Message::Binary(bytes) = message else {
             return Err(Error::new("protocol"));
         };
-        let response = decode(&bytes)?;
-        self.apply(response)
+        let frame_type = bytes.get(1).map(|b| b >> 4);
+        let flags = bytes.get(1).map(|b| b & 15);
+        let response = decode(&bytes).inspect_err(|e| {
+            log::warn!(target:"sayweave","SAYWEAVE_ASR protocol=doubao stage=decode code={} frame_type={frame_type:?} flags={flags:?} bytes={}",e.code,bytes.len());
+        })?;
+        self.apply(response).inspect_err(|e| {
+            log::warn!(target:"sayweave","SAYWEAVE_ASR protocol=doubao stage=transcript code={} frame_type={frame_type:?} flags={flags:?}",e.code);
+        })
     }
     fn apply(&mut self, response: Response) -> Result<Event, Error> {
         if self.finished {
             return Ok(Event::Heartbeat);
         }
-        if let Some(seq) = response.sequence {
+        if let Some(seq) = response.sequence.filter(|_| !response.last) {
             let seq = seq.unsigned_abs();
-            if seq <= self.server_sequence && !response.last {
+            if seq <= self.server_sequence {
                 return Ok(Event::Heartbeat);
-            }
-            if seq < self.server_sequence {
-                return Err(Error::new("protocol"));
             }
             self.server_sequence = seq;
         }
-        self.finished = response.last;
         let Some(result) = response.value.get("result") else {
             return if response.last {
-                Ok(Event::Finished)
+                Ok(self.finish_existing())
             } else {
                 Ok(Event::Heartbeat)
             };
         };
-        self.sequence += 1;
-        if let Some(utterances) = result
+        if !result.is_object() {
+            return Err(Error::new("protocol"));
+        }
+        let text = result
+            .get("text")
+            .map(|v| v.as_str().ok_or(Error::new("protocol")))
+            .transpose()?;
+        let utterances = result
             .get("utterances")
-            .and_then(Value::as_array)
-            .filter(|u| !u.is_empty())
-        {
+            .map(|v| v.as_array().ok_or(Error::new("protocol")))
+            .transpose()?;
+        if let Some(utterances) = utterances {
             if utterances.len() > 10000 {
                 return Err(Error::new("responseTooLarge"));
             }
+            // Validate all declared items, including positions whose confirmed text we retain.
+            for utterance in utterances {
+                let text = utterance
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or(Error::new("protocol"))?;
+                if text.len() > 64 * 1024 {
+                    return Err(Error::new("responseTooLarge"));
+                }
+                if utterance.get("definite").is_some_and(|v| !v.is_boolean()) {
+                    return Err(Error::new("protocol"));
+                }
+            }
+        }
+        self.sequence += 1;
+        if let Some(utterances) = utterances.filter(|u| !u.is_empty()) {
             // Full results replace the tentative suffix; confirmed positions are immutable.
             let confirmed = self
                 .text
@@ -196,7 +223,11 @@ impl Transcript {
                 .take_while(|s| s.confirmed)
                 .count();
             if utterances.len() < confirmed {
-                return Ok(Event::Heartbeat);
+                return Ok(if response.last {
+                    self.finish_existing()
+                } else {
+                    Event::Heartbeat
+                });
             }
             let mut segments = Vec::with_capacity(utterances.len());
             for (index, utterance) in utterances.iter().enumerate() {
@@ -222,7 +253,10 @@ impl Transcript {
                 });
             }
             self.text.segments = segments;
-        } else if let Some(text) = result.get("text").and_then(Value::as_str) {
+        } else if let Some(text) = text {
+            if text.is_empty() && response.last {
+                return Ok(self.finish_existing());
+            }
             let confirmed = self.text.confirmed_text.clone();
             if !text.starts_with(&confirmed) {
                 return if response.last {
@@ -244,7 +278,11 @@ impl Transcript {
                 });
             }
         } else {
-            return Err(Error::new("protocol"));
+            return if response.last {
+                Ok(self.finish_existing())
+            } else {
+                Ok(Event::Heartbeat)
+            };
         }
         self.text.text = self.text.segments.iter().map(|s| s.text.as_str()).collect();
         self.text.confirmed_text = self
@@ -257,7 +295,23 @@ impl Transcript {
         if self.text.text.len() > LIMIT {
             return Err(Error::new("responseTooLarge"));
         }
+        self.finished = response.last;
         Ok(Event::Update(self.text.clone()))
+    }
+
+    fn finish_existing(&mut self) -> Event {
+        self.finished = true;
+        self.sequence += 1;
+        for segment in &mut self.text.segments {
+            segment.confirmed = true;
+            segment.sequence = self.sequence;
+        }
+        self.text.confirmed_text = self.text.text.clone();
+        if self.text.segments.is_empty() {
+            Event::Finished
+        } else {
+            Event::Update(self.text.clone())
+        }
     }
 }
 
@@ -345,6 +399,105 @@ mod tests {
             frame.splice(4..4, sequence.to_be_bytes());
         }
         frame
+    }
+    fn with_sequence(value: Value, flags: u8, sequence: i32) -> Vec<u8> {
+        let mut frame = response(value, flags, true);
+        frame[4..8].copy_from_slice(&sequence.to_be_bytes());
+        frame
+    }
+    #[test]
+    fn terminal_sequence_is_not_a_stale_partial_update() {
+        for (flags, sequence) in [(3, -1), (3, 43), (1, -43)] {
+            let mut t = Transcript::default();
+            for (seq, text) in [(1, "你"), (42, "你好")] {
+                t.event(Message::Binary(
+                    with_sequence(json!({"result":{"text":text}}), 1, seq).into(),
+                ))
+                .unwrap();
+            }
+            assert!(matches!(
+                t.event(Message::Binary(
+                    with_sequence(json!({"result":{"text":"你好。"}}), flags, sequence).into()
+                ))
+                .unwrap(),
+                Event::Update(_)
+            ));
+            assert!(t.finished);
+            assert_eq!(t.text.confirmed_text, "你好。");
+        }
+    }
+    #[test]
+    fn explicit_empty_terminal_packet_confirms_existing_text_only() {
+        for value in [
+            json!({}),
+            json!({"result":{}}),
+            json!({"result":{"text":"","utterances":[]}}),
+        ] {
+            let mut t = Transcript::default();
+            t.event(Message::Binary(
+                with_sequence(json!({"result":{"text":"有效文字"}}), 1, 42).into(),
+            ))
+            .unwrap();
+            t.event(Message::Binary(with_sequence(value, 3, -1).into()))
+                .unwrap();
+            assert!(t.finished);
+            assert_eq!(t.text.confirmed_text, "有效文字");
+            assert!(t.text.segments.iter().all(|s| s.confirmed));
+        }
+        let mut empty = Transcript::default();
+        empty
+            .event(Message::Binary(with_sequence(json!({}), 3, -1).into()))
+            .unwrap();
+        assert!(empty.finished);
+        assert!(empty.text.text.is_empty());
+        let mut malformed = Transcript::default();
+        assert!(
+            malformed
+                .event(Message::Binary(
+                    with_sequence(json!({"result":[]}), 3, -1).into()
+                ))
+                .is_err()
+        );
+        assert!(!malformed.finished);
+    }
+    #[test]
+    fn malformed_terminal_payload_cannot_confirm_partial_or_completed_segments() {
+        for value in [
+            json!([]),
+            json!(null),
+            json!({"code":"45000001"}),
+            json!({"code":-1}),
+            json!({"result":{"text":123}}),
+            json!({"result":{"utterances":"bad"}}),
+            json!({"result":{"utterances":[null]}}),
+            json!({"result":{"utterances":[{"text":123}]}}),
+            json!({"result":{"utterances":[{"text":"有效文字","definite":"true"}]}}),
+        ] {
+            for confirmed in [false, true] {
+                let mut transcript = Transcript::default();
+                transcript
+                    .event(Message::Binary(
+                        with_sequence(
+                            json!({"result":{"utterances":[{"text":"有效文字","definite":confirmed}]}}),
+                            1,
+                            42,
+                        )
+                        .into(),
+                    ))
+                    .unwrap();
+                assert_eq!(
+                    transcript
+                        .event(Message::Binary(with_sequence(value.clone(), 3, -1).into()))
+                        .err()
+                        .unwrap()
+                        .code,
+                    "protocol"
+                );
+                assert!(!transcript.finished);
+                assert_eq!(transcript.text.text, "有效文字");
+                assert_eq!(transcript.text.segments[0].confirmed, confirmed);
+            }
+        }
     }
     #[test]
     fn cumulative_results_replace_partial_and_preserve_confirmed_text() {

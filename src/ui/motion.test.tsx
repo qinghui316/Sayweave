@@ -10,6 +10,19 @@ import { LoadingIndicator } from './controls';
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); Object.defineProperty(Element.prototype, 'animate', { configurable: true, value: undefined }); });
 function deferred() { let resolve!: () => void; let reject!: () => void; const promise = new Promise<void>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
+
+test('real speech feedback uses recognition labels independently of microphone levels', () => {
+  const actions = { onStart: vi.fn(), onFinish: vi.fn(), onCancel: vi.fn() };
+  const { rerender } = render(<VoiceControl mode="speech" phase="failed" {...actions}/>);
+  expect(screen.getByRole('group', { name: '识别失败' })).toBeVisible();
+  fireEvent.click(screen.getByRole('button', { name: '重新开始录音' }));
+  expect(actions.onStart).toHaveBeenCalledOnce();
+  rerender(<VoiceControl mode="speech" phase="completed" {...actions}/>);
+  expect(screen.getByRole('group', { name: '识别完成' })).toBeVisible();
+  expect(screen.getByRole('status')).toHaveTextContent('识别完成');
+  rerender(<VoiceControl mode="speech" phase="recording" {...actions}/>);
+  expect(screen.getByRole('button', { name: '结束录音' })).toBeVisible();
+});
 test('password repeatedly toggles without losing selection, input node or button focus', () => {
   render(<PasswordInput aria-label="密钥" defaultValue="abcdef"/>);
   const input = screen.getByLabelText('密钥') as HTMLInputElement;

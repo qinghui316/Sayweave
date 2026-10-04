@@ -61,3 +61,8 @@ CPAL 实际设备格式通过有界环形缓冲送给处理线程；回调只下
 有限 280ms 外壳尺寸转换保留既定设计，原生预留画布并延迟收拢，音量使用 transform；不是其他组件动画布局属性的通用许可。减少动态取消循环/回弹，保留明确状态文字，见 [motion.md](motion.md)。
 
 隔离数据、截图、音频、日志和凭据不进 Git。仅 `desktop-acceptance` 加 UUID 环境可注入 localhost 证书，普通构建不能。复现见 [testing.md](testing.md)。供应商语义质量、持续 10 分钟、掉电、所有设备格式/DPI/多屏需单独证据。未实现快捷键、跨应用输入、编辑合并、热词上传、润色/翻译、本地模型和其余 ASR 协议。
+## Terminal recognition responses
+
+Doubao completion is driven by the last-package flag or negative terminal sequence after payload validation. Positive update ordinals are used to reject stale interim responses; a terminal sentinel is handled independently. A valid terminal packet can contain final text or just acknowledge the already received text. The adapter confirms retained segments and emits completion before the business session stores a successful attempt. Malformed packets, supplier errors, timeout, cancellation and connection loss still follow their respective failure paths.
+
+The main and floating voice controls receive an explicit speech/demo presentation mode. Real sessions use recording and recognition status labels, independently of whether a microphone level is available. Decoder diagnostics contain only stage, stable error, frame type, flags and byte count; they exclude credentials and response content.

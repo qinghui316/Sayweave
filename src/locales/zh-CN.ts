@@ -28,7 +28,7 @@ export const zh = {
     trialSentence: '明天下午三点，我们一起讨论新方案。',
     trialHints: { idle: '点击开始，体验输入过程', connecting: '连接演示中', recording: '左侧取消，右侧完成', processing: '正在整理演示文字', completed: '演示完成，未写入其他应用', cancelled: '已取消，可重新开始', failed: '演示失败，保留文字后可重试' },
   },
-  voice: { start: '开始预设演示', cancel: '取消演示', finish: '完成演示', retry: '重试演示', hide: '隐藏悬浮窗', statuses: { idle: '待机', connecting: '连接中', recording: '录音展示', processing: '处理中', completed: '完成', cancelled: '已取消', failed: '演示失败' } },
+  voice: { start: '开始预设演示', cancel: '取消演示', finish: '完成演示', retry: '重试演示', hide: '隐藏悬浮窗', statuses: { idle: '待机', connecting: '连接中', recording: '录音展示', processing: '处理中', completed: '完成', cancelled: '已取消', failed: '演示失败' }, liveStatuses: { idle: '待机', connecting: '连接中', recording: '录音中', processing: '识别中', completed: '识别完成', cancelled: '已取消', failed: '识别失败' }, liveHints: { idle:'点击麦克风开始录音', connecting:'正在连接语音服务', recording:'左侧取消，右侧结束录音', processing:'正在等待最终结果', completed:'识别完成', cancelled:'已取消，可重新开始', failed:'录音可用时，可以重识别' } },
   settings: {
     title: '设置', close: '关闭设置', description: '调整设备、模型和应用偏好。',
     tabs: { device: '设备与快捷键', models: '模型', language: '语言与翻译', appearance: '外观与历史保存', about: '关于' },
