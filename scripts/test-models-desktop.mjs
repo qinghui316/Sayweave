@@ -46,6 +46,7 @@ async function stop(page,graceful=true){
  app=null;await delay(600);
 }
 const invoke=(page,command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
+async function readModels(page){for(let n=0;n<30;n++){try{const status=await invoke(page,'model_status',{retry:false});if(status.state==='preparing'){await delay(100);continue;}expect(status.state).toBe('ready');return await invoke(page,'model_overview');}catch(e){if(n===29||!['busy','preparing'].includes(e?.code))throw e;await delay(100);}}throw Error('Model initialization did not become ready');}
 async function fill(page,name,url,model,keyValue=key){
  const more=page.getByRole('button',{name:'更多设置'});if(await more.count())await more.click();
  await page.getByLabel('名称',{exact:true}).fill(name);
@@ -74,8 +75,7 @@ try{
  await expect(page.getByRole('link',{name:'组件展示'})).toHaveCount(0);
  await expect(page.getByText(/浏览器模拟/)).toHaveCount(0);
  if(regular){
-  const status=await invoke(page,'model_status',{retry:false});expect(status.state).toBe('ready');
-  const overview=await invoke(page,'model_overview');expect(overview.defaults).toHaveLength(2);
+  const overview=await readModels(page);expect(overview.defaults).toHaveLength(2);
   const acceptanceCommand=await page.evaluate(async()=>{try{await window.__TAURI_INTERNALS__.invoke('acceptance_exit');return null;}catch(e){return String(e);}});
   expect(acceptanceCommand).toContain('not found');
   const sizingCommand=await page.evaluate(async()=>{try{await window.__TAURI_INTERNALS__.invoke('acceptance_main_size',{minimum:true});return null;}catch(e){return String(e);}});

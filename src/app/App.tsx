@@ -3,7 +3,7 @@ import { HashRouter, Link, Route, Routes,useNavigate,useLocation } from 'react-r
 import {createSpeechPorts} from '../adapters/speech-tauri';
 import {SpeechStore} from './speech-store';
 import {speechError} from '../contracts/speech';
-import {modelExecutable} from '../contracts/models';
+import {readReadyModel} from './ready-model';
 import {speechMessages} from '../locales/speech';
 import type {Usage} from '../contracts/history';
 import { createRuntime } from '../adapters/tauri';
@@ -71,16 +71,13 @@ function RuntimeApp() {
   },[ports,store,speech.snapshot.saved,speech.snapshot.attemptId,dataRevision,location.pathname]);
   useEffect(()=>{
     if(store.port.surface==='overlay'||settingsOpen)return;
-    let stopped=false;let sequence=0;let timer:ReturnType<typeof setTimeout>|undefined;
+    let stopped=false;let sequence=0;
     async function read(){const token=++sequence;try{
-      const status=await models.status();if(stopped||token!==sequence)return;if(status.state==='preparing'){timer=setTimeout(()=>void read(),100);return;}
-      const [overview,prefs,devices]=await Promise.all([models.overview(),ports.speech.preferences(),ports.speech.devices()]);
-      const model=overview.configs.find(c=>c.id===overview.defaults.find(d=>d.usage==='speech')?.configId);
-      const device=prefs.deviceId?devices.find(d=>d.id===prefs.deviceId):devices.find(d=>d.isDefault);
-      if(!stopped&&token===sequence)setReady({model:model&&modelExecutable(model,'speech')?model.modelId:'',device:device?.name??(prefs.deviceId?'麦克风不可用':'系统默认麦克风')});
+      const value=await readReadyModel(models,ports.speech,()=>!stopped&&token===sequence);
+      if(value&&!stopped&&token===sequence)setReady(value);
     }catch{if(!stopped&&token===sequence)setReady({model:'',device:''});}}
     void read();const focus=()=>{if(!document.hidden)void read();};window.addEventListener('focus',focus);
-    return()=>{stopped=true;clearTimeout(timer);window.removeEventListener('focus',focus);};
+    return()=>{stopped=true;window.removeEventListener('focus',focus);};
   },[ports,store,models,dataRevision,settingsOpen]);
   const startSpeech=()=>{setSpeechFailure('');void ports.speech.start().then(speechStore.accept).catch(e=>setSpeechFailure(speechMessages[speechError(e).code]));};
   const controlSpeech=(action:'finish'|'cancel')=>{const id=speech.snapshot.taskId;if(id)void ports.speech.control(id,action).catch(e=>setSpeechFailure(speechMessages[speechError(e).code]));};
