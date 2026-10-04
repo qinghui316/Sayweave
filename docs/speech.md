@@ -20,7 +20,7 @@
 
 CPAL 实际设备格式通过有界环形缓冲送给处理线程；回调只下混和移交，不执行 SQL、文件、网络或等待。Rubato 转为 16kHz 单声道 PCM16，补偿初始延迟并排空尾部。溢出明确失败。本地 10 分钟保护上限不代表供应商已验证该容量。采集前停止本应用回放，采集期间播放返回忙。
 
-千问等待 `task-started` 后才采集和发送。结束先停止/排空，再发 `finish-task`。连接5秒、准备总预算15秒、结束等待30秒。消息 1MiB、单句 64KiB、累计文本 1MiB、最多 10,000 句段。暂定结果替换、最终冻结去重、心跳不进正文；错误与空文本明确反馈，无自动重传。
+千问等待 `task-started` 后才采集和发送。结束先停止/排空，再发 `finish-task`。连接10秒、准备总预算15秒、结束等待30秒。连接或服务准备超时返回 connectionTimeout；识别中的等待仍返回 timeout。连接和准备日志记录阶段、耗时、协议及稳定错误，不包含地址、密钥或正文。消息 1MiB、单句 64KiB、累计文本 1MiB、最多 10,000 句段。暂定结果替换、最终冻结去重、心跳不进正文；错误与空文本明确反馈，无自动重传。
 
 ## 协议扩展边界
 
@@ -64,5 +64,7 @@ CPAL 实际设备格式通过有界环形缓冲送给处理线程；回调只下
 ## Terminal recognition responses
 
 Doubao completion is driven by the last-package flag or negative terminal sequence after payload validation. Positive update ordinals are used to reject stale interim responses; a terminal sentinel is handled independently. A valid terminal packet can contain final text or just acknowledge the already received text. The adapter confirms retained segments and emits completion before the business session stores a successful attempt. Malformed packets, supplier errors, timeout, cancellation and connection loss still follow their respective failure paths.
+
+Connection diagnostics distinguish DNS, TCP, TLS/WebSocket upgrade and overall service preparation. Transport entries share a generated connection ID and contain only stage, elapsed time and stable outcome. TCP_NODELAY avoids batching small handshake/audio frames. The microphone still starts only after service preparation succeeds; the UI then enters recording. The ten-second transport allowance within the fifteen-second preparation budget is a failure threshold, not expected startup latency. Zero-byte missing audio with zero recorded duration is shown as uncaptured audio; missing recordings that contained samples retain the missing-file label. Unavailable audio has no displayed expiry.
 
 The main and floating voice controls receive an explicit speech/demo presentation mode. Real sessions use recording and recognition status labels, independently of whether a microphone level is available. Decoder diagnostics contain only stage, stable error, frame type, flags and byte count; they exclude credentials and response content.

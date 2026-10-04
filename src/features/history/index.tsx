@@ -8,6 +8,7 @@ import {speechMessages} from '../../locales/speech';
 import s from './history.module.css';
 const statusLabel:Record<string,string>={preparing:'准备中',recording:'录音中',processing:'处理中',success:'识别完成',failed:'识别失败',cancelled:'已取消',interrupted:'意外中断',delete_pending:'等待删除'};
 const audioLabel:Record<string,string>={prepared:'录音未完成',ready:'录音可用',delete_pending:'录音等待清理',expire_pending:'录音到期待清理',expired:'录音已到期',missing:'录音文件缺失',corrupt:'录音损坏'};
+const recordAudioLabel=(r:HistoryRecord)=>r.audio?.status==='missing'&&r.audio.bytes===0&&r.durationMs===0?'没有录下音频':r.audio?audioLabel[r.audio.status]:'未永久保留录音';
 const time=(ms:number)=>new Date(ms).toLocaleString('zh-CN');
 const duration=(ms:number)=>`${Math.floor(ms/60000)}:${String(Math.floor(ms/1000)%60).padStart(2,'0')}`;
 export function History({port,speech,models,snapshot}:{port:HistoryPort;speech:SpeechPort;models:ModelConfigPort;snapshot:SpeechSnapshot}){
@@ -53,7 +54,7 @@ export function History({port,speech,models,snapshot}:{port:HistoryPort;speech:S
   <div className={s.toolbar}><TextInput aria-label="搜索识别文字" placeholder="搜索识别文字" maxLength={256} value={search} onChange={e=>{setSearch(e.target.value);setPage(1);}}/><span>{result.total} 条</span><Button onClick={reload}>刷新</Button></div>
   {error&&<InlineMessage status="error">{error}</InlineMessage>}{notice&&<InlineMessage>{notice}</InlineMessage>}
   {loading?<p role="status">正在读取历史…</p>:error&&!record?<Button onClick={reload}>重试读取</Button>:result.records.length===0?<EmptyState title={search?'没有匹配的记录':'还没有识别记录'} description="在首页完成一次真实口述，开启保存后会出现在这里。"/>:
-  <div className={s.list}>{result.records.map(r=><button className={s.record} key={r.id} onClick={()=>void open(r.id)}><strong>{historyText(r)||'无识别文字'}</strong><span>{time(r.createdAt)} · {duration(r.durationMs)} · {statusLabel[r.status]??r.status}{r.audio?' · '+audioLabel[r.audio.status]:''}</span></button>)}</div>}
+  <div className={s.list}>{result.records.map(r=><button className={s.record} key={r.id} onClick={()=>void open(r.id)}><strong>{historyText(r)||'无识别文字'}</strong><span>{time(r.createdAt)} · {duration(r.durationMs)} · {statusLabel[r.status]??r.status}{r.audio?' · '+recordAudioLabel(r):''}</span></button>)}</div>}
   {result.total>0&&<footer className={s.actions}><span>{result.page} / {Math.ceil(result.total/50)}</span><Button disabled={result.page<=1} onClick={()=>setPage(result.page-1)}>上一页</Button><Button disabled={result.page>=Math.ceil(result.total/50)} onClick={()=>setPage(result.page+1)}>下一页</Button></footer>}
   <Dialog open={record!==null} onOpenChange={open=>{if(!open&&!inFlight.current){setRecord(null);setDeleting(false);setRetryModel(null);setError('');}}} title="识别详情" description="查看原始文字、版本及录音" className={s.dialog}>
    {record&&<div className={s.detail}><h2>识别详情</h2><p>{time(record.createdAt)} · {duration(record.durationMs)}</p>
@@ -62,7 +63,7 @@ export function History({port,speech,models,snapshot}:{port:HistoryPort;speech:S
     <div className={s.text} role="region" aria-label="历史识别文字" tabIndex={0}>{attempt?.text||'此版本没有可用文字。'}</div>
     {attempt?.errorCode&&<InlineMessage status="error">{speechMessages[speechError({code:attempt.errorCode}).code]}</InlineMessage>}
     <CopyFeedbackButton key={attempt?.id} disabled={!attempt?.text} onCopy={()=>speech.copy(attempt?.text??'')}/>
-    <div className={s.player}><h3>录音</h3><p>{record.audio?audioLabel[record.audio.status]:'未永久保留录音'}{record.audio?.expiresAt?' · 到期 '+time(record.audio.expiresAt):''}</p>
+    <div className={s.player}><h3>录音</h3><p>{recordAudioLabel(record)}{record.audio?.status==='ready'&&record.audio.expiresAt?' · 到期 '+time(record.audio.expiresAt):''}</p>
      {record.audio?.status==='ready'&&<><div className={s.actions}><Button disabled={busy||active} onClick={()=>void play(player.resourceId===record.audio?.id?(player.playing?'pause':'resume'):'play')}>{player.resourceId===record.audio.id?(player.playing?'暂停':'继续'):'播放录音'}</Button><Button disabled={player.resourceId!==record.audio.id} onClick={()=>void play('stop')}>停止</Button><span>{duration(player.resourceId===record.audio.id?player.positionMs:0)} / {duration(record.audio.bytes/32)}</span></div><input type="range" aria-label="录音播放位置" min="0" max={record.audio.bytes/32} value={player.resourceId===record.audio.id?Math.min(player.positionMs,record.audio.bytes/32):0} disabled={player.resourceId!==record.audio.id||busy} onChange={e=>void play('seek',Number(e.target.value))}/></>}
     </div>
     {active&&<InlineMessage>正在重识别 · {Math.floor(snapshot.durationMs/1000)} 秒 <Button onClick={()=>void speech.control(snapshot.taskId!,'cancel').catch(e=>setError(speechMessages[speechError(e).code]))}>取消本次重识别</Button></InlineMessage>}

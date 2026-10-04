@@ -3,9 +3,10 @@ import {render,screen,fireEvent,act} from '@testing-library/react';
 import {MemoryRouter} from 'react-router-dom';
 import {DeviceSettings} from '../src/features/settings/DeviceSettings';
 import {History} from '../src/features/history';
-import {initialSpeech,type SpeechPort,type RecordingPreferences} from '../src/contracts/speech';
+import {initialSpeech,parseSpeech,speechError,type SpeechPort,type RecordingPreferences} from '../src/contracts/speech';
 import type {HistoryPort,HistoryRecord,PlaybackState} from '../src/contracts/history';
 import type {ModelConfigPort} from '../src/contracts/models';
+import {speechMessages} from '../src/locales/speech';
 vi.mock('../src/ui',()=>({
  Button:({children,onClick,disabled}:{children:React.ReactNode;onClick?:()=>void;disabled?:boolean})=><button disabled={disabled} onClick={onClick}>{children}</button>,
  Field:({label,children}:{label:string;children:(p:object)=>React.ReactNode})=><label>{label}{children({'aria-label':label})}</label>,
@@ -14,6 +15,25 @@ vi.mock('../src/ui',()=>({
  CopyFeedbackButton:()=>null,EmptyState:()=>null,TextInput:(p:React.InputHTMLAttributes<HTMLInputElement>)=><input {...p}/>
 }));
 function deferred<T>(){let resolve!:(v:T)=>void;const promise=new Promise<T>(r=>resolve=r);return {promise,resolve};}
+it('connection timeout survives snapshot parsing separately from recognition timeout',()=>{
+ const value={...initialSpeech(),phase:'failed',error:'connectionTimeout'};
+ expect(parseSpeech(value).error).toBe('connectionTimeout');
+ expect(speechMessages[speechError({code:value.error}).code]).toBe('连接语音服务超时，请重新开始录音。');
+ expect(parseSpeech({...value,error:'timeout'}).error).toBe('timeout');
+});
+it.each([{bytes:0,durationMs:0,label:'没有录下音频'},{bytes:32000,durationMs:1000,label:'录音文件缺失'}])('distinguishes uncaptured audio from a lost recorded file ($label)',async({bytes,durationMs,label})=>{
+ const record:HistoryRecord={id:'failed',createdAt:1,endedAt:2,durationMs,status:'failed',currentAttempt:'attempt',revision:1,
+  audio:{id:'audio',recordId:'failed',status:'missing',bytes,expiresAt:999999},
+  attempts:[{id:'attempt',recordId:'failed',kind:'live',configId:'c',configName:'model',configRevision:1,modelId:'m',serviceHost:'host',createdAt:1,endedAt:2,status:'failed',text:'',errorCode:bytes?'timeout':'connectionTimeout',elapsedMs:5000}]};
+ const port={mode:'native',status:vi.fn().mockResolvedValue({state:'ready'}),list:vi.fn().mockResolvedValue({records:[record],total:1,page:1,pageSize:50}),detail:vi.fn().mockResolvedValue(record),playback:vi.fn().mockResolvedValue({resourceId:null,playing:false,positionMs:0,durationMs:0})} as unknown as HistoryPort;
+ const speech={preferences:vi.fn().mockResolvedValue({deviceId:null,historyEnabled:true,audioEnabled:true,retentionDays:30,revision:1})} as unknown as SpeechPort;
+ render(<MemoryRouter><History port={port} speech={speech} models={{} as ModelConfigPort} snapshot={initialSpeech()}/></MemoryRouter>);
+ fireEvent.click(await screen.findByRole('button',{name:new RegExp(label)}));
+ expect(await screen.findByText(label,{exact:true})).toBeVisible();
+ expect(screen.queryByText(/到期 /)).not.toBeInTheDocument();
+ expect(screen.getByRole('button',{name:'重新识别'})).toBeDisabled();
+ if(!bytes){expect(screen.queryByText('录音文件缺失',{exact:true})).not.toBeInTheDocument();expect(screen.getByText('连接语音服务超时，请重新开始录音。')).toBeVisible();}
+});
 it('a late device refresh cannot overwrite a committed selection',async()=>{
  const old:RecordingPreferences={deviceId:null,historyEnabled:true,audioEnabled:true,retentionDays:30,revision:1};
  const refresh=deferred<RecordingPreferences>(),save=deferred<RecordingPreferences>();

@@ -2,7 +2,7 @@ use super::{doubao, qwen};
 use crate::{history::types::Error, models::SpeechConfiguration};
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -98,6 +98,7 @@ impl RecognitionSession {
         if !crate::models::types::capabilities(&cfg.input.protocol).is_some_and(|c| c.live_text) {
             return Err(Error::new("unsupported"));
         }
+        let began = Instant::now();
         let prepared = tokio::time::timeout(Duration::from_secs(15), async {
             match cfg.input.protocol.as_str() {
                 "qwen-audio-streaming" => {
@@ -124,7 +125,10 @@ impl RecognitionSession {
             }
         })
         .await
-        .map_err(|_| Error::new("timeout"))??;
+        .unwrap_or_else(|_| Err(Error::new("connectionTimeout")));
+        log::info!(target:"sayweave", "SAYWEAVE_SPEECH operation=recognition_prepare protocol={} elapsed_ms={} result={}",
+            cfg.input.protocol, began.elapsed().as_millis(), prepared.as_ref().map(|_| "ok").unwrap_or_else(|e| e.code.as_str()));
+        let prepared = prepared?;
         Ok(Self::spawn(prepared.0, prepared.1, task.to_owned()))
     }
     fn spawn(socket: super::transport::Socket, mut parser: Parser, task: String) -> Self {
