@@ -274,6 +274,7 @@ enum Proof {
         pattern: Option<IUIAutomationTextPattern>,
         context: Option<(String, String, String)>,
         prefix_start: Option<IUIAutomationTextRange>,
+        at_document_start: bool,
         selection: Option<IUIAutomationTextRange>,
         position: Option<(i32, i32)>,
     },
@@ -329,7 +330,21 @@ fn uia_position(pattern: &IUIAutomationTextPattern) -> Result<(i32, i32), Error>
 type UiaContext = ((String, String, String), IUIAutomationTextRange);
 fn uia_context(pattern: &IUIAutomationTextPattern) -> Result<UiaContext, Error> {
     unsafe {
-        let selected = uia_selection(pattern)?;
+        let selected = match uia_selection(pattern) {
+            Ok(range) => range,
+            Err(error) => {
+                // Some providers expose no selected range until the empty editor contains text.
+                let doc =
+                    probe!(pattern.DocumentRange()).map_err(|_| err("targetReadUnavailable"))?;
+                if !probe!(doc.GetText(1))
+                    .map_err(|_| err("targetReadUnavailable"))?
+                    .is_empty()
+                {
+                    return Err(error);
+                }
+                return Ok(((String::new(), String::new(), String::new()), doc));
+            }
+        };
         let prefix = probe!(selected.Clone()).map_err(|_| err("targetReadUnavailable"))?;
         probe!(prefix.MoveEndpointByRange(
             TextPatternRangeEndpoint_End,
@@ -500,6 +515,18 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
             let readback = pattern.as_ref().and_then(|p| uia_context(p).ok());
             let context = readback.as_ref().map(|(text, _)| text.clone());
             let prefix_start = readback.map(|(_, range)| range);
+            let at_document_start = match (&pattern, &prefix_start) {
+                (Some(pattern), Some(start)) => pattern.DocumentRange().ok().is_some_and(|doc| {
+                    start
+                        .CompareEndpoints(
+                            TextPatternRangeEndpoint_Start,
+                            &doc,
+                            TextPatternRangeEndpoint_Start,
+                        )
+                        .is_ok_and(|offset| offset == 0)
+                }),
+                _ => false,
+            };
             let selection = pattern.as_ref().and_then(|p| uia_selection(p).ok());
             let position = pattern.as_ref().and_then(|p| uia_position(p).ok());
             if context.is_none() && selection.is_none() && !crate::input_state::tracking_ready() {
@@ -510,6 +537,7 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
                 pattern,
                 context,
                 prefix_start,
+                at_document_start,
                 selection,
                 position,
             }
@@ -701,6 +729,7 @@ fn verified(t: &Target, text: &str) -> Result<bool, Error> {
             pattern: Some(pattern),
             context: Some((prefix, _, suffix)),
             prefix_start: Some(prefix_start),
+            at_document_start,
             ..
         } => unsafe {
             let (_, selected, after) = uia_parts(pattern)?;
@@ -720,9 +749,15 @@ fn verified(t: &Target, text: &str) -> Result<bool, Error> {
             }
             // Preserve the provider's range boundary; Character units are not UTF-16 offsets.
             let inserted = probe!(caret.Clone()).map_err(|_| err("targetReadUnavailable"))?;
+            let boundary = if *at_document_start {
+                // An empty provider may replace its old live range when the first text is inserted.
+                probe!(pattern.DocumentRange()).map_err(|_| err("targetReadUnavailable"))?
+            } else {
+                prefix_start.clone()
+            };
             probe!(inserted.MoveEndpointByRange(
                 TextPatternRangeEndpoint_Start,
-                prefix_start,
+                &boundary,
                 TextPatternRangeEndpoint_Start
             ))
             .map_err(|_| err("targetReadUnavailable"))?;
