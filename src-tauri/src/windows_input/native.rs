@@ -29,32 +29,122 @@ fn hwnd(value: usize) -> HWND {
     HWND(value as *mut _)
 }
 static CHANGES: AtomicU64 = AtomicU64::new(0);
-static WATCH: Mutex<Option<(usize, usize, u32)>> = Mutex::new(None);
+static CAPTURE_ID: AtomicU64 = AtomicU64::new(0);
+struct TargetWatch {
+    anchor: Anchor,
+    task: Option<String>,
+    overlay: Option<crate::voice_window::TaskWindow>,
+}
+static WATCH: Mutex<Option<TargetWatch>> = Mutex::new(None);
 pub(super) fn start_anchor() -> Result<Anchor, Error> {
-    let a = anchor()?;
+    let mut a = anchor()?;
+    a.capture_id = CAPTURE_ID.fetch_add(1, Ordering::AcqRel) + 1;
     if let Ok(mut watch) = WATCH.lock() {
-        *watch = Some((a.window, a.focus, a.captured_tick));
+        // A second toggle/queued key must not replace the active task's event evidence.
+        if !watch.as_ref().is_some_and(|w| w.task.is_some()) {
+            *watch = Some(TargetWatch {
+                anchor: a.clone(),
+                task: None,
+                overlay: None,
+            });
+        }
     }
     Ok(a)
 }
-fn event_invalidates(event: u32, window: usize, top: usize, focus: usize) -> bool {
-    event == EVENT_OBJECT_DESTROY && (window == top || window == focus)
-        || event == EVENT_SYSTEM_FOREGROUND && window != top
-        || event == EVENT_OBJECT_FOCUS
-            && window != focus
-            && unsafe { GetAncestor(hwnd(window), GA_ROOT) == hwnd(top) }
-        || [EVENT_OBJECT_VALUECHANGE, EVENT_OBJECT_TEXTSELECTIONCHANGED].contains(&event)
-            && (window == focus || window == top)
-}
-pub(super) fn observe(event: u32, window: usize, _object: i32, event_tick: u32) {
-    if let Ok(watch) = WATCH.lock()
-        && let Some((top, focus, captured_tick)) = *watch
-        && event_after_capture(event_tick, captured_tick)
+pub(super) fn bind_watch(
+    id: &str,
+    anchor: &Anchor,
+    overlay: Option<crate::voice_window::TaskWindow>,
+) -> Result<(), Error> {
+    let mut guard = WATCH.lock().map_err(|_| err("targetProbeFailed"))?;
+    let watch = guard.as_mut().ok_or_else(|| err("targetChanged"))?;
+    if watch.anchor.capture_id != anchor.capture_id
+        || watch.task.as_deref().is_some_and(|t| t != id)
     {
-        // Caret geometry can change without an edit. Selection/range proof owns text position.
-        if event_invalidates(event, window, top, focus) {
+        return Err(err("targetChanged"));
+    }
+    if watch.task.is_none() {
+        watch.task = Some(id.into());
+        watch.overlay = overlay;
+    }
+    Ok(())
+}
+pub(super) fn release_watch(id: &str) {
+    if let Ok(mut watch) = WATCH.lock()
+        && watch
+            .as_ref()
+            .is_some_and(|w| w.task.as_deref() == Some(id))
+    {
+        *watch = None;
+    }
+}
+#[derive(Debug, PartialEq, Eq)]
+enum EventDecision {
+    Unrelated,
+    Original,
+    OwnOverlay,
+    Changed(&'static str),
+}
+struct EventEvidence {
+    window: usize,
+    root: usize,
+    foreground: usize,
+    own_event: bool,
+    own_foreground: bool,
+}
+fn event_decision(event: u32, top: usize, focus: usize, e: &EventEvidence) -> EventDecision {
+    if event == EVENT_SYSTEM_FOREGROUND {
+        if e.window != top && !e.own_event {
+            return EventDecision::Changed("externalForeground");
+        }
+        if e.foreground != top && !e.own_foreground {
+            return EventDecision::Changed("currentForeground");
+        }
+        return if e.own_event {
+            EventDecision::OwnOverlay
+        } else {
+            EventDecision::Original
+        };
+    }
+    if event == EVENT_OBJECT_DESTROY && (e.window == top || e.window == focus) {
+        return EventDecision::Changed("targetDestroyed");
+    }
+    if event == EVENT_OBJECT_FOCUS && e.window != focus && e.root == top {
+        return EventDecision::Changed("controlFocus");
+    }
+    if [EVENT_OBJECT_VALUECHANGE, EVENT_OBJECT_TEXTSELECTIONCHANGED].contains(&event)
+        && (e.window == focus || e.window == top)
+    {
+        return EventDecision::Changed("textOrSelection");
+    }
+    EventDecision::Unrelated
+}
+pub(super) fn observe(event: u32, window: usize, object: i32, event_tick: u32) {
+    if let Ok(watch) = WATCH.lock()
+        && let Some(watch) = watch.as_ref()
+        && event_after_capture(event_tick, watch.anchor.captured_tick)
+    {
+        let received_tick = unsafe { GetTickCount() };
+        let foreground = unsafe { GetForegroundWindow().0 as usize };
+        let evidence = EventEvidence {
+            window,
+            root: unsafe { GetAncestor(hwnd(window), GA_ROOT).0 as usize },
+            foreground,
+            own_event: watch
+                .overlay
+                .as_ref()
+                .is_some_and(|o| crate::voice_window::contains(o, window, event_tick)),
+            own_foreground: watch
+                .overlay
+                .as_ref()
+                .is_some_and(|o| crate::voice_window::contains(o, foreground, received_tick)),
+        };
+        let decision = event_decision(event, watch.anchor.window, watch.anchor.focus, &evidence);
+        if matches!(decision, EventDecision::Changed(_)) {
             CHANGES.fetch_add(1, Ordering::AcqRel);
-            log::info!(target:"sayweave", "operation=input_target_event event={event}");
+        }
+        if decision != EventDecision::Unrelated {
+            log::info!(target:"sayweave", "operation=input_target_event task_id={} event={event} object={object} event_tick={event_tick} received_tick={received_tick} own_overlay={} foreground_original={} foreground_overlay={} decision={decision:?} generation={}",watch.task.as_deref().unwrap_or("pending"),evidence.own_event,foreground==watch.anchor.window,evidence.own_foreground,CHANGES.load(Ordering::Acquire));
         }
     }
 }
@@ -63,16 +153,61 @@ mod event_tests {
     use super::*;
     #[test]
     fn caret_geometry_is_advisory_but_text_and_selection_invalidate() {
-        assert!(!event_invalidates(EVENT_OBJECT_LOCATIONCHANGE, 12, 10, 12));
-        assert!(event_invalidates(
+        let e = EventEvidence {
+            window: 12,
+            root: 10,
+            foreground: 10,
+            own_event: false,
+            own_foreground: false,
+        };
+        assert_eq!(
+            event_decision(EVENT_OBJECT_LOCATIONCHANGE, 10, 12, &e),
+            EventDecision::Unrelated
+        );
+        for event in [
             EVENT_OBJECT_TEXTSELECTIONCHANGED,
-            12,
-            10,
-            12
-        ));
-        assert!(event_invalidates(EVENT_OBJECT_VALUECHANGE, 12, 10, 12));
-        assert!(event_invalidates(EVENT_OBJECT_DESTROY, 12, 10, 12));
-        assert!(event_invalidates(EVENT_SYSTEM_FOREGROUND, 14, 10, 12));
+            EVENT_OBJECT_VALUECHANGE,
+            EVENT_OBJECT_DESTROY,
+        ] {
+            assert!(matches!(
+                event_decision(event, 10, 12, &e),
+                EventDecision::Changed(_)
+            ));
+        }
+    }
+    #[test]
+    fn only_task_overlay_is_advisory_and_external_switches_remain_sticky() {
+        let mut e = EventEvidence {
+            window: 14,
+            root: 14,
+            foreground: 10,
+            own_event: true,
+            own_foreground: false,
+        };
+        assert_eq!(
+            event_decision(EVENT_SYSTEM_FOREGROUND, 10, 12, &e),
+            EventDecision::OwnOverlay
+        );
+        e.foreground = 14;
+        e.own_foreground = true;
+        assert_eq!(
+            event_decision(EVENT_SYSTEM_FOREGROUND, 10, 12, &e),
+            EventDecision::OwnOverlay
+        );
+        e.foreground = 15;
+        e.own_foreground = false;
+        assert_eq!(
+            event_decision(EVENT_SYSTEM_FOREGROUND, 10, 12, &e),
+            EventDecision::Changed("currentForeground")
+        );
+        e.foreground = 10;
+        e.own_event = false;
+        // Another application, main window, old lease or unknown window remains a change even
+        // when the asynchronously delivered event arrives after the original regained foreground.
+        assert_eq!(
+            event_decision(EVENT_SYSTEM_FOREGROUND, 10, 12, &e),
+            EventDecision::Changed("externalForeground")
+        );
     }
 }
 fn lifetime(pid: u32) -> Result<u64, Error> {
@@ -109,6 +244,7 @@ pub(super) fn anchor() -> Result<Anchor, Error> {
         };
         GetGUIThreadInfo(tid, &mut gui).map_err(|_| err("targetProbeFailed"))?;
         Ok(Anchor {
+            capture_id: 0,
             window: window.0 as usize,
             focus: gui.hwndFocus.0 as usize,
             process,
@@ -127,7 +263,8 @@ fn same(a: &Anchor) -> bool {
             && now.lifetime == a.lifetime
             && now.generation == a.generation;
         if !unchanged {
-            log::info!(target:"sayweave", "operation=input_target_identity window_same={} focus_same={} process_same={} lifetime_same={} generation_same={}", now.window == a.window, now.focus == a.focus, now.process == a.process, now.lifetime == a.lifetime, now.generation == a.generation);
+            let task = WATCH.lock().ok().and_then(|w| w.as_ref().filter(|w| w.anchor.capture_id == a.capture_id).and_then(|w| w.task.clone())).unwrap_or_else(|| "pending".into());
+            log::info!(target:"sayweave", "operation=input_target_identity task_id={task} window_same={} focus_same={} process_same={} lifetime_same={} generation_same={}", now.window == a.window, now.focus == a.focus, now.process == a.process, now.lifetime == a.lifetime, now.generation == a.generation);
         }
         unchanged
     })
@@ -1472,7 +1609,7 @@ pub(super) fn worker(
             Request::Capture(id, anchor, response) => {
                 deadline(500);
                 let at = Instant::now();
-                let result = capture(anchor, &automation).and_then(|t| {
+                let result = bind_watch(&id, &anchor, None).and_then(|()|capture(anchor, &automation)).and_then(|t| {
                     if at.elapsed() > Duration::from_millis(500) {
                         Err(err("targetTimeout"))
                     } else {
@@ -1487,6 +1624,7 @@ pub(super) fn worker(
                     }
                 });
                 if let Err(e) = &result {
+                    release_watch(&id);
                     log::info!(target:"sayweave", "operation=input_capture task_id={} stage=capture error={} elapsed_ms={}", id, e.code, at.elapsed().as_millis());
                 }
                 let _ = response.send(result);
@@ -1508,6 +1646,7 @@ pub(super) fn worker(
                     })
                     .unwrap_or_else(|| Delivery::not_submitted("targetUnavailable"));
                 log::info!(target:"sayweave", "operation=input_delivery task_id={} stage={} submission={:?} verification={:?} submitted_events={} restore_error={} error={} elapsed_ms={}", id, result.stage, result.submission, result.verification, result.submitted_events, result.restore_error, result.error.as_deref().unwrap_or("none"), result.elapsed_ms);
+                release_watch(&id);
                 let _ = response.send(result);
             }
             Request::Copy(text, gate, response) => {
@@ -1520,6 +1659,7 @@ pub(super) fn worker(
                 let _ = response.send(result);
             }
             Request::Forget(id) => {
+                release_watch(&id);
                 if let Some(t) = targets.remove(&id) {
                     unwatch(&t, &automation);
                 }
@@ -1538,6 +1678,9 @@ pub(super) fn worker(
     busy.store(false, Ordering::Release);
     for t in targets.values() {
         unwatch(t, &automation);
+    }
+    if let Ok(mut watch) = WATCH.lock() {
+        *watch = None;
     }
     drop(targets);
     drop(automation);

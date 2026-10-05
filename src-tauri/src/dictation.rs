@@ -83,7 +83,7 @@ impl DictationCoordinator {
         record: String,
         task: String,
     ) -> Result<SpeechSnapshot, Error> {
-        let mut reserved = self.reserve(&app, "history", 0, None)?;
+        let mut reserved = self.reserve(&app, "history", 0, None, None)?;
         reserved.expected_task = Some(task);
         self.start_reserved(app, "history", None, Some(record), None, reserved)
             .await
@@ -209,7 +209,8 @@ impl DictationCoordinator {
         if !pressed {
             return;
         }
-        let Ok(reserved) = self.reserve(app, "external", epoch, Some(&task)) else {
+        let Ok(reserved) = self.reserve(app, "external", epoch, Some(&task), anchor.as_ref())
+        else {
             return;
         };
         let app = app.clone();
@@ -229,7 +230,7 @@ impl DictationCoordinator {
         retry: Option<String>,
         expected: Option<(String, i64)>,
     ) -> Result<SpeechSnapshot, Error> {
-        let reserved = self.reserve(&app, source, epoch, None)?;
+        let reserved = self.reserve(&app, source, epoch, None, anchor.as_ref())?;
         self.start_reserved(app, source, anchor, retry, expected, reserved)
             .await
     }
@@ -247,6 +248,7 @@ impl DictationCoordinator {
         source: &str,
         epoch: u64,
         event: Option<&TaskStamp>,
+        anchor: Option<&Anchor>,
     ) -> Result<Reservation, Error> {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, _) = watch::channel(0u8);
@@ -288,6 +290,13 @@ impl DictationCoordinator {
             presentation: Presentation::Preparing,
             ..Snapshot::default()
         };
+        if source == "external" {
+            let overlay = crate::voice_window::bind(&id);
+            if let Some(anchor) = anchor {
+                app.state::<WindowsInputService>()
+                    .bind_target(&id, anchor, overlay);
+            }
+        }
         self.update(app, &id, |_| {});
         if source == "external" {
             // Keydown owns the view before model, credential or provider preparation begins.
@@ -513,6 +522,7 @@ impl DictationCoordinator {
             a.clone()
         };
         app.state::<ShortcutService>().settle(app).await;
+        crate::voice_window::release(id);
         {
             let Ok(mut a) = self.active.lock() else {
                 return;

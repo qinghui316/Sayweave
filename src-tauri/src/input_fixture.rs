@@ -7,7 +7,7 @@ use std::{
 use windows::{
     Win32::{
         Foundation::*,
-        UI::{Input::KeyboardAndMouse::SetFocus, WindowsAndMessaging::*},
+        UI::{Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
     },
     core::{BOOL, w},
 };
@@ -59,6 +59,7 @@ unsafe fn focus_window(window: HWND) {
 struct ProcessWindow {
     process: u32,
     window: HWND,
+    overlay: bool,
 }
 unsafe extern "system" fn process_window(window: HWND, parameter: LPARAM) -> BOOL {
     unsafe {
@@ -68,6 +69,8 @@ unsafe extern "system" fn process_window(window: HWND, parameter: LPARAM) -> BOO
         if process == target.process
             && IsWindowVisible(window).as_bool()
             && GetWindow(window, GW_OWNER).unwrap_or_default().0.is_null()
+            && (!target.overlay
+                || GetWindowLongPtrW(window, GWL_EXSTYLE) as u32 & WS_EX_NOACTIVATE.0 != 0)
         {
             target.window = window;
             return BOOL(0);
@@ -80,6 +83,10 @@ fn main() {
         return;
     }
     unsafe {
+        use windows::Win32::UI::HiDpi::{
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+        };
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let class = WNDCLASSW {
             lpfnWndProc: Some(fixture_proc),
             lpszClassName: w!("SayweaveInputFixture"),
@@ -169,6 +176,14 @@ fn main() {
                 if value["action"] == "readonly" {
                     let _ = message(editor, 0x00CF, WPARAM(1), LPARAM(0));
                 }
+                if value["action"] == "selection" {
+                    let _ = message(
+                        editor,
+                        0x00B1,
+                        WPARAM(value["start"].as_u64().unwrap_or(0) as usize),
+                        LPARAM(value["end"].as_i64().unwrap_or(0) as isize),
+                    );
+                }
                 if value["action"] == "delayClipboard" {
                     use windows::Win32::System::DataExchange::*;
                     if OpenClipboard(Some(top)).is_ok() {
@@ -195,11 +210,64 @@ fn main() {
                     let mut target = ProcessWindow {
                         process,
                         window: HWND::default(),
+                        overlay: false,
                     };
                     let _ =
                         EnumWindows(Some(process_window), LPARAM(&mut target as *mut _ as isize));
                     if !target.window.0.is_null() {
                         focus_window(target.window);
+                    }
+                }
+                let mut clicked = None;
+                let mut click_check = None;
+                let mut overlay_window = None;
+                if value["action"] == "inspect-overlay" {
+                    let mut target = ProcessWindow {
+                        process: value["process"].as_u64().unwrap_or(0) as u32,
+                        window: HWND::default(),
+                        overlay: true,
+                    };
+                    let _ =
+                        EnumWindows(Some(process_window), LPARAM(&mut target as *mut _ as isize));
+                    if !target.window.0.is_null() {
+                        overlay_window = Some(target.window.0 as usize);
+                    }
+                }
+                if value["action"] == "click-window" {
+                    let window = HWND(value["window"].as_u64().unwrap_or(0) as usize as *mut _);
+                    let mut process = 0;
+                    GetWindowThreadProcessId(window, Some(&mut process));
+                    if process == value["process"].as_u64().unwrap_or(0) as u32
+                        && IsWindow(Some(window)).as_bool()
+                    {
+                        let mut point = POINT {
+                            x: value["x"].as_i64().unwrap_or(0) as i32,
+                            y: value["y"].as_i64().unwrap_or(0) as i32,
+                        };
+                        use windows::Win32::Graphics::Gdi::ClientToScreen;
+                        let converted = ClientToScreen(window, &mut point).as_bool();
+                        let mut client = RECT::default();
+                        let _ = GetClientRect(window, &mut client);
+                        click_check = Some(
+                            serde_json::json!({"converted":converted,"width":client.right,"height":client.bottom,"pointRootMatches":GetAncestor(WindowFromPoint(point), GA_ROOT) == window,"x":point.x,"y":point.y}),
+                        );
+                        if converted && GetAncestor(WindowFromPoint(point), GA_ROOT) == window {
+                            let mut old = POINT::default();
+                            let _ = GetCursorPos(&mut old);
+                            let _ = SetCursorPos(point.x, point.y);
+                            let events =
+                                [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP].map(|flags| INPUT {
+                                    r#type: INPUT_MOUSE,
+                                    Anonymous: INPUT_0 {
+                                        mi: MOUSEINPUT {
+                                            dwFlags: flags,
+                                            ..Default::default()
+                                        },
+                                    },
+                                });
+                            clicked = Some(SendInput(&events, std::mem::size_of::<INPUT>() as i32));
+                            let _ = SetCursorPos(old.x, old.y);
+                        }
                     }
                 }
                 let mut foreground_process = 0;
@@ -209,7 +277,7 @@ fn main() {
                 let selection = message(editor, 0x00B0, WPARAM(0), LPARAM(0)).0 as usize;
                 println!(
                     "{}",
-                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535})
+                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window})
                 );
                 io::stdout().flush().unwrap();
                 let _ = ok.send(());

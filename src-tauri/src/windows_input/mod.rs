@@ -60,6 +60,7 @@ impl Delivery {
 }
 #[derive(Clone, Debug)]
 pub struct Anchor {
+    pub capture_id: u64,
     pub window: usize,
     pub focus: usize,
     pub process: u32,
@@ -199,6 +200,19 @@ impl WindowsInputService {
             None
         }
     }
+    pub(crate) fn bind_target(
+        &self,
+        id: &str,
+        anchor: &Anchor,
+        overlay: Option<crate::voice_window::TaskWindow>,
+    ) {
+        #[cfg(windows)]
+        if let Err(error) = native::bind_watch(id, anchor, overlay) {
+            log::info!(target: "sayweave", "operation=input_binding task_id={id} error={}", error.code);
+        }
+        #[cfg(not(windows))]
+        let _ = (id, anchor, overlay);
+    }
     fn send(&self, request: Request) -> Result<(), Error> {
         let _guard = self
             .admission
@@ -255,6 +269,8 @@ impl WindowsInputService {
         rx.await.map_err(|_| Error::new("copyFailed"))?
     }
     pub fn forget(&self, id: String) {
+        #[cfg(windows)]
+        native::release_watch(&id);
         let _ = self.send(Request::Forget(id));
     }
     pub async fn restore(&self) -> Result<(), Error> {

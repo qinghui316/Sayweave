@@ -57,6 +57,8 @@ const rejected=(page,command,args={})=>page.evaluate(async({command,args})=>{try
 async function start(round){
  if(await fetch('http://127.0.0.1:'+port+'/json/version').then(()=>true).catch(()=>false))throw Error('Test port occupied');
  app=spawn(exe,[],{cwd:root,windowsHide:true,env:{...process.env,SAYWEAVE_DATA_ACCEPTANCE_ID:id,WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:'--remote-debugging-port='+port+' --remote-debugging-address=127.0.0.1'},stdio:['ignore','pipe','pipe']});app.stdout.pipe(createWriteStream(path.join(directory,`round-${round}.log`)));app.stderr.pipe(createWriteStream(path.join(directory,`round-${round}-errors.log`)));
+ report.processBindings??=[];report.processBindings.push({round,pid:app.pid,exe,sha256:createHash('sha256').update(readFileSync(exe)).digest('hex'),data,logSource:'launched-process-stderr'});
+ let diagnostic='';app.stderr.on('data',chunk=>{diagnostic+=chunk.toString('utf8');let at;while((at=diagnostic.indexOf('\n'))>=0){const line=diagnostic.slice(0,at);diagnostic=diagnostic.slice(at+1);if(/operation=(input_target_event|input_target_identity|input_capture|input_delivery|input_binding|voice_window|dictation_phase)\b/.test(line)){report.taskTrace??=[];report.taskTrace.push({round,line});}}});
  let endpoint;for(let n=0;n<200;n++){if(app.exitCode!==null)throw Error('Application exited early');endpoint=await fetch('http://127.0.0.1:'+port+'/json/version').then(r=>r.json()).catch(()=>null);if(endpoint)break;await delay(100);}if(!endpoint)throw Error('WebView unavailable');browser=await chromium.connectOverCDP(endpoint.webSocketDebuggerUrl);
  let page;for(let n=0;n<100;n++){page=browser.contexts().flatMap(c=>c.pages()).find(p=>p.url().includes('tauri')&&!p.url().includes('surface=overlay'));if(page)break;await delay(100);}if(!page)throw Error('Main page missing');await page.waitForFunction(()=>window.__TAURI_INTERNALS__?.invoke);for(let n=0;n<50;n++){const status=await invoke(page,'history_status',{retry:false});if(status.state==='ready')break;await delay(100);}await overlayPage();return page;
 }
@@ -76,8 +78,15 @@ async function ownedEditor(){
  const next=()=>queue.length?Promise.resolve(queue.shift()):Promise.race([new Promise(resolve=>waiting.push(resolve)),delay(3000).then(()=>{throw Error('Owned editor response timeout');})]);
  await next();return {command:async value=>{child.stdin.write(JSON.stringify(value)+'\n');const result=await next();if(['focus','focus-process'].includes(value.action))await delay(80);return result;},close:async()=>{if(child.exitCode===null){child.stdin.write('{"action":"exit"}\n');for(let n=0;n<20&&child.exitCode===null;n++)await delay(50);if(child.exitCode===null)child.kill();}}};
 }
-async function externalRound(page,finish){
- const start=await invoke(page,'dictation_start');await waitPhase(page,'recording');for(const command of ['dictation_control','speech_control'])expect((await rejected(page,command,{taskId:'stale-task',action:'cancel'})).code).toBe('staleSession');await finish(start);await invoke(page,'dictation_control',{taskId:start.taskId,action:'finish'});if(mode==='delayed-final'){expect((await invoke(page,'dictation_snapshot')).presentation).toBe('recognizing');const view=await overlayPage();await expect(view.getByText('识别中',{exact:true})).toBeVisible();await expect(view.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);}await waitPhase(page,'completed');await expect.poll(async()=>{const result=await invoke(page,'dictation_snapshot');return result.taskId===start.taskId&&result.stage==='result'&&result.delivery!==null&&!['preparing','recording','recognizing','delivering'].includes(result.presentation);},{timeout:5000}).toBe(true);return {speech:await invoke(page,'speech_snapshot'),dictation:await invoke(page,'dictation_snapshot')};
+async function nativeOverlayClick(view,editor,name){
+ const owned=await editor.command({action:'inspect-overlay',process:app.pid});expect(owned.overlayWindow).toBeGreaterThan(0);
+ const box=await view.getByRole('button',{name,exact:true}).boundingBox();expect(box).not.toBeNull();
+ const scale=await view.evaluate(()=>devicePixelRatio);
+ const click=await editor.command({action:'click-window',process:app.pid,window:owned.overlayWindow,x:Math.round((box.x+box.width/2)*scale),y:Math.round((box.y+box.height/2)*scale)});
+ expect(click.clickCheck.pointRootMatches).toBe(true);expect(click.clicked).toBe(2);return click;
+}
+async function externalRound(page,finish,end){
+ const start=await invoke(page,'dictation_start');await waitPhase(page,'recording');for(const command of ['dictation_control','speech_control'])expect((await rejected(page,command,{taskId:'stale-task',action:'cancel'})).code).toBe('staleSession');await finish(start);if(end)await end(start);else await invoke(page,'dictation_control',{taskId:start.taskId,action:'finish'});if(mode==='delayed-final'){await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).presentation,{timeout:3000}).toBe('recognizing');const view=await overlayPage();await expect(view.getByText('识别中',{exact:true})).toBeVisible();await expect(view.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);}await waitPhase(page,'completed');await expect.poll(async()=>{const result=await invoke(page,'dictation_snapshot');return result.taskId===start.taskId&&result.stage==='result'&&result.delivery!==null&&!['preparing','recording','recognizing','delivering'].includes(result.presentation);},{timeout:5000}).toBe(true);return {speech:await invoke(page,'speech_snapshot'),dictation:await invoke(page,'dictation_snapshot')};
 }
 async function waitPhase(page,phase){
  let timeout=15000;
@@ -164,23 +173,54 @@ try{
  const editor=await ownedEditor();try{
   expect((await editor.command({action:'focus',text:'before tail',start:7,end:11})).foreground).toBe(true);
   await invoke(page,'runtime_window',{surface:'overlay',action:'show'});mode='delayed-final';
-  const result=await externalRound(page,async()=>{const before=await editor.command({action:'read'});expect(before.foreground).toBe(true);await invoke(page,'shortcut_capture',{begin:false});await invoke(page,'shortcut_capture',{begin:false});await delay(180);const after=await editor.command({action:'read'});report.externalFocus={beforeProcess:before.foregroundProcess,afterProcess:after.foregroundProcess,applicationProcess:app.pid};expect(after.foreground).toBe(true);});
+  const result=await externalRound(page,async()=>{const before=await editor.command({action:'read'});expect(before.foreground).toBe(true);await invoke(page,'shortcut_capture',{begin:false});await invoke(page,'shortcut_capture',{begin:false});await delay(180);const after=await editor.command({action:'read'});report.externalFocus={beforeProcess:before.foregroundProcess,afterProcess:after.foregroundProcess,applicationProcess:app.pid};expect(after.foreground).toBe(true);},async()=>{report.nativeEndClick=await nativeOverlayClick(overlay,editor,'结束录音');});
   report.externalEdit=result.dictation.delivery;expect(result.dictation.delivery.state).toBe('confirmed');expect((await rejected(page,'dictation_copy',{taskId:'stale-task',presentationId:randomUUID()})).code).toBe('staleSession');expect((await editor.command({action:'read'})).text).toBe('before 原生受控识别完成。');
   expect(result.dictation.presentation).toBe('completed');await expect(overlay.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);await expect.poll(async()=>(await invoke(page,'runtime_snapshot')).windows.overlay,{timeout:2500}).toBe(false);expect((await invoke(page,'dictation_snapshot')).presentation).toBe('idle');mode='normal';
   expect((await rejected(page,'speech_retry_current',{taskId:'stale-displayed-task'})).code).toBe('staleSession');
   expect((await invoke(page,'history_delivery',{id:result.speech.recordId}))[0].state).toBe('confirmed');
   expect((await editor.command({action:'read'})).foreground).toBe(true);
+  report.overlayInsertion=[];
+  mode='unicode';
+  for(const sample of [{before:'前面尾部',start:2,end:4},{before:'',start:0,end:0},{before:'a😀b',start:1,end:3}]){
+   await editor.command({action:'focus',text:sample.before,start:sample.start,end:sample.end});
+   const result=await externalRound(page,async()=>delay(180),async()=>nativeOverlayClick(overlay,editor,'结束录音'));
+   const actual=await editor.command({action:'read'});
+   expect(actual.text.replace(/\r\n/g,'\n')).toBe(sample.before.slice(0,sample.start)+'中文，🙂\n第二行 e\u0301。'+sample.before.slice(sample.end));
+   expect(actual.foreground).toBe(true);expect(result.dictation.delivery.state).toBe('confirmed');
+   await expect.poll(async()=>(await invoke(page,'runtime_snapshot')).windows.overlay,{timeout:2500}).toBe(false);
+   report.overlayInsertion.push({taskId:result.dictation.taskId,beforeLength:sample.before.length,actualWrite:true,delivery:result.dictation.delivery});
+  }
+  mode='normal';
+  const other=await ownedEditor();
+  try{
+   await editor.command({action:'focus',text:'protected',start:9,end:9});
+   const away=await externalRound(page,async()=>{expect((await other.command({action:'focus'})).foreground).toBe(true);expect((await editor.command({action:'focus'})).foreground).toBe(true);});
+   expect(away.dictation.delivery).toMatchObject({submission:'notSubmitted',error:'targetChanged',submittedEvents:0});
+   expect((await editor.command({action:'read'})).text).toBe('protected');
+   await invoke(page,'dictation_dismiss',{taskId:away.dictation.taskId,presentationId:away.dictation.presentationId});
+   report.externalSwitchBack=away.dictation.delivery;
+  }finally{await other.close();}
+  await editor.command({action:'focus',text:'protected',start:9,end:9});
+  const mainSwitch=await externalRound(page,async()=>{await invoke(page,'runtime_window',{surface:'main',action:'show'});await delay(100);expect((await editor.command({action:'read'})).foregroundProcess).toBe(app.pid);expect((await editor.command({action:'focus'})).foreground).toBe(true);});
+  expect(mainSwitch.dictation.delivery).toMatchObject({submission:'notSubmitted',error:'targetChanged',submittedEvents:0});
+  expect((await editor.command({action:'read'})).text).toBe('protected');
+  await invoke(page,'dictation_dismiss',{taskId:mainSwitch.dictation.taskId,presentationId:mainSwitch.dictation.presentationId});report.mainSwitchBack=mainSwitch.dictation.delivery;
+  await editor.command({action:'focus',text:'protected',start:9,end:9});
+  const caret=await externalRound(page,async()=>{await editor.command({action:'selection',start:0,end:0});});
+  expect(caret.dictation.delivery).toMatchObject({submission:'notSubmitted',error:'targetChanged',submittedEvents:0});
+  expect((await editor.command({action:'read'})).text).toBe('protected');
+  await invoke(page,'dictation_dismiss',{taskId:caret.dictation.taskId,presentationId:caret.dictation.presentationId});report.caretChange=caret.dictation.delivery;
   expect((await editor.command({action:'focus',text:'initial',start:7,end:7})).foreground).toBe(true);
   const changed=await externalRound(page,async()=>{await editor.command({action:'focus',text:'user changed',start:0,end:0});});
   expect(changed.dictation.delivery.state).toBe('copy');expect(changed.dictation.presentation).toBe('result');await expect(overlay.getByRole('button',{name:'复制',exact:true})).toBeVisible();await invoke(page,'dictation_dismiss',{taskId:changed.dictation.taskId,presentationId:changed.dictation.presentationId});expect((await editor.command({action:'read'})).text).toBe('user changed');
-  report.checks.push('external native editor replacement confirmed; overlay show/resize/control keeps external foreground; duplicate capture(false) preserves task; changed target provides Copy and Close without writing; delayed provider tail waits and naturally hides previously shown overlay; journal and overlay permissions verified');
+  report.checks.push('real Win32 mouse end click inserts native selection and Unicode/multiline/emoji, foreground retained; external/main switches remain refused after switching back; changed target provides Copy and Close; delayed provider tail waits and overlay naturally hides; journal and overlay permissions verified');
  }finally{await editor.close();}
  const targetBrowser=await chromium.launch({headless:false,args:['--force-renderer-accessibility']});
  const focusHelper=await ownedEditor();
  try{const session=await targetBrowser.newBrowserCDPSession();const process=(await session.send('SystemInfo.getProcessInfo')).processInfo.find(p=>p.type==='browser').id;await session.detach();const target=await targetBrowser.newPage();await target.setContent('<input id="input"/><textarea id="area"></textarea><div id="editable" contenteditable="true"></div><textarea id="readonly" readonly></textarea><input id="password" type="password"/><div id="mixed" contenteditable="true"></div><div id="body" tabindex="0"></div>');
   report.inputCompatibility=[];
   for(const id of ['input','area','editable','readonly','password','mixed','body']){const nonce='fixture-'+randomUUID(),original=id==='mixed'?nonce+' fixed':nonce;await target.locator('#'+id).evaluate((node,nonce)=>{if('value'in node)node.value=nonce;else if(node.id==='mixed')node.innerHTML=nonce+'<span contenteditable="false"> fixed</span>';else node.textContent=nonce;},nonce);await target.bringToFront();await target.locator('#'+id).focus();await target.locator('#'+id).evaluate(node=>{if(node instanceof HTMLInputElement||node instanceof HTMLTextAreaElement)node.setSelectionRange(node.value.length,node.value.length);else{const selection=getSelection(),range=document.createRange();if(node.id==='mixed'){range.setStart(node.firstChild,node.firstChild.textContent.length);range.collapse(true);}else{range.selectNodeContents(node);range.collapse(false);}selection.removeAllRanges();selection.addRange(range);}});
-   expect((await focusHelper.command({action:'focus-process',process})).foregroundProcess).toBe(process);await delay(200);const result=await externalRound(page,async()=>delay(150));const actual=await target.locator('#'+id).evaluate(node=>'value'in node?node.value:node.textContent);
+   expect((await focusHelper.command({action:'focus-process',process})).foregroundProcess).toBe(process);await delay(200);const result=await externalRound(page,async()=>delay(150),['input','area','editable','mixed'].includes(id)?async()=>nativeOverlayClick(overlay,focusHelper,'结束录音'):undefined);const actual=await target.locator('#'+id).evaluate(node=>'value'in node?node.value:node.textContent);
    const expected=id==='mixed'?nonce+'原生受控识别完成。 fixed':original+'原生受控识别完成。';if(['readonly','password','body'].includes(id)){expect(result.dictation.delivery.submission).toBe('notSubmitted');expect(actual).toBe(original);}else{expect(actual,'Writable '+id+' must actually receive text: '+JSON.stringify(result.dictation.delivery)).toBe(expected);expect(result.dictation.delivery.submission).toBe('submitted');}
    if(result.dictation.delivery.state==='confirmed'||result.dictation.delivery.state==='unconfirmed')expect(result.dictation.presentation).not.toBe('result');
    if(result.dictation.presentation==='result'){await expect(overlay.getByRole('button',{name:'复制',exact:true})).toBeVisible();await expect(overlay.getByRole('button',{name:'关闭',exact:true})).toBeVisible();}
@@ -202,7 +242,7 @@ try{
   for(const sample of [{text:'前面尾部',start:2,end:4},{text:'很长的文档。'.repeat(8000),start:24000,end:24000}]){
    await target.bringToFront();await target.evaluate(sample=>window.fixtureEditor.set(sample.text,sample.start,sample.end),sample);
    expect((await focusHelper.command({action:'focus-process',process})).foregroundProcess).toBe(process);await delay(100);
-   const result=await externalRound(page,async()=>delay(100));const actual=await target.evaluate(()=>window.fixtureEditor.read());
+   const result=await externalRound(page,async()=>delay(100),async()=>nativeOverlayClick(overlay,focusHelper,'结束录音'));const actual=await target.evaluate(()=>window.fixtureEditor.read());
    expect(actual,'ProseMirror must receive text: '+JSON.stringify(result.dictation.delivery)).toBe(sample.text.slice(0,sample.start)+'原生受控识别完成。'+sample.text.slice(sample.end));
    expect(result.dictation.delivery.submission).toBe('submitted');
    report.inputCompatibility.push({app:'Chromium',control:'ProseMirror',length:sample.text.length,delivery:result.dictation.delivery});
