@@ -135,3 +135,14 @@ it('dismissed external feedback does not replay its completed state when shown l
  expect(dictationPhase({...initialDictation(),source:'external',taskId:'old',stage:'result',text:'old'},'completed',{taskId:'old',text:'old'})).toBe('idle');
  expect(()=>parseDictation({...initialDictation(),presentation:'recording'})).toThrow();
 });
+
+it('dismissed preparation failures and clipboard notices remain closed when the overlay reopens',()=>{
+ const dismissed={...initialDictation(),source:'external' as const,taskId:'failed',error:'network'};
+ expect(dictationPhase(dismissed,'failed',{taskId:'failed',text:''})).toBe('idle');
+ const view=render(<VoiceSurface presentation="idle" phase="idle" error="连接失败" delivery={{state:'confirmed',error:null,restoreError:true,elapsedMs:10}} start={()=>{}} finish={()=>{}} cancel={()=>{}} restore={vi.fn()}/>);
+ expect(screen.queryByRole('region',{name:'口述提示'})).not.toBeInTheDocument();
+ expect(screen.queryByRole('button',{name:'重试恢复剪贴板'})).not.toBeInTheDocument();
+ view.rerender(<VoiceSurface presentation="idle" phase={dictationPhase(dismissed,'failed',{taskId:'failed',text:''})} error="连接失败" start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
+ expect(screen.queryByText('连接失败')).not.toBeInTheDocument();
+ expect(screen.queryByRole('button',{name:'重新开始录音'})).not.toBeInTheDocument();
+});
