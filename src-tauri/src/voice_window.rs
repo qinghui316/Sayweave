@@ -171,13 +171,27 @@ mod native {
             if GetWindowLongPtrW(window, GWL_EXSTYLE) as u32 & WS_EX_NOACTIVATE.0 == 0
                 || !SetWindowSubclass(window, Some(procedure), SUBCLASS, instance as usize)
                     .as_bool()
+                || SetWindowPos(
+                    window,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                )
+                .is_err()
             {
+                let _ = RemoveWindowSubclass(window, Some(procedure), SUBCLASS);
                 if let Ok(mut s) = WINDOW.lock() {
                     s.root = 0;
                 }
                 return Err("nonactivating voice window unavailable".into());
             }
         }
+        // Creation can leave cached non-client insets on an undecorated window.
+        // Recalculate once without activation: setting the same outer size later
+        // does not refresh them when normal phases share a fixed canvas.
         log::info!(target:"sayweave","operation=voice_window_setup instance={instance} noactivate=true");
         Ok(())
     }

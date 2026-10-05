@@ -98,11 +98,9 @@ fn voice_layout(app: &tauri::AppHandle, phase: Phase) -> VoiceLayout {
         .and_then(voice_view);
     let size = if let Some((_, _, presentation)) = &view {
         match presentation {
-            Presentation::Completed => (120.0, 112.0),
             Presentation::Result => (384.0, 232.0),
             Presentation::Notice | Presentation::Error => (384.0, 112.0),
-            Presentation::Recording => (240.0, 112.0),
-            _ => (280.0, 150.0),
+            _ => (160.0, 88.0),
         }
     } else {
         overlay_size(phase)
@@ -765,7 +763,7 @@ pub fn run() {
             )
             .data_directory(root.join("webview2"))
             .title("Sayweave · 语音控件")
-            .inner_size(68.0, 68.0)
+            .inner_size(160.0, 88.0)
             .decorations(false)
             .transparent(true)
             .shadow(false)
@@ -794,7 +792,7 @@ pub fn run() {
                 let size = monitor.work_area().size.to_logical::<f64>(scale);
                 let pos = monitor.work_area().position.to_logical::<f64>(scale);
                 overlay.set_position(LogicalPosition::new(
-                    pos.x + size.width / 2.0 - 120.0,
+                    pos.x + size.width / 2.0 - 80.0,
                     pos.y + size.height - 140.0,
                 ))?;
             }

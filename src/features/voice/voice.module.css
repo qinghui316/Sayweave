@@ -1,5 +1,5 @@
-.surface { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px; }
-.stage { font-size: var(--text-meta); line-height: var(--line-meta); color: var(--text-primary); background: var(--surface-content); border-radius: var(--radius-control); padding: 3px 10px; }
+.surface { position: relative; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px; }
+.stage { position: absolute; bottom: 52px; max-width: calc(100% - 24px); text-align: center; font-size: var(--text-meta); line-height: var(--line-meta); color: var(--text-primary); background: var(--surface-content); border-radius: var(--radius-control); padding: 3px 8px; }
 .result { width: min(360px,100%); min-width: 0; border-radius: var(--radius-card); background: var(--surface-content); padding: 12px; box-shadow: var(--shadow-voice); }
 .result header { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: var(--text-small); line-height: var(--line-small); }
 .result header button { flex: none; }

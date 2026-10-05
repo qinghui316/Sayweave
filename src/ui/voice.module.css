@@ -18,4 +18,16 @@
 .control[data-motion="static"] .wave[data-live="true"] i { transition: none; }
 .control[data-motion="static"],.control[data-motion="static"] .statusGlyph { transition: opacity var(--duration-reduced); }
 @keyframes sound { to { transform: scaleY(.42); opacity: .65; } }
+.compact { width: 34px; height: 34px; padding: 4px; gap: 6px; transition: width var(--duration-shape) var(--ease-shape); }
+.compact.connecting,.compact.processing { width: 72px; }
+.compact.recording { width: 136px; }
+.compact.failed { width: 136px; }
+.compact .round,.compact .cancel,.compact .finish,.compact .cancelSmall,.compact .statusGlyph { width: 26px; height: 26px; }
+.compact .cancelSmall { left: 4px; background: rgb(246 246 246 / 20%); }
+.compact .flow { transform: translateX(15px); }
+.compact .wave { flex: 1; min-width: 0; max-width: 60px; height: 26px; gap: 2px; }
+.compact .wave i { width: 2px; }
+.compact .failure { transform: translateX(-50px); width: 22px; height: 22px; }
+.compact .failureText { font-size: 12px; padding-left: 22px; }
+.compact .retry { width: 24px; height: 24px; }
 @media (prefers-reduced-motion: reduce) { .wave i { animation: none; }.control,.statusGlyph { transition: opacity var(--duration-reduced); } }

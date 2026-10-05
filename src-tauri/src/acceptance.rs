@@ -122,13 +122,13 @@ async fn verify(app: &tauri::AppHandle, menu_ids: Vec<String>) -> Result<(), Str
             .ok_or("missing overlay")?;
         runtime_demo(app.clone(), overlay, "finish".into(), snapshot.session.id)
             .map_err(|e| format!("{e:?}"))?;
-        viewport(app, (240.0, 76.0))?;
+        viewport(app, (160.0, 88.0))?;
         Ok(())
     })
     .await?;
     tokio::time::sleep(Duration::from_millis(400)).await;
     step(app, "processing-shrink-after-transition", |app| {
-        viewport(app, (108.0, 64.0))
+        viewport(app, (160.0, 88.0))
     })
     .await?;
     tokio::time::sleep(Duration::from_millis(950)).await;
@@ -138,7 +138,7 @@ async fn verify(app: &tauri::AppHandle, menu_ids: Vec<String>) -> Result<(), Str
             snapshot.session.phase == Phase::Completed,
             "completion did not settle",
         )?;
-        viewport(app, (68.0, 68.0))?;
+        viewport(app, (160.0, 88.0))?;
         let main = app.get_webview_window("main").ok_or("missing main")?;
         let next = runtime_demo(
             app.clone(),
@@ -167,7 +167,7 @@ async fn verify(app: &tauri::AppHandle, menu_ids: Vec<String>) -> Result<(), Str
             .map_err(|e| format!("{e:?}"))?;
         runtime_demo(app.clone(), main.clone(), "fail".into(), next.session.id)
             .map_err(|e| format!("{e:?}"))?;
-        viewport(app, (200.0, 68.0))?;
+        viewport(app, (160.0, 88.0))?;
         let retry = runtime_demo(app.clone(), main.clone(), "start".into(), next.session.id)
             .map_err(|e| format!("{e:?}"))?;
         runtime_demo(app.clone(), main, "cancel".into(), retry.session.id)
@@ -185,12 +185,12 @@ async fn verify(app: &tauri::AppHandle, menu_ids: Vec<String>) -> Result<(), Str
     .await?;
     tokio::time::sleep(Duration::from_millis(240)).await;
     step(app, "stale-shrink-rejected", |app| {
-        viewport(app, (200.0, 68.0))
+        viewport(app, (160.0, 88.0))
     })
     .await?;
     tokio::time::sleep(Duration::from_millis(150)).await;
     step(app, "latest-shrink-applied", |app| {
-        viewport(app, (108.0, 64.0))
+        viewport(app, (160.0, 88.0))
     })
     .await
 }

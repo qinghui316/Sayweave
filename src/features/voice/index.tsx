@@ -9,6 +9,6 @@ export function VoiceSurface({ phase, start, finish, cancel, motionEnabled = tru
   return <main className={s.surface}>
     {result&&<section className={s.result} aria-label="口述结果"><header><span>口述结果</span>{dismiss&&<IconButton label="关闭" onClick={dismiss}><Icon name="x" size={16}/></IconButton>}</header><div className={s.resultText}>{text}</div><div className={s.actions}>{copy&&<CopyFeedbackButton onCopy={copy}/>}</div></section>}
     {(notice||failure)&&<section className={s.notice} aria-label="口述提示"><span role={failure?'alert':'status'}>{failure?(error??'识别未完成，请重试。'):deliveryNotice(delivery?.error??null)}</span>{failure&&configure&&<Button onClick={configure}>设置</Button>}{dismiss&&<IconButton label="关闭" onClick={dismiss}><Icon name="x" size={16}/></IconButton>}</section>}
-    {!result&&!notice&&!failure&&<><VoiceControl mode={mode} feedbackLabel={workingLabel} cancelLabel={cancelLabel??(retry?'取消本次重识别':undefined)} level={kind==='editing'||kind==='resuming'?0:level} motionEnabled={motionEnabled} phase={phase} onStart={start} onFinish={finish} onCancel={cancel}/>{workingLabel&&<p className={s.stage} role="status">{workingLabel}</p>}</>}
+    {!result&&!notice&&!failure&&<><VoiceControl compact mode={mode} feedbackLabel={workingLabel} cancelLabel={cancelLabel??(retry?'取消本次重识别':undefined)} level={kind==='editing'||kind==='resuming'?0:level} motionEnabled={motionEnabled} phase={phase} onStart={start} onFinish={finish} onCancel={cancel}/>{workingLabel&&<p className={s.stage} role="status">{workingLabel}</p>}</>}
   </main>;
 }

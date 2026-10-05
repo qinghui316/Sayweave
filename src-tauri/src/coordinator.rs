@@ -100,13 +100,9 @@ impl Snapshot {
 pub fn authorized_window(caller: &str, surface: &str, action: &str) -> bool {
     caller == "main" || (caller == "voice-overlay" && surface == "overlay" && action == "hide")
 }
-pub fn overlay_size(phase: Phase) -> (f64, f64) {
-    match phase {
-        Phase::Connecting | Phase::Processing => (108.0, 64.0),
-        Phase::Recording => (240.0, 76.0),
-        Phase::Failed => (200.0, 68.0),
-        _ => (68.0, 68.0),
-    }
+pub fn overlay_size(_phase: Phase) -> (f64, f64) {
+    // The compact shell animates inside this canvas, keeping its screen anchor stable.
+    (160.0, 88.0)
 }
 pub fn reserve_size(current: (f64, f64), target: (f64, f64)) -> (f64, f64) {
     (current.0.max(target.0), current.1.max(target.1))
