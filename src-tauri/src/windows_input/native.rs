@@ -37,24 +37,42 @@ pub(super) fn start_anchor() -> Result<Anchor, Error> {
     }
     Ok(a)
 }
-pub(super) fn observe(event: u32, window: usize, object: i32, event_tick: u32) {
+fn event_invalidates(event: u32, window: usize, top: usize, focus: usize) -> bool {
+    event == EVENT_OBJECT_DESTROY && (window == top || window == focus)
+        || event == EVENT_SYSTEM_FOREGROUND && window != top
+        || event == EVENT_OBJECT_FOCUS
+            && window != focus
+            && unsafe { GetAncestor(hwnd(window), GA_ROOT) == hwnd(top) }
+        || [EVENT_OBJECT_VALUECHANGE, EVENT_OBJECT_TEXTSELECTIONCHANGED].contains(&event)
+            && (window == focus || window == top)
+}
+pub(super) fn observe(event: u32, window: usize, _object: i32, event_tick: u32) {
     if let Ok(watch) = WATCH.lock()
         && let Some((top, focus, captured_tick)) = *watch
         && event_after_capture(event_tick, captured_tick)
     {
-        let changed = event == EVENT_OBJECT_DESTROY && (window == top || window == focus)
-            || event == EVENT_SYSTEM_FOREGROUND && window != top
-            || event == EVENT_OBJECT_FOCUS
-                && window != focus
-                && unsafe { GetAncestor(hwnd(window), GA_ROOT) == hwnd(top) }
-            || [EVENT_OBJECT_VALUECHANGE, EVENT_OBJECT_TEXTSELECTIONCHANGED].contains(&event)
-                && (window == focus || window == top)
-            || event == EVENT_OBJECT_LOCATIONCHANGE
-                && object == OBJID_CARET.0
-                && (window == focus || window == top);
-        if changed {
+        // Caret geometry can change without an edit. Selection/range proof owns text position.
+        if event_invalidates(event, window, top, focus) {
             CHANGES.fetch_add(1, Ordering::AcqRel);
+            log::info!(target:"sayweave", "operation=input_target_event event={event}");
         }
+    }
+}
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    #[test]
+    fn caret_geometry_is_advisory_but_text_and_selection_invalidate() {
+        assert!(!event_invalidates(EVENT_OBJECT_LOCATIONCHANGE, 12, 10, 12));
+        assert!(event_invalidates(
+            EVENT_OBJECT_TEXTSELECTIONCHANGED,
+            12,
+            10,
+            12
+        ));
+        assert!(event_invalidates(EVENT_OBJECT_VALUECHANGE, 12, 10, 12));
+        assert!(event_invalidates(EVENT_OBJECT_DESTROY, 12, 10, 12));
+        assert!(event_invalidates(EVENT_SYSTEM_FOREGROUND, 14, 10, 12));
     }
 }
 fn lifetime(pid: u32) -> Result<u64, Error> {
@@ -89,7 +107,7 @@ pub(super) fn anchor() -> Result<Anchor, Error> {
             cbSize: size_of::<GUITHREADINFO>() as u32,
             ..Default::default()
         };
-        GetGUIThreadInfo(tid, &mut gui).map_err(|_| err("targetUnsupported"))?;
+        GetGUIThreadInfo(tid, &mut gui).map_err(|_| err("targetProbeFailed"))?;
         Ok(Anchor {
             window: window.0 as usize,
             focus: gui.hwndFocus.0 as usize,
@@ -103,11 +121,15 @@ pub(super) fn anchor() -> Result<Anchor, Error> {
 }
 fn same(a: &Anchor) -> bool {
     anchor().is_ok_and(|now| {
-        now.window == a.window
+        let unchanged = now.window == a.window
             && now.focus == a.focus
             && now.process == a.process
             && now.lifetime == a.lifetime
-            && now.generation == a.generation
+            && now.generation == a.generation;
+        if !unchanged {
+            log::info!(target:"sayweave", "operation=input_target_identity window_same={} focus_same={} process_same={} lifetime_same={} generation_same={}", now.window == a.window, now.focus == a.focus, now.process == a.process, now.lifetime == a.lifetime, now.generation == a.generation);
+        }
+        unchanged
     })
 }
 unsafe fn message(window: HWND, msg: u32, w: WPARAM, l: LPARAM) -> Result<usize, Error> {
@@ -144,7 +166,7 @@ fn native_text(window: HWND) -> Result<String, Error> {
     unsafe {
         let len = message(window, WM_GETTEXTLENGTH, WPARAM(0), LPARAM(0))?;
         if len > 32768 {
-            return Err(err("targetUnsupported"));
+            return Err(err("targetReadUnavailable"));
         }
         let mut text = vec![0u16; len + 1];
         let count = message(
@@ -153,7 +175,7 @@ fn native_text(window: HWND) -> Result<String, Error> {
             WPARAM(text.len()),
             LPARAM(text.as_mut_ptr() as isize),
         )?;
-        String::from_utf16(&text[..count.min(len)]).map_err(|_| err("targetUnsupported"))
+        String::from_utf16(&text[..count.min(len)]).map_err(|_| err("targetReadUnavailable"))
     }
 }
 fn native_selection(window: HWND) -> Result<(usize, usize), Error> {
@@ -251,6 +273,7 @@ enum Proof {
         element: IUIAutomationElement,
         pattern: Option<IUIAutomationTextPattern>,
         context: Option<(String, String, String)>,
+        prefix_start: Option<IUIAutomationTextRange>,
         selection: Option<IUIAutomationTextRange>,
         position: Option<(i32, i32)>,
     },
@@ -303,7 +326,8 @@ fn uia_position(pattern: &IUIAutomationTextPattern) -> Result<(i32, i32), Error>
     }
 }
 // Read only the selection and bounded adjacent context, independently of editability.
-fn uia_parts(pattern: &IUIAutomationTextPattern) -> Result<(String, String, String), Error> {
+type UiaContext = ((String, String, String), IUIAutomationTextRange);
+fn uia_context(pattern: &IUIAutomationTextPattern) -> Result<UiaContext, Error> {
     unsafe {
         let selected = uia_selection(pattern)?;
         let prefix = probe!(selected.Clone()).map_err(|_| err("targetReadUnavailable"))?;
@@ -319,6 +343,13 @@ fn uia_parts(pattern: &IUIAutomationTextPattern) -> Result<(String, String, Stri
             -2048
         ))
         .map_err(|_| err("targetReadUnavailable"))?;
+        let prefix_start = probe!(prefix.Clone()).map_err(|_| err("targetReadUnavailable"))?;
+        probe!(prefix_start.MoveEndpointByRange(
+            TextPatternRangeEndpoint_End,
+            &prefix,
+            TextPatternRangeEndpoint_Start
+        ))
+        .map_err(|_| err("targetReadUnavailable"))?;
         let suffix = probe!(selected.Clone()).map_err(|_| err("targetReadUnavailable"))?;
         probe!(suffix.MoveEndpointByRange(
             TextPatternRangeEndpoint_Start,
@@ -328,7 +359,7 @@ fn uia_parts(pattern: &IUIAutomationTextPattern) -> Result<(String, String, Stri
         .map_err(|_| err("targetReadUnavailable"))?;
         probe!(suffix.MoveEndpointByUnit(TextPatternRangeEndpoint_End, TextUnit_Character, 2048))
             .map_err(|_| err("targetReadUnavailable"))?;
-        let prefix = probe!(prefix.GetText(8192))
+        let prefix = probe!(prefix.GetText(8193))
             .map_err(|_| err("targetReadUnavailable"))?
             .to_string();
         let value = probe!(selected.GetText(8193))
@@ -337,11 +368,20 @@ fn uia_parts(pattern: &IUIAutomationTextPattern) -> Result<(String, String, Stri
         if value.encode_utf16().count() > 8192 {
             return Err(err("targetReadUnavailable"));
         }
-        let suffix = probe!(suffix.GetText(8192))
+        let suffix = probe!(suffix.GetText(8193))
             .map_err(|_| err("targetReadUnavailable"))?
             .to_string();
-        Ok((normalize(&prefix), normalize(&value), normalize(&suffix)))
+        if prefix.encode_utf16().count() > 8192 || suffix.encode_utf16().count() > 8192 {
+            return Err(err("targetReadUnavailable"));
+        }
+        Ok((
+            (normalize(&prefix), normalize(&value), normalize(&suffix)),
+            prefix_start,
+        ))
     }
+}
+fn uia_parts(pattern: &IUIAutomationTextPattern) -> Result<(String, String, String), Error> {
+    uia_context(pattern).map(|(text, _)| text)
 }
 fn uia_composing(element: &IUIAutomationElement) -> Result<bool, Error> {
     unsafe {
@@ -356,7 +396,7 @@ fn uia_composing(element: &IUIAutomationElement) -> Result<bool, Error> {
         let mut range = std::ptr::null_mut();
         (Interface::vtable(&pattern).GetActiveComposition)(Interface::as_raw(&pattern), &mut range)
             .ok()
-            .map_err(|_| err("targetUnsupported"))?;
+            .map_err(|_| err("targetProbeFailed"))?;
         let active = !range.is_null();
         if active {
             drop(IUIAutomationTextRange::from_raw(range));
@@ -367,9 +407,9 @@ fn uia_composing(element: &IUIAutomationElement) -> Result<bool, Error> {
 }
 fn exact_uia_bool(value: &windows::Win32::System::Variant::VARIANT) -> Result<bool, Error> {
     if value.vt() != windows::Win32::System::Variant::VT_BOOL {
-        return Err(err("targetUnsupported"));
+        return Err(err("targetEditabilityUnknown"));
     }
-    bool::try_from(value).map_err(|_| err("targetUnsupported"))
+    bool::try_from(value).map_err(|_| err("targetEditabilityUnknown"))
 }
 // A writable ValuePattern or current editing range proves admission. Whole-document
 // attributes can be mixed in rich editors and are not evidence about the current caret.
@@ -420,7 +460,7 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
                 .as_ref()
                 .is_some_and(|before| expected_text(before, start, end, "").is_none())
             {
-                return Err(err("targetUnsupported"));
+                return Err(err("targetSelectionUnavailable"));
             }
             if before.is_none() && !crate::input_state::tracking_ready() {
                 return Err(err("targetTrackingUnavailable"));
@@ -430,23 +470,23 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
             let auto = automation
                 .as_ref()
                 .ok_or_else(|| err("targetProbeFailed"))?;
-            let element = probe!(auto.GetFocusedElement()).map_err(|_| err("targetUnsupported"))?;
+            let element = probe!(auto.GetFocusedElement()).map_err(|_| err("targetProbeFailed"))?;
             if uia_composing(&element)? {
                 return Err(err("inputComposition"));
             }
-            if probe!(element.CurrentProcessId()).map_err(|_| err("targetUnsupported"))?
+            if probe!(element.CurrentProcessId()).map_err(|_| err("targetProbeFailed"))?
                 != a.process as i32
             {
                 return Err(err("targetChanged"));
             }
             if probe!(element.CurrentIsPassword())
-                .map_err(|_| err("targetUnsupported"))?
+                .map_err(|_| err("targetProbeFailed"))?
                 .as_bool()
             {
                 return Err(err("targetPassword"));
             }
             if !probe!(element.CurrentIsEnabled())
-                .map_err(|_| err("targetUnsupported"))?
+                .map_err(|_| err("targetProbeFailed"))?
                 .as_bool()
             {
                 return Err(err("targetReadonly"));
@@ -457,7 +497,9 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
             if uia_readonly(&element, pattern.as_ref())? {
                 return Err(err("targetReadonly"));
             }
-            let context = pattern.as_ref().and_then(|p| uia_parts(p).ok());
+            let readback = pattern.as_ref().and_then(|p| uia_context(p).ok());
+            let context = readback.as_ref().map(|(text, _)| text.clone());
+            let prefix_start = readback.map(|(_, range)| range);
             let selection = pattern.as_ref().and_then(|p| uia_selection(p).ok());
             let position = pattern.as_ref().and_then(|p| uia_position(p).ok());
             if context.is_none() && selection.is_none() && !crate::input_state::tracking_ready() {
@@ -467,6 +509,7 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
                 element,
                 pattern,
                 context,
+                prefix_start,
                 selection,
                 position,
             }
@@ -560,6 +603,7 @@ fn unchanged(t: &Target, automation: &Option<IUIAutomation>) -> Result<(), Error
             context,
             selection,
             position,
+            ..
         } => unsafe {
             if element
                 .CurrentIsPassword()
@@ -656,31 +700,42 @@ fn verified(t: &Target, text: &str) -> Result<bool, Error> {
         Proof::Uia {
             pattern: Some(pattern),
             context: Some((prefix, _, suffix)),
-            position: Some((start, _)),
+            prefix_start: Some(prefix_start),
             ..
-        } => {
-            let (now, selected, after) = uia_parts(pattern)?;
-            let caret = uia_position(pattern)?;
-            let expected_caret = start
-                .checked_add(normalize(text).encode_utf16().count() as i32)
-                .ok_or_else(|| err("targetReadUnavailable"))?;
+        } => unsafe {
+            let (_, selected, after) = uia_parts(pattern)?;
+            let caret = uia_selection(pattern)?;
+            if probe!(caret.CompareEndpoints(
+                TextPatternRangeEndpoint_Start,
+                &caret,
+                TextPatternRangeEndpoint_End
+            ))
+            .map_err(|_| err("targetReadUnavailable"))?
+                != 0
+            {
+                return Ok(false);
+            }
             if text.chars().count() > 1024 {
                 return Err(err("targetReadUnavailable"));
             }
-            let expected = format!("{prefix}{}", normalize(text));
-            let tail: String = expected
-                .chars()
-                .rev()
-                .take(2048)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            Ok(caret == (expected_caret, expected_caret)
-                && selected.is_empty()
-                && now.ends_with(&tail)
+            // Preserve the provider's range boundary; Character units are not UTF-16 offsets.
+            let inserted = probe!(caret.Clone()).map_err(|_| err("targetReadUnavailable"))?;
+            probe!(inserted.MoveEndpointByRange(
+                TextPatternRangeEndpoint_Start,
+                prefix_start,
+                TextPatternRangeEndpoint_Start
+            ))
+            .map_err(|_| err("targetReadUnavailable"))?;
+            let actual = probe!(inserted.GetText(16385))
+                .map_err(|_| err("targetReadUnavailable"))?
+                .to_string();
+            if actual.encode_utf16().count() > 16384 {
+                return Err(err("targetReadUnavailable"));
+            }
+            Ok(selected.is_empty()
+                && normalize(&actual) == format!("{prefix}{}", normalize(text))
                 && after == *suffix)
-        }
+        },
         _ => Err(err("targetReadUnavailable")),
     }
 }

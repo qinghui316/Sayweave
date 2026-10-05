@@ -373,7 +373,7 @@ impl DictationCoordinator {
             let capture_result = match capture {
                 Some(c) => c
                     .await
-                    .unwrap_or_else(|_| Err(Error::new("targetUnsupported"))),
+                    .unwrap_or_else(|_| Err(Error::new("targetProbeFailed"))),
                 None => Err(Error::new("targetUnavailable")),
             };
             let coordinator = app.state::<Self>();
@@ -432,7 +432,7 @@ impl DictationCoordinator {
                         } else if let Err(error) = &capture_result {
                             &error.code
                         } else {
-                            "targetUnsupported"
+                            "targetUnavailable"
                         })
                     };
                     if terminal.persistent {

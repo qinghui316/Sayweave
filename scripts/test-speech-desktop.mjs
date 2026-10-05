@@ -34,7 +34,7 @@ function websocket(req,socket,head){
    const kind=payload[1]>>4,flags=payload[1]&15;expect(payload.readUInt32BE(4)).toBe(payload.length-8);const body=gunzipSync(payload.subarray(8));
    if(kind===1){const value=JSON.parse(body.toString());expect(value.audio).toMatchObject({format:'pcm',rate:16000,bits:16,channel:1});expect(value.request).toMatchObject({model_name:'bigmodel',result_type:'full',show_utterances:true});connection.model='Doubao-Seed-ASR-2.0';connection.started=true;binaryResult('',false);return;}
    expect(kind).toBe(2);expect(connection.started).toBe(true);
-   if(flags&2){connection.finished=true;if(connection.mode==='pending')return;if(connection.mode==='empty'||connection.mode==='empty-ack'){binaryResult('',true,true);return;}if(connection.mode==='malformed-terminal'){binaryPayload({code:20000000,result:{text:123}},true);return;}const complete=()=>{const text=connection.mode==='single-a'?'a':'原生受控识别完成。';binaryResult(text,true);binaryResult('旧暂定不能覆盖。',false);binaryResult(text,true,true);};if(connection.mode==='delayed-final')setTimeout(complete,650);else complete();return;}
+   if(flags&2){connection.finished=true;if(connection.mode==='pending')return;if(connection.mode==='empty'||connection.mode==='empty-ack'){binaryResult('',true,true);return;}if(connection.mode==='malformed-terminal'){binaryPayload({code:20000000,result:{text:123}},true);return;}const complete=()=>{const text=connection.mode==='single-a'?'a':connection.mode==='unicode'?'中文，🙂\n第二行 e\u0301。':'原生受控识别完成。';binaryResult(text,true);binaryResult('旧暂定不能覆盖。',false);binaryResult(text,true,true);};if(connection.mode==='delayed-final')setTimeout(complete,650);else complete();return;}
    connection.frames++;connection.bytes+=body.length;if(connection.frames===1)binaryResult('正在识别',false);return;
   }
 
@@ -208,6 +208,25 @@ try{
    report.inputCompatibility.push({app:'Chromium',control:'ProseMirror',length:sample.text.length,delivery:result.dictation.delivery});
    if(result.dictation.presentationId)await invoke(page,'dictation_dismiss',{taskId:result.dictation.taskId,presentationId:result.dictation.presentationId});
   }
+  mode='unicode';
+  for(const sample of [
+   ...['area','editable','ProseMirror'].map(control=>({control,before:'前面尾部',start:2,end:4})),
+   {control:'area',before:'',start:0,end:0},
+   {control:'ProseMirror',before:'尾部',start:0,end:0},
+  ]){
+   const {control}=sample;
+   await target.bringToFront();
+   if(control==='ProseMirror')await target.evaluate(sample=>window.fixtureEditor.set(sample.before,sample.start,sample.end),sample);
+   else await target.locator('#'+control).evaluate((node,sample)=>{if('value'in node){node.removeAttribute('maxlength');node.value=sample.before;node.focus();node.setSelectionRange(sample.start,sample.end);}else{node.textContent=sample.before;node.focus();const range=document.createRange();range.setStart(node.firstChild,sample.start);range.setEnd(node.firstChild,sample.end);const selected=getSelection();selected.removeAllRanges();selected.addRange(range);}},sample);
+   await focusHelper.command({action:'focus-process',process});await delay(150);
+   const result=await externalRound(page,async()=>delay(100));
+   const actual=control==='ProseMirror'?await target.evaluate(()=>window.fixtureEditor.read()):await target.locator('#'+control).evaluate(node=>'value'in node?node.value:node.innerText);
+   expect(actual.replace(/\r\n/g,'\n')).toBe(sample.before.slice(0,sample.start)+'中文，🙂\n第二行 e\u0301。'+sample.before.slice(sample.end));
+   expect(result.dictation.delivery.state,'Unicode range confirmation: '+JSON.stringify(result.dictation.delivery)).toBe('confirmed');
+   report.inputCompatibility.push({app:'Chromium',control,case:'unicode-multiline',start:sample.start,beforeLength:sample.before.length,delivery:result.dictation.delivery});
+   if(result.dictation.presentationId)await invoke(page,'dictation_dismiss',{taskId:result.dictation.taskId,presentationId:result.dictation.presentationId});
+  }
+  mode='normal';
  }finally{await focusHelper.close();await targetBrowser.close();}
  await invoke(page,'shortcut_save',{config:{...(await invoke(page,'shortcut_status')).saved,binding:'AltRight',mode:'toggle'}});
 
