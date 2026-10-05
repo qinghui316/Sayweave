@@ -40,7 +40,7 @@ function RuntimeApp() {
   const updateShortcutGuard=useCallback((guard:((action:()=>void)=>void)|null)=>{shortcutGuard.current=guard;},[]);
   useEffect(()=>{let alive=true;const releases:(()=>void)[]=[];const accept=(v:ReturnType<typeof initialDictation>)=>{if(alive)setDictation(old=>v.sequence>=old.sequence?v:old);};
     if(dictationPorts.dictation){void dictationPorts.dictation.subscribe(accept).then(r=>{if(alive)releases.push(r);else r();}).catch(()=>{});void dictationPorts.dictation.snapshot().then(accept).catch(()=>{});}
-    const keys=(v:ShortcutStatus)=>{if(alive)setShortcut(v);};void dictationPorts.shortcuts.subscribe(keys).then(r=>{if(alive)releases.push(r);else r();}).catch(()=>{});void dictationPorts.shortcuts.status().then(keys).catch(()=>{});
+    let shortcutSequence=-1;const keys=(v:ShortcutStatus)=>{if(alive&&v.sequence>shortcutSequence){shortcutSequence=v.sequence;setShortcut(v);}};void dictationPorts.shortcuts.subscribe(keys).then(r=>{if(alive)releases.push(r);else r();}).catch(()=>{});void dictationPorts.shortcuts.status().then(keys).catch(()=>{});
     return()=>{alive=false;for(const r of releases)r();};},[dictationPorts]);
   const [reading]=useState(()=>new HistoryFeedStore(ports.history));
   const [speechStore]=useState(()=>new SpeechStore(ports.speech));

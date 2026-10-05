@@ -26,6 +26,8 @@ pub enum Mode {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
+    pub sequence: u64,
+    pub capture_token: Option<String>,
     pub saved: Config,
     pub active: Option<Config>,
     pub capturing: bool,

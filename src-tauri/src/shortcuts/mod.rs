@@ -40,6 +40,8 @@ impl ShortcutService {
         Self {
             data,
             state: Mutex::new(Status {
+                sequence: 0,
+                capture_token: None,
                 saved: Config::default(),
                 active: None,
                 capturing: false,
@@ -82,10 +84,13 @@ impl ShortcutService {
             == Some(generation)
     }
     pub fn status(&self) -> Result<Status, Error> {
-        self.state
-            .lock()
-            .map(|s| s.clone())
-            .map_err(|_| Error::new("unavailable"))
+        let mut state = self.state.lock().map_err(|_| Error::new("unavailable"))?;
+        // Snapshot order includes command reads and event publications, under the same state lock.
+        state.sequence = state
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::new("unavailable"))?;
+        Ok(state.clone())
     }
     pub async fn db(&self, operation: DbOperation) -> Result<DbOutput, Error> {
         match self
@@ -313,6 +318,17 @@ impl ShortcutService {
         self.status()
     }
     pub fn capture(&self, app: &tauri::AppHandle, begin: bool) -> Result<Status, Error> {
+        self.capture_owned(app, begin, None)
+    }
+    pub fn capture_owned(
+        &self,
+        app: &tauri::AppHandle,
+        begin: bool,
+        token: Option<String>,
+    ) -> Result<Status, Error> {
+        if let Some(token) = &token {
+            uuid::Uuid::parse_str(token).map_err(|_| Error::new("invalidShortcut"))?;
+        }
         if begin && self.stopping.load(Ordering::Acquire) {
             return Err(Error::new("stopping"));
         }
@@ -329,12 +345,17 @@ impl ShortcutService {
                 }
                 let mut s = self.state.lock().map_err(|_| Error::new("unavailable"))?;
                 if s.capturing == begin {
+                    if begin && token.is_some() && s.capture_token != token {
+                        return Err(Error::new("busy"));
+                    }
                     return Ok(s.clone());
                 }
                 s.capturing = begin;
                 self.capturing.store(begin, Ordering::Release);
                 self.capture_generation.fetch_add(1, Ordering::AcqRel);
                 if begin {
+                    s.capture_token =
+                        Some(token.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
                     s.captured_binding = None;
                 }
                 if let Some(b) = self.backend.lock().ok().and_then(|b| b.clone()) {

@@ -148,6 +148,9 @@ try{
  report.checks.push('Doubao selection, credential and history survive a real process restart');
  mode='normal';
  const keys=await invoke(page,'shortcut_status');expect(keys.active.binding).toBe('AltRight');
+ const captureToken=randomUUID();const capturingKeys=await invoke(page,'shortcut_capture',{begin:true,token:captureToken});expect(capturingKeys.captureToken).toBe(captureToken);expect(capturingKeys.capturing).toBe(true);expect(capturingKeys.sequence).toBeGreaterThan(keys.sequence);
+ const stoppedCapture=await invoke(page,'shortcut_capture',{begin:false});expect(stoppedCapture.captureToken).toBe(captureToken);expect(stoppedCapture.capturing).toBe(false);expect(stoppedCapture.sequence).toBeGreaterThan(capturingKeys.sequence);
+ expect((await rejected(page,'shortcut_capture',{begin:true,token:'invalid'})).code).toBe('invalidShortcut');
  const savedKeys=await invoke(page,'shortcut_save',{config:{...keys.saved,binding:'Control+Shift+F10',mode:'hold'}});expect(savedKeys.active.mode).toBe('hold');
  overlay=browser.contexts().flatMap(c=>c.pages()).find(p=>p.url().includes('surface=overlay'));
  for(const command of ['shortcut_status','shortcut_save','history_delivery'])expect((await rejected(overlay,command,command==='history_delivery'?{id:doubaoRecord.id}:command==='shortcut_save'?{config:savedKeys.saved}:{})).code).toBe('forbidden');

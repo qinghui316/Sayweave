@@ -28,9 +28,10 @@ pub fn shortcut_capture(
     window: WebviewWindow,
     service: State<'_, ShortcutService>,
     begin: bool,
+    token: Option<String>,
 ) -> Result<Status, Error> {
     crate::data::model::authorize(window.label())?;
-    let status = service.capture(&app, begin)?;
+    let status = service.capture_owned(&app, begin, token)?;
     let generation = service.capture_generation();
     if begin {
         tauri::async_runtime::spawn(async move {
