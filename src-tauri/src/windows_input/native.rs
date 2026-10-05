@@ -275,6 +275,7 @@ enum Proof {
         context: Option<(String, String, String)>,
         prefix_start: Option<IUIAutomationTextRange>,
         at_document_start: bool,
+        initially_empty: bool,
         selection: Option<IUIAutomationTextRange>,
         position: Option<(i32, i32)>,
     },
@@ -527,6 +528,12 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
                 }),
                 _ => false,
             };
+            let initially_empty = pattern.as_ref().is_some_and(|pattern| {
+                pattern
+                    .DocumentRange()
+                    .and_then(|doc| doc.GetText(1))
+                    .is_ok_and(|text| text.is_empty())
+            });
             let selection = pattern.as_ref().and_then(|p| uia_selection(p).ok());
             let position = pattern.as_ref().and_then(|p| uia_position(p).ok());
             if context.is_none() && selection.is_none() && !crate::input_state::tracking_ready() {
@@ -538,6 +545,7 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
                 context,
                 prefix_start,
                 at_document_start,
+                initially_empty,
                 selection,
                 position,
             }
@@ -726,12 +734,36 @@ fn verified(t: &Target, text: &str) -> Result<bool, Error> {
                 && insertion_prefix(&actual, a, "") == insertion_prefix(before, *start, text))
         }
         Proof::Uia {
+            element,
             pattern: Some(pattern),
             context: Some((prefix, _, suffix)),
             prefix_start: Some(prefix_start),
             at_document_start,
+            initially_empty,
             ..
         } => unsafe {
+            // For an initially empty field, its complete value is also exact insertion proof.
+            // Chromium can replace the empty TextPattern provider on the first paste.
+            if *initially_empty
+                && text.chars().count() <= 1024
+                && let Ok(value) = probe!(
+                    element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                )
+                && let Ok(actual) = probe!(value.CurrentValue())
+                && normalize(&actual.to_string()) == normalize(text)
+            {
+                return Ok(true);
+            }
+            let fresh_pattern;
+            let pattern = if *at_document_start {
+                fresh_pattern = probe!(
+                    element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                )
+                .map_err(|_| err("targetReadUnavailable"))?;
+                &fresh_pattern
+            } else {
+                pattern
+            };
             let (_, selected, after) = uia_parts(pattern)?;
             let caret = uia_selection(pattern)?;
             if probe!(caret.CompareEndpoints(

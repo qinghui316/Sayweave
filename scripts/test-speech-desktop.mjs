@@ -212,6 +212,7 @@ try{
   for(const sample of [
    ...['area','editable','ProseMirror'].map(control=>({control,before:'前面尾部',start:2,end:4})),
    {control:'area',before:'',start:0,end:0},
+   {control:'ProseMirror',before:'',start:0,end:0},
    {control:'ProseMirror',before:'尾部',start:0,end:0},
   ]){
    const {control}=sample;
