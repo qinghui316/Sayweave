@@ -81,6 +81,7 @@ struct State {
     backup: Option<ITfRangeBackup>,
     expected: String,
     selection: Option<ITfRange>,
+    preserved_attributes: Vec<(GUID, i32)>,
     text_cookie: Option<u32>,
 }
 type Shared = Rc<RefCell<State>>;
@@ -402,6 +403,28 @@ fn lease(
         Ok(())
     }
 }
+// No COM calls: use immediately before/after a mutation when a provider may
+// have reentered while resolving the property or range.
+fn edit_identity(
+    shared: &Shared,
+    r: &Request,
+    generation: u64,
+    epoch: u64,
+) -> windows::core::Result<()> {
+    let s = shared.borrow();
+    if !s.active
+        || s.generation != generation
+        || s.epoch != epoch
+        || !s.version.owned
+        || !s.version.accepts(r)
+        || s.cleanup
+        || s.capability.as_ref() != Some(&r.capability)
+        || !r.live(unsafe { GetTickCount64() })
+    {
+        return Err(failure(TF_E_DISCONNECTED));
+    }
+    Ok(())
+}
 fn schedule(
     shared: &Shared,
     r: &Request,
@@ -560,8 +583,74 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
         _: u32,
         composition: Ref<ITfComposition>,
     ) -> windows::core::Result<()> {
+        #[cfg(feature = "acceptance")]
+        eprintln!(
+            "composition terminated: epoch={} generation={} owned={}",
+            self.epoch,
+            self.state.borrow().generation,
+            self.state.borrow().version.owned
+        );
         release_composition(&self.state, self.epoch, composition.as_ref());
         Ok(())
+    }
+}
+// Uniform scalar attributes can be preserved through a cumulative text correction.
+// Mixed/partial or opaque properties cannot be mapped to revised text: hand off instead.
+unsafe fn changed_attributes(
+    context: &ITfContext,
+    record: &ITfEditRecord,
+    owned: &ITfRange,
+    ec: u32,
+) -> windows::core::Result<Vec<(GUID, i32)>> {
+    unsafe {
+        let properties = context.EnumProperties()?;
+        let mut result = Vec::new();
+        for _ in 0..64 {
+            let mut entries = [None];
+            let mut fetched = 0;
+            properties.Next(&mut entries, &mut fetched)?;
+            if fetched == 0 {
+                return Ok(result);
+            }
+            let property = entries[0].as_ref().ok_or_else(|| failure(E_FAIL))?;
+            let id = property.GetType()?;
+            let updates =
+                record.GetTextAndPropertyUpdates(GET_TEXT_AND_PROPERTY_UPDATES_FLAGS(0), &[&id])?;
+            let mut relevant = false;
+            let mut ended = false;
+            for _ in 0..64 {
+                let mut ranges = [None];
+                let mut count = 0;
+                updates.Next(&mut ranges, &mut count)?;
+                if count == 0 {
+                    ended = true;
+                    break;
+                }
+                let range = ranges[0].as_ref().ok_or_else(|| failure(E_FAIL))?;
+                if range.CompareStart(ec, owned, TF_ANCHOR_END)? >= 0
+                    || range.CompareEnd(ec, owned, TF_ANCHOR_START)? <= 0
+                {
+                    continue;
+                }
+                if range.CompareStart(ec, owned, TF_ANCHOR_START)? > 0
+                    || range.CompareEnd(ec, owned, TF_ANCHOR_END)? < 0
+                {
+                    return Err(failure(TF_E_DISCONNECTED));
+                }
+                relevant = true;
+            }
+            if !ended {
+                return Err(failure(E_FAIL));
+            }
+            if relevant {
+                let value = property.GetValue(ec, owned)?;
+                if value.vt() != windows::Win32::System::Variant::VT_I4 {
+                    return Err(failure(TF_E_DISCONNECTED));
+                }
+                result.push((id, i32::try_from(&value)?));
+            }
+        }
+        Err(failure(E_FAIL))
     }
 }
 #[implement(ITfTextEditSink)]
@@ -574,62 +663,90 @@ impl ITfTextEditSink_Impl for TextSink_Impl {
     fn OnEndEdit(
         &self,
         context: Ref<ITfContext>,
-        _: u32,
+        ec: u32,
         record: Ref<ITfEditRecord>,
     ) -> windows::core::Result<()> {
-        let (owned, client) = {
+        let (client, generation, composition, expected, expected_selection) = {
             let s = self.state.borrow();
-            if s.epoch != self.epoch {
+            if s.epoch != self.epoch || !s.version.owned {
                 return Ok(());
             }
-            (s.version.owned, s.client)
+            (
+                s.client,
+                s.generation,
+                s.composition.clone(),
+                s.expected.clone(),
+                s.selection.clone(),
+            )
         };
-        if owned {
-            let result = (|| unsafe {
-                let context = context.as_ref().ok_or_else(|| failure(E_POINTER))?;
-                // TSF identifies the owner of the completed write session.
-                // A carried boolean cannot reliably associate later notifications.
-                if !context.InWriteSession(client)?.as_bool() {
-                    let record = record.as_ref().ok_or_else(|| failure(E_POINTER))?;
-                    let changed_selection = record.GetSelectionStatus()?.as_bool();
-                    let mut properties = Vec::new();
-                    let enumerator = context.EnumProperties()?;
-                    loop {
-                        let mut property = [None];
-                        let mut fetched = 0;
-                        enumerator.Next(&mut property, &mut fetched)?;
-                        if fetched == 0 {
-                            break;
-                        }
-                        properties.push(
-                            property[0]
-                                .as_ref()
-                                .ok_or_else(|| failure(E_FAIL))?
-                                .GetType()?,
-                        );
-                        if properties.len() > 64 {
-                            return Err(failure(E_FAIL));
-                        }
-                    }
-                    let pointers: Vec<_> = properties.iter().map(|p| p as *const GUID).collect();
-                    let updates = record.GetTextAndPropertyUpdates(TF_GTP_INCL_TEXT, &pointers)?;
-                    let mut ranges = [None];
-                    let mut fetched = 0;
-                    updates.Next(&mut ranges, &mut fetched)?;
-                    #[cfg(feature = "acceptance")]
-                    eprintln!(
-                        "owned edit notification: client={client} selection_changed={changed_selection} text_or_property_changed={}",
-                        fetched != 0
-                    );
-                    return Ok(changed_selection || fetched != 0);
-                }
-                Ok(false)
-            })();
-            if !matches!(&result, Ok(false)) {
-                end_owned(&self.state);
+        let result: windows::core::Result<bool> = (|| unsafe {
+            let context = context.as_ref().ok_or_else(|| failure(E_POINTER))?;
+            if context.InWriteSession(client)?.as_bool() {
+                return Ok(false);
             }
-            result?;
+            let record = record.as_ref().ok_or_else(|| failure(E_POINTER))?;
+            let text_updates = record.GetTextAndPropertyUpdates(TF_GTP_INCL_TEXT, &[])?;
+            let mut text_ranges = [None];
+            let mut changed_text = 0;
+            text_updates.Next(&mut text_ranges, &mut changed_text)?;
+            let range = composition
+                .as_ref()
+                .ok_or_else(|| failure(TF_E_DISCONNECTED))?
+                .GetRange()?;
+            let selected = selection(context, ec)?;
+            let expected_selection =
+                expected_selection.ok_or_else(|| failure(TF_E_DISCONNECTED))?;
+            if record.GetSelectionStatus()?.as_bool()
+                || changed_text != 0
+                || range_text(&range, ec)? != expected
+                || selected.CompareStart(ec, &expected_selection, TF_ANCHOR_START)? != 0
+                || selected.CompareEnd(ec, &expected_selection, TF_ANCHOR_END)? != 0
+            {
+                return Ok(true);
+            }
+            let attributes = changed_attributes(context, record, &range, ec)?;
+            if attributes.is_empty() {
+                return Ok(false);
+            }
+            let backup = {
+                let mut s = self.state.borrow_mut();
+                if s.epoch != self.epoch || s.generation != generation || !s.version.owned {
+                    return Ok(false);
+                }
+                let added = attributes
+                    .iter()
+                    .filter(|(id, _)| !s.preserved_attributes.iter().any(|(known, _)| known == id))
+                    .count();
+                if s.preserved_attributes.len() + added > 64 {
+                    return Ok(true);
+                }
+                for (id, value) in attributes {
+                    if let Some((_, old)) = s
+                        .preserved_attributes
+                        .iter_mut()
+                        .find(|(known, _)| *known == id)
+                    {
+                        *old = value;
+                    } else {
+                        s.preserved_attributes.push((id, value));
+                    }
+                }
+                s.backup.take()
+            };
+            drop(backup);
+            Ok(false)
+        })();
+        let current = {
+            let s = self.state.borrow();
+            s.epoch == self.epoch
+                && s.generation == generation
+                && s.version.owned
+                && s.composition == composition
+        };
+        if current && !matches!(&result, Ok(false)) {
+            end_owned(&self.state);
         }
+        result?;
         Ok(())
     }
 }
@@ -818,6 +935,7 @@ fn apply(
             let mut s = shared.borrow_mut();
             s.epoch = epoch;
             s.composition = Some(composition);
+            s.preserved_attributes.clear();
             s.backup = Some(backup);
             s.context = Some(context.clone());
             s.expected = expected;
@@ -855,12 +973,40 @@ fn apply(
         }
         match r.action {
             Action::Update => {
+                *phase = "updateSafety";
+                if password(context, &range, ec)? {
+                    return Err(failure(E_ACCESSDENIED));
+                }
                 *phase = "updateLease";
                 lease(shared, r, generation, context)?;
                 *mutation = Mutation::Uncertain;
                 *phase = "updateText";
-                range.SetText(ec, 0, &r.text.encode_utf16().collect::<Vec<_>>())?;
+                range.SetText(
+                    ec,
+                    TF_ST_CORRECTION,
+                    &r.text.encode_utf16().collect::<Vec<_>>(),
+                )?;
                 *mutation = Mutation::Changed;
+                *phase = "updateAttributes";
+                let attributes = { shared.borrow().preserved_attributes.clone() };
+                for (id, value) in attributes {
+                    lease(shared, r, generation, context)?;
+                    let property = context.GetProperty(&id)?;
+                    edit_identity(shared, r, generation, epoch)?;
+                    property.SetValue(
+                        ec,
+                        &range,
+                        &windows::Win32::System::Variant::VARIANT::from(value),
+                    )?;
+                    edit_identity(shared, r, generation, epoch)?;
+                    let actual = property.GetValue(ec, &range)?;
+                    edit_identity(shared, r, generation, epoch)?;
+                    if actual.vt() != windows::Win32::System::Variant::VT_I4
+                        || i32::try_from(&actual)? != value
+                    {
+                        return Err(failure(TF_E_DISCONNECTED));
+                    }
+                }
                 *phase = "updateReadback";
                 let actual = range_text(&range, ec)?;
                 // RichEdit and browser text stores can use different newline representations.
@@ -912,12 +1058,13 @@ fn apply(
             }
             Action::Abort => {
                 *phase = "abort";
-                let backup = shared
-                    .borrow()
-                    .backup
-                    .as_ref()
-                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?
-                    .clone();
+                let backup = { shared.borrow().backup.clone() };
+                let Some(backup) = backup else {
+                    // Finish even when property changes made rollback unsafe.
+                    composition.EndComposition(ec)?;
+                    release_composition(shared, epoch, Some(&composition));
+                    return Err(failure(TF_E_DISCONNECTED));
+                };
                 *mutation = Mutation::Uncertain;
                 lease(shared, r, generation, context)?;
                 backup.Restore(ec, &range)?;

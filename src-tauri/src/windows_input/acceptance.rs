@@ -138,6 +138,14 @@ impl Fixture {
 /// Production host against an owned TSF editor. No clipboard reads/writes or supplier requests.
 pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
     use super::composition::{Draft, Finish};
+    let input = WindowsInputService::new();
+    struct InputLease(WindowsInputService);
+    impl Drop for InputLease {
+        fn drop(&mut self) {
+            self.0.shutdown();
+        }
+    }
+    let _input_lease = InputLease(input.clone());
     let mut fixture = Fixture::open(exe, true)?;
     let _evidence = EvidenceLease::new()?;
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
@@ -158,6 +166,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
                 1,
                 anchor,
                 Arc::new(DeliveryGate::default()),
+                input.clone(),
             ))
             .map_err(|e| e.code)?;
         draft.update(1, 1, prefix);
@@ -224,6 +233,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
                 1,
                 anchor,
                 Arc::new(DeliveryGate::default()),
+                input.clone(),
             ))
             .map_err(|e| e.code)?;
         draft.update(1, 1, "正在识别");
@@ -272,7 +282,13 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         bind_watch(&id, &anchor, None).map_err(|e| e.code)?;
         let gate = Arc::new(DeliveryGate::default());
         let draft = runtime
-            .block_on(Draft::begin(id.clone(), 1, anchor.clone(), gate.clone()))
+            .block_on(Draft::begin(
+                id.clone(),
+                1,
+                anchor.clone(),
+                gate.clone(),
+                input.clone(),
+            ))
             .map_err(|e| e.code)?;
         let flow = Control::new(crate::input_state::activity_evidence());
         flow.resume(1, anchor.activity);
@@ -356,6 +372,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             1,
             anchor,
             Arc::new(DeliveryGate::default()),
+            input.clone(),
         ))
         .map_err(|e| e.code)?;
     draft.update(1, 1, "已有草稿");

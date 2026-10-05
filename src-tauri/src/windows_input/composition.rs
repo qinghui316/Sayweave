@@ -1,5 +1,5 @@
 //! Session-owned host. TSF ranges stay in the target's apartment, never in this worker.
-use super::{Anchor, Delivery, DeliveryGate, Submission, Verification};
+use super::{Anchor, Delivery, DeliveryGate, Submission, Verification, WindowsInputService, proof};
 use crate::history::types::Error;
 use sayweave_text_service::{
     client::ProfileLease,
@@ -38,6 +38,7 @@ pub enum Finish {
     Abort,
 }
 pub struct Draft {
+    input: WindowsInputService,
     turn: u64,
     sender: mpsc::SyncSender<Command>,
     desired: Arc<Mutex<Desired>>,
@@ -48,17 +49,19 @@ impl Draft {
         turn: u64,
         anchor: Anchor,
         gate: Arc<DeliveryGate>,
+        input: WindowsInputService,
     ) -> Result<Arc<Self>, Error> {
         let (sender, commands) = mpsc::sync_channel(4);
         let desired = Arc::new(Mutex::new(Desired::default()));
         let (ready, result) = oneshot::channel();
         let shared = desired.clone();
+        let worker_input = input.clone();
         std::thread::Builder::new()
             .name("sayweave-composition-sta".into())
             .spawn(move || {
                 let began = Instant::now();
                 let diagnostic_task = task.clone();
-                let mut host = match Host::open(task, turn, anchor, gate) {
+                let mut host = match Host::open(task, turn, anchor, gate, worker_input) {
                     Ok(host) => host,
                     Err(error) => {
                         log::info!(target:"sayweave", "operation=draft_admission task_id={} turn={} result=rejected error={} elapsed_ms={}", diagnostic_task,turn,error.code,began.elapsed().as_millis());
@@ -114,10 +117,14 @@ impl Draft {
             .await
             .map_err(|_| Error::new("compositionWorker"))??;
         Ok(Arc::new(Self {
+            input,
             turn,
             sender,
             desired,
         }))
+    }
+    pub(crate) fn input(&self) -> WindowsInputService {
+        self.input.clone()
     }
     /// One replaceable snapshot; a blocked target cannot create an unbounded edit queue.
     pub fn update(&self, turn: u64, sequence: u64, text: &str) {
@@ -191,6 +198,8 @@ struct Host {
     attempted: bool,
     visible: bool,
     failure: Option<String>,
+    input: WindowsInputService,
+    proof_available: bool,
     profile: ProfileLease,
     _lease: registration::HostLease,
     _apartment: Apartment,
@@ -201,6 +210,7 @@ impl Host {
         turn: u64,
         anchor: Anchor,
         gate: Arc<DeliveryGate>,
+        input: WindowsInputService,
     ) -> Result<Self, Error> {
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED)
@@ -250,16 +260,72 @@ impl Host {
             attempted: false,
             visible: false,
             failure: None,
+            input,
+            proof_available: false,
             profile,
             _lease: lease,
             _apartment: apartment,
         };
         super::native::composition_begin_target(&host.task, &host.anchor)?;
+        host.proof_available = host.observe(proof::Action::Begin)?;
+        log::info!(target:"sayweave", "operation=draft_proof task_id={} turn={} phase=begin available={}", host.task, host.turn, host.proof_available);
         host.exchange(Action::Begin, "", false)?;
         // Begin itself does not change text. Do not publish a writable draft if input moved
         // while the target's asynchronous edit session was being scheduled/executed.
         super::native::composition_begin_target(&host.task, &host.anchor)?;
+        host.check_position()?;
         Ok(host)
+    }
+    fn observe(&self, action: proof::Action) -> Result<bool, Error> {
+        self.observe_until(action, Instant::now() + Duration::from_millis(500))
+    }
+    fn observe_until(&self, action: proof::Action, expires: Instant) -> Result<bool, Error> {
+        let response = self.input.proof(proof::Request {
+            task: self.task.clone(),
+            turn: self.turn,
+            anchor: self.anchor.clone(),
+            expires,
+            action,
+        })?;
+        loop {
+            if Instant::now() >= expires {
+                return Err(Error::new("targetTimeout"));
+            }
+            if self.gate.cancelled() {
+                return Err(Error::new("cancelled"));
+            }
+            match response.try_recv() {
+                Ok(value) => return value,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(Error::new("targetProbeFailed"));
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            pump();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    fn check_position(&self) -> Result<(), Error> {
+        if self.proof_available {
+            let text = self.visible.then(|| self.text.clone());
+            let expires = Instant::now() + Duration::from_millis(500);
+            let observed = loop {
+                let value = self.observe_until(proof::Action::Check(text.clone()), expires);
+                if matches!(&value, Err(e) if matches!(e.code.as_str(), "targetObservationPending" | "targetProbeFailed"))
+                    && Instant::now() < expires
+                {
+                    pump();
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                break value;
+            };
+            log::info!(target:"sayweave", "operation=draft_proof task_id={} turn={} revision={} phase=check matched={} error={}", self.task,self.turn,self.revision,matches!(observed,Ok(true)),observed.as_ref().err().map(|e|e.code.as_str()).unwrap_or("none"));
+            if !observed? {
+                return Err(Error::new("targetProbeFailed"));
+            }
+        }
+        Ok(())
     }
     fn exchange(&mut self, action: Action, text: &str, cleanup: bool) -> Result<(), Error> {
         if !cleanup {
@@ -328,6 +394,10 @@ impl Host {
         }
     }
     fn update(&mut self, text: &str) -> Result<(), Error> {
+        if let Err(error) = self.check_position() {
+            self.failure = Some(error.code.clone());
+            return Err(error);
+        }
         if text == self.text {
             return Ok(());
         }
@@ -352,6 +422,7 @@ impl Host {
                 .and(Err(Error::new(self.failure.as_deref().unwrap())))
         } else {
             self.update(text).and_then(|_| {
+                self.check_position()?;
                 if !self.gate.commit() {
                     return self
                         .exchange(Action::Abort, "", true)
@@ -360,7 +431,30 @@ impl Host {
                 self.exchange(Action::Commit, "", false)
             })
         };
-        let confirmed = result.is_ok() && mode == Finish::Commit;
+        // A TSF applied acknowledgement is submission, not proof that the application
+        // accepted the text after releasing its edit lock (e.g. maxlength constraints).
+        let committed = result.is_ok() && mode == Finish::Commit;
+        let verification_started = Instant::now();
+        let mut confirmed = false;
+        if committed && self.proof_available {
+            let expires = verification_started + Duration::from_millis(500);
+            loop {
+                match self.observe_until(proof::Action::Confirm(text.into()), expires) {
+                    Ok(true) => {
+                        confirmed = true;
+                        break;
+                    }
+                    Err(_) => break,
+                    Ok(false) => {}
+                }
+                if verification_started.elapsed() >= Duration::from_millis(500) {
+                    break;
+                }
+                pump();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        log::info!(target:"sayweave", "operation=draft_proof task_id={} turn={} revision={} phase=confirm submitted={} confirmed={} elapsed_ms={}", self.task,self.turn,self.revision,committed,confirmed,verification_started.elapsed().as_millis());
         let mut delivery = Delivery::not_submitted(
             result
                 .as_ref()
@@ -378,8 +472,11 @@ impl Host {
             delivery.error = None;
             delivery.submission = Submission::Submitted;
             delivery.verification = Verification::Confirmed;
-        } else if self.visible && !aborted || self.attempted && result.is_err() {
+        } else if committed || self.visible && !aborted || self.attempted && result.is_err() {
             delivery.state = "unconfirmed".into();
+            if committed {
+                delivery.error = Some("compositionUnconfirmed".into());
+            }
             delivery.submission = if self.visible {
                 Submission::Submitted
             } else {

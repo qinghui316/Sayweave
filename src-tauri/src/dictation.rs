@@ -447,7 +447,7 @@ impl DictationCoordinator {
         let raw_draft = if source == "external"
             && let Some(target) = anchor.clone()
         {
-            match Draft::begin(id.clone(), 1, target, gate.clone()).await {
+            match Draft::begin(id.clone(), 1, target, gate.clone(), input.inner().clone()).await {
                 Ok(draft) => Some(draft),
                 Err(error) if error.code == "targetReadonlyContext" => {
                     anchor = None;

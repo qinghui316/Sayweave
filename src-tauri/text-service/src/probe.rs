@@ -360,7 +360,7 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let manager: ITfThreadMgr =
             CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
-        let client = manager.Activate()?;
+        manager.Activate()?;
         if !plain {
             let _ = SendMessageW(
                 editor,
@@ -375,6 +375,15 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         if GetForegroundWindow() != top {
             // A background test launcher may be denied SetForegroundWindow.
             // Exercise only the blank window this fixture owns, then verify focus.
+            SetWindowPos(
+                top,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )?;
             let mut rect = RECT::default();
             GetWindowRect(editor, &mut rect)?;
             SetCursorPos(rect.left + 30, rect.top + 30)?;
@@ -391,6 +400,15 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("owned fixture focus click was not submitted".into());
             }
             pump(Duration::from_millis(200));
+            SetWindowPos(
+                top,
+                Some(HWND_NOTOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )?;
             println!("owned fixture required a real activation click=true");
         }
         if GetForegroundWindow() != top {
@@ -400,8 +418,19 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
             .nth(2)
             .map(std::path::PathBuf::from)
             .unwrap_or(std::env::current_exe()?.with_file_name("sayweave_text_service.dll"));
+        // The installed speech profile can already be active in this fixture process.
+        // Isolate the explicitly loaded component here only; leave the desktop/user
+        // profile and keyboard unchanged.
+        let (activation, language) = sayweave_text_service::client::speech_activation()?;
+        if activation == sayweave_text_service::client::SpeechActivation::Own {
+            registration::deactivate(language, false)?;
+            pump(Duration::from_millis(100));
+        }
         let (component, processor) = load_processor(&module_path)?;
-        processor.Activate(&manager, client)?;
+        let service_client = manager
+            .cast::<ITfClientId>()?
+            .GetClientId(&registration::CLASS)?;
+        processor.Activate(&manager, service_client)?;
         let capability = uuid::Uuid::new_v4().to_string();
         let host = registration::host_capability(std::process::id(), &capability)?;
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
@@ -473,6 +502,34 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "owned plain EDIT cumulative replacement and single commit actual text=true"
                 );
+                let before = editor_text(editor)?;
+                if !exchange(&pipe, &capability, &task, 2, 1, 0, Action::Begin, "", false)?.applied
+                    || !exchange(
+                        &pipe,
+                        &capability,
+                        &task,
+                        2,
+                        2,
+                        1,
+                        Action::Update,
+                        "取消保留",
+                        false,
+                    )?
+                    .applied
+                {
+                    return Err("plain cancel setup rejected".into());
+                }
+                pump(Duration::from_millis(100));
+                let abort = exchange(&pipe, &capability, &task, 2, 3, 1, Action::Abort, "", false)?;
+                if abort.applied
+                    || abort.mutation != Mutation::NotAttempted
+                    || editor_text(editor)? != format!("{before}取消保留")
+                {
+                    return Err("plain property-affected cancellation lost visible text".into());
+                }
+                println!(
+                    "owned plain EDIT cancellation retains property-affected text and ends composition=true"
+                );
                 return Ok(());
             }
             let original = "前 被选🙂 后";
@@ -532,22 +589,39 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
             if !update.applied {
                 return Err("property case setup rejected".into());
             }
-            let handed_off_text = editor_text(editor)?;
             let user_edit: ITfEditSession = UserPropertyEdit {
                 context: context.clone(),
+                mode: 0,
             }
             .into();
             context
                 .RequestEditSession(0, &user_edit, TF_ES_SYNC | TF_ES_READWRITE)?
                 .ok()?;
             pump(Duration::from_millis(100));
-            let abort = exchange(
+            verify_language(&context, 0x409)?;
+            let corrected = exchange(
                 &pipe,
                 &capability,
                 &task,
                 4,
                 11,
-                1,
+                2,
+                Action::Update,
+                "更新文字",
+                false,
+            )?;
+            if !corrected.applied {
+                return Err("property-preserving correction rejected".into());
+            }
+            verify_language(&context, 0x409)?;
+            let handed_off_text = editor_text(editor)?;
+            let abort = exchange(
+                &pipe,
+                &capability,
+                &task,
+                4,
+                12,
+                2,
                 Action::Abort,
                 "",
                 false,
@@ -558,14 +632,15 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
             {
                 return Err("external property edit was overwritten by rollback".into());
             }
+            verify_language(&context, 0x409)?;
             println!("owned property-only user edit revoked rollback ownership=true");
             let handoff = exchange(
                 &pipe,
                 &capability,
                 &task,
                 4,
-                12,
-                1,
+                13,
+                2,
                 Action::Handoff,
                 "",
                 false,
@@ -578,6 +653,77 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("same-turn released range handoff acknowledgement changed text".into());
             }
             println!("owned released-range handoff acknowledged without mutation=true");
+            // A property affecting only part of the owned text cannot be mapped
+            // onto a replacement snapshot; deleting a property is likewise not
+            // a scalar value that can be preserved.
+            for (turn, mode) in [(6, 1), (7, 2)] {
+                SendMessageW(
+                    editor,
+                    WM_SETTEXT,
+                    None,
+                    Some(LPARAM([0u16].as_ptr() as isize)),
+                );
+                SendMessageW(editor, 0xB1, Some(WPARAM(0)), Some(LPARAM(0)));
+                pump(Duration::from_millis(50));
+                for (operation, revision, action, text) in [
+                    (1, 0, Action::Begin, ""),
+                    (2, 1, Action::Update, "保留原文字"),
+                ] {
+                    if !exchange(
+                        &pipe,
+                        &capability,
+                        &task,
+                        turn,
+                        operation,
+                        revision,
+                        action,
+                        text,
+                        false,
+                    )?
+                    .applied
+                    {
+                        return Err("attribute rejection setup failed".into());
+                    }
+                }
+                let full: ITfEditSession = UserPropertyEdit {
+                    context: context.clone(),
+                    mode: 0,
+                }
+                .into();
+                context
+                    .RequestEditSession(0, &full, TF_ES_SYNC | TF_ES_READWRITE)?
+                    .ok()?;
+                let changed: ITfEditSession = UserPropertyEdit {
+                    context: context.clone(),
+                    mode,
+                }
+                .into();
+                context
+                    .RequestEditSession(0, &changed, TF_ES_SYNC | TF_ES_READWRITE)?
+                    .ok()?;
+                pump(Duration::from_millis(100));
+                let preserved = editor_text(editor)?;
+                let reply = exchange(
+                    &pipe,
+                    &capability,
+                    &task,
+                    turn,
+                    3,
+                    2,
+                    Action::Update,
+                    "不得覆盖",
+                    false,
+                )?;
+                if reply.applied
+                    || reply.mutation != Mutation::NotAttempted
+                    || editor_text(editor)? != preserved
+                {
+                    return Err("partial/cleared attribute allowed later overwrite".into());
+                }
+                println!(
+                    "owned attribute mode={mode} hands off and rejects stale replacement=true"
+                );
+            }
             SendMessageW(
                 editor,
                 WM_SETTEXT,
@@ -596,7 +742,7 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                     &pipe,
                     &capability,
                     &task,
-                    5,
+                    8,
                     operation,
                     revision,
                     action,
@@ -740,6 +886,56 @@ fn load_processor(
 #[windows::core::implement(ITfEditSession)]
 struct UserPropertyEdit {
     context: ITfContext,
+    mode: u8,
+}
+#[cfg(feature = "acceptance")]
+#[windows::core::implement(ITfEditSession)]
+struct ReadLanguage {
+    context: ITfContext,
+    result: std::rc::Rc<std::cell::Cell<Option<i32>>>,
+}
+#[cfg(feature = "acceptance")]
+impl ITfEditSession_Impl for ReadLanguage_Impl {
+    fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        unsafe {
+            let range = self.context.GetStart(ec)?;
+            range.ShiftEndToRange(ec, &self.context.GetEnd(ec)?, TF_ANCHOR_END)?;
+            let value = self
+                .context
+                .GetProperty(&GUID_PROP_LANGID)?
+                .GetValue(ec, &range)?;
+            eprintln!(
+                "language proof type={} value={:?}",
+                value.vt().0,
+                i32::try_from(&value).ok()
+            );
+            if value.vt() != windows::Win32::System::Variant::VT_I4 {
+                return Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ));
+            }
+            self.result.set(Some(i32::try_from(&value)?));
+            Ok(())
+        }
+    }
+}
+#[cfg(feature = "acceptance")]
+fn verify_language(context: &ITfContext, expected: i32) -> Result<(), Box<dyn std::error::Error>> {
+    let result = std::rc::Rc::new(std::cell::Cell::new(None));
+    let read: ITfEditSession = ReadLanguage {
+        context: context.clone(),
+        result: result.clone(),
+    }
+    .into();
+    unsafe {
+        context
+            .RequestEditSession(0, &read, TF_ES_SYNC | TF_ES_READ)?
+            .ok()?;
+    }
+    if result.get() != Some(expected) {
+        return Err("user LANGID changed during correction/rollback".into());
+    }
+    Ok(())
 }
 #[cfg(feature = "acceptance")]
 impl ITfEditSession_Impl for UserPropertyEdit_Impl {
@@ -747,10 +943,25 @@ impl ITfEditSession_Impl for UserPropertyEdit_Impl {
         unsafe {
             let range = self.context.GetStart(ec)?;
             range.ShiftEndToRange(ec, &self.context.GetEnd(ec)?, TF_ANCHOR_END)?;
+            if self.mode == 1 {
+                range.Collapse(ec, TF_ANCHOR_START)?;
+                let mut shifted = 0;
+                range.ShiftEnd(ec, 1, &mut shifted, std::ptr::null())?;
+            }
+            if self.mode == 2 {
+                return self
+                    .context
+                    .GetProperty(&GUID_PROP_LANGID)?
+                    .Clear(ec, &range);
+            }
             self.context.GetProperty(&GUID_PROP_LANGID)?.SetValue(
                 ec,
                 &range,
-                &windows::Win32::System::Variant::VARIANT::from(0x409i32),
+                &windows::Win32::System::Variant::VARIANT::from(if self.mode == 1 {
+                    0x804i32
+                } else {
+                    0x409i32
+                }),
             )
         }
     }

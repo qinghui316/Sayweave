@@ -14,6 +14,8 @@ pub(crate) mod composition;
 #[cfg(windows)]
 mod native;
 #[cfg(windows)]
+mod proof;
+#[cfg(windows)]
 pub(crate) use native::{composition_target, reanchor_turn};
 #[cfg(feature = "desktop-acceptance")]
 pub fn native_checks(fixture: &std::path::Path) -> Result<(), String> {
@@ -125,6 +127,8 @@ fn event_after_capture(event_tick: u32, captured_tick: u32) -> bool {
     event_tick.wrapping_sub(captured_tick) <= i32::MAX as u32
 }
 enum Request {
+    #[cfg(windows)]
+    Proof(proof::Request, mpsc::SyncSender<Result<bool, Error>>),
     Capture(String, Anchor, oneshot::Sender<Result<(), Error>>),
     Copy(
         String,
@@ -253,6 +257,12 @@ impl WindowsInputService {
         let (tx, rx) = oneshot::channel();
         self.send(Request::Capture(id, anchor, tx))?;
         rx.await.map_err(|_| Error::new("targetProbeFailed"))?
+    }
+    #[cfg(windows)]
+    fn proof(&self, request: proof::Request) -> Result<mpsc::Receiver<Result<bool, Error>>, Error> {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.send(Request::Proof(request, tx))?;
+        Ok(rx)
     }
     pub async fn copy(&self, text: String) -> Result<(), Error> {
         if text.len() > 1024 * 1024 {

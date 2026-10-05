@@ -652,6 +652,7 @@ pub(super) fn worker(
             let _ = a2.SetTransactionTimeout(50);
         }
     }
+    let mut proof = super::proof::Evidence::default();
     while let Ok(envelope) = receiver.recv() {
         let request = envelope.request;
         if matches!(request, Request::Stop) {
@@ -671,6 +672,11 @@ pub(super) fn worker(
             break;
         }
         match request {
+            Request::Proof(request, response) => {
+                deadline(500);
+                let result = proof.execute(automation.as_ref(), request);
+                let _ = response.send(result);
+            }
             Request::Capture(id, anchor, response) => {
                 deadline(500);
                 let at = Instant::now();
@@ -688,7 +694,10 @@ pub(super) fn worker(
                 });
                 let _ = response.send(result);
             }
-            Request::Forget(id) => release_watch(&id),
+            Request::Forget(id) => {
+                proof.forget(&id);
+                release_watch(&id);
+            }
             Request::Stop => break,
         }
         busy.store(false, Ordering::Release);
@@ -697,6 +706,7 @@ pub(super) fn worker(
     if let Ok(mut watch) = WATCH.lock() {
         *watch = None;
     }
+    drop(proof);
     drop(automation);
     unsafe {
         CoUninitialize();

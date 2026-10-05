@@ -26,6 +26,7 @@ struct State {
     last_delivery: Option<Delivery>,
 }
 pub(crate) struct SessionDraft {
+    input: windows_input::WindowsInputService,
     task: String,
     anchor: Anchor,
     gate: Arc<DeliveryGate>,
@@ -58,6 +59,7 @@ impl SessionDraft {
         cancel: watch::Sender<u8>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            input: draft.input(),
             task,
             anchor: anchor.clone(),
             gate,
@@ -154,19 +156,26 @@ impl SessionDraft {
         }
         let anchor = windows_input::reanchor_turn(&self.task, &self.anchor)?;
         self.feedback(publish, Presentation::Resuming);
-        let draft =
-            match Draft::begin(self.task.clone(), turn, anchor.clone(), self.gate.clone()).await {
-                Ok(draft) => draft,
-                // Begin does not write text. Wait for the foreign IME composition to actually
-                // end; the300ms debounce alone is not permission to acquire its range.
-                Err(error) if error.code == "inputComposition" => {
-                    if let Ok(mut state) = self.state.lock() {
-                        state.paused_at = Some(Instant::now());
-                    }
-                    return Ok(());
+        let draft = match Draft::begin(
+            self.task.clone(),
+            turn,
+            anchor.clone(),
+            self.gate.clone(),
+            self.input.clone(),
+        )
+        .await
+        {
+            Ok(draft) => draft,
+            // Begin does not write text. Wait for the foreign IME composition to actually
+            // end; the300ms debounce alone is not permission to acquire its range.
+            Err(error) if error.code == "inputComposition" => {
+                if let Ok(mut state) = self.state.lock() {
+                    state.paused_at = Some(Instant::now());
                 }
-                Err(error) => return Err(error),
-            };
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         if *self.cancel.borrow() > 0
             || self.control.stopping()
             || input_state::activity() != activity
