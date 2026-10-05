@@ -40,13 +40,20 @@ pub fn final_presentation(
     delivery: Option<&Delivery>,
     error: Option<&str>,
 ) -> Presentation {
+    // A failed rollback can leave visible text even when recognition itself was cancelled.
+    if delivery.is_some_and(|d| {
+        d.submission != Submission::NotSubmitted
+            && (d.state != "confirmed" || d.error.is_some() || d.restore_error)
+    }) {
+        return Presentation::Notice;
+    }
     if error == Some("cancelled")
         || delivery.is_some_and(|d| d.error.as_deref() == Some("cancelled"))
     {
         return Presentation::Idle;
     }
     if let Some(delivery) = delivery {
-        if delivery.state == "confirmed" && !delivery.restore_error {
+        if delivery.state == "confirmed" && delivery.error.is_none() && !delivery.restore_error {
             return Presentation::Completed;
         }
         // Submitted input can already be visible in the target. Never offer a duplicate paste.
@@ -97,6 +104,7 @@ mod tests {
             Presentation::Notice
         );
         delivery.state = "confirmed".into();
+        delivery.error = None;
         assert_eq!(
             final_presentation(false, "文字", Some(&delivery), None),
             Presentation::Completed
@@ -105,6 +113,22 @@ mod tests {
         assert_eq!(
             final_presentation(false, "文字", Some(&delivery), None),
             Presentation::Notice
+        );
+    }
+    #[test]
+    fn cancelled_recognition_cannot_hide_failed_draft_rollback() {
+        let mut delivery = Delivery::not_submitted("compositionRollback");
+        delivery.state = "unconfirmed".into();
+        delivery.submission = Submission::Submitted;
+        assert_eq!(
+            final_presentation(false, "部分文字", Some(&delivery), Some("cancelled")),
+            Presentation::Notice
+        );
+        delivery.submission = Submission::NotSubmitted;
+        delivery.error = Some("cancelled".into());
+        assert_eq!(
+            final_presentation(false, "", Some(&delivery), Some("cancelled")),
+            Presentation::Idle
         );
     }
     #[test]

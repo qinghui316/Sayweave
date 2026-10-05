@@ -10,10 +10,16 @@ use tokio::sync::oneshot;
 #[cfg(feature = "desktop-acceptance")]
 mod acceptance;
 #[cfg(windows)]
+pub(crate) mod composition;
+#[cfg(windows)]
 mod native;
 #[cfg(feature = "desktop-acceptance")]
 pub fn native_checks(fixture: &std::path::Path) -> Result<(), String> {
     acceptance::run(fixture)
+}
+#[cfg(feature = "desktop-acceptance")]
+pub fn composition_checks(fixture: &std::path::Path) -> Result<(), String> {
+    acceptance::composition_run(fixture)
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -57,6 +63,24 @@ impl Delivery {
             submitted_events: 0,
         }
     }
+}
+/// Lack of UIA readback is not a rejection of TSF. Positive password/readonly/target-change
+/// evidence, however, is shared by every input strategy and cannot be overridden by another probe.
+pub(crate) fn draft_rejection(result: &Result<(), Error>) -> Option<String> {
+    result
+        .as_ref()
+        .err()
+        .filter(|e| {
+            matches!(
+                e.code.as_str(),
+                "targetPassword"
+                    | "targetReadonly"
+                    | "targetPermission"
+                    | "inputComposition"
+                    | "targetChanged"
+            )
+        })
+        .map(|e| e.code.clone())
 }
 #[derive(Clone, Debug)]
 pub struct Anchor {

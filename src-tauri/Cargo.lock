@@ -4236,6 +4236,7 @@ dependencies = [
  "rubato",
  "rusqlite",
  "rustls",
+ "sayweave-text-service",
  "serde",
  "serde_json",
  "sha2",
@@ -4249,6 +4250,17 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "unicode-normalization",
+ "uuid",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
+name = "sayweave-text-service"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "uuid",
  "windows",
  "windows-core",

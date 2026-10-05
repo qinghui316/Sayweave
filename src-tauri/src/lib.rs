@@ -31,6 +31,10 @@ pub fn input_acceptance(fixture: &std::path::Path) -> Result<(), String> {
     windows_input::native_checks(fixture)
 }
 #[cfg(feature = "desktop-acceptance")]
+pub fn composition_acceptance(fixture: &std::path::Path) -> Result<(), String> {
+    windows_input::composition_checks(fixture)
+}
+#[cfg(feature = "desktop-acceptance")]
 #[tauri::command]
 fn acceptance_exit(app: tauri::AppHandle, window: WebviewWindow) -> Result<(), RuntimeError> {
     if window.label() != "main"
@@ -99,7 +103,8 @@ fn voice_layout(app: &tauri::AppHandle, phase: Phase) -> VoiceLayout {
             Presentation::Notice | Presentation::Error => {
                 (384.0, if *recovery { 240.0 } else { 152.0 })
             }
-            _ => (384.0, 220.0),
+            Presentation::Recording => (240.0, 112.0),
+            _ => (280.0, 150.0),
         }
     } else {
         overlay_size(phase)
@@ -640,6 +645,18 @@ pub fn run() {
                     )));
                     app.manage(shortcuts::ShortcutService::new(worker.clone()));
                     app.manage(worker);
+                    let handle = app.handle().clone();
+                    let mut transcripts = handle
+                        .state::<speech::SpeechService>()
+                        .subscribe_transcripts();
+                    tauri::async_runtime::spawn(async move {
+                        while transcripts.changed().await.is_ok() {
+                            let transcript = transcripts.borrow_and_update().clone();
+                            handle
+                                .state::<dictation::DictationCoordinator>()
+                                .observe_transcript(&transcript);
+                        }
+                    });
                     let handle = app.handle().clone();
                     let mut states = handle.state::<speech::SpeechService>().subscribe();
                     tauri::async_runtime::spawn(async move {

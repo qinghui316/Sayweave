@@ -74,9 +74,88 @@ struct Fixture {
     input: ChildStdin,
     output: std::sync::mpsc::Receiver<String>,
 }
+struct EvidenceLease {
+    thread: Option<std::thread::JoinHandle<()>>,
+    id: u32,
+}
+unsafe extern "system" fn evidence_event(
+    _: windows::Win32::UI::Accessibility::HWINEVENTHOOK,
+    event: u32,
+    window: HWND,
+    object: i32,
+    _: i32,
+    _: u32,
+    time: u32,
+) {
+    super::native::observe(event, window.0 as usize, object, time);
+}
+impl EvidenceLease {
+    fn new() -> Result<Self, String> {
+        let (ready, value) = std::sync::mpsc::channel::<Result<u32, String>>();
+        let thread = std::thread::spawn(move || unsafe {
+            use windows::Win32::{System::Threading::GetCurrentThreadId, UI::Accessibility::*};
+            let hooks = [
+                EVENT_SYSTEM_FOREGROUND,
+                EVENT_OBJECT_FOCUS,
+                EVENT_OBJECT_DESTROY,
+                EVENT_OBJECT_VALUECHANGE,
+                EVENT_OBJECT_TEXTSELECTIONCHANGED,
+            ]
+            .map(|event| {
+                SetWinEventHook(
+                    event,
+                    event,
+                    None,
+                    Some(evidence_event),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT,
+                )
+            });
+            let mut message = MSG::default();
+            let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+            if hooks.iter().any(|h| h.0.is_null()) {
+                for hook in hooks {
+                    let _ = UnhookWinEvent(hook);
+                }
+                let _ = ready.send(Err("event hook unavailable".into()));
+                return;
+            }
+            let _ = ready.send(Ok(GetCurrentThreadId()));
+            while GetMessageW(&mut message, None, 0, 0).0 > 0 {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            for hook in hooks {
+                let _ = UnhookWinEvent(hook);
+            }
+        });
+        Ok(Self {
+            thread: Some(thread),
+            id: value.recv().map_err(|_| "event hook worker")??,
+        })
+    }
+}
+impl Drop for EvidenceLease {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = PostThreadMessageW(self.id, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 impl Fixture {
     fn new(exe: &std::path::Path) -> Result<Self, String> {
-        let mut child = Command::new(exe)
+        Self::open(exe, false)
+    }
+    fn open(exe: &std::path::Path, composition: bool) -> Result<Self, String> {
+        let mut command = Command::new(exe);
+        if composition {
+            command.arg("composition");
+        }
+        let mut child = command
             .env("SAYWEAVE_INPUT_ACCEPTANCE", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -119,6 +198,104 @@ impl Fixture {
         self.input.flush().map_err(|e| e.to_string())?;
         self.read()
     }
+}
+/// Production host against an owned TSF editor. No clipboard reads/writes or supplier requests.
+pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
+    use super::composition::{Draft, Finish};
+    let mut fixture = Fixture::open(exe, true)?;
+    let _evidence = EvidenceLease::new()?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    for (before, start, end, prefix, text, expected) in [
+        ("abc", 1, 1, "中", "中文，🙂", "a中文，🙂bc"),
+        ("前 被选🙂 后", 2, 6, "替", "替换🙂", "前 替换🙂 后"),
+        ("", 0, 0, "第一行", "第一行\n第二行🙂", "第一行\n第二行🙂"),
+    ] {
+        fixture
+            .command(serde_json::json!({"action":"focus","text":before,"start":start,"end":end}))?;
+        std::thread::sleep(Duration::from_millis(60));
+        let id = uuid::Uuid::new_v4().to_string();
+        let anchor = WindowsInputService::anchor().ok_or("fixture not foreground")?;
+        bind_watch(&id, &anchor, None).map_err(|e| e.code)?;
+        let draft = runtime
+            .block_on(Draft::begin(
+                id.clone(),
+                1,
+                anchor,
+                Arc::new(DeliveryGate::default()),
+            ))
+            .map_err(|e| e.code)?;
+        draft.update(1, 1, prefix);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let value = fixture.command(serde_json::json!({"action":"read"}))?;
+            if value["text"].as_str().is_some_and(|v| v.contains(prefix)) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("live prefix did not reach actual target".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        draft.update(1, 2, text);
+        draft.update(1, 1, "STALE");
+        let delivery = runtime.block_on(draft.finish(text.into(), Finish::Commit));
+        if delivery.verification != Verification::Confirmed {
+            return Err(format!("composition commit failed: {:?}", delivery.error));
+        }
+        let actual = fixture.command(serde_json::json!({"action":"read"}))?;
+        if actual["text"]
+            .as_str()
+            .map(|t| t.replace("\r\n", "\n"))
+            .as_deref()
+            != Some(expected)
+        {
+            return Err("composition actual target assertion failed".into());
+        }
+        release_watch(&id);
+        println!(
+            "SAYWEAVE_COMPOSITION_SAMPLE_PASS actual_prefix=true cumulative=true final_single_copy=true"
+        );
+    }
+    // Actual foreground notifications must remain sticky after switching back. This is
+    // deliberately a second owned process, not a fabricated WinEvent or personal app.
+    fixture.command(serde_json::json!({"action":"focus","text":"","start":0,"end":0}))?;
+    std::thread::sleep(Duration::from_millis(60));
+    let id = uuid::Uuid::new_v4().to_string();
+    let anchor = WindowsInputService::anchor().ok_or("fixture not foreground")?;
+    bind_watch(&id, &anchor, None).map_err(|e| e.code)?;
+    let draft = runtime
+        .block_on(Draft::begin(
+            id.clone(),
+            1,
+            anchor,
+            Arc::new(DeliveryGate::default()),
+        ))
+        .map_err(|e| e.code)?;
+    draft.update(1, 1, "已有草稿");
+    let until = std::time::Instant::now() + Duration::from_secs(3);
+    while fixture.command(serde_json::json!({"action":"read"}))?["text"] != "已有草稿" {
+        if std::time::Instant::now() >= until {
+            return Err("negative fixture prefix missing".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    {
+        let mut other = Fixture::open(exe, true)?;
+        other.command(serde_json::json!({"action":"focus","text":"other","start":5,"end":5}))?;
+        std::thread::sleep(Duration::from_millis(100));
+        fixture.command(serde_json::json!({"action":"focus"}))?;
+        std::thread::sleep(Duration::from_millis(100));
+        let result = runtime.block_on(draft.finish("禁止追加".into(), Finish::Commit));
+        if result.error.as_deref() != Some("targetChanged")
+            || fixture.command(serde_json::json!({"action":"read"}))?["text"] != "已有草稿"
+            || other.command(serde_json::json!({"action":"read"}))?["text"] != "other"
+        {
+            return Err("real foreground switch was not protected".into());
+        }
+    }
+    release_watch(&id);
+    println!("SAYWEAVE_COMPOSITION_PROTECTION_PASS real_switch_return=true no_wrong_write=true");
+    Ok(())
 }
 impl Drop for Fixture {
     fn drop(&mut self) {

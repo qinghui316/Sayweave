@@ -106,11 +106,20 @@ pub struct NativeStart {
     pub cancel: watch::Sender<u8>,
     pub terminal: tokio::sync::oneshot::Sender<NativeTerminal>,
 }
+/// Native cumulative recognition stream; separate from renderer and lifecycle projection.
+#[derive(Clone, Default)]
+pub struct NativeTranscript {
+    pub task_id: String,
+    pub turn: u64,
+    pub sequence: u64,
+    pub text: String,
+}
 pub struct SpeechService {
     pub history: HistoryService,
     pub playback: Playback,
     snapshot: Mutex<Snapshot>,
     states: watch::Sender<Snapshot>,
+    transcripts: watch::Sender<NativeTranscript>,
     active: Mutex<Option<(String, watch::Sender<u8>)>>,
     gate: AsyncMutex<()>,
     stopping: AtomicBool,
@@ -130,11 +139,13 @@ impl Drop for FreshOperation {
 impl SpeechService {
     pub fn new(history: HistoryService) -> Self {
         let (states, _) = watch::channel(Snapshot::default());
+        let (transcripts, _) = watch::channel(NativeTranscript::default());
         Self {
             history,
             playback: Playback::new(),
             snapshot: Mutex::new(Snapshot::default()),
             states,
+            transcripts,
             active: Mutex::new(None),
             gate: AsyncMutex::new(()),
             stopping: AtomicBool::new(false),
@@ -165,6 +176,18 @@ impl SpeechService {
     }
     pub fn subscribe(&self) -> watch::Receiver<Snapshot> {
         self.states.subscribe()
+    }
+    pub fn subscribe_transcripts(&self) -> watch::Receiver<NativeTranscript> {
+        self.transcripts.subscribe()
+    }
+    fn publish_transcript(&self, task: &str, text: String) {
+        let sequence = self.transcripts.borrow().sequence + 1;
+        self.transcripts.send_replace(NativeTranscript {
+            task_id: task.into(),
+            turn: 1,
+            sequence,
+            text,
+        });
     }
     pub fn is_active(&self) -> bool {
         self.preparing.load(Ordering::Acquire)
@@ -611,7 +634,7 @@ impl SpeechService {
                                    biased;
                                    _=cancel.changed()=>{if *cancel.borrow()==1 {if let Some(c)=&capture{c.stop();}log::info!(target:"sayweave","operation=speech_phase task_id={} phase=capture_stopped elapsed_ms={}",task.id,began.elapsed().as_millis());self.update(app,&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}},
                                    message=session.next_event()=>{match message? {
-                                       recognition::Event::Update(value)=>{transcript=value;dirty=true;if !transcript.confirmed_text.is_empty()&&task.persistent&&checkpoint.elapsed()>Duration::from_secs(1){if self.history.db(DbOperation::Checkpoint{attempt_id:task.attempt_id.clone(),text:transcript.text(true)}).await.is_err(){save_error=true;}checkpoint=Instant::now();}},
+                                       recognition::Event::Update(value)=>{transcript=value;dirty=true;self.publish_transcript(&task.id,transcript.text(false));if !transcript.confirmed_text.is_empty()&&task.persistent&&checkpoint.elapsed()>Duration::from_secs(1){if self.history.db(DbOperation::Checkpoint{attempt_id:task.attempt_id.clone(),text:transcript.text(true)}).await.is_err(){save_error=true;}checkpoint=Instant::now();}},
                                        recognition::Event::Finished=>{if sending{return Err(Error::new("protocol"));}
                 if transcript.text(true).trim().is_empty(){return Err(Error::new("emptyText"));}log::info!(target:"sayweave","operation=speech_phase task_id={} phase=final_received elapsed_ms={}",task.id,began.elapsed().as_millis());break;},
                                        recognition::Event::Heartbeat=>{}

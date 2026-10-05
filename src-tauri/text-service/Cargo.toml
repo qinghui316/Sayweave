@@ -8,7 +8,9 @@ publish = false
 [workspace]
 
 [features]
-acceptance = []
+default = ["component"]
+component = []
+acceptance = ["component"]
 
 [lib]
 name = "sayweave_text_service"

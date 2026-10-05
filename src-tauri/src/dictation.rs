@@ -13,6 +13,8 @@ use std::sync::{
 use tauri::{Emitter, Manager};
 use tokio::sync::{oneshot, watch};
 mod presentation;
+#[cfg(windows)]
+use crate::windows_input::composition::{Draft, Finish};
 pub use presentation::Presentation;
 use presentation::{final_presentation, speech_presentation};
 #[derive(Clone, Debug, Serialize)]
@@ -53,6 +55,8 @@ struct Active {
     gate: Arc<DeliveryGate>,
     overlay_revision: u64,
     began: std::time::Instant,
+    #[cfg(windows)]
+    draft: Option<Arc<crate::windows_input::composition::Draft>>,
 }
 struct Reservation {
     id: String,
@@ -77,6 +81,19 @@ impl Default for DictationCoordinator {
     }
 }
 impl DictationCoordinator {
+    pub fn observe_transcript(&self, transcript: &crate::speech::NativeTranscript) {
+        #[cfg(windows)]
+        if let Ok(active) = self.active.lock()
+            && let Some(session) = active.as_ref().filter(|s| {
+                s.id == transcript.task_id && s.source == "external" && !s.gate.cancelled()
+            })
+            && let Some(draft) = &session.draft
+        {
+            draft.update(transcript.turn, transcript.sequence, &transcript.text);
+        }
+        #[cfg(not(windows))]
+        let _ = transcript;
+    }
     pub async fn retry_displayed(
         &self,
         app: tauri::AppHandle,
@@ -274,6 +291,8 @@ impl DictationCoordinator {
                 gate: gate.clone(),
                 overlay_revision: crate::OVERLAY_VISIBILITY.load(Ordering::Acquire),
                 began: std::time::Instant::now(),
+                #[cfg(windows)]
+                draft: None,
             });
         }
         app.state::<ShortcutService>().active_task(Some(id.clone()));
@@ -328,6 +347,18 @@ impl DictationCoordinator {
         app.state::<ShortcutService>().active_task(Some(id.clone()));
         self.update(&app, &id, |_| {});
         let input = app.state::<WindowsInputService>();
+        #[cfg(windows)]
+        let composition = if source == "external" {
+            anchor.clone().map(|anchor| {
+                let task = id.clone();
+                let gate = gate.clone();
+                tauri::async_runtime::spawn(
+                    async move { Draft::begin(task, 1, anchor, gate).await },
+                )
+            })
+        } else {
+            None
+        };
         let capture = if source == "external" {
             let service = input.inner().clone();
             let task = id.clone();
@@ -360,6 +391,12 @@ impl DictationCoordinator {
             if let Some(c) = capture {
                 let _ = c.await;
             }
+            #[cfg(windows)]
+            if let Some(composition) = composition
+                && let Ok(Ok(draft)) = composition.await
+            {
+                let _ = draft.finish(String::new(), Finish::Abort).await;
+            }
             input.forget(id.clone());
             self.update(&app, &id, |s| {
                 s.stage = "idle".into();
@@ -386,6 +423,48 @@ impl DictationCoordinator {
                 None => Err(Error::new("targetUnavailable")),
             };
             let coordinator = app.state::<Self>();
+            #[cfg(windows)]
+            let capture_rejection = crate::windows_input::draft_rejection(&capture_result);
+            #[cfg(windows)]
+            let draft = match composition {
+                Some(composition) => Some(
+                    composition
+                        .await
+                        .unwrap_or_else(|_| Err(Error::new("compositionWorker"))),
+                ),
+                None => None,
+            };
+            #[cfg(windows)]
+            let mut journal_ok = true;
+            #[cfg(windows)]
+            if let Some(Ok(draft)) = &draft {
+                let initial = app
+                    .state::<SpeechService>()
+                    .snapshot()
+                    .ok()
+                    .filter(|s| s.task_id.as_deref() == Some(&id));
+                journal_ok = match initial {
+                    Some(s) if s.record_id.is_some() => coordinator
+                        .journal(&app, &id, s.attempt_id.as_deref(), "pending", None)
+                        .await
+                        .is_ok(),
+                    Some(_) => true,
+                    None => false,
+                };
+                if journal_ok && capture_rejection.is_none() && !gate.cancelled() {
+                    if let Ok(mut active) = coordinator.active.lock()
+                        && let Some(session) = active.as_mut().filter(|s| s.id == id)
+                    {
+                        session.draft = Some(draft.clone());
+                    }
+                    let latest = app
+                        .state::<SpeechService>()
+                        .subscribe_transcripts()
+                        .borrow()
+                        .clone();
+                    coordinator.observe_transcript(&latest);
+                }
+            }
             if let Ok(terminal) = terminal_rx.await {
                 coordinator.update(&app, &id, |s| {
                     s.text = terminal.text.clone();
@@ -394,7 +473,32 @@ impl DictationCoordinator {
                     s.presentation = Presentation::Recognizing;
                 });
                 if source == "external" && !terminal.text.is_empty() {
-                    let mut delivery = if terminal.phase == Phase::Completed
+                    #[cfg(windows)]
+                    let inline = match &draft {
+                        Some(Ok(draft)) => {
+                            let mut mode = composition_finish(
+                                terminal.phase,
+                                journal_ok,
+                                !terminal.persistent || terminal.saved,
+                                gate.cancelled(),
+                            );
+                            if mode == Finish::Commit
+                                && let Some(error) = &capture_rejection
+                            {
+                                mode = Finish::Handoff(error.clone());
+                            }
+                            Some(draft.finish(terminal.text.clone(), mode).await)
+                        }
+                        Some(Err(error)) if error.code != "compositionNotEnabled" => {
+                            Some(Delivery::not_submitted(&error.code))
+                        }
+                        _ => None,
+                    };
+                    #[cfg(not(windows))]
+                    let inline: Option<Delivery> = None;
+                    let mut delivery = if let Some(inline) = inline {
+                        inline
+                    } else if terminal.phase == Phase::Completed
                         && !gate.cancelled()
                         && capture_result.is_ok()
                     {
@@ -468,7 +572,54 @@ impl DictationCoordinator {
                 coordinator.update(&app, &id, |s| {
                     s.presentation = Presentation::Recognizing;
                 });
+                #[cfg(windows)]
+                if terminal.text.is_empty()
+                    && let Some(Ok(draft)) = &draft
+                {
+                    let mode = if terminal.phase == Phase::Cancelled {
+                        Finish::Abort
+                    } else {
+                        Finish::Handoff(
+                            terminal.error.clone().unwrap_or_else(|| "emptyText".into()),
+                        )
+                    };
+                    let delivery = draft.finish(String::new(), mode).await;
+                    let partial = app
+                        .state::<SpeechService>()
+                        .subscribe_transcripts()
+                        .borrow()
+                        .clone();
+                    if terminal.record_id.is_some() {
+                        let _ = coordinator
+                            .journal(
+                                &app,
+                                &id,
+                                terminal.attempt_id.as_deref(),
+                                &delivery.state,
+                                delivery.error.clone(),
+                            )
+                            .await;
+                    }
+                    coordinator.update(&app, &id, |s| {
+                        if delivery.submission != crate::windows_input::Submission::NotSubmitted
+                            && partial.task_id == id
+                        {
+                            s.text = partial.text;
+                        }
+                        s.delivery = Some(delivery);
+                    });
+                }
             } else {
+                #[cfg(windows)]
+                let abandoned_delivery = if let Some(Ok(draft)) = &draft {
+                    Some(
+                        draft
+                            .finish(String::new(), Finish::Handoff("interrupted".into()))
+                            .await,
+                    )
+                } else {
+                    None
+                };
                 let partial = app
                     .state::<SpeechService>()
                     .snapshot()
@@ -482,6 +633,10 @@ impl DictationCoordinator {
                     s.text = partial;
                     if source == "external" && !s.text.is_empty() {
                         s.delivery = Some(Delivery::not_submitted("recognitionFailed"));
+                    }
+                    #[cfg(windows)]
+                    if let Some(delivery) = abandoned_delivery {
+                        s.delivery = Some(delivery);
                     }
                     s.presentation = Presentation::Recognizing;
                 });
@@ -682,6 +837,20 @@ impl DictationCoordinator {
         }
     }
 }
+#[cfg(windows)]
+fn composition_finish(phase: Phase, journaled: bool, saved: bool, interrupted: bool) -> Finish {
+    if phase == Phase::Cancelled {
+        Finish::Abort
+    } else if !journaled || !saved {
+        Finish::Handoff("saveFailed".into())
+    } else if phase != Phase::Completed {
+        Finish::Handoff("recognitionFailed".into())
+    } else if interrupted {
+        Finish::Handoff("interrupted".into())
+    } else {
+        Finish::Commit
+    }
+}
 fn key_matches_task(
     id: Option<&str>,
     origin: Option<&TaskStamp>,
@@ -694,6 +863,34 @@ fn key_matches_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn failed_persistence_and_recognition_cannot_take_the_normal_commit_path() {
+        assert_eq!(
+            composition_finish(Phase::Completed, false, true, false),
+            Finish::Handoff("saveFailed".into())
+        );
+        assert_eq!(
+            composition_finish(Phase::Completed, true, false, false),
+            Finish::Handoff("saveFailed".into())
+        );
+        assert_eq!(
+            composition_finish(Phase::Failed, true, true, false),
+            Finish::Handoff("recognitionFailed".into())
+        );
+        assert_eq!(
+            composition_finish(Phase::Completed, true, true, true),
+            Finish::Handoff("interrupted".into())
+        );
+        assert_eq!(
+            composition_finish(Phase::Cancelled, false, false, true),
+            Finish::Abort
+        );
+        assert_eq!(
+            composition_finish(Phase::Completed, true, true, false),
+            Finish::Commit
+        );
+    }
     #[test]
     fn queued_copy_is_invalidated_by_dismiss_or_new_task_before_commit() {
         let coordinator = DictationCoordinator::default();

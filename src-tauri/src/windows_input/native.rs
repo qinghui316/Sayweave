@@ -34,6 +34,7 @@ struct TargetWatch {
     anchor: Anchor,
     task: Option<String>,
     overlay: Option<crate::voice_window::TaskWindow>,
+    identity_changed: bool,
 }
 static WATCH: Mutex<Option<TargetWatch>> = Mutex::new(None);
 pub(super) fn start_anchor() -> Result<Anchor, Error> {
@@ -46,6 +47,7 @@ pub(super) fn start_anchor() -> Result<Anchor, Error> {
                 anchor: a.clone(),
                 task: None,
                 overlay: None,
+                identity_changed: false,
             });
         }
     }
@@ -78,6 +80,46 @@ pub(super) fn release_watch(id: &str) {
         *watch = None;
     }
 }
+/// Composition owns its range in the target apartment. Its own text/selection notifications
+/// must not invalidate that range; external foreground changes remain sticky for the task.
+pub(super) fn composition_target(id: &str, anchor: &Anchor) -> Result<bool, Error> {
+    let guard = WATCH.lock().map_err(|_| err("targetProbeFailed"))?;
+    let watch = guard
+        .as_ref()
+        .filter(|w| w.task.as_deref() == Some(id) && w.anchor.capture_id == anchor.capture_id)
+        .ok_or_else(|| err("targetChanged"))?;
+    if watch.identity_changed
+        || lifetime(anchor.process)? != anchor.lifetime
+        || !unsafe { IsWindow(Some(hwnd(anchor.window))) }.as_bool()
+    {
+        return Err(err("targetChanged"));
+    }
+    let foreground = unsafe { GetForegroundWindow().0 as usize };
+    if foreground == anchor.window {
+        return Ok(true);
+    }
+    if watch
+        .overlay
+        .as_ref()
+        .is_some_and(|o| crate::voice_window::contains(o, foreground, unsafe { GetTickCount() }))
+    {
+        return Ok(false); // Own interaction is advisory, but never submit while it has focus.
+    }
+    Err(err("targetChanged"))
+}
+pub(super) fn composition_begin_target(id: &str, expected: &Anchor) -> Result<(), Error> {
+    if !composition_target(id, expected)? {
+        return Err(err("targetChanged"));
+    }
+    let current = anchor()?;
+    if current.focus != expected.focus
+        || current.activity != expected.activity
+        || current.generation != expected.generation
+    {
+        return Err(err("targetChanged"));
+    }
+    Ok(())
+}
 /// Physical pointer evidence shares the same task-window lease as WinEvent evidence.
 /// WebView descendants can live in another process; process identity is not ownership.
 pub(super) fn observe_pointer(window: usize, event_tick: u32) {
@@ -102,6 +144,7 @@ enum EventDecision {
 }
 struct EventEvidence {
     window: usize,
+    object: i32,
     root: usize,
     foreground: usize,
     own_event: bool,
@@ -122,7 +165,13 @@ fn event_decision(event: u32, top: usize, focus: usize, e: &EventEvidence) -> Ev
         };
     }
     if event == EVENT_OBJECT_DESTROY && (e.window == top || e.window == focus) {
-        return EventDecision::Changed("targetDestroyed");
+        // WinEvent identifies an accessible object, not just its hosting HWND. RichEdit
+        // recreates OBJID_CARET during normal TSF updates while the editor stays alive.
+        return match e.object {
+            value if value == OBJID_WINDOW.0 => EventDecision::Changed("targetDestroyed"),
+            value if value == OBJID_CARET.0 => EventDecision::Unrelated,
+            _ => EventDecision::Changed("targetObjectDestroyed"),
+        };
     }
     if event == EVENT_OBJECT_FOCUS && e.window != focus && e.root == top {
         return EventDecision::Changed("controlFocus");
@@ -135,14 +184,15 @@ fn event_decision(event: u32, top: usize, focus: usize, e: &EventEvidence) -> Ev
     EventDecision::Unrelated
 }
 pub(super) fn observe(event: u32, window: usize, object: i32, event_tick: u32) {
-    if let Ok(watch) = WATCH.lock()
-        && let Some(watch) = watch.as_ref()
+    if let Ok(mut watch) = WATCH.lock()
+        && let Some(watch) = watch.as_mut()
         && event_after_capture(event_tick, watch.anchor.captured_tick)
     {
         let received_tick = unsafe { GetTickCount() };
         let foreground = unsafe { GetForegroundWindow().0 as usize };
         let evidence = EventEvidence {
             window,
+            object,
             root: unsafe { GetAncestor(hwnd(window), GA_ROOT).0 as usize },
             foreground,
             own_event: watch
@@ -155,6 +205,10 @@ pub(super) fn observe(event: u32, window: usize, object: i32, event_tick: u32) {
                 .is_some_and(|o| crate::voice_window::contains(o, foreground, received_tick)),
         };
         let decision = event_decision(event, watch.anchor.window, watch.anchor.focus, &evidence);
+        watch.identity_changed |= matches!(
+            decision,
+            EventDecision::Changed("externalForeground" | "currentForeground" | "targetDestroyed")
+        );
         if matches!(decision, EventDecision::Changed(_)) {
             CHANGES.fetch_add(1, Ordering::AcqRel);
         }
@@ -170,6 +224,7 @@ mod event_tests {
     fn caret_geometry_is_advisory_but_text_and_selection_invalidate() {
         let e = EventEvidence {
             window: 12,
+            object: OBJID_CLIENT.0,
             root: 10,
             foreground: 10,
             own_event: false,
@@ -191,9 +246,35 @@ mod event_tests {
         }
     }
     #[test]
+    fn accessible_caret_destruction_is_not_editor_destruction() {
+        let mut e = EventEvidence {
+            window: 12,
+            object: OBJID_CARET.0,
+            root: 10,
+            foreground: 10,
+            own_event: false,
+            own_foreground: false,
+        };
+        assert_eq!(
+            event_decision(EVENT_OBJECT_DESTROY, 10, 12, &e),
+            EventDecision::Unrelated
+        );
+        e.object = OBJID_CLIENT.0;
+        assert_eq!(
+            event_decision(EVENT_OBJECT_DESTROY, 10, 12, &e),
+            EventDecision::Changed("targetObjectDestroyed")
+        );
+        e.object = OBJID_WINDOW.0;
+        assert_eq!(
+            event_decision(EVENT_OBJECT_DESTROY, 10, 12, &e),
+            EventDecision::Changed("targetDestroyed")
+        );
+    }
+    #[test]
     fn only_task_overlay_is_advisory_and_external_switches_remain_sticky() {
         let mut e = EventEvidence {
             window: 14,
+            object: OBJID_WINDOW.0,
             root: 14,
             foreground: 10,
             own_event: true,

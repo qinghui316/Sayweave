@@ -83,6 +83,16 @@ fn main() {
         return;
     }
     unsafe {
+        let composition = std::env::args().nth(1).as_deref() == Some("composition");
+        let mut tsf_manager = None;
+        let mut rich_library = None;
+        if composition {
+            use windows::Win32::System::{Com::*, LibraryLoader::*};
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+            rich_library = Some(
+                LoadLibraryExW(w!("Msftedit.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32).unwrap(),
+            );
+        }
         use windows::Win32::UI::HiDpi::{
             DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
         };
@@ -110,7 +120,11 @@ fn main() {
         .unwrap();
         let editor = CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("EDIT"),
+            if composition {
+                w!("RICHEDIT50W")
+            } else {
+                w!("EDIT")
+            },
             w!(""),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_MULTILINE as u32),
             10,
@@ -123,6 +137,14 @@ fn main() {
             None,
         )
         .unwrap();
+        if composition {
+            use windows::Win32::{System::Com::*, UI::TextServices::*};
+            let manager: ITfThreadMgr =
+                CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER).unwrap();
+            manager.Activate().unwrap();
+            message(editor, WM_USER + 204, WPARAM(0x10000), LPARAM(0x10000));
+            tsf_manager = Some(manager);
+        }
         let (t, r) = mpsc::channel::<serde_json::Value>();
         let (ok, ready) = mpsc::channel::<()>();
         let h = top.0 as usize;
@@ -284,6 +306,14 @@ fn main() {
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+        if let Some(manager) = tsf_manager {
+            let _ = manager.Deactivate();
+            drop(manager);
+            windows::Win32::System::Com::CoUninitialize();
+        }
+        if let Some(library) = rich_library {
+            let _ = FreeLibrary(library);
         }
     }
 }
