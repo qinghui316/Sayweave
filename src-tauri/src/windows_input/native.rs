@@ -82,7 +82,7 @@ pub(super) fn release_watch(id: &str) {
 }
 /// Composition owns its range in the target apartment. Its own text/selection notifications
 /// must not invalidate that range; external foreground changes remain sticky for the task.
-pub(super) fn composition_target(id: &str, anchor: &Anchor) -> Result<bool, Error> {
+pub(crate) fn composition_target(id: &str, anchor: &Anchor) -> Result<bool, Error> {
     let guard = WATCH.lock().map_err(|_| err("targetProbeFailed"))?;
     let watch = guard
         .as_ref()
@@ -119,6 +119,33 @@ pub(super) fn composition_begin_target(id: &str, expected: &Anchor) -> Result<()
         return Err(err("targetChanged"));
     }
     Ok(())
+}
+/// Acquire a new edit position in the original session window after handing off the
+/// previous range. Never clear sticky foreground/identity evidence or its capture time.
+pub(crate) fn reanchor_turn(id: &str, original: &Anchor) -> Result<Anchor, Error> {
+    if !composition_target(id, original)? {
+        return Err(err("targetChanged"));
+    }
+    let mut next = anchor()?;
+    if next.window != original.window
+        || next.process != original.process
+        || next.lifetime != original.lifetime
+    {
+        return Err(err("targetChanged"));
+    }
+    next.capture_id = original.capture_id;
+    next.captured_tick = original.captured_tick;
+    let mut state = WATCH.lock().map_err(|_| err("targetProbeFailed"))?;
+    let watch = state
+        .as_mut()
+        .filter(|w| {
+            w.task.as_deref() == Some(id)
+                && w.anchor.capture_id == original.capture_id
+                && !w.identity_changed
+        })
+        .ok_or_else(|| err("targetChanged"))?;
+    watch.anchor = next.clone();
+    Ok(next)
 }
 /// Physical pointer evidence shares the same task-window lease as WinEvent evidence.
 /// WebView descendants can live in another process; process identity is not ownership.

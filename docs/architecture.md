@@ -162,4 +162,4 @@ SAYWEAVE_SPEECH operation=transport_connect connection_id=<UUID> stage=tls_webso
 
 ## Windows 口述模块
 
-本分支的快捷键、目标绑定、纯文本交付与剪贴板恢复由小型原生模块接入，详见 [职责与边界](dictation.md)。识别、存档与输入结果分别维护；设置、网络、系统输入不占用数据库线程。
+本分支的口述协调器管理 Session 身份与结束手势，语音服务管理采集及识别连接，SessionDraft 管理 Turn、累计草稿与编辑交接，Windows 输入模块管理 TSF 范围及最终交付兼容路径。原始识别、存档、外部输入和展示结果分别维护，详见 [职责与边界](dictation.md)。组件只在目标线程操作组合范围；录音、密钥及数据库留在主程序。设置、网络与系统输入不占用数据库线程。组件维护与口述共用准入锁，维护期间不能启动新任务。

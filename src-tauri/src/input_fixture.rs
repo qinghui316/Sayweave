@@ -180,7 +180,9 @@ fn main() {
                     let _ = ok.send(());
                     break;
                 }
-                if let Some(text) = value["text"].as_str() {
+                if value["action"] != "type"
+                    && let Some(text) = value["text"].as_str()
+                {
                     let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
                     let _ = message(
                         editor,
@@ -205,6 +207,14 @@ fn main() {
                         WPARAM(value["start"].as_u64().unwrap_or(0) as usize),
                         LPARAM(value["end"].as_i64().unwrap_or(0) as isize),
                     );
+                }
+                if value["action"] == "type"
+                    && let Some(text) = value["text"].as_str()
+                {
+                    // Test-only foreign edit, delivered to this owned target's message loop.
+                    for unit in text.encode_utf16() {
+                        message(editor, WM_CHAR, WPARAM(unit as usize), LPARAM(0));
+                    }
                 }
                 if value["action"] == "delayClipboard" {
                     use windows::Win32::System::DataExchange::*;

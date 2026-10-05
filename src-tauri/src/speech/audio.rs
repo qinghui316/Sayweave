@@ -138,6 +138,77 @@ impl Converter {
 pub struct Packet {
     pub pcm: Vec<i16>,
     pub duration_ms: u64,
+    pub turn: u64,
+}
+#[derive(Clone, Copy)]
+struct CapturedSample {
+    value: f32,
+    turn: u64,
+}
+/// Independent from the continuous WAV converter: no FFT history or pending
+/// capture samples can cross an editing boundary into a newly acquired range.
+struct TurnConverter {
+    rate: usize,
+    turn: u64,
+    converter: Option<Converter>,
+}
+impl TurnConverter {
+    fn new(rate: usize) -> Self {
+        Self {
+            rate,
+            turn: 0,
+            converter: None,
+        }
+    }
+    fn push(
+        &mut self,
+        samples: &[CapturedSample],
+        route: &super::continuous::AudioRoute,
+    ) -> Result<Vec<(u64, Vec<i16>)>, Error> {
+        let mut output = Vec::new();
+        let mut begin = 0;
+        while begin < samples.len() {
+            let stamp = samples[begin].turn;
+            let mut end = begin + 1;
+            while end < samples.len() && samples[end].turn == stamp {
+                end += 1;
+            }
+            let turn = if stamp > 0 && route.current() == stamp {
+                stamp
+            } else {
+                0
+            };
+            if turn != self.turn {
+                self.turn = turn;
+                self.converter = if turn > 0 {
+                    Some(Converter::new(self.rate)?)
+                } else {
+                    None
+                };
+            }
+            if let Some(converter) = &mut self.converter {
+                let input: Vec<_> = samples[begin..end].iter().map(|s| s.value).collect();
+                let pcm = converter.push(&input)?;
+                if !pcm.is_empty() && route.current() == turn {
+                    output.push((turn, pcm));
+                }
+            }
+            begin = end;
+        }
+        Ok(output)
+    }
+    fn finish(
+        &mut self,
+        route: &super::continuous::AudioRoute,
+    ) -> Result<Option<(u64, Vec<i16>)>, Error> {
+        if self.turn == 0 || route.current() != self.turn {
+            return Ok(None);
+        }
+        match &mut self.converter {
+            Some(converter) => Ok(Some((self.turn, converter.finish()?))),
+            None => Ok(None),
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalMeter {
@@ -220,6 +291,7 @@ impl Capture {
         device_id: Option<String>,
         file: Option<(AudioFiles, String)>,
         signal: watch::Receiver<u8>,
+        route: Option<Arc<super::continuous::AudioRoute>>,
     ) -> Result<Self, Error> {
         let stop = Arc::new(AtomicBool::new(false));
         let stopper = stop.clone();
@@ -259,20 +331,23 @@ impl Capture {
                     if channels == 0 || channels > 32 {
                         return Err(Error::new("deviceFormat"));
                     }
-                    let (mut producer, mut consumer) = rtrb::RingBuffer::<f32>::new(rate * 2);
+                    let (mut producer, mut consumer) = rtrb::RingBuffer::<CapturedSample>::new(rate * 2);
                     let overflow = Arc::new(AtomicBool::new(false));
                     let failure = Arc::new(AtomicBool::new(false));
                     macro_rules! stream {
                         ($t:ty) => {{
                             let o = overflow.clone();
                             let f = failure.clone();
+                            let capture_route = route.clone();
                             device
                                 .build_input_stream::<$t, _, _>(
                                     config,
                                     move |data, _| {
+                                        // One nonblocking route read per callback, before buffering.
+                                        let turn = capture_route.as_ref().map_or(1, |r|r.current());
                                         for frame in data.chunks_exact(channels) {
                                             let value = mono(frame);
-                                            if producer.push(value).is_err() {
+                                            if producer.push(CapturedSample {value,turn}).is_err() {
                                                 o.store(true, Ordering::Release);
                                                 break;
                                             }
@@ -298,6 +373,7 @@ impl Capture {
                         _ => return Err(Error::new("deviceFormat")),
                     };
                     let mut converter = Converter::new(rate)?;
+                    let mut turn_converter = TurnConverter::new(rate);
                     let mut save_error = false;
                     let mut writer = match &file {
                         Some((files, key)) => match files.writer(key) {
@@ -345,13 +421,20 @@ impl Capture {
                             meter_tx.send_replace(LocalMeter{level:meter_window.take(),duration_ms:pcm.len() as u64/16});
                             meter_at=Instant::now();
                         }
-                        if sender
+                        if route.is_none() && sender
                             .try_send(Packet {
                                 pcm: chunk,
                                 duration_ms: pcm.len() as u64 / 16,
+                                turn: 1,
                             })
                             .is_err()
                         {
+                            overflow.store(true, Ordering::Release);
+                        }
+                    };
+                    let mut captured_frames = 0u64;
+                    let transmit = |turn: u64, chunk: Vec<i16>, duration_ms: u64| {
+                        if !chunk.is_empty() && sender.try_send(Packet {turn,pcm:chunk,duration_ms}).is_err() {
                             overflow.store(true, Ordering::Release);
                         }
                     };
@@ -361,7 +444,12 @@ impl Capture {
                         while let Ok(v) = consumer.pop() {
                             input.push(v);
                         }
-                        accept(converter.push(&input)?);
+                        captured_frames += input.len() as u64;
+                        let local: Vec<_> = input.iter().map(|s: &CapturedSample|s.value).collect();
+                        accept(converter.push(&local)?);
+                        if let Some(route) = &route {
+                            for (turn,pcm) in turn_converter.push(&input,route)? { transmit(turn,pcm,captured_frames*1000/rate as u64); }
+                        }
                         if stopper.load(Ordering::Acquire)
                             || began.elapsed() >= Duration::from_secs(600)
                             || overflow.load(Ordering::Acquire)
@@ -376,8 +464,14 @@ impl Capture {
                     while let Ok(v) = consumer.pop() {
                         tail.push(v);
                     }
-                    accept(converter.push(&tail)?);
+                    captured_frames += tail.len() as u64;
+                    let local: Vec<_> = tail.iter().map(|s: &CapturedSample|s.value).collect();
+                    accept(converter.push(&local)?);
                     accept(converter.finish()?);
+                    if let Some(route) = &route {
+                        for (turn,pcm) in turn_converter.push(&tail,route)? { transmit(turn,pcm,captured_frames*1000/rate as u64); }
+                        if let Some((turn,pcm))=turn_converter.finish(route)? { transmit(turn,pcm,captured_frames*1000/rate as u64); }
+                    }
                     drop(accept);
                     if overflow.load(Ordering::Acquire) {
                         error = Some("bufferOverflow".into());
@@ -426,6 +520,76 @@ mod supported_config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delayed_capture_and_fft_tail_cannot_be_relabelled_as_the_next_turn() {
+        use super::super::continuous::{Control, Route};
+        use std::sync::atomic::AtomicU64;
+        let evidence = Arc::new(AtomicU64::new(0));
+        let control = Control::new(evidence.clone());
+        control.resume(1, 0);
+        control.enabled(Route {
+            turn: 1,
+            activity: 0,
+        });
+        let mut encoder = TurnConverter::new(48000);
+        let old = vec![
+            CapturedSample {
+                value: 1.0,
+                turn: 1
+            };
+            200
+        ];
+        assert!(encoder.push(&old, &control.audio).unwrap().is_empty());
+        evidence.fetch_add(1, Ordering::AcqRel);
+        control.pause();
+        let mut backlog = vec![
+            CapturedSample {
+                value: 1.0,
+                turn: 1
+            };
+            600
+        ];
+        backlog.extend(vec![
+            CapturedSample {
+                value: 1.0,
+                turn: 0
+            };
+            600
+        ]);
+        control.resume(2, 1);
+        control.enabled(Route {
+            turn: 2,
+            activity: 1,
+        });
+        // Consumer was delayed until after resume: only originally stamped turn2 is eligible.
+        backlog.extend(vec![
+            CapturedSample {
+                value: 0.0,
+                turn: 2
+            };
+            4800
+        ]);
+        let mut encoded = encoder.push(&backlog, &control.audio).unwrap();
+        encoded.extend(encoder.finish(&control.audio).unwrap());
+        assert!(!encoded.is_empty());
+        assert!(
+            encoded
+                .iter()
+                .all(|(turn, pcm)| *turn == 2 && pcm.iter().all(|s| *s == 0))
+        );
+        let mut local = Converter::new(48000).unwrap();
+        let mut recording = local
+            .push(
+                &old.iter()
+                    .chain(&backlog)
+                    .map(|s| s.value)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        recording.extend(local.finish().unwrap());
+        assert!(recording.iter().any(|s| *s > 10000));
+        assert_eq!(recording.len(), (old.len() + backlog.len()) / 3);
+    }
     #[test]
     fn meter_aggregates_samples_without_turning_an_empty_packet_into_silence() {
         let mut window = MeterWindow::default();

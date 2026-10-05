@@ -1,9 +1,10 @@
-# Windows inline composition — Stage A
+# Windows inline composition
 
-This is an **in-progress feasibility component**, not an enabled Sayweave feature.
-The application still uses its existing final-delivery path. ASR streaming,
-Session/Turn integration and automatic editing resume are gated on real Codex
-and input-method coexistence evidence.
+This branch connects native ASR updates to task-owned TSF drafts. The host
+coordinates Session/Turn identities, editing handoff and quiet-period resume;
+the component updates one composition range in the focused target. A real Codex
+probe retained its final text. Full speech/shortcut and input-method coexistence
+acceptance remains separate from that probe and from controlled text tests.
 
 The COM DLL owns one focused TSF composition on the target apartment. The host
 owns audio, recognition, credentials and history. The bounded pipe carries
@@ -23,14 +24,34 @@ npm run check:tsf
 npm run test:tsf
 ```
 
-`test:tsf` owns a disposable RichEdit window, loads the actual COM DLL through
+`test:tsf` owns disposable RichEdit and legacy EDIT windows, loads the actual COM DLL through
 its factory export and activates it only in that process. It asserts actual text after cumulative updates, commit,
 selection replacement and abort, plus expired-request refusal and handoff after
 a property-only edit, multiline/emoji, and unloading with no live leases. It leaves the clipboard and existing input profiles
-untouched. This **does not prove global registration, Codex, IME coexistence or
+untouched. Legacy EDIT asserts exact live composition-range text and, after commit,
+the final control text; its committed WM_GETTEXT buffer can exclude active
+composition. These observations are reported separately. This **does not prove global registration, Codex, IME coexistence or
 speech recognition integration**.
 
-## Operator probe and installation scope
+## Product component lifecycle
+
+The standard `desktop:dev` and `desktop:build` commands build and embed the DLL
+in the application. Settings exposes fixed status, enable, disable, install and
+remove operations. Enablement is per user; install/update/removal explicitly
+request Windows administrator approval through the same EXE's fixed helper.
+No renderer-supplied script, path or DLL is accepted and startup never elevates.
+
+The machine module lives in a protected Program Files directory named by its
+SHA256. Ownership, reparse points and ACLs are checked before mutation. Updates
+retain old mapped modules and replace only an owned COM registration; failed
+readback rolls that path back. A protected ledger permits exact cleanup after
+applications release mapped versions. Missing owned files remain repairable;
+access-denied and other I/O errors are not treated as missing. Removal unregisters
+first and reports pending file cleanup for an explicit retry. Unknown files are
+never recursively deleted. Maintenance holds the same admission guard as
+dictation, including while an elevated helper is still running after a timeout.
+
+## Historical Stage A operator probe
 
 `tsf-probe register DLL` attempts current-user COM registration and the official
 TSF profile registration. Existing registrations are refused. On the current
@@ -63,7 +84,9 @@ manager's `GetActiveProfile` API supports the keyboard category only.
 An optional `probe <expected-pid> <focus-seconds>` countdown (5–30 seconds) is
 operator preparation time, not product input latency.
 
-The initial build covers x64 only. x86 installation, upgrade/replacement, crash
-recovery, product enablement and event-driven idle transport belong to later
-stages after the feasibility gate. The prototype's 50ms apartment timer is not
-an accepted production idle-resource result.
+The build covers x64 targets. x86 application compatibility remains unverified.
+The component's 50ms apartment timer exists while its speech profile is active;
+deactivation destroys its owned window and timer. Long-session and idle-resource
+measurements, machine lifecycle runtime checks and original-environment IME
+handoff still need their own evidence. Private-factory tests do not establish
+those results.

@@ -143,6 +143,16 @@ it('dismissed external feedback does not replay its completed state when shown l
  expect(()=>parseDictation({...initialDictation(),presentation:'recording'})).toThrow();
 });
 
+it.each(['editing','resuming'] as const)('keeps finish available while the continuous session is %s without a result card',async presentation=>{
+ const finish=vi.fn(),user=userEvent.setup();
+ const state=parseDictation({...initialDictation(),source:'external',taskId:'live',presentationId:'view',stage:'recognizing',presentation});
+ const phase=dictationPhase(state,'recording',{taskId:'live',text:'原始识别'});
+ render(<VoiceSurface presentation={presentation} phase={phase} text="原始识别" start={()=>{}} finish={finish} cancel={()=>{}}/>);
+ expect(screen.getByText(presentation==='editing'?'编辑中，口述已暂停':'准备继续口述')).toBeVisible();
+ expect(screen.queryByRole('region',{name:'口述结果'})).not.toBeInTheDocument();
+ await user.click(screen.getByRole('button',{name:'结束录音'}));expect(finish).toHaveBeenCalledOnce();
+});
+
 it('dismissed preparation failures and clipboard notices remain closed when the overlay reopens',()=>{
  const dismissed={...initialDictation(),source:'external' as const,taskId:'failed',error:'network'};
  expect(dictationPhase(dismissed,'failed',{taskId:'failed',text:''})).toBe('idle');

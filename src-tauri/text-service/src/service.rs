@@ -274,13 +274,34 @@ fn poll(shared: &Shared) {
             return;
         }
     }
-    if let Err(e) = schedule(shared, &r, connection) {
+    let already_handed_off = {
+        let s = shared.borrow();
+        s.pending.is_none()
+            && !s.cleanup
+            && s.composition.is_none()
+            && s.context.is_none()
+            && s.version.acknowledges_handoff(&r)
+            && r.live(unsafe { GetTickCount64() })
+    };
+    if already_handed_off {
+        shared.borrow_mut().version.applied(&r);
+        reply(
+            shared,
+            &r,
+            connection,
+            true,
+            "alreadyHandedOff",
+            Mutation::NotAttempted,
+        );
+        return;
+    }
+    if let Err((stage, e)) = schedule(shared, &r, connection) {
         reply(
             shared,
             &r,
             connection,
             false,
-            &format!("requestEdit:{:08x}", e.code().0 as u32),
+            &format!("{stage}:{:08x}", e.code().0 as u32),
             Mutation::NotAttempted,
         );
     }
@@ -381,26 +402,36 @@ fn lease(
         Ok(())
     }
 }
-fn schedule(shared: &Shared, r: &Request, connection: u64) -> windows::core::Result<()> {
+fn schedule(
+    shared: &Shared,
+    r: &Request,
+    connection: u64,
+) -> Result<(), (&'static str, windows::core::Error)> {
     unsafe {
         let (manager, client, generation) = {
             let s = shared.borrow();
-            if !s.version.accepts(r)
-                || s.cleanup
-                || r.action == Action::Begin && s.composition.is_some()
-            {
-                return Err(failure(E_INVALIDARG));
+            if !s.version.accepts(r) {
+                return Err(("draftOwnership", failure(E_INVALIDARG)));
+            }
+            if s.cleanup || r.action == Action::Begin && s.composition.is_some() {
+                return Err(("draftCleanup", failure(E_INVALIDARG)));
             }
             (
-                s.manager.as_ref().ok_or_else(|| failure(E_FAIL))?.clone(),
+                s.manager
+                    .as_ref()
+                    .ok_or_else(|| ("editManager", failure(E_FAIL)))?
+                    .clone(),
                 s.client,
                 s.generation,
             )
         };
-        let context = manager.GetFocus()?.GetTop()?;
-        lease(shared, r, generation, &context)?;
+        let context = manager
+            .GetFocus()
+            .and_then(|d| d.GetTop())
+            .map_err(|e| ("editFocus", e))?;
+        lease(shared, r, generation, &context).map_err(|e| ("editLease", e))?;
         if r.action != Action::Begin && shared.borrow().context.as_ref() != Some(&context) {
-            return Err(failure(TF_E_DISCONNECTED));
+            return Err(("editContext", failure(TF_E_DISCONNECTED)));
         }
         let edit: ITfEditSession = Edit {
             state: shared.clone(),
@@ -418,9 +449,20 @@ fn schedule(shared: &Shared, r: &Request, connection: u64) -> windows::core::Res
             connection,
             capability: r.capability.clone(),
         });
-        context
-            .RequestEditSession(client, &edit, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE)?
-            .ok()
+        let session = context
+            .RequestEditSession(client, &edit, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE)
+            .map_err(|e| ("requestEdit", e))?;
+        // Synchronous DoEditSession owns its acknowledgement, including failure.
+        // Its HRESULT must not produce a second reply for the same operation.
+        if shared
+            .borrow()
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.operation == r.operation)
+        {
+            session.ok().map_err(|e| ("requestEditResult", e))?;
+        }
+        Ok(())
     }
 }
 fn unwatch(context: Option<&ITfContext>, cookie: Option<u32>) {
@@ -603,6 +645,7 @@ struct Edit {
 impl ITfEditSession_Impl for Edit_Impl {
     fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
         let mut mutation = Mutation::NotAttempted;
+        let mut phase = "lease";
         let result =
             lease(&self.state, &self.request, self.generation, &self.context).and_then(|()| {
                 apply(
@@ -612,6 +655,7 @@ impl ITfEditSession_Impl for Edit_Impl {
                     self.generation,
                     ec,
                     &mut mutation,
+                    &mut phase,
                 )
             });
         match &result {
@@ -629,7 +673,7 @@ impl ITfEditSession_Impl for Edit_Impl {
                     &self.request,
                     self.connection,
                     false,
-                    &format!("edit:{:08x}", e.code().0 as u32),
+                    &format!("edit:{phase}:{:08x}", e.code().0 as u32),
                     mutation,
                 );
                 // A stale callback must not hand off a newer draft on the same service.
@@ -716,10 +760,13 @@ fn apply(
     generation: u64,
     ec: u32,
     mutation: &mut Mutation,
+    phase: &mut &'static str,
 ) -> windows::core::Result<()> {
     unsafe {
         if r.action == Action::Begin {
+            *phase = "beginSelection";
             let range = selection(context, ec)?;
+            *phase = "beginProperties";
             if password(context, &range, ec)? {
                 return Err(failure(E_ACCESSDENIED));
             }
@@ -732,6 +779,7 @@ fn apply(
                 return Err(failure(TF_E_LOCKED));
             }
             let backup = context.CreateRangeBackup(ec, &range)?;
+            *phase = "beginText";
             let expected = range_text(&range, ec)?;
             let original_selection = range.Clone()?;
             let epoch = COMPOSITION_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
@@ -748,11 +796,13 @@ fn apply(
             }
             .into();
             let source: ITfSource = context.cast()?;
+            *phase = "beginWatch";
             let cookie = source.AdviseSink(&ITfTextEditSink::IID, &text_sink)?;
             if let Err(e) = lease(shared, r, generation, context) {
                 let _ = source.UnadviseSink(cookie);
                 return Err(e);
             }
+            *phase = "beginComposition";
             let composition = match composition_context.StartComposition(ec, &range, &sink) {
                 Ok(c) => c,
                 Err(e) => {
@@ -776,6 +826,7 @@ fn apply(
             s.version.applied(r);
             return Ok(());
         }
+        *phase = "ownership";
         let (composition, expected, old_selection, epoch) = {
             let s = shared.borrow();
             (
@@ -790,8 +841,11 @@ fn apply(
                 s.epoch,
             )
         };
+        *phase = "range";
         let range = composition.GetRange()?;
+        *phase = "selection";
         let current_selection = selection(context, ec)?;
+        *phase = "position";
         if password(context, &range, ec)?
             || range_text(&range, ec)? != expected
             || current_selection.CompareStart(ec, &old_selection, TF_ANCHOR_START)? != 0
@@ -801,10 +855,13 @@ fn apply(
         }
         match r.action {
             Action::Update => {
+                *phase = "updateLease";
                 lease(shared, r, generation, context)?;
                 *mutation = Mutation::Uncertain;
+                *phase = "updateText";
                 range.SetText(ec, 0, &r.text.encode_utf16().collect::<Vec<_>>())?;
                 *mutation = Mutation::Changed;
+                *phase = "updateReadback";
                 let actual = range_text(&range, ec)?;
                 // RichEdit and browser text stores can use different newline representations.
                 // Preserve the provider's range text; permit only equivalent line breaks.
@@ -822,6 +879,7 @@ fn apply(
                     s.version.applied(r);
                     s.selection = None;
                 }
+                *phase = "updateCaret";
                 let caret = range.Clone()?;
                 caret.Collapse(ec, TF_ANCHOR_END)?;
                 {
@@ -841,6 +899,7 @@ fn apply(
                         fInterimChar: false.into(),
                     },
                 };
+                *phase = "updateSelection";
                 let result = context.SetSelection(ec, std::slice::from_ref(&selected));
                 ManuallyDrop::drop(&mut selected.range);
                 result?;
@@ -852,6 +911,7 @@ fn apply(
                 s.selection = Some(next_selection);
             }
             Action::Abort => {
+                *phase = "abort";
                 let backup = shared
                     .borrow()
                     .backup
@@ -869,6 +929,7 @@ fn apply(
                 release_composition(shared, epoch, Some(&composition));
             }
             Action::Commit | Action::Handoff => {
+                *phase = "commit";
                 lease(shared, r, generation, context)?;
                 shared.borrow_mut().version.applied(r);
                 composition.EndComposition(ec)?;

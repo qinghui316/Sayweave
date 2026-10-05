@@ -1,6 +1,7 @@
 import {invoke,isTauri} from '@tauri-apps/api/core';
 import {listen} from '@tauri-apps/api/event';
 import {parseSpeech} from '../contracts/speech';
+import {parseTextService,type TextServicePort,type TextServiceAction,type TextServiceStatus} from '../contracts/text-service';
 import {parseDictation,parseShortcut,initialDictation,type DictationPort,type DictationSnapshot,type ShortcutConfigPort,type ShortcutConfig,type ShortcutStatus} from '../contracts/dictation';
 class NativeShortcuts implements ShortcutConfigPort {
  readonly mode='native' as const;
@@ -29,5 +30,16 @@ export class BrowserShortcuts implements ShortcutConfigPort {
  async save(config:ShortcutConfig){if(config.revision!==this.value.saved.revision)throw {code:'conflict'};const saved={...config,revision:config.revision+1};this.value={...this.value,saved,active:saved};this.emit();return this.status();}
  async capture(begin:boolean,token?:string){this.value={...this.value,capturing:begin,captureToken:begin?(token??crypto.randomUUID()):this.value.captureToken,capturedBinding:begin?null:this.value.capturedBinding};window.removeEventListener('keydown',this.key,true);if(begin)window.addEventListener('keydown',this.key,true);this.emit();return this.status();}
 }
-export function createDictationPorts():{shortcuts:ShortcutConfigPort;dictation:DictationPort|null}{return isTauri()?{shortcuts:new NativeShortcuts(),dictation:new NativeDictation()}:{shortcuts:new BrowserShortcuts(),dictation:null};}
+class NativeTextService implements TextServicePort {
+ readonly mode='native' as const;
+ async status(){return parseTextService(await invoke('text_service_status'));}
+ async act(action:TextServiceAction){return parseTextService(await invoke('text_service_action',{action}));}
+}
+export class BrowserTextService implements TextServicePort {
+ readonly mode='simulation' as const;
+ private value:TextServiceStatus={installed:false,enabled:false,updateAvailable:false,payloadAvailable:true,cleanupPending:false,error:null};
+ async status(){return {...this.value};}
+ async act(action:TextServiceAction){this.value=action==='remove'?{...this.value,installed:false,enabled:false}:{...this.value,installed:true,enabled:action!=='disable',updateAvailable:false};return this.status();}
+}
+export function createDictationPorts():{shortcuts:ShortcutConfigPort;dictation:DictationPort|null;textService:TextServicePort}{return isTauri()?{shortcuts:new NativeShortcuts(),dictation:new NativeDictation(),textService:new NativeTextService()}:{shortcuts:new BrowserShortcuts(),dictation:null,textService:new BrowserTextService()};}
 export {initialDictation};

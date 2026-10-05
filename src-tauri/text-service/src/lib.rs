@@ -2,6 +2,8 @@
 #[cfg(windows)]
 pub mod client;
 #[cfg(windows)]
+pub mod deployment;
+#[cfg(windows)]
 pub mod registration;
 #[cfg(all(windows, feature = "component"))]
 mod service;

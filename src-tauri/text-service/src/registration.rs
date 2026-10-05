@@ -151,7 +151,7 @@ pub fn register_machine(path: &str) -> windows::core::Result<()> {
     }
     register_scope(&canonical.to_string_lossy(), HKEY_LOCAL_MACHINE)
 }
-fn administrator() -> windows::core::Result<()> {
+pub(crate) fn administrator() -> windows::core::Result<()> {
     unsafe {
         let mut sid = [0usize; SECURITY_MAX_SID_SIZE as usize / std::mem::size_of::<usize>() + 1];
         let mut size = std::mem::size_of_val(&sid) as u32;
@@ -170,6 +170,68 @@ fn administrator() -> windows::core::Result<()> {
             ));
         }
         Ok(())
+    }
+}
+/// Owned machine registration only. A per-user shadow registration is a conflict.
+pub fn owned_module() -> windows::core::Result<Option<String>> {
+    if exists(HKEY_CURRENT_USER, COM_ROOT)? {
+        return Err(windows::core::Error::new(
+            E_ACCESSDENIED,
+            "userRegistrationConflict",
+        ));
+    }
+    if !exists(HKEY_LOCAL_MACHINE, COM_ROOT)? {
+        return Ok(None);
+    }
+    let read = |name: &str| -> windows::core::Result<String> {
+        unsafe {
+            let mut value = [0u16; 32768];
+            let mut bytes = std::mem::size_of_val(&value) as u32;
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(wide(COM_PATH).as_ptr()),
+                PCWSTR(wide(name).as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                Some(value.as_mut_ptr().cast()),
+                Some(&mut bytes),
+            )
+            .ok()?;
+            let end = value
+                .iter()
+                .position(|c| *c == 0)
+                .ok_or_else(|| windows::core::Error::from_hresult(E_INVALIDARG))?;
+            String::from_utf16(&value[..end])
+                .map_err(|_| windows::core::Error::from_hresult(E_INVALIDARG))
+        }
+    };
+    if read("SayweaveOwner")? != OWNER {
+        return Err(windows::core::Error::new(
+            E_ACCESSDENIED,
+            "registrationOwnerMismatch",
+        ));
+    }
+    Ok(Some(read("")?))
+}
+/// Replacement changes only our owned COM module; existing TSF/profile/default relationships stay.
+pub(crate) fn replace_machine(path: &str, expected: &str) -> windows::core::Result<()> {
+    administrator()?;
+    if owned_module()?.as_deref() != Some(expected) {
+        return Err(windows::core::Error::new(
+            E_ACCESSDENIED,
+            "registrationChanged",
+        ));
+    }
+    let k = key(HKEY_LOCAL_MACHINE, COM_PATH)?;
+    string(&k, "", path)?;
+    match owned_module() {
+        Ok(Some(actual)) if actual == path => Ok(()),
+        confirmation => {
+            string(&k, "", expected)?;
+            Err(confirmation
+                .err()
+                .unwrap_or_else(|| windows::core::Error::new(E_FAIL, "replacementNotConfirmed")))
+        }
     }
 }
 fn register_scope(path: &str, root: HKEY) -> windows::core::Result<()> {

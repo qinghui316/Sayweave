@@ -256,6 +256,55 @@ impl Drop for RecognitionSession {
 }
 
 #[cfg(test)]
+pub(super) struct ControlledPeer {
+    pub events: mpsc::Sender<Result<Event, Error>>,
+    commands: mpsc::Receiver<Command>,
+}
+#[cfg(test)]
+impl ControlledPeer {
+    pub async fn audio(&mut self) -> Vec<i16> {
+        match tokio::time::timeout(Duration::from_secs(2), self.commands.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Command::Audio(pcm) => pcm,
+            Command::Finish(_) => panic!("finish arrived instead of PCM"),
+        }
+    }
+    pub async fn finished_audio(&mut self) {
+        match tokio::time::timeout(Duration::from_secs(2), self.commands.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Command::Finish(ack) => {
+                ack.send(Ok(())).unwrap();
+            }
+            Command::Audio(_) => panic!("paused or wrong-turn PCM reached connection"),
+        }
+    }
+}
+#[cfg(test)]
+impl RecognitionSession {
+    pub(super) fn controlled() -> (Self, ControlledPeer) {
+        let (audio, commands) = mpsc::channel(32);
+        let (send, events) = mpsc::channel(32);
+        (
+            Self {
+                audio,
+                events,
+                worker: tokio::spawn(std::future::pending()),
+            },
+            ControlledPeer {
+                events: send,
+                commands,
+            },
+        )
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[tokio::test]

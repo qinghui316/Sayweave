@@ -85,7 +85,7 @@ fn resampling_preserves_first_and_last_audio_and_exact_duration() {
 #[tokio::test]
 async fn bounded_buffers_and_capture_failure_are_explicit() {
     let (_control, signal) = tokio::sync::watch::channel(0);
-    let err = audio::Capture::start(Some("invalid-device-id".into()), None, signal)
+    let err = audio::Capture::start(Some("invalid-device-id".into()), None, signal, None)
         .await
         .err()
         .unwrap();

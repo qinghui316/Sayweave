@@ -9,7 +9,10 @@ mod models;
 mod network;
 mod shortcuts;
 mod speech;
+mod text_service;
 mod voice_window;
+pub use text_service::helper_entry as text_service_helper_entry;
+use text_service::{text_service_action, text_service_status};
 mod windows_input;
 use dictation::*;
 use shortcuts::commands::*;
@@ -555,6 +558,8 @@ pub fn run() {
             shortcut_status,
             shortcut_save,
             shortcut_capture,
+            text_service_status,
+            text_service_action,
             dictation_snapshot,
             dictation_start,
             dictation_control,

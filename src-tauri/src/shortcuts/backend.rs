@@ -173,6 +173,12 @@ fn matches(b: &Bridge) -> bool {
                         }
         })
 }
+fn edits_target(b: &Bridge, value: u16) -> bool {
+    !b.capturing
+        && !matches!(value, 0xa0..=0xa5 | 0x5b..=0x5c)
+        && !(value == VK_ESCAPE.0 && b.task_active.is_some())
+        && !(value == vk(&b.binding.key) && matches(b))
+}
 fn send(b: &Bridge, event: Event) {
     if b.sender.try_send(event).is_err()
         && !b.overflow.swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -246,11 +252,10 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             let released = [WM_KEYUP, WM_SYSKEYUP].contains(&(w.0 as u32));
             let value = key.vkCode as u16;
             crate::input_state::key(value, pressed);
-            if pressed && value != vk(&b.binding.key) && !matches!(value, 0xa0..=0xa5 | 0x5b..=0x5c)
-            {
+            let (repeated, consumed_release) = track_key(b, value, pressed, released);
+            if pressed && edits_target(b, value) {
                 crate::input_state::edited();
             }
-            let (repeated, consumed_release) = track_key(b, value, pressed, released);
             if repeated {
                 return if b.consumed.contains(&value) {
                     LRESULT(1)
@@ -671,6 +676,23 @@ mod tests {
             },
             receiver,
         )
+    }
+    #[test]
+    fn a_configured_combo_main_key_is_still_an_edit_when_modifiers_do_not_match() {
+        let (mut b, _) = bridge();
+        b.binding = Binding::parse("Control+Space").unwrap();
+        b.task_active = Some("recording".into());
+        track_key(&mut b, VK_SPACE.0, true, false);
+        assert!(edits_target(&b, VK_SPACE.0));
+        track_key(&mut b, VK_SPACE.0, false, true);
+        track_key(&mut b, VK_LCONTROL.0, true, false);
+        track_key(&mut b, VK_SPACE.0, true, false);
+        assert!(!edits_target(&b, VK_SPACE.0));
+        assert!(!edits_target(&b, VK_ESCAPE.0));
+        b.binding = Binding::parse("Control+KeyA").unwrap();
+        b.pressed.clear();
+        track_key(&mut b, VK_A.0, true, false);
+        assert!(edits_target(&b, VK_A.0));
     }
     #[test]
     fn altgr_and_unrequired_modifiers_cannot_trigger() {

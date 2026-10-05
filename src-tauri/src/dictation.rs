@@ -12,6 +12,8 @@ use std::sync::{
 };
 use tauri::{Emitter, Manager};
 use tokio::sync::{oneshot, watch};
+#[cfg(windows)]
+pub(crate) mod drafts;
 mod presentation;
 #[cfg(windows)]
 use crate::windows_input::composition::{Draft, Finish};
@@ -55,8 +57,9 @@ struct Active {
     gate: Arc<DeliveryGate>,
     overlay_revision: u64,
     began: std::time::Instant,
+    continuous: Option<crate::speech::continuous::Control>,
     #[cfg(windows)]
-    draft: Option<Arc<crate::windows_input::composition::Draft>>,
+    draft: Option<Arc<drafts::SessionDraft>>,
 }
 struct Reservation {
     id: String,
@@ -69,6 +72,35 @@ pub struct DictationCoordinator {
     snapshot: Mutex<Snapshot>,
     stopping: AtomicBool,
     copy_gate: Mutex<Option<Arc<DeliveryGate>>>,
+    component_maintenance: Arc<AtomicBool>,
+}
+pub struct ComponentMaintenance(Arc<AtomicBool>);
+impl Drop for ComponentMaintenance {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+    #[test]
+    fn component_maintenance_has_one_guard_and_releases_admission_on_drop() {
+        let coordinator = DictationCoordinator::default();
+        assert!(!coordinator.busy());
+        let guard = coordinator.component_maintenance().unwrap();
+        assert!(coordinator.busy());
+        assert_eq!(
+            coordinator.component_maintenance().err().unwrap().code,
+            "busy"
+        );
+        drop(guard);
+        assert!(!coordinator.busy());
+        coordinator.stopping.store(true, Ordering::Release);
+        assert_eq!(
+            coordinator.component_maintenance().err().unwrap().code,
+            "stopping"
+        );
+    }
 }
 impl Default for DictationCoordinator {
     fn default() -> Self {
@@ -77,6 +109,7 @@ impl Default for DictationCoordinator {
             snapshot: Mutex::new(Snapshot::default()),
             stopping: AtomicBool::new(false),
             copy_gate: Mutex::new(None),
+            component_maintenance: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -89,7 +122,7 @@ impl DictationCoordinator {
             })
             && let Some(draft) = &session.draft
         {
-            draft.update(transcript.turn, transcript.sequence, &transcript.text);
+            draft.update(transcript);
         }
         #[cfg(not(windows))]
         let _ = transcript;
@@ -106,7 +139,18 @@ impl DictationCoordinator {
             .await
     }
     pub fn busy(&self) -> bool {
-        self.active.lock().map(|s| s.is_some()).unwrap_or(true)
+        self.component_maintenance.load(Ordering::Acquire)
+            || self.active.lock().map(|s| s.is_some()).unwrap_or(true)
+    }
+    pub fn component_maintenance(&self) -> Result<ComponentMaintenance, Error> {
+        let active = self.active.lock().map_err(|_| Error::new("unavailable"))?;
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(Error::new("stopping"));
+        }
+        if active.is_some() || self.component_maintenance.swap(true, Ordering::AcqRel) {
+            return Err(Error::new("busy"));
+        }
+        Ok(ComponentMaintenance(self.component_maintenance.clone()))
     }
     pub fn configure_capture<T>(
         &self,
@@ -167,6 +211,12 @@ impl DictationCoordinator {
         };
         let Some(next) = speech_presentation(speech.phase, *task.cancel.borrow()) else {
             return;
+        };
+        #[cfg(windows)]
+        let next = if next == Presentation::Recording {
+            task.draft.as_ref().map_or(next, |d| d.presentation())
+        } else {
+            next
         };
         if next != current.presentation {
             self.update(app, id, |s| {
@@ -275,7 +325,10 @@ impl DictationCoordinator {
             if self.stopping.load(Ordering::Acquire) {
                 return Err(Error::new("stopping"));
             }
-            if a.is_some() || app.state::<ShortcutService>().triggers_paused() {
+            if a.is_some()
+                || self.component_maintenance.load(Ordering::Acquire)
+                || app.state::<ShortcutService>().triggers_paused()
+            {
                 return Err(Error::new("busy"));
             }
             if event.is_some_and(|event| !app.state::<ShortcutService>().task_is_current(event)) {
@@ -291,6 +344,7 @@ impl DictationCoordinator {
                 gate: gate.clone(),
                 overlay_revision: crate::OVERLAY_VISIBILITY.load(Ordering::Acquire),
                 began: std::time::Instant::now(),
+                continuous: None,
                 #[cfg(windows)]
                 draft: None,
             });
@@ -347,6 +401,19 @@ impl DictationCoordinator {
         app.state::<ShortcutService>().active_task(Some(id.clone()));
         self.update(&app, &id, |_| {});
         let input = app.state::<WindowsInputService>();
+        let continuous = (source == "external" && anchor.is_some()).then(|| {
+            let flow =
+                crate::speech::continuous::Control::new(crate::input_state::activity_evidence());
+            flow.resume(1, anchor.as_ref().unwrap().activity);
+            flow
+        });
+        if let Ok(mut active) = self.active.lock()
+            && let Some(active) = active.as_mut().filter(|s| s.id == id)
+        {
+            active.continuous = continuous.clone();
+        }
+        let session_anchor = anchor.clone();
+        let session_cancel = tx.clone();
         #[cfg(windows)]
         let composition = if source == "external" {
             anchor.clone().map(|anchor| {
@@ -384,6 +451,7 @@ impl DictationCoordinator {
                     expected_task,
                     cancel: tx,
                     terminal: terminal_tx,
+                    continuous: continuous.clone(),
                 },
             )
             .await;
@@ -426,7 +494,7 @@ impl DictationCoordinator {
             #[cfg(windows)]
             let capture_rejection = crate::windows_input::draft_rejection(&capture_result);
             #[cfg(windows)]
-            let draft = match composition {
+            let raw_draft = match composition {
                 Some(composition) => Some(
                     composition
                         .await
@@ -437,33 +505,77 @@ impl DictationCoordinator {
             #[cfg(windows)]
             let mut journal_ok = true;
             #[cfg(windows)]
-            if let Some(Ok(draft)) = &draft {
+            if let Some(Ok(_)) = &raw_draft {
                 let initial = app
                     .state::<SpeechService>()
                     .snapshot()
                     .ok()
                     .filter(|s| s.task_id.as_deref() == Some(&id));
                 journal_ok = match initial {
-                    Some(s) if s.record_id.is_some() => coordinator
-                        .journal(&app, &id, s.attempt_id.as_deref(), "pending", None)
-                        .await
-                        .is_ok(),
+                    Some(s) if s.record_id.is_some() => {
+                        // Streaming may mutate the range before the terminal result. Enter
+                        // delivering before publishing its first writable update, using the
+                        // same monotonic journal transitions as final-only input.
+                        coordinator
+                            .journal(&app, &id, s.attempt_id.as_deref(), "pending", None)
+                            .await
+                            .is_ok()
+                            && coordinator
+                                .journal(&app, &id, s.attempt_id.as_deref(), "delivering", None)
+                                .await
+                                .is_ok()
+                    }
                     Some(_) => true,
                     None => false,
                 };
-                if journal_ok && capture_rejection.is_none() && !gate.cancelled() {
-                    if let Ok(mut active) = coordinator.active.lock()
-                        && let Some(session) = active.as_mut().filter(|s| s.id == id)
-                    {
-                        session.draft = Some(draft.clone());
-                    }
-                    let latest = app
-                        .state::<SpeechService>()
-                        .subscribe_transcripts()
-                        .borrow()
-                        .clone();
-                    coordinator.observe_transcript(&latest);
+            }
+            #[cfg(windows)]
+            let draft = raw_draft.map(|result| {
+                result.map(|draft| {
+                    drafts::SessionDraft::new(
+                        id.clone(),
+                        session_anchor.clone().unwrap(),
+                        draft,
+                        gate.clone(),
+                        continuous.clone().unwrap(),
+                        session_cancel.clone(),
+                    )
+                })
+            });
+            #[cfg(windows)]
+            if let Some(Ok(draft)) = &draft
+                && journal_ok
+                && capture_rejection.is_none()
+                && !gate.cancelled()
+            {
+                draft.activate();
+                if let Ok(mut active) = coordinator.active.lock()
+                    && let Some(session) = active.as_mut().filter(|s| s.id == id)
+                {
+                    session.draft = Some(draft.clone());
                 }
+                let latest = app
+                    .state::<SpeechService>()
+                    .subscribe_transcripts()
+                    .borrow()
+                    .clone();
+                coordinator.observe_transcript(&latest);
+                let manager = draft.clone();
+                let handle = app.clone();
+                let task_id = id.clone();
+                tauri::async_runtime::spawn(async move {
+                    manager
+                        .maintain(move |presentation| {
+                            handle
+                                .state::<DictationCoordinator>()
+                                .update(&handle, &task_id, |s| s.presentation = presentation);
+                        })
+                        .await;
+                });
+            } else if let Some(flow) = &continuous {
+                // No live range is writable. Recognition remains complete; final-delivery
+                // target checks decide whether any result can be submitted.
+                flow.use_final_delivery();
             }
             if let Ok(terminal) = terminal_rx.await {
                 coordinator.update(&app, &id, |s| {
@@ -487,7 +599,12 @@ impl DictationCoordinator {
                             {
                                 mode = Finish::Handoff(error.clone());
                             }
-                            Some(draft.finish(terminal.text.clone(), mode).await)
+                            let latest = app
+                                .state::<SpeechService>()
+                                .subscribe_transcripts()
+                                .borrow()
+                                .clone();
+                            Some(draft.finish(&latest, mode).await)
                         }
                         Some(Err(error)) if error.code != "compositionNotEnabled" => {
                             Some(Delivery::not_submitted(&error.code))
@@ -583,7 +700,12 @@ impl DictationCoordinator {
                             terminal.error.clone().unwrap_or_else(|| "emptyText".into()),
                         )
                     };
-                    let delivery = draft.finish(String::new(), mode).await;
+                    let latest = app
+                        .state::<SpeechService>()
+                        .subscribe_transcripts()
+                        .borrow()
+                        .clone();
+                    let delivery = draft.finish(&latest, mode).await;
                     let partial = app
                         .state::<SpeechService>()
                         .subscribe_transcripts()
@@ -612,9 +734,14 @@ impl DictationCoordinator {
             } else {
                 #[cfg(windows)]
                 let abandoned_delivery = if let Some(Ok(draft)) = &draft {
+                    let latest = app
+                        .state::<SpeechService>()
+                        .subscribe_transcripts()
+                        .borrow()
+                        .clone();
                     Some(
                         draft
-                            .finish(String::new(), Finish::Handoff("interrupted".into()))
+                            .finish(&latest, Finish::Handoff("interrupted".into()))
                             .await,
                     )
                 } else {
@@ -793,6 +920,9 @@ impl DictationCoordinator {
             .ok_or_else(|| Error::new("staleSession"))?;
         let s = app.state::<SpeechService>().snapshot()?;
         if s.task_id.as_ref() == Some(&a.id) && s.phase == Phase::Recording {
+            if let Some(flow) = &a.continuous {
+                flow.request_finish();
+            }
             a.cancel.send(1).map_err(|_| Error::new("staleSession"))?;
             self.update(app, id, |s| s.presentation = Presentation::Recognizing);
             log::info!(target:"sayweave","operation=dictation_phase task_id={} phase=finish_requested elapsed_ms={}",id,a.began.elapsed().as_millis());
@@ -810,6 +940,9 @@ impl DictationCoordinator {
         if !a.gate.cancel() {
             return Err(Error::new("inputSubmitted"));
         }
+        if let Some(flow) = &a.continuous {
+            flow.request_finish();
+        }
         a.cancel.send_replace(2);
         Ok(())
     }
@@ -818,6 +951,9 @@ impl DictationCoordinator {
             && let Some(a) = a.as_ref().filter(|a| Some(a.id.as_str()) == id)
         {
             a.gate.cancel();
+            if let Some(flow) = &a.continuous {
+                flow.request_finish();
+            }
             a.cancel.send_replace(3);
         }
     }
@@ -828,6 +964,9 @@ impl DictationCoordinator {
             && let Some(a) = a.as_ref()
         {
             a.gate.cancel();
+            if let Some(flow) = &a.continuous {
+                flow.request_finish();
+            }
             a.cancel.send_replace(3);
         }
     }

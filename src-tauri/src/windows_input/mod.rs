@@ -13,6 +13,8 @@ mod acceptance;
 pub(crate) mod composition;
 #[cfg(windows)]
 mod native;
+#[cfg(windows)]
+pub(crate) use native::{composition_target, reanchor_turn};
 #[cfg(feature = "desktop-acceptance")]
 pub fn native_checks(fixture: &std::path::Path) -> Result<(), String> {
     acceptance::run(fixture)

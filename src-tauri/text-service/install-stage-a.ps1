@@ -90,6 +90,10 @@ if ($Action -eq 'Install') {
     }
     Write-Output 'Stage A speech component installed. Run the probe from a normal terminal; no keyboard profile has been selected.'
 } else {
+    $registered = (Get-ItemProperty -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}\InprocServer32').'(default)'
+    # Canonical Rust paths may use the local Win32 verbatim prefix.
+    if ($registered.StartsWith('\\?\')) { $registered = $registered.Substring(4) }
+    if ($registered -ne (Join-Path $target 'sayweave_text_service.dll')) { throw 'A newer registered component exists; use its own removal entry.' }
     if (-not (Test-Path -LiteralPath $target)) { throw 'Stage A directory does not exist.' }
     Assert-Protected (Join-Path $programFiles 'Sayweave')
     Assert-Protected $base

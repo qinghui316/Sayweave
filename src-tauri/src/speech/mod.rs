@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod commands;
+pub mod continuous;
 mod doubao;
 pub mod qwen;
 mod recognition;
@@ -89,6 +90,7 @@ struct Task {
     audio: Option<Audio>,
     preferences: Preferences,
     replay: Option<Vec<i16>>,
+    continuous: Option<continuous::Control>,
 }
 pub struct NativeTerminal {
     pub snapshot: Snapshot,
@@ -105,6 +107,7 @@ pub struct NativeStart {
     pub expected_task: Option<String>,
     pub cancel: watch::Sender<u8>,
     pub terminal: tokio::sync::oneshot::Sender<NativeTerminal>,
+    pub continuous: Option<continuous::Control>,
 }
 /// Native cumulative recognition stream; separate from renderer and lifecycle projection.
 #[derive(Clone, Default)]
@@ -180,11 +183,11 @@ impl SpeechService {
     pub fn subscribe_transcripts(&self) -> watch::Receiver<NativeTranscript> {
         self.transcripts.subscribe()
     }
-    fn publish_transcript(&self, task: &str, text: String) {
+    fn publish_transcript(&self, task: &str, turn: u64, text: String) {
         let sequence = self.transcripts.borrow().sequence + 1;
         self.transcripts.send_replace(NativeTranscript {
             task_id: task.into(),
-            turn: 1,
+            turn,
             sequence,
             text,
         });
@@ -445,6 +448,7 @@ impl SpeechService {
             }
             return Err(e);
         }
+        let continuous = context.as_ref().and_then(|c| c.continuous.clone());
         let (tx, rx, terminal) = if let Some(c) = context {
             let rx = c.cancel.subscribe();
             (c.cancel, rx, Some(c.terminal))
@@ -495,6 +499,7 @@ impl SpeechService {
             audio,
             preferences,
             replay,
+            continuous,
         };
         tauri::async_runtime::spawn(async move {
             let service = app.state::<SpeechService>();
@@ -553,7 +558,13 @@ impl SpeechService {
         let mut save_error = false;
         let mut abort = cancel.clone();
         let work = async {
-            let mut session = recognition::RecognitionSession::open(cfg, &task.id).await?;
+            let mut session = continuous::Stream::open(
+                cfg,
+                &task.id,
+                task.continuous.clone(),
+                app.state::<ModelService>().requests.clone(),
+            )
+            .await?;
             if *cancel.borrow() >= 2 {
                 return Err(Error::new("cancelled"));
             }
@@ -566,6 +577,7 @@ impl SpeechService {
                             .map(|a| self.history.files.clone().map(|f| (f, a.file_key.clone())))
                             .transpose()?,
                         cancel.clone(),
+                        task.continuous.as_ref().map(|c| c.audio.clone()),
                     )
                     .await?,
                 );
@@ -634,18 +646,23 @@ impl SpeechService {
                                    biased;
                                    _=cancel.changed()=>{if *cancel.borrow()==1 {if let Some(c)=&capture{c.stop();}log::info!(target:"sayweave","operation=speech_phase task_id={} phase=capture_stopped elapsed_ms={}",task.id,began.elapsed().as_millis());self.update(app,&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}},
                                    message=session.next_event()=>{match message? {
-                                       recognition::Event::Update(value)=>{transcript=value;dirty=true;self.publish_transcript(&task.id,transcript.text(false));if !transcript.confirmed_text.is_empty()&&task.persistent&&checkpoint.elapsed()>Duration::from_secs(1){if self.history.db(DbOperation::Checkpoint{attempt_id:task.attempt_id.clone(),text:transcript.text(true)}).await.is_err(){save_error=true;}checkpoint=Instant::now();}},
-                                       recognition::Event::Finished=>{if sending{return Err(Error::new("protocol"));}
+                                       continuous::StreamEvent::Update(value)=>{
+                                           transcript=value.raw;
+                                           dirty=true;
+                                           if let Some((turn,text))=value.draft {self.publish_transcript(&task.id,turn,text);}
+                                           if !transcript.confirmed_text.is_empty()&&task.persistent&&checkpoint.elapsed()>Duration::from_secs(1){if self.history.db(DbOperation::Checkpoint{attempt_id:task.attempt_id.clone(),text:transcript.text(true)}).await.is_err(){save_error=true;}checkpoint=Instant::now();}
+                                       },
+                                       continuous::StreamEvent::Finished=>{if sending{return Err(Error::new("protocol"));}
                 if transcript.text(true).trim().is_empty(){return Err(Error::new("emptyText"));}log::info!(target:"sayweave","operation=speech_phase task_id={} phase=final_received elapsed_ms={}",task.id,began.elapsed().as_millis());break;},
-                                       recognition::Event::Heartbeat=>{}
+                                       continuous::StreamEvent::Heartbeat=>{}
                                    }},
                                    _=tick.tick()=>{
                                        if began.elapsed()>Duration::from_secs(650){return Err(Error::new("timeout"));}
                                        if sending {
                                            if let Some(pcm)=&task.replay {
-                                               let end=(replay_at+800).min(pcm.len());if replay_at<end {session.send_pcm(&pcm[replay_at..end]).await?;replay_at=end;duration=replay_at as u64/16;}else{sending=false;}
+                                               let end=(replay_at+800).min(pcm.len());if replay_at<end {session.send_pcm(1,&pcm[replay_at..end]).await?;replay_at=end;duration=replay_at as u64/16;}else{sending=false;}
                                            } else if let Some(c)=capture.as_mut(){
-                                               for _ in 0..16 {let Ok(packet)=c.packets.try_recv() else {break};duration=packet.duration_ms;session.send_pcm(&packet.pcm).await?;}
+                                               for _ in 0..16 {let Ok(packet)=c.packets.try_recv() else {break};duration=packet.duration_ms;session.send_pcm(packet.turn,&packet.pcm).await?;}
                                                if c.packets.is_closed()&&c.packets.is_empty(){sending=false;}
                                            }
                                            if !sending {session.finish().await?;final_at=Some(Instant::now());log::info!(target:"sayweave","operation=speech_phase task_id={} phase=audio_drained elapsed_ms={}",task.id,began.elapsed().as_millis());self.update(app,&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}
@@ -718,11 +735,20 @@ impl SpeechService {
                 "interrupted"
             }));
         }
+        if let Some(raw) = task.continuous.as_ref().and_then(|c| c.latest_raw()) {
+            transcript = raw;
+        }
         let cancelled = outcome
             .as_ref()
             .err()
             .is_some_and(|e| e.code == "cancelled");
-        if cancelled && !task.retry {
+        if cancelled
+            && !task.retry
+            && !task
+                .continuous
+                .as_ref()
+                .is_some_and(|c| c.preserve_history())
+        {
             save_error |= self.discard_new(&task.record_id, task.persistent).await;
             self.update(app, &task.id, |s| {
                 s.text.clear();

@@ -58,7 +58,7 @@ async function start(round){
  if(await fetch('http://127.0.0.1:'+port+'/json/version').then(()=>true).catch(()=>false))throw Error('Test port occupied');
  app=spawn(exe,[],{cwd:root,windowsHide:true,env:{...process.env,SAYWEAVE_DATA_ACCEPTANCE_ID:id,WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:'--remote-debugging-port='+port+' --remote-debugging-address=127.0.0.1'},stdio:['ignore','pipe','pipe']});app.stdout.pipe(createWriteStream(path.join(directory,`round-${round}.log`)));app.stderr.pipe(createWriteStream(path.join(directory,`round-${round}-errors.log`)));
  report.processBindings??=[];report.processBindings.push({round,pid:app.pid,exe,sha256:createHash('sha256').update(readFileSync(exe)).digest('hex'),data,logSource:'launched-process-stderr'});
- let diagnostic='';app.stderr.on('data',chunk=>{diagnostic+=chunk.toString('utf8');let at;while((at=diagnostic.indexOf('\n'))>=0){const line=diagnostic.slice(0,at);diagnostic=diagnostic.slice(at+1);if(/operation=(input_target_event|input_target_identity|input_capture|input_delivery|input_binding|voice_window|dictation_phase)\b/.test(line)){report.taskTrace??=[];report.taskTrace.push({round,line});}}});
+ let diagnostic='';app.stderr.on('data',chunk=>{diagnostic+=chunk.toString('utf8');let at;while((at=diagnostic.indexOf('\n'))>=0){const line=diagnostic.slice(0,at);diagnostic=diagnostic.slice(at+1);if(/operation=(input_target_event|input_target_identity|input_capture|input_delivery|input_binding|voice_window|dictation_phase|composition_edit|dictation_turn)\b/.test(line)){report.taskTrace??=[];report.taskTrace.push({round,line});}}});
  let endpoint;for(let n=0;n<200;n++){if(app.exitCode!==null)throw Error('Application exited early');endpoint=await fetch('http://127.0.0.1:'+port+'/json/version').then(r=>r.json()).catch(()=>null);if(endpoint)break;await delay(100);}if(!endpoint)throw Error('WebView unavailable');browser=await chromium.connectOverCDP(endpoint.webSocketDebuggerUrl);
  let page;for(let n=0;n<100;n++){page=browser.contexts().flatMap(c=>c.pages()).find(p=>p.url().includes('tauri')&&!p.url().includes('surface=overlay'));if(page)break;await delay(100);}if(!page)throw Error('Main page missing');await page.waitForFunction(()=>window.__TAURI_INTERNALS__?.invoke);for(let n=0;n<50;n++){const status=await invoke(page,'history_status',{retry:false});if(status.state==='ready')break;await delay(100);}await overlayPage();return page;
 }
@@ -72,8 +72,8 @@ async function stop(page,graceful=true){
  if(app?.exitCode===null&&page&&graceful){await invoke(page,'acceptance_exit').catch(()=>{});for(let n=0;n<60&&app.exitCode===null;n++)await delay(100);if(app.exitCode===null)throw Error('Exit did not drain');}
  if(browser){await browser.close().catch(()=>{});browser=null;}if(app?.exitCode===null){const owned=app;owned.kill();await new Promise(r=>owned.exitCode!==null?r():owned.once('exit',r));}app=null;await delay(600);
 }
-async function ownedEditor(){
- const child=spawn(path.join(root,'src-tauri/target/debug/input-fixture.exe'),[],{cwd:root,windowsHide:true,env:{...process.env,SAYWEAVE_INPUT_ACCEPTANCE:'1'},stdio:['pipe','pipe','pipe']});
+async function ownedEditor(composition=true){
+ const child=spawn(path.join(root,'src-tauri/target/debug/input-fixture.exe'),composition?['composition']:[],{cwd:root,windowsHide:true,env:{...process.env,SAYWEAVE_INPUT_ACCEPTANCE:'1'},stdio:['pipe','pipe','pipe']});
  let buffer='',queue=[],waiting=[];child.stdout.on('data',data=>{buffer+=data.toString('utf8');let at;while((at=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,at);buffer=buffer.slice(at+1);const value=JSON.parse(line);if(waiting.length)waiting.shift()(value);else queue.push(value);}});
  const next=()=>queue.length?Promise.resolve(queue.shift()):Promise.race([new Promise(resolve=>waiting.push(resolve)),delay(3000).then(()=>{throw Error('Owned editor response timeout');})]);
  await next();return {command:async value=>{child.stdin.write(JSON.stringify(value)+'\n');const result=await next();if(['focus','focus-process'].includes(value.action))await delay(80);return result;},close:async()=>{if(child.exitCode===null){child.stdin.write('{"action":"exit"}\n');for(let n=0;n<20&&child.exitCode===null;n++)await delay(50);if(child.exitCode===null)child.kill();}}};
@@ -85,8 +85,17 @@ async function nativeOverlayClick(view,editor,name){
  const click=await editor.command({action:'click-window',process:app.pid,window:owned.overlayWindow,x:Math.round((box.x+box.width/2)*scale),y:Math.round((box.y+box.height/2)*scale)});
  expect(click.clickCheck.pointRootMatches).toBe(true);expect(click.clicked).toBe(2);return click;
 }
-async function externalRound(page,finish,end){
- const start=await invoke(page,'dictation_start');await waitPhase(page,'recording');for(const command of ['dictation_control','speech_control'])expect((await rejected(page,command,{taskId:'stale-task',action:'cancel'})).code).toBe('staleSession');await finish(start);if(end)await end(start);else await invoke(page,'dictation_control',{taskId:start.taskId,action:'finish'});if(mode==='delayed-final'){await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).presentation,{timeout:3000}).toBe('recognizing');const view=await overlayPage();await expect(view.getByText('识别中',{exact:true})).toBeVisible();await expect(view.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);}await waitPhase(page,'completed');await expect.poll(async()=>{const result=await invoke(page,'dictation_snapshot');return result.taskId===start.taskId&&result.stage==='result'&&result.delivery!==null&&!['preparing','recording','recognizing','delivering'].includes(result.presentation);},{timeout:5000}).toBe(true);return {speech:await invoke(page,'speech_snapshot'),dictation:await invoke(page,'dictation_snapshot')};
+async function externalRound(page,finish,end,interrupted=false){
+ const start=await invoke(page,'dictation_start');await waitPhase(page,'recording');
+ for(const command of ['dictation_control','speech_control'])expect((await rejected(page,command,{taskId:'stale-task',action:'cancel'})).code).toBe('staleSession');
+ await finish(start);
+ if(!['completed','failed','cancelled'].includes((await invoke(page,'speech_snapshot')).phase)){
+  if(end)await end(start);else await invoke(page,'dictation_control',{taskId:start.taskId,action:'finish'});
+ }
+ if(mode==='delayed-final'){await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).presentation,{timeout:3000}).toBe('recognizing');const view=await overlayPage();await expect(view.getByText('识别中',{exact:true})).toBeVisible();await expect(view.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);}
+ if(interrupted)await expect.poll(async()=>['completed','failed','cancelled'].includes((await invoke(page,'speech_snapshot')).phase),{timeout:15000}).toBe(true);else await waitPhase(page,'completed');
+ await expect.poll(async()=>{const result=await invoke(page,'dictation_snapshot');return result.taskId===start.taskId&&result.stage==='result'&&result.delivery!==null&&!['preparing','recording','recognizing','delivering'].includes(result.presentation);},{timeout:5000}).toBe(true);
+ return {speech:await invoke(page,'speech_snapshot'),dictation:await invoke(page,'dictation_snapshot')};
 }
 async function waitPhase(page,phase){
  let timeout=15000;
@@ -173,7 +182,7 @@ try{
  const editor=await ownedEditor();try{
   expect((await editor.command({action:'focus',text:'before tail',start:7,end:11})).foreground).toBe(true);
   await invoke(page,'runtime_window',{surface:'overlay',action:'show'});mode='delayed-final';
-  const result=await externalRound(page,async()=>{const before=await editor.command({action:'read'});expect(before.foreground).toBe(true);await invoke(page,'shortcut_capture',{begin:false});await invoke(page,'shortcut_capture',{begin:false});await delay(180);const after=await editor.command({action:'read'});report.externalFocus={beforeProcess:before.foregroundProcess,afterProcess:after.foregroundProcess,applicationProcess:app.pid};expect(after.foreground).toBe(true);},async()=>{report.nativeEndClick=await nativeOverlayClick(overlay,editor,'结束录音');});
+  const result=await externalRound(page,async()=>{await expect.poll(async()=>(await editor.command({action:'read'})).text,{timeout:5000}).toBe('before 正在识别');const before=await editor.command({action:'read'});expect(before.foreground).toBe(true);await invoke(page,'shortcut_capture',{begin:false});await invoke(page,'shortcut_capture',{begin:false});await delay(180);const after=await editor.command({action:'read'});report.externalFocus={beforeProcess:before.foregroundProcess,afterProcess:after.foregroundProcess,applicationProcess:app.pid};report.streamingInput={beforeFinishActualText:true,clipboardUsed:false,taskId:(await invoke(page,'dictation_snapshot')).taskId};expect(after.foreground).toBe(true);},async()=>{report.nativeEndClick=await nativeOverlayClick(overlay,editor,'结束录音');});
   report.externalEdit=result.dictation.delivery;expect(result.dictation.delivery.state).toBe('confirmed');expect((await rejected(page,'dictation_copy',{taskId:'stale-task',presentationId:randomUUID()})).code).toBe('staleSession');expect((await editor.command({action:'read'})).text).toBe('before 原生受控识别完成。');
   expect(result.dictation.presentation).toBe('completed');await expect(overlay.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);await expect.poll(async()=>(await invoke(page,'runtime_snapshot')).windows.overlay,{timeout:2500}).toBe(false);expect((await invoke(page,'dictation_snapshot')).presentation).toBe('idle');mode='normal';
   expect((await rejected(page,'speech_retry_current',{taskId:'stale-displayed-task'})).code).toBe('staleSession');
@@ -191,29 +200,38 @@ try{
    report.overlayInsertion.push({taskId:result.dictation.taskId,beforeLength:sample.before.length,actualWrite:true,delivery:result.dictation.delivery});
   }
   mode='normal';
+  const legacy=await ownedEditor(false);
+  try{
+   await legacy.command({action:'focus',text:'legacy ',start:7,end:7});
+   const legacyResult=await externalRound(page,async()=>delay(180));
+   expect((await legacy.command({action:'read'})).text,'Plain EDIT compatibility must actually receive its final text: '+JSON.stringify(legacyResult.dictation.delivery)).toBe('legacy 原生受控识别完成。');
+   expect(legacyResult.dictation.delivery.submission).toBe('submitted');
+   report.plainEditCompatibility=legacyResult.dictation.delivery;
+  }finally{await legacy.close();}
   const other=await ownedEditor();
   try{
    await editor.command({action:'focus',text:'protected',start:9,end:9});
-   const away=await externalRound(page,async()=>{expect((await other.command({action:'focus'})).foreground).toBe(true);expect((await editor.command({action:'focus'})).foreground).toBe(true);});
-   expect(away.dictation.delivery).toMatchObject({submission:'notSubmitted',error:'targetChanged',submittedEvents:0});
-   expect((await editor.command({action:'read'})).text).toBe('protected');
+   const away=await externalRound(page,async()=>{await expect.poll(async()=>(await editor.command({action:'read'})).text).toBe('protected正在识别');expect((await other.command({action:'focus'})).foreground).toBe(true);expect((await editor.command({action:'focus'})).foreground).toBe(true);},undefined,true);
+   expect(away.dictation.delivery.state).not.toBe('confirmed');
+   expect((await editor.command({action:'read'})).text).toBe('protected正在识别');
+   expect((await other.command({action:'read'})).text).toBe('');
    await invoke(page,'dictation_dismiss',{taskId:away.dictation.taskId,presentationId:away.dictation.presentationId});
    report.externalSwitchBack=away.dictation.delivery;
   }finally{await other.close();}
   await editor.command({action:'focus',text:'protected',start:9,end:9});
-  const mainSwitch=await externalRound(page,async()=>{await invoke(page,'runtime_window',{surface:'main',action:'show'});await delay(100);expect((await editor.command({action:'read'})).foregroundProcess).toBe(app.pid);expect((await editor.command({action:'focus'})).foreground).toBe(true);});
-  expect(mainSwitch.dictation.delivery).toMatchObject({submission:'notSubmitted',error:'targetChanged',submittedEvents:0});
-  expect((await editor.command({action:'read'})).text).toBe('protected');
+  const mainSwitch=await externalRound(page,async()=>{await expect.poll(async()=>(await editor.command({action:'read'})).text).toBe('protected正在识别');await invoke(page,'runtime_window',{surface:'main',action:'show'});await delay(100);expect((await editor.command({action:'read'})).foregroundProcess).toBe(app.pid);expect((await editor.command({action:'focus'})).foreground).toBe(true);},undefined,true);
+  expect(mainSwitch.dictation.delivery.state).not.toBe('confirmed');
+  expect((await editor.command({action:'read'})).text).toBe('protected正在识别');
   await invoke(page,'dictation_dismiss',{taskId:mainSwitch.dictation.taskId,presentationId:mainSwitch.dictation.presentationId});report.mainSwitchBack=mainSwitch.dictation.delivery;
   await editor.command({action:'focus',text:'protected',start:9,end:9});
-  const caret=await externalRound(page,async()=>{await editor.command({action:'selection',start:0,end:0});});
-  expect(caret.dictation.delivery).toMatchObject({submission:'notSubmitted',error:'targetChanged',submittedEvents:0});
-  expect((await editor.command({action:'read'})).text).toBe('protected');
+  const caret=await externalRound(page,async()=>{await expect.poll(async()=>(await editor.command({action:'read'})).text).toBe('protected正在识别');await editor.command({action:'selection',start:0,end:0});},undefined,true);
+  expect(caret.dictation.delivery.state).not.toBe('confirmed');
+  expect((await editor.command({action:'read'})).text).toBe('protected正在识别');
   await invoke(page,'dictation_dismiss',{taskId:caret.dictation.taskId,presentationId:caret.dictation.presentationId});report.caretChange=caret.dictation.delivery;
   expect((await editor.command({action:'focus',text:'initial',start:7,end:7})).foreground).toBe(true);
-  const changed=await externalRound(page,async()=>{await editor.command({action:'focus',text:'user changed',start:0,end:0});});
-  expect(changed.dictation.delivery.state).toBe('copy');expect(changed.dictation.presentation).toBe('result');await expect(overlay.getByRole('button',{name:'复制',exact:true})).toBeVisible();await invoke(page,'dictation_dismiss',{taskId:changed.dictation.taskId,presentationId:changed.dictation.presentationId});expect((await editor.command({action:'read'})).text).toBe('user changed');
-  report.checks.push('real Win32 mouse end click inserts native selection and Unicode/multiline/emoji, foreground retained; external/main switches remain refused after switching back; changed target provides Copy and Close; delayed provider tail waits and overlay naturally hides; journal and overlay permissions verified');
+  const changed=await externalRound(page,async()=>{await expect.poll(async()=>(await editor.command({action:'read'})).text).toBe('initial正在识别');await editor.command({action:'focus',text:'user changed',start:0,end:0});},undefined,true);
+  expect(changed.dictation.delivery.state).not.toBe('confirmed');await invoke(page,'dictation_dismiss',{taskId:changed.dictation.taskId,presentationId:changed.dictation.presentationId});expect((await editor.command({action:'read'})).text).toBe('user changed');
+  report.checks.push('ASR partial enters actual native selection before finish; real Win32 mouse end click updates one range with final Unicode/multiline/emoji and retains foreground; external/main switches preserve handed-off visible text without further writes after switching back; programmatic target edits retain user text; delayed provider tail waits and overlay hides; journal and overlay permissions verified');
  }finally{await editor.close();}
  const targetBrowser=await chromium.launch({headless:false,args:['--force-renderer-accessibility']});
  const focusHelper=await ownedEditor();
@@ -289,7 +307,7 @@ for(const r of (await invoke(page,'history_list',{query:{search:'',page:1}})).re
  await invoke(page,'acceptance_main_size',{minimum:false});
  report.checks.push('10k native summaries through IPC;1000 rows continuously loaded; cached reading restored by real routes');
  await stop(page);expect(readFileSync(path.join(data,'dictionary.sqlite')).includes(Buffer.from(key))).toBe(false);for(let round=1;round<=5;round++)for(const suffix of ['.log','-errors.log'])expect(readFileSync(path.join(directory,'round-'+round+suffix),'utf8')).not.toContain(key);report.passed=true;
-}catch(e){report.error=String(e).replaceAll(key,'[redacted]');report.errorStack=e.stack?.replaceAll(key,'[redacted]');if(browser){const main=browser.contexts().flatMap(c=>c.pages()).find(p=>!p.url().includes('surface=overlay'));if(main){await main.screenshot({path:path.join(directory,'failure.png')}).catch(()=>{});report.failureDialogs=await main.getByRole('dialog').count().catch(()=>null);const speech=await invoke(main,'speech_snapshot').catch(()=>null);report.failureSpeechPhase=speech?.phase??null;}}process.exitCode=1;}finally{
+}catch(e){report.error=String(e).replaceAll(key,'[redacted]');report.errorStack=e.stack?.replaceAll(key,'[redacted]');if(browser){const main=browser.contexts().flatMap(c=>c.pages()).find(p=>!p.url().includes('surface=overlay'));if(main){await main.screenshot({path:path.join(directory,'failure.png')}).catch(()=>{});report.failureDialogs=await main.getByRole('dialog').count().catch(()=>null);const speech=await invoke(main,'speech_snapshot').catch(()=>null);report.failureSpeechPhase=speech?.phase??null;report.failureSpeechError=speech?.error??null;}}process.exitCode=1;}finally{
  if(browser){const page=browser.contexts().flatMap(c=>c.pages()).find(p=>!p.url().includes('surface=overlay'));await stop(page).catch(()=>stop(null,false));}else await stop(null,false);for(const socket of sockets)socket.destroy();if(server)await new Promise(r=>server.close(r));
  try{await command(['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_cleanup','--','--ignored']);report.credentialCleanup=true;}catch{report.credentialCleanup=false;report.passed=false;process.exitCode=1;}
  for(const name of ['fixture-ca.der','fixture-ca.pem','fixture-key.pem'])if(existsSync(path.join(data,name)))unlinkSync(path.join(data,name));writeFileSync(path.join(directory,'report.json'),JSON.stringify(report,null,2));writeFileSync(path.join(root,'.local','speech-desktop-report.json'),JSON.stringify(report,null,2));

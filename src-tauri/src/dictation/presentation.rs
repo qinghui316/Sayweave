@@ -9,6 +9,8 @@ pub enum Presentation {
     Idle,
     Preparing,
     Recording,
+    Editing,
+    Resuming,
     Recognizing,
     Delivering,
     Completed,

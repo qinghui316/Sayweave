@@ -295,6 +295,7 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
             },
             core::w,
         };
+        let plain = std::env::args().nth(3).as_deref() == Some("plain");
         let library = LoadLibraryExW(w!("Msftedit.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)?;
         let top = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -312,7 +313,7 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let editor = CreateWindowExW(
             WINDOW_EX_STYLE(0),
-            w!("RICHEDIT50W"),
+            if plain { w!("EDIT") } else { w!("RICHEDIT50W") },
             w!(""),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_MULTILINE as u32),
             10,
@@ -327,15 +328,41 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         let manager: ITfThreadMgr =
             CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
         let client = manager.Activate()?;
-        let _ = SendMessageW(
-            editor,
-            WM_USER + 204,
-            Some(WPARAM(0x10000)),
-            Some(LPARAM(0x10000)),
-        );
+        if !plain {
+            let _ = SendMessageW(
+                editor,
+                WM_USER + 204,
+                Some(WPARAM(0x10000)),
+                Some(LPARAM(0x10000)),
+            );
+        }
         let _ = SetForegroundWindow(top);
         let _ = SetFocus(Some(editor));
         pump(Duration::from_millis(200));
+        if GetForegroundWindow() != top {
+            // A background test launcher may be denied SetForegroundWindow.
+            // Exercise only the blank window this fixture owns, then verify focus.
+            let mut rect = RECT::default();
+            GetWindowRect(editor, &mut rect)?;
+            SetCursorPos(rect.left + 30, rect.top + 30)?;
+            let events = [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP].map(|flags| INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dwFlags: flags,
+                        ..Default::default()
+                    },
+                },
+            });
+            if SendInput(&events, std::mem::size_of::<INPUT>() as i32) != 2 {
+                return Err("owned fixture focus click was not submitted".into());
+            }
+            pump(Duration::from_millis(200));
+            println!("owned fixture required a real activation click=true");
+        }
+        if GetForegroundWindow() != top {
+            return Err("owned fixture is not the actual foreground window".into());
+        }
         let module_path = std::env::args()
             .nth(2)
             .map(std::path::PathBuf::from)
@@ -388,10 +415,32 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                 if action == Action::Update {
                     expected = text.into();
                 }
-                if editor_text(editor)? != expected {
-                    return Err("owned target text assertion failed".into());
+                // A legacy IMM-backed EDIT keeps active composition outside its
+                // committed WM_GETTEXT buffer. Read the actual TSF range while
+                // composing, and require real control text after Commit.
+                let composing = plain && action == Action::Update;
+                let actual = if composing {
+                    composition_text(&context)?
+                } else {
+                    editor_text(editor)?
+                };
+                if actual != expected {
+                    return Err(format!("owned target text assertion failed: operation={operation} expected_utf16={} actual_utf16={} actual_hash={}", expected.encode_utf16().count(), actual.encode_utf16().count(), sayweave_text_service::deployment::version(actual.as_bytes())).into());
                 }
-                println!("owned operation={operation} applied=true actual_text_assertion=true");
+                println!(
+                    "owned operation={operation} applied=true actual_text_assertion=true source={}",
+                    if composing {
+                        "compositionRange"
+                    } else {
+                        "controlText"
+                    }
+                );
+            }
+            if plain {
+                println!(
+                    "owned plain EDIT cumulative replacement and single commit actual text=true"
+                );
+                return Ok(());
             }
             let original = "前 被选🙂 后";
             SendMessageW(
@@ -477,6 +526,25 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("external property edit was overwritten by rollback".into());
             }
             println!("owned property-only user edit revoked rollback ownership=true");
+            let handoff = exchange(
+                &pipe,
+                &capability,
+                &task,
+                4,
+                12,
+                1,
+                Action::Handoff,
+                "",
+                false,
+            )?;
+            if !handoff.applied
+                || handoff.code != "alreadyHandedOff"
+                || handoff.mutation != Mutation::NotAttempted
+                || editor_text(editor)? != handed_off_text
+            {
+                return Err("same-turn released range handoff acknowledgement changed text".into());
+            }
+            println!("owned released-range handoff acknowledged without mutation=true");
             SendMessageW(
                 editor,
                 WM_SETTEXT,
@@ -487,9 +555,9 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
             pump(Duration::from_millis(50));
             let multiline = "中文，\n换行🙂";
             for (operation, revision, action, text) in [
-                (12, 0, Action::Begin, ""),
-                (13, 1, Action::Update, multiline),
-                (14, 1, Action::Commit, ""),
+                (13, 0, Action::Begin, ""),
+                (14, 1, Action::Update, multiline),
+                (15, 1, Action::Commit, ""),
             ] {
                 let reply = exchange(
                     &pipe,
@@ -534,6 +602,63 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         FreeLibrary(component)?;
         println!("owned COM DLL unloaded with no live leases=true");
         result
+    }
+}
+#[cfg(feature = "acceptance")]
+fn composition_text(context: &ITfContext) -> Result<String, Box<dyn std::error::Error>> {
+    let output = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let read: ITfEditSession = ReadComposition {
+        context: context.clone(),
+        output: output.clone(),
+    }
+    .into();
+    unsafe {
+        context
+            .RequestEditSession(0, &read, TF_ES_ASYNCDONTCARE | TF_ES_READ)?
+            .ok()?;
+    }
+    let started = Instant::now();
+    loop {
+        if let Some(value) = output.borrow_mut().take() {
+            return Ok(value?);
+        }
+        if started.elapsed() > Duration::from_secs(2) {
+            return Err("owned composition read timeout".into());
+        }
+        pump(Duration::from_millis(10));
+    }
+}
+#[cfg(feature = "acceptance")]
+#[windows::core::implement(ITfEditSession)]
+struct ReadComposition {
+    context: ITfContext,
+    output: std::rc::Rc<std::cell::RefCell<Option<windows::core::Result<String>>>>,
+}
+#[cfg(feature = "acceptance")]
+impl ITfEditSession_Impl for ReadComposition_Impl {
+    fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        let result = (|| unsafe {
+            let compositions: ITfContextComposition = self.context.cast()?;
+            let mut composition = [None];
+            let mut count = 0;
+            compositions
+                .EnumCompositions()?
+                .Next(&mut composition, &mut count)?;
+            if count != 1 {
+                return Err(windows::core::Error::new(
+                    windows::Win32::Foundation::E_FAIL,
+                    "owned composition missing",
+                ));
+            }
+            let range = composition[0].as_ref().unwrap().GetRange()?;
+            let mut text = [0u16; 256];
+            let mut fetched = 0;
+            range.GetText(ec, 0, &mut text, &mut fetched)?;
+            String::from_utf16(&text[..fetched as usize])
+                .map_err(|_| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))
+        })();
+        *self.output.borrow_mut() = Some(result);
+        Ok(())
     }
 }
 #[cfg(feature = "acceptance")]

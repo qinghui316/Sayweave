@@ -24,6 +24,8 @@ struct Desired {
     text: String,
     closed: bool,
     notified: bool,
+    frozen: bool,
+    failure: Option<String>,
 }
 enum Command {
     Wake,
@@ -86,13 +88,17 @@ impl Draft {
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                     }
                     let latest = shared.lock().ok().and_then(|d| {
-                        (!d.closed && d.revision > applied).then(|| (d.revision, d.text.clone()))
+                        (!d.closed && !d.frozen && d.revision > applied)
+                            .then(|| (d.revision, d.text.clone()))
                     });
                     if let Some((revision, text)) = latest
                         && last_update.is_none_or(|at| at.elapsed() >= Duration::from_millis(50))
                     {
                         if host.failure.is_none() {
                             let _ = host.update(&text);
+                        }
+                        if let Ok(mut desired) = shared.lock() {
+                            desired.failure = host.failure.clone();
                         }
                         applied = revision;
                         last_update = Some(Instant::now());
@@ -114,7 +120,7 @@ impl Draft {
         let Ok(mut desired) = self.desired.lock() else {
             return;
         };
-        if turn != self.turn || desired.closed || sequence <= desired.revision {
+        if turn != self.turn || desired.closed || desired.frozen || sequence <= desired.revision {
             return;
         }
         desired.revision = sequence;
@@ -125,6 +131,14 @@ impl Draft {
                 desired.notified = false;
             }
         }
+    }
+    pub fn freeze(&self) {
+        if let Ok(mut desired) = self.desired.lock() {
+            desired.frozen = true;
+        }
+    }
+    pub fn failure(&self) -> Option<String> {
+        self.desired.lock().ok().and_then(|d| d.failure.clone())
     }
     pub async fn finish(&self, text: String, mode: Finish) -> Delivery {
         if let Ok(mut desired) = self.desired.lock() {
@@ -305,7 +319,7 @@ impl Host {
                 return if reply.applied {
                     Ok(())
                 } else {
-                    Err(Error::new("compositionRejected"))
+                    Err(Error::new(reply_error(&reply.code)))
                 };
             }
             if at.elapsed() >= Duration::from_secs(2) {
@@ -382,11 +396,66 @@ impl Host {
             .map_err(|_| Error::new("compositionCleanup"))
     }
 }
+fn reply_error(code: &str) -> &'static str {
+    let edit_lock = ["edit:", "requestEdit:", "requestEditResult:"]
+        .iter()
+        .any(|prefix| code.starts_with(prefix))
+        && code.rsplit(':').next()
+            == Some(
+                format!(
+                    "{:08x}",
+                    windows::Win32::UI::TextServices::TF_E_LOCKED.0 as u32
+                )
+                .as_str(),
+            );
+    if edit_lock {
+        "inputComposition"
+    } else {
+        "compositionRejected"
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::reply_error;
+    #[test]
+    fn foreign_ime_lock_remains_temporary_at_each_edit_boundary() {
+        let locked = format!(
+            "{:08x}",
+            windows::Win32::UI::TextServices::TF_E_LOCKED.0 as u32
+        );
+        for phase in [
+            "edit",
+            "edit:beginProperties",
+            "requestEdit",
+            "requestEditResult",
+        ] {
+            assert_eq!(
+                reply_error(&format!("{phase}:{locked}")),
+                "inputComposition"
+            );
+        }
+        assert_eq!(
+            reply_error("edit:updateText:80070057"),
+            "compositionRejected"
+        );
+        assert_eq!(
+            reply_error(&format!("editLease:{locked}")),
+            "compositionRejected"
+        );
+        assert_eq!(
+            reply_error("draftOwnership:80070057"),
+            "compositionRejected"
+        );
+    }
+}
 fn target_ready(task: &str, anchor: &Anchor, gate: &DeliveryGate) -> Result<(), Error> {
     let began = Instant::now();
     loop {
         if gate.cancelled() {
             return Err(Error::new("cancelled"));
+        }
+        if crate::input_state::activity() != anchor.activity {
+            return Err(Error::new("editing"));
         }
         if super::native::composition_target(task, anchor)? {
             return Ok(());

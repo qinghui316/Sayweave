@@ -64,6 +64,16 @@ pub struct DraftVersion {
     pub owned: bool,
 }
 impl DraftVersion {
+    /// A cleanup acknowledgement for the same relinquished range, never a new write.
+    pub fn acknowledges_handoff(&self, request: &Request) -> bool {
+        request.valid()
+            && request.action == Action::Handoff
+            && !self.owned
+            && self.task == request.task
+            && self.turn == request.turn
+            && request.operation > self.operation
+            && request.revision >= self.revision
+    }
     pub fn accepts(&self, request: &Request) -> bool {
         request.valid()
             && request.operation > self.operation
@@ -100,6 +110,22 @@ mod tests {
             action,
             text: "中文🙂".into(),
         }
+    }
+    #[test]
+    fn released_ranges_acknowledge_only_their_own_handoff_and_never_mutate_again() {
+        let mut draft = DraftVersion::default();
+        draft.applied(&request(Action::Begin, 1, 0));
+        draft.applied(&request(Action::Update, 2, 1));
+        draft.owned = false; // target has already handed it to a foreign editor
+        assert!(draft.acknowledges_handoff(&request(Action::Handoff, 3, 1)));
+        assert!(!draft.accepts(&request(Action::Update, 3, 2)));
+        assert!(!draft.acknowledges_handoff(&request(Action::Abort, 3, 1)));
+        let mut other = request(Action::Handoff, 3, 1);
+        other.turn = 2;
+        assert!(!draft.acknowledges_handoff(&other));
+        other.turn = 1;
+        other.task = uuid::Uuid::new_v4().to_string();
+        assert!(!draft.acknowledges_handoff(&other));
     }
     #[test]
     fn old_updates_and_handed_off_turns_never_write_again() {

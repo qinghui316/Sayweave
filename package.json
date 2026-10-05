@@ -8,7 +8,7 @@
   },
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "desktop:dev": "tauri dev",
+    "desktop:dev": "node scripts/desktop.mjs dev",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src tests scripts/*.mjs && node scripts/check-boundaries.mjs && node scripts/check-text.mjs",
     "test": "vitest run && npm run test:native",
@@ -20,7 +20,7 @@
     "check:tsf": "cargo fmt --manifest-path src-tauri/text-service/Cargo.toml -- --check && cargo clippy --manifest-path src-tauri/text-service/Cargo.toml --all-targets --features acceptance -- -D warnings && cargo test --manifest-path src-tauri/text-service/Cargo.toml",
     "test:tsf": "cargo build --manifest-path src-tauri/text-service/Cargo.toml --features acceptance && powershell -NoProfile -ExecutionPolicy Bypass -File src-tauri/text-service/test-stage-a.ps1",
     "build": "tsc --noEmit && vite build",
-    "desktop:build": "tauri build --no-bundle",
+    "desktop:build": "node scripts/desktop.mjs build",
     "check": "npm run typecheck && npm run lint && npm run test:ui && npm run check:native && npm run build",
     "check:distribution": "node scripts/check-distribution.mjs",
     "tauri": "tauri",

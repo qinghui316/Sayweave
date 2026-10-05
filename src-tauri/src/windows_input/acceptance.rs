@@ -256,6 +256,91 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             "SAYWEAVE_COMPOSITION_SAMPLE_PASS actual_prefix=true cumulative=true final_single_copy=true"
         );
     }
+    // Exact production turn manager, actual TSF target text. Editing evidence is
+    // explicitly controlled here; this does not stand in for physical-key/Codex acceptance.
+    {
+        use crate::{
+            dictation::{Presentation, drafts::SessionDraft},
+            speech::{NativeTranscript, continuous::Control},
+        };
+        fixture.command(serde_json::json!({"action":"focus","text":"abc","start":1,"end":1}))?;
+        std::thread::sleep(Duration::from_millis(60));
+        let id = uuid::Uuid::new_v4().to_string();
+        let anchor = WindowsInputService::anchor().ok_or("turn fixture target")?;
+        bind_watch(&id, &anchor, None).map_err(|e| e.code)?;
+        let gate = Arc::new(DeliveryGate::default());
+        let draft = runtime
+            .block_on(Draft::begin(id.clone(), 1, anchor.clone(), gate.clone()))
+            .map_err(|e| e.code)?;
+        let flow = Control::new(crate::input_state::activity_evidence());
+        flow.resume(1, anchor.activity);
+        let (cancel, _) = tokio::sync::watch::channel(0);
+        let manager = SessionDraft::new(
+            id.clone(),
+            anchor,
+            draft,
+            gate,
+            flow.clone(),
+            cancel.clone(),
+        );
+        manager.activate();
+        let ongoing = manager.clone();
+        let actor = runtime.spawn(async move {
+            ongoing.maintain(|_| {}).await;
+        });
+        manager.update(&NativeTranscript {
+            task_id: id.clone(),
+            turn: 1,
+            sequence: 1,
+            text: "你好".into(),
+        });
+        let until = std::time::Instant::now() + Duration::from_secs(3);
+        while fixture.command(serde_json::json!({"action":"read"}))?["text"] != "a你好bc" {
+            if std::time::Instant::now() >= until {
+                return Err("turn1 actual text missing".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        crate::input_state::edited();
+        fixture.command(serde_json::json!({"action":"type","text":"X"}))?;
+        let until = std::time::Instant::now() + Duration::from_secs(4);
+        while manager.presentation() != Presentation::Resuming {
+            if *cancel.borrow() > 0 || std::time::Instant::now() >= until {
+                actor.abort();
+                return Err("production turn manager did not resume".into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        manager.update(&NativeTranscript {
+            task_id: id.clone(),
+            turn: 1,
+            sequence: 2,
+            text: "旧轮禁止覆盖".into(),
+        });
+        let latest = NativeTranscript {
+            task_id: id.clone(),
+            turn: 2,
+            sequence: 3,
+            text: "新🙂".into(),
+        };
+        manager.update(&latest);
+        flow.request_finish();
+        cancel.send_replace(1);
+        let delivery = runtime.block_on(manager.finish(&latest, Finish::Commit));
+        runtime.block_on(actor).map_err(|e| e.to_string())?;
+        let actual = fixture.command(serde_json::json!({"action":"read"}))?;
+        if delivery.verification != Verification::Confirmed || actual["text"] != "a你好X新🙂bc"
+        {
+            return Err(format!(
+                "handoff owned-fixture assertion failed delivery={:?} actual={}",
+                delivery.error, actual["text"]
+            ));
+        }
+        release_watch(&id);
+        println!(
+            "SAYWEAVE_COMPOSITION_TURNS_PASS controlled_edit=true actual_handoff=true resumed_range=true old_turn_ignored=true final_single_copy=true"
+        );
+    }
     // Actual foreground notifications must remain sticky after switching back. This is
     // deliberately a second owned process, not a fabricated WinEvent or personal app.
     fixture.command(serde_json::json!({"action":"focus","text":"","start":0,"end":0}))?;
