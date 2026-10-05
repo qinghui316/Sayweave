@@ -33,6 +33,21 @@ unsafe extern "system" fn fixture_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) ->
 fn message(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe { SendMessageW(h, m, Some(w), Some(l)) }
 }
+fn context_status() -> serde_json::Value {
+    use windows::Win32::{System::Com::*, UI::TextServices::*};
+    let result = (|| unsafe {
+        let manager: ITfThreadMgr =
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
+        let context = manager.GetFocus()?.GetTop()?;
+        let status = context.GetStatus()?;
+        Ok::<_, windows::core::Error>(serde_json::json!({
+            "staticFlags": status.dwStaticFlags,
+            "dynamicFlags": status.dwDynamicFlags,
+            "transitory": status.dwStaticFlags & TF_SS_TRANSITORY != 0,
+        }))
+    })();
+    result.unwrap_or_else(|e| serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}))
+}
 unsafe fn focus_window(window: HWND) {
     unsafe {
         use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -86,9 +101,12 @@ fn main() {
         let composition = std::env::args().nth(1).as_deref() == Some("composition");
         let mut tsf_manager = None;
         let mut rich_library = None;
+        use windows::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize,
+        };
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
         if composition {
-            use windows::Win32::System::{Com::*, LibraryLoader::*};
-            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+            use windows::Win32::System::LibraryLoader::*;
             rich_library = Some(
                 LoadLibraryExW(w!("Msftedit.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32).unwrap(),
             );
@@ -179,6 +197,12 @@ fn main() {
                     PostQuitMessage(0);
                     let _ = ok.send(());
                     break;
+                }
+                if value["action"] == "inspect-context" {
+                    println!("{}", context_status());
+                    io::stdout().flush().unwrap();
+                    let _ = ok.send(());
+                    continue;
                 }
                 if value["action"] != "type"
                     && let Some(text) = value["text"].as_str()
@@ -320,10 +344,10 @@ fn main() {
         if let Some(manager) = tsf_manager {
             let _ = manager.Deactivate();
             drop(manager);
-            windows::Win32::System::Com::CoUninitialize();
         }
         if let Some(library) = rich_library {
             let _ = FreeLibrary(library);
         }
+        CoUninitialize();
     }
 }

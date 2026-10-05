@@ -203,7 +203,7 @@ try{
   const legacy=await ownedEditor(false);
   try{
    await legacy.command({action:'focus',text:'legacy ',start:7,end:7});
-   const legacyResult=await externalRound(page,async()=>delay(180));
+   const legacyResult=await externalRound(page,async()=>{await delay(180);report.plainEditContext=await legacy.command({action:'inspect-context'});});
    expect((await legacy.command({action:'read'})).text,'Plain EDIT compatibility must actually receive its final text: '+JSON.stringify(legacyResult.dictation.delivery)).toBe('legacy 原生受控识别完成。');
    expect(legacyResult.dictation.delivery.submission).toBe('submitted');
    report.plainEditCompatibility=legacyResult.dictation.delivery;
