@@ -528,12 +528,22 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
                 }),
                 _ => false,
             };
-            let initially_empty = pattern.as_ref().is_some_and(|pattern| {
-                pattern
-                    .DocumentRange()
-                    .and_then(|doc| doc.GetText(1))
-                    .is_ok_and(|text| text.is_empty())
-            });
+            let initially_empty =
+                pattern.as_ref().is_some_and(|pattern| {
+                    pattern
+                        .DocumentRange()
+                        .and_then(|doc| doc.GetText(1))
+                        .is_ok_and(|text| text.is_empty())
+                }) || context.as_ref().is_some_and(|(prefix, selected, suffix)| {
+                    // An empty Chromium field may expose a virtual newline in DocumentRange.
+                    [prefix, selected, suffix]
+                        .iter()
+                        .all(|part| part.chars().all(|c| c == '\r' || c == '\n'))
+                        && element
+                            .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                            .and_then(|value| value.CurrentValue())
+                            .is_ok_and(|value| value.is_empty())
+                });
             let selection = pattern.as_ref().and_then(|p| uia_selection(p).ok());
             let position = pattern.as_ref().and_then(|p| uia_position(p).ok());
             if context.is_none() && selection.is_none() && !crate::input_state::tracking_ready() {
@@ -1381,8 +1391,8 @@ pub(super) fn worker(
                             unwatch(old, &automation);
                         }
                         targets.clear();
-                        let readable = match &t.proof { Proof::Edit { before, .. } => before.is_some(), Proof::Uia { context, .. } => context.is_some() };
-                        log::info!(target:"sayweave", "operation=input_capture task_id={} stage=capture editable=true readable={} elapsed_ms={}", id, readable, at.elapsed().as_millis());
+                        let (readable, initially_empty) = match &t.proof { Proof::Edit { before, .. } => (before.is_some(), before.as_ref().is_some_and(String::is_empty)), Proof::Uia { context, initially_empty, .. } => (context.is_some(), *initially_empty) };
+                        log::info!(target:"sayweave", "operation=input_capture task_id={} stage=capture editable=true readable={} initially_empty={} elapsed_ms={}", id, readable, initially_empty, at.elapsed().as_millis());
                         targets.insert(id.clone(), t);
                         Ok(())
                     }
