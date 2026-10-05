@@ -276,6 +276,7 @@ enum Proof {
         prefix_start: Option<IUIAutomationTextRange>,
         at_document_start: bool,
         initially_empty: bool,
+        empty_paragraph: bool,
         selection: Option<IUIAutomationTextRange>,
         position: Option<(i32, i32)>,
     },
@@ -336,15 +337,33 @@ fn empty_value_candidate(prefix: &str, selected: &str, suffix: &str) -> bool {
             .chars()
             .all(|c| matches!(c, '\u{fffc}' | '\r' | '\n'))
 }
+fn empty_paragraph_candidate(document: &str, context: &(String, String, String)) -> bool {
+    normalize(document) == "\n" && context.0.is_empty() && context.1.is_empty() && context.2 == "\n"
+}
 #[cfg(test)]
 mod empty_value_tests {
-    use super::empty_value_candidate;
+    use super::{empty_paragraph_candidate, empty_value_candidate};
     #[test]
     fn virtual_objects_are_candidates_but_real_text_is_not() {
         assert!(empty_value_candidate("", "", "\u{fffc}\r\n\u{fffc}"));
         assert!(!empty_value_candidate("", "", "\u{fffc}tail"));
         assert!(!empty_value_candidate("before", "", "\u{fffc}"));
         assert!(!empty_value_candidate("", "selected", "\u{fffc}"));
+    }
+    #[test]
+    fn only_one_empty_paragraph_can_have_a_consumed_structural_break() {
+        let empty = (String::new(), String::new(), "\n".into());
+        assert!(empty_paragraph_candidate("\r\n", &empty));
+        assert!(!empty_paragraph_candidate("\n\n", &empty));
+        assert!(!empty_paragraph_candidate("text\n", &empty));
+        assert!(!empty_paragraph_candidate(
+            "\n",
+            &("before".into(), String::new(), "\n".into())
+        ));
+        assert!(!empty_paragraph_candidate(
+            "\n",
+            &(String::new(), "selected".into(), "\n".into())
+        ));
     }
 }
 fn uia_context(pattern: &IUIAutomationTextPattern) -> Result<UiaContext, Error> {
@@ -579,7 +598,15 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
             };
             let document_probe = pattern
                 .as_ref()
-                .and_then(|pattern| pattern.DocumentRange().and_then(|doc| doc.GetText(1)).ok());
+                .and_then(|pattern| pattern.DocumentRange().and_then(|doc| doc.GetText(2)).ok());
+            let empty_paragraph = document_probe.as_ref().is_some_and(|document| {
+                context.as_ref().is_some_and(|context| {
+                    empty_paragraph_candidate(&document.to_string(), context)
+                        && element
+                            .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                            .is_err()
+                })
+            });
             let initially_empty = document_probe.as_ref().is_some_and(|text| text.is_empty())
                 || context.as_ref().is_some_and(|(prefix, selected, suffix)| {
                     // Empty text controls can expose a virtual object in their TextPattern.
@@ -603,6 +630,7 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
                 prefix_start,
                 at_document_start,
                 initially_empty,
+                empty_paragraph,
                 selection,
                 position,
             }
@@ -797,6 +825,7 @@ fn verified(t: &Target, text: &str) -> Result<bool, Error> {
             prefix_start: Some(prefix_start),
             at_document_start,
             initially_empty,
+            empty_paragraph,
             ..
         } => unsafe {
             // For an initially empty field, its complete value is also exact insertion proof.
@@ -813,8 +842,21 @@ fn verified(t: &Target, text: &str) -> Result<bool, Error> {
             }
             let fresh_pattern;
             let pattern = if *at_document_start {
+                let auto = t
+                    .automation
+                    .as_ref()
+                    .ok_or_else(|| err("targetReadUnavailable"))?;
+                let fresh_element =
+                    probe!(auto.GetFocusedElement()).map_err(|_| err("targetReadUnavailable"))?;
+                if !probe!(auto.CompareElements(element, &fresh_element))
+                    .map_err(|_| err("targetReadUnavailable"))?
+                    .as_bool()
+                {
+                    return Err(err("targetChanged"));
+                }
                 fresh_pattern = probe!(
-                    element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                    fresh_element
+                        .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
                 )
                 .map_err(|_| err("targetReadUnavailable"))?;
                 &fresh_pattern
@@ -858,7 +900,7 @@ fn verified(t: &Target, text: &str) -> Result<bool, Error> {
             }
             Ok(selected.is_empty()
                 && normalize(&actual) == format!("{prefix}{}", normalize(text))
-                && after == *suffix)
+                && (after == *suffix || *empty_paragraph && after.is_empty()))
         },
         _ => Err(err("targetReadUnavailable")),
     }
