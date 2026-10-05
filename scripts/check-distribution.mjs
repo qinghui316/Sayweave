@@ -11,7 +11,7 @@ const docs = new Set(['architecture.md', 'development.md', 'design.md', 'testing
 const scripts = new Set(['check-boundaries.mjs', 'check-text.mjs', 'check-distribution.mjs',
   'test-desktop.ps1', 'test-dictionary-desktop.mjs', 'test-models-desktop.mjs', 'test-speech-desktop.mjs', 'test-input.ps1']);
 const testRoots = new Set(['contracts', 'e2e']);
-const testFixtures = new Set(['voice-recovery.html', 'voice-recovery.tsx']);
+const testFixtures = new Set(['voice-recovery.html', 'voice-recovery.tsx', 'input-target.ts']);
 const generated = /(?:^|\/)(?:node_modules|target|gen|dist|coverage|test-results|playwright-report|\.local|\.git)(?:\/|$)|^tests\/visual\//i;
 const ownerLocal = /(?:^|\/)(?:\.agents|\.claude|\.codex|\.impeccable)(?:\/|$)|(?:^|\/)(?:AGENTS\.md|CLAUDE\.md|\.env[^/]*|dev\.ps1|doctor\.mjs|environment\.ps1|setup-tools\.ps1|harness-skill-link\.(?:mjs|ps1|py))$|\.cmd$/i;
 function allowed(file) {
