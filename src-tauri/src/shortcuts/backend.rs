@@ -245,6 +245,11 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             let pressed = [WM_KEYDOWN, WM_SYSKEYDOWN].contains(&(w.0 as u32));
             let released = [WM_KEYUP, WM_SYSKEYUP].contains(&(w.0 as u32));
             let value = key.vkCode as u16;
+            crate::input_state::key(value, pressed);
+            if pressed && value != vk(&b.binding.key) && !matches!(value, 0xa0..=0xa5 | 0x5b..=0x5c)
+            {
+                crate::input_state::edited();
+            }
             let (repeated, consumed_release) = track_key(b, value, pressed, released);
             if repeated {
                 return if b.consumed.contains(&value) {
@@ -368,11 +373,26 @@ unsafe extern "system" fn input_event(
 ) {
     crate::windows_input::observe(event, window.0 as usize, object, event_tick);
 }
+unsafe extern "system" fn mouse_hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if n >= 0 && [WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN].contains(&(w.0 as u32)) {
+        let event = unsafe { &*(l.0 as *const MSLLHOOKSTRUCT) };
+        let mut process = 0;
+        unsafe {
+            GetWindowThreadProcessId(WindowFromPoint(event.pt), Some(&mut process));
+        }
+        if event.flags & 1 == 0 && process != std::process::id() {
+            crate::input_state::edited();
+        }
+    }
+    unsafe { CallNextHookEx(None, n, w, l) }
+}
 #[derive(Clone)]
 pub struct Backend {
     thread: u32,
 }
 fn interrupt(b: &mut Bridge) {
+    crate::input_state::ready(false);
+    crate::input_state::edited();
     send(b, Event::Interrupt(b.task_active.clone()));
     b.generation += 1;
     b.pressed.clear();
@@ -384,6 +404,8 @@ fn interrupt(b: &mut Bridge) {
     }
 }
 fn rearm(b: &mut Bridge, physical: HashSet<u16>) {
+    // The resume sample is logical state, not a witnessed physical down event.
+    crate::input_state::ready(true);
     b.pressed = physical;
     b.consumed.retain(|key| b.pressed.contains(key));
     b.armed = b.pressed.is_empty();
@@ -446,6 +468,7 @@ impl Backend {
                 let mut message = MSG::default();
                 let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
                 let keyboard = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook), None, 0);
+                let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), None, 0);
                 RegisterClassW(&WNDCLASSW {
                     lpfnWndProc: Some(listener_proc),
                     lpszClassName: w!("SayweaveShortcutEvents"),
@@ -496,6 +519,7 @@ impl Backend {
                     WTSRegisterSessionNotification(*w, NOTIFY_FOR_THIS_SESSION).is_ok()
                 });
                 if keyboard.is_err()
+                    || mouse.is_err()
                     || window.is_err()
                     || foreground.0.is_null()
                     || destroyed.0.is_null()
@@ -505,6 +529,9 @@ impl Backend {
                     let _ = tx.send(Err(Error::new("shortcutUnavailable")));
                     if let Ok(k) = keyboard {
                         let _ = UnhookWindowsHookEx(k);
+                    }
+                    if let Ok(m) = mouse {
+                        let _ = UnhookWindowsHookEx(m);
                     }
                     if let Ok(w) = window {
                         if notification {
@@ -519,6 +546,8 @@ impl Backend {
                     return;
                 }
                 let keyboard = keyboard.unwrap();
+                let mouse = mouse.unwrap();
+                crate::input_state::ready(true);
                 let window = window.unwrap();
                 let _ = tx.send(Ok(GetCurrentThreadId()));
                 while GetMessageW(&mut message, None, 0, 0).0 > 0 {
@@ -536,6 +565,8 @@ impl Backend {
                 }
                 let _ = WTSUnRegisterSessionNotification(window);
                 let _ = UnhookWindowsHookEx(keyboard);
+                let _ = UnhookWindowsHookEx(mouse);
+                crate::input_state::ready(false);
                 let _ = UnhookWinEvent(foreground);
                 let _ = UnhookWinEvent(objects);
                 let _ = UnhookWinEvent(destroyed);

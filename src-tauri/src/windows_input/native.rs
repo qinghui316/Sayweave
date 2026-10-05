@@ -97,6 +97,7 @@ pub(super) fn anchor() -> Result<Anchor, Error> {
             lifetime: lifetime(process)?,
             generation: CHANGES.load(Ordering::Acquire),
             captured_tick,
+            activity: crate::input_state::activity(),
         })
     }
 }
@@ -157,8 +158,14 @@ fn native_text(window: HWND) -> Result<String, Error> {
 }
 fn native_selection(window: HWND) -> Result<(usize, usize), Error> {
     unsafe {
-        let value = message(window, 0x00B0, WPARAM(0), LPARAM(0))?;
-        Ok((value & 65535, (value >> 16) & 65535))
+        let (mut start, mut end) = (0u32, 0u32);
+        message(
+            window,
+            0x00B0,
+            WPARAM(&mut start as *mut u32 as usize),
+            LPARAM(&mut end as *mut u32 as isize),
+        )?;
+        Ok((start as usize, end as usize))
     }
 }
 
@@ -217,12 +224,12 @@ fn composing(a: &Anchor) -> bool {
         }
         let count = ImmGetCompositionStringW(context, GCS_COMPSTR, None, 0);
         let _ = ImmReleaseContext(h, context);
-        count != 0
+        count > 0
     }
 }
 #[windows::core::implement(IUIAutomationEventHandler)]
 struct Changes {
-    generation: u64,
+    dirty: Arc<AtomicBool>,
 }
 impl IUIAutomationEventHandler_Impl for Changes_Impl {
     fn HandleAutomationEvent(
@@ -230,33 +237,29 @@ impl IUIAutomationEventHandler_Impl for Changes_Impl {
         _: windows::core::Ref<IUIAutomationElement>,
         _: UIA_EVENT_ID,
     ) -> windows::core::Result<()> {
-        let _ = CHANGES.compare_exchange(
-            self.generation,
-            self.generation + 1,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        self.dirty.store(true, Ordering::Release);
         Ok(())
     }
 }
 enum Proof {
     Edit {
-        before: String,
+        before: Option<String>,
         start: usize,
         end: usize,
     },
     Uia {
         element: IUIAutomationElement,
-        pattern: IUIAutomationTextPattern,
-        before: String,
-        prefix: String,
-        selected: String,
+        pattern: Option<IUIAutomationTextPattern>,
+        context: Option<(String, String, String)>,
+        selection: Option<IUIAutomationTextRange>,
+        position: Option<(i32, i32)>,
     },
 }
 struct Target {
     anchor: Anchor,
     proof: Proof,
-    invalid: bool,
+    dirty: Arc<AtomicBool>,
+    watching: bool,
     handler: Option<IUIAutomationEventHandler>,
     automation: Option<IUIAutomation>,
 }
@@ -265,37 +268,79 @@ impl Drop for Target {
         unwatch(self, &self.automation);
     }
 }
+fn uia_selection(pattern: &IUIAutomationTextPattern) -> Result<IUIAutomationTextRange, Error> {
+    unsafe {
+        let ranges =
+            probe!(pattern.GetSelection()).map_err(|_| err("targetSelectionUnavailable"))?;
+        if probe!(ranges.Length()).map_err(|_| err("targetSelectionUnavailable"))? != 1 {
+            return Err(err("targetSelectionUnavailable"));
+        }
+        probe!(ranges.GetElement(0)).map_err(|_| err("targetSelectionUnavailable"))
+    }
+}
+fn uia_position(pattern: &IUIAutomationTextPattern) -> Result<(i32, i32), Error> {
+    unsafe {
+        let selected = uia_selection(pattern)?;
+        let offset = |endpoint| -> Result<i32, Error> {
+            let range = probe!(selected.Clone()).map_err(|_| err("targetSelectionUnavailable"))?;
+            probe!(range.MoveEndpointByRange(TextPatternRangeEndpoint_Start, &selected, endpoint))
+                .map_err(|_| err("targetSelectionUnavailable"))?;
+            probe!(range.MoveEndpointByRange(TextPatternRangeEndpoint_End, &selected, endpoint))
+                .map_err(|_| err("targetSelectionUnavailable"))?;
+            probe!(range.MoveEndpointByUnit(
+                TextPatternRangeEndpoint_Start,
+                TextUnit_Character,
+                -i32::MAX
+            ))
+            .map_err(|_| err("targetSelectionUnavailable"))?
+            .checked_neg()
+            .ok_or_else(|| err("targetSelectionUnavailable"))
+        };
+        Ok((
+            offset(TextPatternRangeEndpoint_Start)?,
+            offset(TextPatternRangeEndpoint_End)?,
+        ))
+    }
+}
+// Read only the selection and bounded adjacent context, independently of editability.
 fn uia_parts(pattern: &IUIAutomationTextPattern) -> Result<(String, String, String), Error> {
     unsafe {
-        let doc = probe!(pattern.DocumentRange()).map_err(|_| err("targetUnsupported"))?;
-        let ranges = probe!(pattern.GetSelection()).map_err(|_| err("targetUnsupported"))?;
-        if probe!(ranges.Length()).map_err(|_| err("targetUnsupported"))? != 1 {
-            return Err(err("targetUnsupported"));
-        }
-        let selected = probe!(ranges.GetElement(0)).map_err(|_| err("targetUnsupported"))?;
-        let prefix = probe!(doc.Clone()).map_err(|_| err("targetUnsupported"))?;
+        let selected = uia_selection(pattern)?;
+        let prefix = probe!(selected.Clone()).map_err(|_| err("targetReadUnavailable"))?;
         probe!(prefix.MoveEndpointByRange(
             TextPatternRangeEndpoint_End,
             &selected,
             TextPatternRangeEndpoint_Start
         ))
-        .map_err(|_| err("targetUnsupported"))?;
-        let before = probe!(doc.GetText(32769))
-            .map_err(|_| err("targetUnsupported"))?
+        .map_err(|_| err("targetReadUnavailable"))?;
+        probe!(prefix.MoveEndpointByUnit(
+            TextPatternRangeEndpoint_Start,
+            TextUnit_Character,
+            -2048
+        ))
+        .map_err(|_| err("targetReadUnavailable"))?;
+        let suffix = probe!(selected.Clone()).map_err(|_| err("targetReadUnavailable"))?;
+        probe!(suffix.MoveEndpointByRange(
+            TextPatternRangeEndpoint_Start,
+            &selected,
+            TextPatternRangeEndpoint_End
+        ))
+        .map_err(|_| err("targetReadUnavailable"))?;
+        probe!(suffix.MoveEndpointByUnit(TextPatternRangeEndpoint_End, TextUnit_Character, 2048))
+            .map_err(|_| err("targetReadUnavailable"))?;
+        let prefix = probe!(prefix.GetText(8192))
+            .map_err(|_| err("targetReadUnavailable"))?
             .to_string();
-        let prefix = probe!(prefix.GetText(32769))
-            .map_err(|_| err("targetUnsupported"))?
+        let value = probe!(selected.GetText(8193))
+            .map_err(|_| err("targetReadUnavailable"))?
             .to_string();
-        let selected = probe!(selected.GetText(32769))
-            .map_err(|_| err("targetUnsupported"))?
-            .to_string();
-        if before.encode_utf16().count() > 32768
-            || !before.starts_with(&prefix)
-            || !before[prefix.len()..].starts_with(&selected)
-        {
-            return Err(err("targetUnsupported"));
+        if value.encode_utf16().count() > 8192 {
+            return Err(err("targetReadUnavailable"));
         }
-        Ok((before, prefix, selected))
+        let suffix = probe!(suffix.GetText(8192))
+            .map_err(|_| err("targetReadUnavailable"))?
+            .to_string();
+        Ok((normalize(&prefix), normalize(&value), normalize(&suffix)))
     }
 }
 fn uia_composing(element: &IUIAutomationElement) -> Result<bool, Error> {
@@ -326,29 +371,25 @@ fn exact_uia_bool(value: &windows::Win32::System::Variant::VARIANT) -> Result<bo
     }
     bool::try_from(value).map_err(|_| err("targetUnsupported"))
 }
-// ValuePattern is optional for contenteditable. Admit a TextPattern provider only when its
-// exact boolean read-only attribute positively proves editability; mixed/unsupported is rejected.
+// A writable ValuePattern or current editing range proves admission. Whole-document
+// attributes can be mixed in rich editors and are not evidence about the current caret.
 fn uia_readonly(
     element: &IUIAutomationElement,
-    pattern: &IUIAutomationTextPattern,
+    pattern: Option<&IUIAutomationTextPattern>,
 ) -> Result<bool, Error> {
     unsafe {
-        let available =
-            probe!(element.GetCurrentPropertyValueEx(UIA_IsValuePatternAvailablePropertyId, true))
-                .map_err(|_| err("targetUnsupported"))?;
-        if exact_uia_bool(&available)? {
-            let value = probe!(
-                element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
-            )
-            .map_err(|_| err("targetUnsupported"))?;
+        if let Ok(value) =
+            probe!(element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId))
+        {
             return Ok(probe!(value.CurrentIsReadOnly())
-                .map_err(|_| err("targetUnsupported"))?
+                .map_err(|_| err("targetProbeFailed"))?
                 .as_bool());
         }
-        let document = probe!(pattern.DocumentRange()).map_err(|_| err("targetUnsupported"))?;
-        let attribute = probe!(document.GetAttributeValue(UIA_IsReadOnlyAttributeId))
-            .map_err(|_| err("targetUnsupported"))?;
-        exact_uia_bool(&attribute)
+        let pattern = pattern.ok_or_else(|| err("targetEditabilityUnknown"))?;
+        let selected = uia_selection(pattern)?;
+        let attribute = probe!(selected.GetAttributeValue(UIA_IsReadOnlyAttributeId))
+            .map_err(|_| err("targetEditabilityUnknown"))?;
+        exact_uia_bool(&attribute).map_err(|_| err("targetEditabilityUnknown"))
     }
 }
 fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Error> {
@@ -373,16 +414,22 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
             if style & 0x800 != 0 || !IsWindowEnabled(control).as_bool() {
                 return Err(err("targetReadonly"));
             }
-            let before = native_text(control)?;
+            let before = native_text(control).ok();
             let (start, end) = native_selection(control)?;
-            if expected_text(&before, start, end, "").is_none() {
+            if before
+                .as_ref()
+                .is_some_and(|before| expected_text(before, start, end, "").is_none())
+            {
                 return Err(err("targetUnsupported"));
+            }
+            if before.is_none() && !crate::input_state::tracking_ready() {
+                return Err(err("targetTrackingUnavailable"));
             }
             Proof::Edit { before, start, end }
         } else {
             let auto = automation
                 .as_ref()
-                .ok_or_else(|| err("targetUnsupported"))?;
+                .ok_or_else(|| err("targetProbeFailed"))?;
             let element = probe!(auto.GetFocusedElement()).map_err(|_| err("targetUnsupported"))?;
             if uia_composing(&element)? {
                 return Err(err("inputComposition"));
@@ -406,49 +453,67 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
             }
             let pattern =
                 probe!(element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId))
-                    .map_err(|_| err("targetUnsupported"))?;
-            if uia_readonly(&element, &pattern)? {
+                    .ok();
+            if uia_readonly(&element, pattern.as_ref())? {
                 return Err(err("targetReadonly"));
             }
-            let (before, prefix, selected) = uia_parts(&pattern)?;
+            let context = pattern.as_ref().and_then(|p| uia_parts(p).ok());
+            let selection = pattern.as_ref().and_then(|p| uia_selection(p).ok());
+            let position = pattern.as_ref().and_then(|p| uia_position(p).ok());
+            if context.is_none() && selection.is_none() && !crate::input_state::tracking_ready() {
+                return Err(err("targetTrackingUnavailable"));
+            }
             Proof::Uia {
                 element,
                 pattern,
-                before,
-                prefix,
-                selected,
+                context,
+                selection,
+                position,
             }
         };
         let mut target = Target {
             anchor: a,
             proof,
-            invalid: false,
+            dirty: Arc::new(AtomicBool::new(false)),
+            watching: false,
             handler: None,
             automation: automation.clone(),
         };
         if let Proof::Uia { element, .. } = &target.proof {
             let handler: IUIAutomationEventHandler = Changes {
-                generation: target.anchor.generation,
+                dirty: target.dirty.clone(),
             }
             .into();
             target.handler = Some(handler.clone());
             let auto = automation.as_ref().unwrap();
-            probe!(auto.AddAutomationEventHandler(
+            let text_watch = probe!(auto.AddAutomationEventHandler(
                 UIA_Text_TextChangedEventId,
                 element,
                 TreeScope_Element,
                 None,
                 &handler
             ))
-            .map_err(|_| err("targetUnsupported"))?;
-            probe!(auto.AddAutomationEventHandler(
+            .is_ok();
+            let selection_watch = probe!(auto.AddAutomationEventHandler(
                 UIA_Text_TextSelectionChangedEventId,
                 element,
                 TreeScope_Element,
                 None,
                 &handler
             ))
-            .map_err(|_| err("targetUnsupported"))?;
+            .is_ok();
+            target.watching = text_watch && selection_watch;
+            if let Proof::Uia {
+                selection,
+                position,
+                ..
+            } = &target.proof
+                && selection.is_none()
+                && position.is_none()
+                && !target.watching
+            {
+                return Err(err("targetTrackingUnavailable"));
+            }
         }
         budget()?;
         if !same(&target.anchor) {
@@ -457,74 +522,166 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
         Ok(target)
     }
 }
-fn unchanged(t: &Target, automation: &Option<IUIAutomation>) -> bool {
-    if t.invalid
-        || !same(&t.anchor)
-        || !permitted(&t.anchor)
-        || composing(&t.anchor)
-        || budget().is_err()
-    {
-        return false;
+fn unchanged(t: &Target, automation: &Option<IUIAutomation>) -> Result<(), Error> {
+    if !same(&t.anchor) || crate::input_state::activity() != t.anchor.activity {
+        return Err(err("targetChanged"));
     }
-    let valid = match &t.proof {
+    if !permitted(&t.anchor) {
+        return Err(err("targetPermission"));
+    }
+    if composing(&t.anchor) {
+        return Err(err("inputComposition"));
+    }
+    budget()?;
+    match &t.proof {
         Proof::Edit { before, start, end } => unsafe {
             let h = hwnd(t.anchor.focus);
             let style = GetWindowLongPtrW(h, GWL_STYLE) as u32;
-            style & (0x20 | 0x800) == 0
-                && IsWindowEnabled(h).as_bool()
-                && native_text(h).is_ok_and(|v| v == *before)
-                && native_selection(h).is_ok_and(|v| v == (*start, *end))
+            if style & 0x20 != 0 {
+                return Err(err("targetPassword"));
+            }
+            if style & 0x800 != 0 || !IsWindowEnabled(h).as_bool() {
+                return Err(err("targetReadonly"));
+            }
+            if native_selection(h)? != (*start, *end) {
+                return Err(err("targetChanged"));
+            }
+            if let Some(before) = before {
+                if native_text(h)? != *before {
+                    return Err(err("targetChanged"));
+                }
+            } else if !crate::input_state::tracking_ready() {
+                return Err(err("targetTrackingUnavailable"));
+            }
         },
         Proof::Uia {
             element,
             pattern,
-            before,
-            prefix,
-            selected,
-        } => (|| -> Result<bool, Error> {
-            unsafe {
-                if probe!(element.CurrentIsPassword())
-                    .map_err(|_| err("targetUnsupported"))?
-                    .as_bool()
-                    || !probe!(element.CurrentIsEnabled())
-                        .map_err(|_| err("targetUnsupported"))?
-                        .as_bool()
-                    || uia_composing(element)?
-                {
-                    return Ok(false);
-                }
-                if uia_readonly(element, pattern)? {
-                    return Ok(false);
-                }
-                let auto = automation
-                    .as_ref()
-                    .ok_or_else(|| err("targetUnsupported"))?;
-                let now = probe!(auto.GetFocusedElement()).map_err(|_| err("targetUnsupported"))?;
-                if !probe!(auto.CompareElements(element, &now))
-                    .map_err(|_| err("targetUnsupported"))?
-                    .as_bool()
-                {
-                    return Ok(false);
-                }
-                Ok(uia_parts(pattern)? == (before.clone(), prefix.clone(), selected.clone()))
+            context,
+            selection,
+            position,
+        } => unsafe {
+            if element
+                .CurrentIsPassword()
+                .map_err(|_| err("targetProbeFailed"))?
+                .as_bool()
+            {
+                return Err(err("targetPassword"));
             }
-        })()
-        .unwrap_or(false),
-    };
-    valid && budget().is_ok() && same(&t.anchor)
+            if !element
+                .CurrentIsEnabled()
+                .map_err(|_| err("targetProbeFailed"))?
+                .as_bool()
+                || uia_readonly(element, pattern.as_ref())?
+            {
+                return Err(err("targetReadonly"));
+            }
+            if uia_composing(element)? {
+                return Err(err("inputComposition"));
+            }
+            let auto = automation
+                .as_ref()
+                .ok_or_else(|| err("targetProbeFailed"))?;
+            let now = probe!(auto.GetFocusedElement()).map_err(|_| err("targetProbeFailed"))?;
+            if !probe!(auto.CompareElements(element, &now))
+                .map_err(|_| err("targetProbeFailed"))?
+                .as_bool()
+            {
+                return Err(err("targetChanged"));
+            }
+            if t.dirty.load(Ordering::Acquire) {
+                return Err(err("targetChanged"));
+            }
+            if let (Some(pattern), Some(position)) = (pattern, position)
+                && uia_position(pattern)? != *position
+            {
+                return Err(err("targetChanged"));
+            }
+            if let (Some(pattern), Some(old)) = (pattern, selection) {
+                let now = uia_selection(pattern)?;
+                if now
+                    .CompareEndpoints(
+                        TextPatternRangeEndpoint_Start,
+                        old,
+                        TextPatternRangeEndpoint_Start,
+                    )
+                    .map_err(|_| err("targetSelectionUnavailable"))?
+                    != 0
+                    || now
+                        .CompareEndpoints(
+                            TextPatternRangeEndpoint_End,
+                            old,
+                            TextPatternRangeEndpoint_End,
+                        )
+                        .map_err(|_| err("targetSelectionUnavailable"))?
+                        != 0
+                {
+                    return Err(err("targetChanged"));
+                }
+            }
+            if let (Some(pattern), Some(old)) = (pattern, context)
+                && uia_parts(pattern)? != *old
+            {
+                return Err(err("targetChanged"));
+            }
+            if selection.is_none()
+                && position.is_none()
+                && (!crate::input_state::tracking_ready() || !t.watching)
+            {
+                return Err(err("targetTrackingUnavailable"));
+            }
+        },
+    }
+    budget()?;
+    if same(&t.anchor) {
+        Ok(())
+    } else {
+        Err(err("targetChanged"))
+    }
 }
-fn expected(t: &Target, text: &str) -> Option<String> {
+fn verified(t: &Target, text: &str) -> Result<bool, Error> {
     match &t.proof {
-        Proof::Edit { before, start, end } => expected_text(before, *start, *end, text),
+        Proof::Edit { before, start, end } => {
+            let before = before
+                .as_ref()
+                .ok_or_else(|| err("targetReadUnavailable"))?;
+            let expected = expected_text(before, *start, *end, text)
+                .ok_or_else(|| err("targetReadUnavailable"))?;
+            let (a, b) = native_selection(hwnd(t.anchor.focus))?;
+            let actual = native_text(hwnd(t.anchor.focus))?;
+            Ok(normalize(&actual) == expected
+                && a == b
+                && insertion_prefix(&actual, a, "") == insertion_prefix(before, *start, text))
+        }
         Proof::Uia {
-            before,
-            prefix,
-            selected,
+            pattern: Some(pattern),
+            context: Some((prefix, _, suffix)),
+            position: Some((start, _)),
             ..
-        } => Some(normalize(&format!(
-            "{prefix}{text}{}",
-            &before[prefix.len() + selected.len()..]
-        ))),
+        } => {
+            let (now, selected, after) = uia_parts(pattern)?;
+            let caret = uia_position(pattern)?;
+            let expected_caret = start
+                .checked_add(normalize(text).encode_utf16().count() as i32)
+                .ok_or_else(|| err("targetReadUnavailable"))?;
+            if text.chars().count() > 1024 {
+                return Err(err("targetReadUnavailable"));
+            }
+            let expected = format!("{prefix}{}", normalize(text));
+            let tail: String = expected
+                .chars()
+                .rev()
+                .take(2048)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            Ok(caret == (expected_caret, expected_caret)
+                && selected.is_empty()
+                && now.ends_with(&tail)
+                && after == *suffix)
+        }
+        _ => Err(err("targetReadUnavailable")),
     }
 }
 fn unwatch(t: &Target, auto: &Option<IUIAutomation>) {
@@ -539,37 +696,6 @@ fn unwatch(t: &Target, auto: &Option<IUIAutomation>) {
         }
     }
 }
-fn selection_confirmed(t: &Target, text: &str) -> bool {
-    match &t.proof {
-        Proof::Edit { before, start, .. } => {
-            native_selection(hwnd(t.anchor.focus)).is_ok_and(|(a, b)| {
-                a == b
-                    && native_text(hwnd(t.anchor.focus)).is_ok_and(|actual| {
-                        insertion_prefix(&actual, a, "").is_some_and(|prefix| {
-                            Some(prefix) == insertion_prefix(before, *start, text)
-                        })
-                    })
-            })
-        }
-        Proof::Uia {
-            pattern, prefix, ..
-        } => uia_parts(pattern).is_ok_and(|(_, now, selected)| {
-            selected.is_empty() && normalize(&now) == normalize(&format!("{prefix}{text}"))
-        }),
-    }
-}
-fn read_text(t: &Target) -> Result<String, Error> {
-    match &t.proof {
-        Proof::Edit { .. } => native_text(hwnd(t.anchor.focus)).map(|s| normalize(&s)),
-        Proof::Uia { pattern, .. } => unsafe {
-            let doc = probe!(pattern.DocumentRange()).map_err(|_| err("targetUnsupported"))?;
-            probe!(doc.GetText(32769))
-                .map(|s| normalize(&s.to_string()))
-                .map_err(|_| err("targetUnsupported"))
-        },
-    }
-}
-
 pub(super) struct Clipboard;
 impl Drop for Clipboard {
     fn drop(&mut self) {
@@ -874,12 +1000,14 @@ fn retry_restore(owner: usize) -> Result<(), Error> {
         Ok(())
     }
 }
-fn paste(t: &Target) -> Result<(), Error> {
+fn paste(t: &Target) -> (Submission, u32, Option<Error>) {
     unsafe {
         match &t.proof {
             Proof::Edit { .. } => {
-                message(hwnd(t.anchor.focus), WM_PASTE, WPARAM(0), LPARAM(0))?;
-                Ok(())
+                match message(hwnd(t.anchor.focus), WM_PASTE, WPARAM(0), LPARAM(0)) {
+                    Ok(_) => (Submission::Submitted, 1, None),
+                    Err(e) => (Submission::Uncertain, 0, Some(e)),
+                }
             }
             Proof::Uia { .. } => {
                 let inputs = [
@@ -900,7 +1028,9 @@ fn paste(t: &Target) -> Result<(), Error> {
                     },
                 });
                 let count = SendInput(&inputs, size_of::<INPUT>() as i32);
-                if count != inputs.len() as u32 {
+                if count == 4 {
+                    (Submission::Submitted, count, None)
+                } else {
                     if count > 0 {
                         let release = if count == 2 {
                             vec![inputs[2], inputs[3]]
@@ -909,22 +1039,31 @@ fn paste(t: &Target) -> Result<(), Error> {
                         };
                         let _ = SendInput(&release, size_of::<INPUT>() as i32);
                     }
-                    Err(err("inputUnconfirmed"))
-                } else {
-                    Ok(())
+                    (
+                        if count == 0 {
+                            Submission::NotSubmitted
+                        } else {
+                            Submission::Uncertain
+                        },
+                        count,
+                        Some(err(if count == 0 {
+                            "inputSubmitFailed"
+                        } else {
+                            "inputUnconfirmed"
+                        })),
+                    )
                 }
             }
         }
     }
 }
-fn modifiers_down() -> bool {
+fn logical_modifiers_down() -> bool {
     unsafe {
         [VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
             .iter()
             .any(|k| GetAsyncKeyState(k.0 as i32) < 0)
     }
 }
-type PasteOutcome = Result<(Result<bool, Error>, Result<(), Error>, bool), Error>;
 fn deliver(
     t: &Target,
     text: &str,
@@ -933,120 +1072,134 @@ fn deliver(
     owner: usize,
 ) -> Delivery {
     let began = Instant::now();
-    let mut result = Delivery::copy("targetChanged");
-    let work = || -> PasteOutcome {
+    let mut result = Delivery::not_submitted("targetChanged");
+    let work = (|| -> Result<(), Error> {
+        result.stage = "keyboard".into();
         let wait = Instant::now();
-        while modifiers_down() {
+        while let Some(reason) = crate::input_state::modifier_block(
+            crate::input_state::modifier_held(),
+            logical_modifiers_down(),
+        ) {
             if cancel.cancelled() {
                 return Err(err("cancelled"));
             }
-            if wait.elapsed() > Duration::from_millis(500) {
-                return Err(err("keysHeld"));
+            if wait.elapsed() >= Duration::from_millis(500) {
+                return Err(err(reason));
             }
             thread::sleep(Duration::from_millis(10));
         }
+        result.stage = "target".into();
         deadline(500);
-        if cancel.cancelled() || !unchanged(t, auto) {
-            return Err(err("targetChanged"));
+        if cancel.cancelled() {
+            return Err(err("cancelled"));
         }
-        let expected = expected(t, text).ok_or_else(|| err("targetUnsupported"))?;
+        unchanged(t, auto)?;
+        result.stage = "clipboard".into();
         let marker = uuid::Uuid::new_v4().as_bytes().to_vec();
         let (saved, before_sequence) = protected_backup(owner)?;
         deadline(500);
-        let saved = {
-            let _lock = open(owner)?;
+        {
+            let lock = open(owner)?;
             if unsafe { GetClipboardSequenceNumber() } != before_sequence {
                 return Err(err("clipboardChanged"));
             }
-            if cancel.cancelled() || !unchanged(t, auto) {
-                return Err(err("targetChanged"));
+            if cancel.cancelled() {
+                return Err(err("cancelled"));
             }
-            match write_text(text, &marker) {
-                Ok(_) => {}
-                Err(e) => {
-                    if install(&saved).is_err() {
-                        let _ = put(format("Sayweave.Delivery"), &marker);
-                        RECOVERY.with(|r| {
-                            drop(_lock);
-                            *r.borrow_mut() = Some(Recovery {
-                                sequence: unsafe { GetClipboardSequenceNumber() },
-                                marker: marker.clone(),
-                                saved: saved.clone(),
-                                owner_evidence: unsafe {
-                                    GetClipboardOwner().is_ok_and(|w| w == hwnd(owner))
-                                },
-                            })
-                        });
-                        return Err(err("clipboardRestore"));
-                    }
-                    return Err(e);
+            unchanged(t, auto)?;
+            if let Err(e) = write_text(text, &marker) {
+                if install(&saved).is_err() {
+                    let _ = put(format("Sayweave.Delivery"), &marker);
+                    drop(lock);
+                    RECOVERY.with(|r| {
+                        *r.borrow_mut() = Some(Recovery {
+                            sequence: unsafe { GetClipboardSequenceNumber() },
+                            marker: marker.clone(),
+                            saved: saved.clone(),
+                            owner_evidence: unsafe {
+                                GetClipboardOwner().is_ok_and(|w| w == hwnd(owner))
+                            },
+                        })
+                    });
+                    return Err(err("clipboardRestore"));
+                }
+                return Err(e);
+            }
+        }
+        let sequence = unsafe { GetClipboardSequenceNumber() };
+        let applied = (|| -> Result<(), Error> {
+            result.stage = "target".into();
+            if cancel.cancelled() {
+                return Err(err("cancelled"));
+            }
+            unchanged(t, auto)?;
+            {
+                let _lock = open(owner)?;
+                if !owned(sequence, &marker) {
+                    return Err(err("clipboardChanged"));
                 }
             }
-            saved
-        };
-        // Closing the clipboard publishes the write and may advance its sequence.
-        let sequence = unsafe { GetClipboardSequenceNumber() };
-        // From here any attempted input is uncertain until readback; never retry a second strategy.
-        let mut submitted = false;
-        let applied = (|| {
-            if cancel.cancelled() || !unchanged(t, auto) {
-                return Err(err("targetChanged"));
-            }
-            if !{
-                let _lock = open(owner)?;
-                owned(sequence, &marker)
-            } {
-                return Err(err("clipboardChanged"));
-            }
-            // Clipboard access may have waited for another application; recheck the bound target now.
-            if !unchanged(t, auto) {
-                return Err(err("targetChanged"));
-            }
+            unchanged(t, auto)?;
             if unsafe { GetClipboardSequenceNumber() } != sequence {
                 return Err(err("clipboardChanged"));
+            }
+            result.stage = "keyboard".into();
+            if let Some(reason) = crate::input_state::modifier_block(
+                crate::input_state::modifier_held(),
+                logical_modifiers_down(),
+            ) {
+                return Err(err(reason));
             }
             if !cancel.commit() {
                 return Err(err("cancelled"));
             }
-            submitted = true;
-            paste(t)?;
+            result.stage = "submit".into();
+            let (submission, count, error) = paste(t);
+            result.submission = submission;
+            result.submitted_events = count;
+            if let Some(e) = error {
+                return Err(e);
+            }
+            result.stage = "verify".into();
             deadline(1000);
             let at = Instant::now();
             loop {
-                if read_text(t).is_ok_and(|s| s == expected) && selection_confirmed(t, text) {
-                    return Ok(true);
+                match verified(t, text) {
+                    Ok(true) => {
+                        result.verification = Verification::Confirmed;
+                        return Ok(());
+                    }
+                    Ok(false) => result.verification = Verification::Mismatch,
+                    Err(_) => result.verification = Verification::Unavailable,
                 }
-                if at.elapsed() >= Duration::from_secs(1) {
-                    return Ok(false);
+                let limit = if result.verification == Verification::Unavailable {
+                    500
+                } else {
+                    1000
+                };
+                if at.elapsed() >= Duration::from_millis(limit) {
+                    if result.verification != Verification::Unavailable {
+                        result.verification = Verification::Timeout;
+                    }
+                    return Err(err("inputUnconfirmed"));
                 }
                 thread::sleep(Duration::from_millis(20));
             }
         })();
-        let restored = restore(owner, sequence, &marker, &saved, false);
-        Ok((applied, restored, submitted))
-    };
-    // Keep state separate so clipboard-restoration failure cannot turn a confirmed input into a retry.
-    match work() {
-        Ok((Ok(true), restored, _)) => {
-            result.state = "confirmed".into();
-            result.error = None;
-            result.restore_error = restored.is_err();
-        }
-        Ok((applied, restored, submitted)) => {
-            result.state = if submitted { "unconfirmed" } else { "copy" }.into();
-            result.error = Some(
-                applied
-                    .err()
-                    .map(|e| e.code)
-                    .unwrap_or_else(|| "inputUnconfirmed".into()),
-            );
-            result.restore_error = restored.is_err();
-        }
-        Err(e) => {
-            result.restore_error = e.code == "clipboardRestore";
-            result.error = Some(e.code);
-        }
+        // Restoration is independent of readback: never turn an already submitted paste into a retry.
+        result.restore_error = restore(owner, sequence, &marker, &saved, false).is_err();
+        applied
+    })();
+    result.error = work.err().map(|e| e.code);
+    result.restore_error |= result.error.as_deref() == Some("clipboardRestore");
+    result.state = if result.verification == Verification::Confirmed {
+        "confirmed"
+    } else if result.submission != Submission::NotSubmitted {
+        "unconfirmed"
+    } else {
+        "copy"
     }
+    .into();
     result.elapsed_ms = began.elapsed().as_millis() as u64;
     result
 }
@@ -1086,7 +1239,7 @@ pub(super) fn worker(
                     let _ = r.send(Err(err("stopping")));
                 }
                 Request::Deliver(_, _, _, r) => {
-                    let _ = r.send(Delivery::copy("stopping"));
+                    let _ = r.send(Delivery::not_submitted("stopping"));
                 }
                 _ => {}
             }
@@ -1106,10 +1259,15 @@ pub(super) fn worker(
                             unwatch(old, &automation);
                         }
                         targets.clear();
-                        targets.insert(id, t);
+                        let readable = match &t.proof { Proof::Edit { before, .. } => before.is_some(), Proof::Uia { context, .. } => context.is_some() };
+                        log::info!(target:"sayweave", "operation=input_capture task_id={} stage=capture editable=true readable={} elapsed_ms={}", id, readable, at.elapsed().as_millis());
+                        targets.insert(id.clone(), t);
                         Ok(())
                     }
                 });
+                if let Err(e) = &result {
+                    log::info!(target:"sayweave", "operation=input_capture task_id={} stage=capture error={} elapsed_ms={}", id, e.code, at.elapsed().as_millis());
+                }
                 let _ = response.send(result);
             }
             Request::Deliver(id, text, cancel, response) => {
@@ -1127,7 +1285,8 @@ pub(super) fn worker(
                         unwatch(&t, &automation);
                         result
                     })
-                    .unwrap_or_else(|| Delivery::copy("targetUnavailable"));
+                    .unwrap_or_else(|| Delivery::not_submitted("targetUnavailable"));
+                log::info!(target:"sayweave", "operation=input_delivery task_id={} stage={} submission={:?} verification={:?} submitted_events={} restore_error={} error={} elapsed_ms={}", id, result.stage, result.submission, result.verification, result.submitted_events, result.restore_error, result.error.as_deref().unwrap_or("none"), result.elapsed_ms);
                 let _ = response.send(result);
             }
             Request::Copy(text, gate, response) => {

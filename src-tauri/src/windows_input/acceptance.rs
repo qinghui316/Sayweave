@@ -6,6 +6,68 @@ use std::{
     time::Duration,
 };
 use windows::Win32::{Foundation::*, System::DataExchange::*, UI::WindowsAndMessaging::*};
+// Clipboard ownership belongs to the caller process, not the external editor fixture.
+struct ClipboardOwner {
+    window: usize,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl ClipboardOwner {
+    fn new() -> Result<Self, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || unsafe {
+            let window = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                windows::core::w!("STATIC"),
+                windows::core::w!("Sayweave input test clipboard"),
+                WINDOW_STYLE(0),
+                0,
+                0,
+                0,
+                0,
+                None,
+                None,
+                None,
+                None,
+            );
+            let Ok(window) = window else {
+                let _ = tx.send(Err("clipboard window"));
+                return;
+            };
+            let _ = tx.send(Ok(window.0 as usize));
+            let mut msg = MSG::default();
+            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+                if msg.message == WM_APP + 17 {
+                    break;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            let _ = DestroyWindow(window);
+        });
+        Ok(Self {
+            window: rx
+                .recv()
+                .map_err(|_| "clipboard owner")?
+                .map_err(str::to_string)?,
+            thread: Some(thread),
+        })
+    }
+}
+impl Drop for ClipboardOwner {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(self.window as *mut _)),
+                WM_APP + 17,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
 struct Fixture {
     child: Child,
     window: usize,
@@ -92,7 +154,8 @@ impl Drop for Restore {
 }
 pub(super) fn run(exe: &std::path::Path) -> Result<(), String> {
     let mut fixture = Fixture::new(exe)?;
-    let owner = HWND(fixture.window as *mut _);
+    let clipboard_owner = ClipboardOwner::new()?;
+    let owner = HWND(clipboard_owner.window as *mut _);
     let previous = {
         let _lock = open(owner.0 as usize).map_err(|e| e.code)?;
         backup().map_err(|e| format!("clipboard protection: {}", e.code))?
@@ -169,7 +232,8 @@ pub(super) fn run(exe: &std::path::Path) -> Result<(), String> {
         let result =
             runtime.block_on(service.deliver(id, text.into(), Arc::new(DeliveryGate::default())));
         if result.state != "confirmed" || result.restore_error {
-            return Err(format!("delivery {result:?}"));
+            let actual = fixture.command(serde_json::json!({"action":"read"}))?;
+            return Err(format!("delivery {result:?} fixture {actual}"));
         }
         let actual = fixture.command(serde_json::json!({"action":"read"}))?;
         if normalize(actual["text"].as_str().unwrap_or("")) != expected {

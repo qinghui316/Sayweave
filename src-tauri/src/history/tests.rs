@@ -794,3 +794,78 @@ fn history_desktop_fixture() {
     tx.commit().unwrap();
     assert_eq!(browse(&mut repo, "", None).total, 10000);
 }
+
+#[test]
+fn migration_journal_refuses_late_writes_and_never_replays() {
+    let root = tempfile::tempdir().unwrap();
+    let mut repo = Repository::open(root.path()).unwrap();
+    repo.connection
+        .execute(
+            "INSERT INTO speech_records(id,created_at,status) VALUES('r',1,'success')",
+            [],
+        )
+        .unwrap();
+    repo.connection.execute("INSERT INTO speech_attempts(id,record_id,kind,config_id,config_name,model_id,service_host,config_revision,created_at,status) VALUES('a','r','live','c','test','model','host',1,1,'success')",[]).unwrap();
+    let write = |task: &str, attempt: &str, state: &str| DbOperation::Delivery {
+        task: task.into(),
+        attempt: attempt.into(),
+        state: state.into(),
+        error: None,
+    };
+    repo.history_operation(write("t", "a", "pending")).unwrap();
+    repo.history_operation(write("t", "a", "delivering"))
+        .unwrap();
+    repo.history_operation(write("t", "a", "confirmed"))
+        .unwrap();
+    assert_eq!(
+        repo.history_operation(write("t", "a", "pending"))
+            .unwrap_err()
+            .code,
+        "conflict"
+    );
+    assert!(
+        repo.history_operation(write("t", "other", "confirmed"))
+            .is_err()
+    );
+    repo.history_operation(write("incomplete", "a", "submitted"))
+        .unwrap();
+    repo.history_operation(DbOperation::RecoverDelivery)
+        .unwrap();
+    let state: String = repo
+        .connection
+        .query_row(
+            "SELECT state FROM delivery_attempts WHERE task_id='incomplete'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "unconfirmed");
+    let state: String = repo
+        .connection
+        .query_row(
+            "SELECT state FROM delivery_attempts WHERE task_id='t'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "confirmed");
+    let DbOutput::Deliveries(rows) = repo
+        .history_operation(DbOperation::Deliveries("r".into()))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .any(|r| r.state == "unconfirmed" && r.error.as_deref() == Some("interrupted"))
+    );
+    repo.connection
+        .execute("DELETE FROM speech_records WHERE id='r'", [])
+        .unwrap();
+    let count: i64 = repo
+        .connection
+        .query_row("SELECT COUNT(*) FROM delivery_attempts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+}

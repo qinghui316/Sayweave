@@ -110,6 +110,7 @@ pub struct SpeechService {
     pub history: HistoryService,
     pub playback: Playback,
     snapshot: Mutex<Snapshot>,
+    states: watch::Sender<Snapshot>,
     active: Mutex<Option<(String, watch::Sender<u8>)>>,
     gate: AsyncMutex<()>,
     stopping: AtomicBool,
@@ -128,10 +129,12 @@ impl Drop for FreshOperation {
 }
 impl SpeechService {
     pub fn new(history: HistoryService) -> Self {
+        let (states, _) = watch::channel(Snapshot::default());
         Self {
             history,
             playback: Playback::new(),
             snapshot: Mutex::new(Snapshot::default()),
+            states,
             active: Mutex::new(None),
             gate: AsyncMutex::new(()),
             stopping: AtomicBool::new(false),
@@ -159,6 +162,9 @@ impl SpeechService {
             .lock()
             .map(|s| s.clone())
             .map_err(|_| Error::new("unavailable"))
+    }
+    pub fn subscribe(&self) -> watch::Receiver<Snapshot> {
+        self.states.subscribe()
     }
     pub fn is_active(&self) -> bool {
         self.preparing.load(Ordering::Acquire)
@@ -198,23 +204,8 @@ impl SpeechService {
         if let Some((s, phase_changed)) = update {
             let _ = app.emit_to("main", "speech:snapshot", &s);
             let _ = app.emit_to("voice-overlay", "speech:snapshot", &s);
-            if phase_changed
-                && let Some(coordinator) = app.try_state::<crate::dictation::DictationCoordinator>()
-            {
-                coordinator.observe_speech(app, &s);
-            }
-            if phase_changed
-                && let Some(runtime) = app.try_state::<crate::Runtime>()
-                && let Ok(mut r) = runtime.0.lock()
-            {
-                if r.session.id != s.runtime_id {
-                    return;
-                }
-                r.session.phase = s.phase;
-                r.revision += 1;
-                let copy = r.clone();
-                drop(r);
-                crate::publish(app, copy);
+            if phase_changed {
+                self.states.send_replace(s);
             }
         }
     }
@@ -839,6 +830,9 @@ impl SpeechService {
     pub fn shutdown(&self) {
         let _guard = self.operation_gate.lock().ok();
         self.stopping.store(true, Ordering::Release);
+        if let Ok(snapshot) = self.snapshot() {
+            self.states.send_replace(snapshot);
+        }
         if let Ok(a) = self.active.lock()
             && let Some((_, tx)) = a.as_ref()
         {

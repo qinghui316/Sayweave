@@ -14,6 +14,13 @@ describe('dictation contracts',()=>{
   expect(()=>parseDeliveryReports([{attemptId:'a',state:'replay',error:null,updatedAt:1}])).toThrow();
   expect(shortcutLabel('Control+Alt+KeyD')).toBe('Ctrl + Alt + D');
  });
+ it('keeps submission and readback separate and rejects unknown outcomes',()=>{
+  const delivery={state:'unconfirmed',submission:'submitted',verification:'unavailable',stage:'verify',submittedEvents:4,error:'inputUnconfirmed',restoreError:false,elapsedMs:500};
+  expect(parseDictation({...initialDictation(),delivery}).delivery).toEqual(delivery);
+  expect(()=>parseDictation({...initialDictation(),delivery:{...delivery,submission:'confirmed'}})).toThrow();
+  expect(()=>parseDictation({...initialDictation(),delivery:{...delivery,verification:'assumed'}})).toThrow();
+  expect(()=>parseDictation({...initialDictation(),delivery:{...delivery,submittedEvents:-1}})).toThrow();
+ });
 });
 describe('shortcut settings',()=>{
  it('keeps the current capture owned when an unrelated initial read arrives before capture starts',async()=>{
@@ -84,7 +91,7 @@ describe('shortcut settings',()=>{
 });
 it('separates confirmed input from a failed clipboard restore',async()=>{
  const restore=vi.fn().mockResolvedValue(undefined),user=userEvent.setup();
- render(<VoiceSurface phase="idle" text="你好" delivery={{state:'confirmed',error:null,restoreError:true,elapsedMs:10}} start={()=>{}} finish={()=>{}} cancel={()=>{}} restore={restore}/>);
+ render(<VoiceSurface phase="idle" text="你好" delivery={{state:'confirmed',submission:'submitted',verification:'confirmed',stage:'verify',submittedEvents:4,error:null,restoreError:true,elapsedMs:10}} start={()=>{}} finish={()=>{}} cancel={()=>{}} restore={restore}/>);
  expect(screen.getByText('已填入')).toBeVisible();
  await user.click(screen.getByRole('button',{name:'重试恢复剪贴板'}));
  await waitFor(()=>expect(screen.queryByText('剪贴板恢复未完成。')).not.toBeInTheDocument());
@@ -95,7 +102,7 @@ it('keeps external completion pending only for the matching nonempty successful 
  const result={...initialDictation(),taskId:'A',source:'external' as const,stage:'result' as const,text:'你好',presentationId:'view-A'};
  const speech={taskId:'A',text:'你好'};
  expect(dictationPhase(result,'completed',speech)).toBe('processing');
- expect(dictationPhase({...result,delivery:{state:'confirmed',error:null,restoreError:false,elapsedMs:10}},'completed',speech)).toBe('completed');
+ expect(dictationPhase({...result,delivery:{state:'confirmed',submission:'submitted',verification:'confirmed',stage:'verify',submittedEvents:4,error:null,restoreError:false,elapsedMs:10}},'completed',speech)).toBe('completed');
  expect(dictationPhase({...result,stage:'delivering'},'completed',speech)).toBe('processing');
  expect(dictationPhase(result,'failed',speech)).toBe('failed');
  expect(dictationPhase(result,'completed',{...speech,taskId:'old'})).toBe('completed');
@@ -121,7 +128,7 @@ it('shows only recognition feedback while final text is pending and clears compl
 });
 it('submitted input offers a closeable notice without a copy card',async()=>{
  const dismiss=vi.fn(),copy=vi.fn(),user=userEvent.setup();
- render(<VoiceSurface presentation="notice" phase="completed" text="已填入文字" delivery={{state:'unconfirmed',error:'inputUnconfirmed',restoreError:false,elapsedMs:1000}} start={()=>{}} finish={()=>{}} cancel={()=>{}} dismiss={dismiss} copy={copy}/>);
+ render(<VoiceSurface presentation="notice" phase="completed" text="已填入文字" delivery={{state:'unconfirmed',submission:'submitted',verification:'timeout',stage:'verify',submittedEvents:4,error:'inputUnconfirmed',restoreError:false,elapsedMs:1000}} start={()=>{}} finish={()=>{}} cancel={()=>{}} dismiss={dismiss} copy={copy}/>);
  expect(screen.getByText('请确认输入结果。')).toBeVisible();expect(screen.queryByRole('region',{name:'口述结果'})).not.toBeInTheDocument();
  expect(screen.queryByRole('button',{name:'复制'})).not.toBeInTheDocument();await user.click(screen.getByRole('button',{name:'关闭'}));expect(dismiss).toHaveBeenCalledOnce();expect(copy).not.toHaveBeenCalled();
 });
@@ -139,7 +146,7 @@ it('dismissed external feedback does not replay its completed state when shown l
 it('dismissed preparation failures and clipboard notices remain closed when the overlay reopens',()=>{
  const dismissed={...initialDictation(),source:'external' as const,taskId:'failed',error:'network'};
  expect(dictationPhase(dismissed,'failed',{taskId:'failed',text:''})).toBe('idle');
- const view=render(<VoiceSurface presentation="idle" phase="idle" error="连接失败" delivery={{state:'confirmed',error:null,restoreError:true,elapsedMs:10}} start={()=>{}} finish={()=>{}} cancel={()=>{}} restore={vi.fn()}/>);
+ const view=render(<VoiceSurface presentation="idle" phase="idle" error="连接失败" delivery={{state:'confirmed',submission:'submitted',verification:'confirmed',stage:'verify',submittedEvents:4,error:null,restoreError:true,elapsedMs:10}} start={()=>{}} finish={()=>{}} cancel={()=>{}} restore={vi.fn()}/>);
  expect(screen.queryByRole('region',{name:'口述提示'})).not.toBeInTheDocument();
  expect(screen.queryByRole('button',{name:'重试恢复剪贴板'})).not.toBeInTheDocument();
  view.rerender(<VoiceSurface presentation="idle" phase={dictationPhase(dismissed,'failed',{taskId:'failed',text:''})} error="连接失败" start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);

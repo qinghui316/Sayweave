@@ -39,30 +39,12 @@ pub struct Status {
 pub enum DbOperation {
     Load,
     Save(Config),
-    Recover,
-    Deliveries(String),
-    Delivery {
-        task: String,
-        attempt: String,
-        state: String,
-        error: Option<String>,
-    },
 }
 #[derive(Debug)]
 pub enum DbOutput {
     Config(Config),
-    Done,
-    Deliveries(Vec<DeliveryReport>),
 }
 
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeliveryReport {
-    pub attempt_id: String,
-    pub state: String,
-    pub error: Option<String>,
-    pub updated_at: i64,
-}
 // A physical primary key plus optional generic modifiers. Sides are meaningful for single modifiers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Binding {

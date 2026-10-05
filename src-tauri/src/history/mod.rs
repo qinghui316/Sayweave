@@ -107,6 +107,7 @@ impl HistoryService {
         Ok(())
     }
     pub async fn recover(&self) -> Result<(), Error> {
+        self.db(DbOperation::RecoverDelivery).await?;
         let assets = match self.db(DbOperation::Pending).await? {
             DbOutput::Assets(v) => v,
             _ => return Err(Error::new("unavailable")),

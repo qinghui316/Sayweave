@@ -132,6 +132,14 @@ pub struct Prepare {
 }
 #[derive(Clone, Debug)]
 pub enum DbOperation {
+    RecoverDelivery,
+    Deliveries(String),
+    Delivery {
+        task: String,
+        attempt: String,
+        state: String,
+        error: Option<String>,
+    },
     Stage {
         attempt_id: String,
         status: String,
@@ -173,6 +181,7 @@ pub enum DbOperation {
 }
 #[derive(Debug)]
 pub enum DbOutput {
+    Deliveries(Vec<DeliveryReport>),
     Preferences(Preferences),
     Page(Page),
     Feed(Feed),
@@ -181,4 +190,13 @@ pub enum DbOutput {
     Audio(Audio),
     Assets(Vec<Audio>),
     Done,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveryReport {
+    pub attempt_id: String,
+    pub state: String,
+    pub error: Option<String>,
+    pub updated_at: i64,
 }

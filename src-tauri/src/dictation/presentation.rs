@@ -1,5 +1,5 @@
 use crate::coordinator::Phase;
-use crate::windows_input::Delivery;
+use crate::windows_input::{Delivery, Submission};
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -35,26 +35,27 @@ pub fn speech_presentation(phase: Phase, stop: u8) -> Option<Presentation> {
 }
 
 pub fn final_presentation(
-    absent_target: bool,
+    _absent_target: bool,
     text: &str,
     delivery: Option<&Delivery>,
     error: Option<&str>,
 ) -> Presentation {
+    if error == Some("cancelled")
+        || delivery.is_some_and(|d| d.error.as_deref() == Some("cancelled"))
+    {
+        return Presentation::Idle;
+    }
     if let Some(delivery) = delivery {
         if delivery.state == "confirmed" && !delivery.restore_error {
             return Presentation::Completed;
         }
         // Submitted input can already be visible in the target. Never offer a duplicate paste.
-        if delivery.state == "unconfirmed" || delivery.state == "confirmed" || !absent_target {
+        if delivery.submission != Submission::NotSubmitted {
             return Presentation::Notice;
         }
     }
     if !text.trim().is_empty() {
-        if absent_target {
-            Presentation::Result
-        } else {
-            Presentation::Notice
-        }
+        Presentation::Result
     } else if error.is_some_and(|e| e != "cancelled" && e != "staleSession") {
         Presentation::Error
     } else {
@@ -79,17 +80,18 @@ mod tests {
         );
     }
     #[test]
-    fn editable_delivery_and_submitted_input_never_become_a_copy_card() {
-        let mut delivery = Delivery::copy("targetChanged");
+    fn unsubmitted_text_is_recoverable_and_submitted_text_is_never_repeated() {
+        let mut delivery = Delivery::not_submitted("targetChanged");
         assert_eq!(
             final_presentation(false, "文字", Some(&delivery), None),
-            Presentation::Notice
+            Presentation::Result
         );
         assert_eq!(
             final_presentation(true, "文字", Some(&delivery), None),
             Presentation::Result
         );
         delivery.state = "unconfirmed".into();
+        delivery.submission = Submission::Submitted;
         assert_eq!(
             final_presentation(true, "文字", Some(&delivery), None),
             Presentation::Notice

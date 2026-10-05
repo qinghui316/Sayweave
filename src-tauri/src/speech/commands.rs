@@ -128,17 +128,13 @@ pub async fn history_detail(
 #[tauri::command]
 pub async fn history_delivery(
     window: WebviewWindow,
-    service: State<'_, crate::shortcuts::ShortcutService>,
     speech: State<'_, SpeechService>,
     id: String,
-) -> Result<Vec<crate::shortcuts::types::DeliveryReport>, Error> {
+) -> Result<Vec<crate::history::types::DeliveryReport>, Error> {
     main(&window)?;
     let _operation = speech.admit()?;
-    match service
-        .db(crate::shortcuts::types::DbOperation::Deliveries(id))
-        .await?
-    {
-        crate::shortcuts::types::DbOutput::Deliveries(rows) => Ok(rows),
+    match speech.history.db(DbOperation::Deliveries(id)).await? {
+        DbOutput::Deliveries(rows) => Ok(rows),
         _ => Err(Error::new("unavailable")),
     }
 }

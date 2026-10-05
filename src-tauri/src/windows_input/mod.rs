@@ -23,14 +23,38 @@ pub struct Delivery {
     pub error: Option<String>,
     pub restore_error: bool,
     pub elapsed_ms: u64,
+    pub submission: Submission,
+    pub verification: Verification,
+    pub stage: String,
+    pub submitted_events: u32,
+}
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Submission {
+    NotSubmitted,
+    Submitted,
+    Uncertain,
+}
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Verification {
+    NotAttempted,
+    Confirmed,
+    Unavailable,
+    Mismatch,
+    Timeout,
 }
 impl Delivery {
-    pub fn copy(code: &str) -> Self {
+    pub fn not_submitted(code: &str) -> Self {
         Self {
             state: "copy".into(),
             error: Some(code.into()),
             restore_error: false,
             elapsed_ms: 0,
+            submission: Submission::NotSubmitted,
+            verification: Verification::NotAttempted,
+            stage: "capture".into(),
+            submitted_events: 0,
         }
     }
 }
@@ -42,6 +66,7 @@ pub struct Anchor {
     pub lifetime: u64,
     pub generation: u64,
     pub captured_tick: u32,
+    pub activity: u64,
 }
 #[derive(Default)]
 pub struct DeliveryGate(AtomicU8);
@@ -58,6 +83,9 @@ impl DeliveryGate {
         self.0
             .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+    pub fn committed(&self) -> bool {
+        self.0.load(Ordering::Acquire) == 2
     }
 }
 pub(crate) fn observe(event: u32, window: usize, object: i32, event_tick: u32) {
@@ -133,7 +161,7 @@ impl WindowsInputService {
                             let _ = r.send(Err(Error::new("targetUnsupported")));
                         }
                         Request::Deliver(_, _, _, r) => {
-                            let _ = r.send(Delivery::copy("targetUnsupported"));
+                            let _ = r.send(Delivery::not_submitted("targetUnsupported"));
                         }
                         Request::Copy(_, _, r) => {
                             let _ = r.send(Err(Error::new("copyFailed")));
@@ -190,15 +218,25 @@ impl WindowsInputService {
     pub async fn capture(&self, id: String, anchor: Anchor) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
         self.send(Request::Capture(id, anchor, tx))?;
-        rx.await.map_err(|_| Error::new("targetUnsupported"))?
+        rx.await.map_err(|_| Error::new("targetProbeFailed"))?
     }
     pub async fn deliver(&self, id: String, text: String, cancel: Arc<DeliveryGate>) -> Delivery {
         let (tx, rx) = oneshot::channel();
-        if self.send(Request::Deliver(id, text, cancel, tx)).is_err() {
-            return Delivery::copy("busy");
+        if self
+            .send(Request::Deliver(id, text, cancel.clone(), tx))
+            .is_err()
+        {
+            return Delivery::not_submitted("busy");
         }
-        rx.await
-            .unwrap_or_else(|_| Delivery::copy("targetUnsupported"))
+        rx.await.unwrap_or_else(|_| {
+            let mut result = Delivery::not_submitted("inputWorkerLost");
+            result.stage = "worker".into();
+            if cancel.committed() {
+                result.submission = Submission::Uncertain;
+                result.state = "unconfirmed".into();
+            }
+            result
+        })
     }
     pub async fn copy(&self, text: String) -> Result<(), Error> {
         if text.len() > 1024 * 1024 {

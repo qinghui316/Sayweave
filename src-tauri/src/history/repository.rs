@@ -34,6 +34,38 @@ fn insert_attempt(c: &Connection, a: &Attempt) -> Result<(), Error> {
 impl Repository {
     pub fn history_operation(&mut self, op: DbOperation) -> Result<DbOutput, Error> {
         match op {
+            DbOperation::RecoverDelivery => {
+                self.connection.execute("UPDATE delivery_attempts SET state='unconfirmed',error_code='interrupted',updated_at=?1 WHERE state IN ('pending','delivering','submitted')",[now()]).map_err(db_error)?;
+                Ok(DbOutput::Done)
+            }
+            DbOperation::Deliveries(id) => {
+                let mut query=self.connection.prepare("SELECT d.attempt_id,d.state,d.error_code,d.updated_at FROM delivery_attempts d JOIN speech_attempts a ON a.id=d.attempt_id WHERE a.record_id=?1 ORDER BY d.updated_at DESC,d.task_id ASC").map_err(db_error)?;
+                let rows = query
+                    .query_map([id], |r| {
+                        Ok(DeliveryReport {
+                            attempt_id: r.get(0)?,
+                            state: r.get(1)?,
+                            error: r.get(2)?,
+                            updated_at: r.get(3)?,
+                        })
+                    })
+                    .map_err(db_error)?;
+                Ok(DbOutput::Deliveries(
+                    rows.collect::<Result<Vec<_>, _>>().map_err(db_error)?,
+                ))
+            }
+            DbOperation::Delivery {
+                task,
+                attempt,
+                state,
+                error,
+            } => {
+                let changed=self.connection.execute("INSERT INTO delivery_attempts(task_id,attempt_id,state,error_code,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5) ON CONFLICT(task_id) DO UPDATE SET state=excluded.state,error_code=excluded.error_code,updated_at=excluded.updated_at WHERE delivery_attempts.attempt_id=excluded.attempt_id AND (delivery_attempts.state=excluded.state OR delivery_attempts.state='pending' AND excluded.state IN ('delivering','copy','failed','unconfirmed') OR delivery_attempts.state='delivering' AND excluded.state IN ('submitted','confirmed','copy','failed','unconfirmed') OR delivery_attempts.state='submitted' AND excluded.state IN ('confirmed','failed','unconfirmed'))",params![task,attempt,state,error,now()]).map_err(db_error)?;
+                if changed != 1 {
+                    return Err(Error::new("conflict"));
+                }
+                Ok(DbOutput::Done)
+            }
             DbOperation::Browse(q) => {
                 if q.search.chars().count() > 256 || q.search.chars().any(char::is_control)
                     || q.cursor.as_ref().is_some_and(|c| c.created_at < 0 || uuid::Uuid::parse_str(&c.id).is_err()) {

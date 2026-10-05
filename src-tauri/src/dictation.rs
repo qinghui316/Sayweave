@@ -1,10 +1,7 @@
 use crate::{
     coordinator::Phase,
-    history::types::Error,
-    shortcuts::{
-        ShortcutService, TaskStamp,
-        types::{DbOperation, Mode},
-    },
+    history::types::{DbOperation, Error},
+    shortcuts::{ShortcutService, TaskStamp, types::Mode},
     speech::{NativeStart, Snapshot as SpeechSnapshot, SpeechService},
     windows_input::{Anchor, Delivery, DeliveryGate, WindowsInputService},
 };
@@ -358,7 +355,7 @@ impl DictationCoordinator {
             self.update(&app, &id, |s| {
                 s.stage = "idle".into();
                 s.error = result.as_ref().err().map(|e| e.code.clone());
-                s.presentation = final_presentation(false, "", None, s.error.as_deref());
+                s.presentation = Presentation::Recognizing;
             });
             if !gate.cancelled()
                 && let Err(error) = &result
@@ -380,9 +377,6 @@ impl DictationCoordinator {
                 None => Err(Error::new("targetUnavailable")),
             };
             let coordinator = app.state::<Self>();
-            let absent_target = capture_result.as_ref().err().is_some_and(|e| {
-                matches!(e.code.as_str(), "targetUnavailable" | "targetUnsupported")
-            });
             if let Ok(terminal) = terminal_rx.await {
                 coordinator.update(&app, &id, |s| {
                     s.text = terminal.text.clone();
@@ -394,7 +388,6 @@ impl DictationCoordinator {
                     let mut delivery = if terminal.phase == Phase::Completed
                         && !gate.cancelled()
                         && capture_result.is_ok()
-                        && app.state::<ShortcutService>().target_tracking_ready()
                     {
                         let journal = if terminal.persistent {
                             coordinator
@@ -404,7 +397,7 @@ impl DictationCoordinator {
                             Ok(())
                         };
                         if journal.is_err() || terminal.persistent && !terminal.saved {
-                            Delivery::copy("saveFailed")
+                            Delivery::not_submitted("saveFailed")
                         } else {
                             coordinator.update(&app, &id, |s| {
                                 s.stage = "delivering".into();
@@ -424,7 +417,7 @@ impl DictationCoordinator {
                                 Ok(())
                             };
                             if preparing.is_err() {
-                                Delivery::copy("saveFailed")
+                                Delivery::not_submitted("saveFailed")
                             } else {
                                 app.state::<WindowsInputService>()
                                     .deliver(id.clone(), terminal.text.clone(), gate.clone())
@@ -432,7 +425,7 @@ impl DictationCoordinator {
                             }
                         }
                     } else {
-                        Delivery::copy(if gate.cancelled() {
+                        Delivery::not_submitted(if gate.cancelled() {
                             "cancelled"
                         } else if terminal.phase != Phase::Completed {
                             "recognitionFailed"
@@ -460,16 +453,11 @@ impl DictationCoordinator {
                         log::info!(target:"sayweave", "operation=dictation_delivery task_id={} state={} elapsed_ms={} error={}", id, delivery.state, delivery.elapsed_ms, delivery.error.as_deref().unwrap_or("none"));
                         s.delivery = Some(delivery);
                         s.stage = "result".into();
-                        s.presentation = final_presentation(absent_target,&s.text,s.delivery.as_ref(),s.error.as_deref());
+                        s.presentation = Presentation::Delivering;
                     });
                 }
                 coordinator.update(&app, &id, |s| {
-                    s.presentation = final_presentation(
-                        absent_target,
-                        &s.text,
-                        s.delivery.as_ref(),
-                        s.error.as_deref(),
-                    );
+                    s.presentation = Presentation::Recognizing;
                 });
             } else {
                 let partial = app
@@ -484,14 +472,9 @@ impl DictationCoordinator {
                     s.stage = "result".into();
                     s.text = partial;
                     if source == "external" && !s.text.is_empty() {
-                        s.delivery = Some(Delivery::copy("recognitionFailed"));
+                        s.delivery = Some(Delivery::not_submitted("recognitionFailed"));
                     }
-                    s.presentation = final_presentation(
-                        absent_target,
-                        &s.text,
-                        s.delivery.as_ref(),
-                        s.error.as_deref(),
-                    );
+                    s.presentation = Presentation::Recognizing;
                 });
             }
             app.state::<WindowsInputService>().forget(id.clone());
@@ -508,7 +491,8 @@ impl DictationCoordinator {
         error: Option<String>,
     ) -> Result<(), Error> {
         let attempt = attempt.ok_or_else(|| Error::new("saveFailed"))?;
-        app.state::<ShortcutService>()
+        app.state::<SpeechService>()
+            .history
             .db(DbOperation::Delivery {
                 task: id.into(),
                 attempt: attempt.into(),
@@ -538,6 +522,11 @@ impl DictationCoordinator {
             }
             app.state::<ShortcutService>().active_task(None);
             *a = None;
+            // Publish actionable recovery only after admission and native resources are settled.
+            self.update(app, id, |s| {
+                s.presentation =
+                    final_presentation(false, &s.text, s.delivery.as_ref(), s.error.as_deref());
+            });
         }
         if let Some(old) = old
             && old.source == "external"

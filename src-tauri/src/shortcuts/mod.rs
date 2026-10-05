@@ -67,15 +67,6 @@ impl ShortcutService {
     pub fn is_capturing(&self) -> bool {
         self.capturing.load(Ordering::Acquire)
     }
-    pub fn target_tracking_ready(&self) -> bool {
-        !self.stopping.load(Ordering::Acquire)
-            && self
-                .backend
-                .lock()
-                .ok()
-                .and_then(|b| b.as_ref().and_then(|b| b.generation()))
-                .is_some()
-    }
     fn current_event(&self, generation: u64) -> bool {
         self.backend
             .lock()
@@ -163,11 +154,7 @@ impl ShortcutService {
         if self.stopping.load(Ordering::Acquire) {
             return Err(Error::new("stopping"));
         }
-        let config = match self.db(DbOperation::Load).await? {
-            DbOutput::Config(c) => c,
-            _ => return Err(Error::new("unavailable")),
-        };
-        self.db(DbOperation::Recover).await?;
+        let DbOutput::Config(config) = self.db(DbOperation::Load).await?;
         if self.stopping.load(Ordering::Acquire) {
             return Err(Error::new("stopping"));
         }
@@ -284,7 +271,6 @@ impl ShortcutService {
         }
         let saved = match self.db(DbOperation::Save(config)).await {
             Ok(DbOutput::Config(c)) => c,
-            Ok(_) => return Err(Error::new("unavailable")),
             Err(e) => {
                 if !pending
                     && !self.stopping.load(Ordering::Acquire)
