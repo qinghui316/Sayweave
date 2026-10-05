@@ -376,12 +376,11 @@ unsafe extern "system" fn input_event(
 unsafe extern "system" fn mouse_hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if n >= 0 && [WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN].contains(&(w.0 as u32)) {
         let event = unsafe { &*(l.0 as *const MSLLHOOKSTRUCT) };
-        let mut process = 0;
-        unsafe {
-            GetWindowThreadProcessId(WindowFromPoint(event.pt), Some(&mut process));
-        }
-        if event.flags & 1 == 0 && process != std::process::id() {
-            crate::input_state::edited();
+        if event.flags & 1 == 0 {
+            crate::windows_input::observe_pointer(
+                unsafe { WindowFromPoint(event.pt) }.0 as usize,
+                event.time,
+            );
         }
     }
     unsafe { CallNextHookEx(None, n, w, l) }

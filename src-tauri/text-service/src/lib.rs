@@ -1,0 +1,8 @@
+//! In-target TSF composition component. It owns no microphone, network, vault or database.
+#[cfg(windows)]
+pub mod registration;
+#[cfg(windows)]
+mod service;
+#[cfg(windows)]
+pub mod transport;
+pub mod wire;

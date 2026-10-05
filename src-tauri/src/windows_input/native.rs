@@ -78,6 +78,21 @@ pub(super) fn release_watch(id: &str) {
         *watch = None;
     }
 }
+/// Physical pointer evidence shares the same task-window lease as WinEvent evidence.
+/// WebView descendants can live in another process; process identity is not ownership.
+pub(super) fn observe_pointer(window: usize, event_tick: u32) {
+    let watch = WATCH.lock().ok();
+    let active = watch.as_ref().and_then(|w| w.as_ref());
+    let own = active
+        .and_then(|w| w.overlay.as_ref())
+        .is_some_and(|overlay| crate::voice_window::contains(overlay, window, event_tick));
+    if let Some(w) = active {
+        log::info!(target:"sayweave", "operation=input_pointer task_id={} task_overlay={own} activity_changed={}", w.task.as_deref().unwrap_or("pending"), !own);
+    }
+    if !own {
+        crate::input_state::edited();
+    }
+}
 #[derive(Debug, PartialEq, Eq)]
 enum EventDecision {
     Unrelated,
@@ -824,8 +839,11 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
     }
 }
 fn unchanged(t: &Target, automation: &Option<IUIAutomation>) -> Result<(), Error> {
-    if !same(&t.anchor) || crate::input_state::activity() != t.anchor.activity {
-        return Err(err("targetChanged"));
+    if !same(&t.anchor) {
+        return Err(rejected(t, "identity"));
+    }
+    if crate::input_state::activity() != t.anchor.activity {
+        return Err(rejected(t, "physicalActivity"));
     }
     if !permitted(&t.anchor) {
         return Err(err("targetPermission"));
@@ -845,11 +863,11 @@ fn unchanged(t: &Target, automation: &Option<IUIAutomation>) -> Result<(), Error
                 return Err(err("targetReadonly"));
             }
             if native_selection(h)? != (*start, *end) {
-                return Err(err("targetChanged"));
+                return Err(rejected(t, "nativeSelection"));
             }
             if let Some(before) = before {
                 if native_text(h)? != *before {
-                    return Err(err("targetChanged"));
+                    return Err(rejected(t, "nativeContent"));
                 }
             } else if !crate::input_state::tracking_ready() {
                 return Err(err("targetTrackingUnavailable"));
@@ -889,15 +907,15 @@ fn unchanged(t: &Target, automation: &Option<IUIAutomation>) -> Result<(), Error
                 .map_err(|_| err("targetProbeFailed"))?
                 .as_bool()
             {
-                return Err(err("targetChanged"));
+                return Err(rejected(t, "focusedElement"));
             }
             if t.dirty.load(Ordering::Acquire) {
-                return Err(err("targetChanged"));
+                return Err(rejected(t, "providerDirty"));
             }
             if let (Some(pattern), Some(position)) = (pattern, position)
                 && uia_position(pattern)? != *position
             {
-                return Err(err("targetChanged"));
+                return Err(rejected(t, "providerPosition"));
             }
             if let (Some(pattern), Some(old)) = (pattern, selection) {
                 let now = uia_selection(pattern)?;
@@ -918,13 +936,13 @@ fn unchanged(t: &Target, automation: &Option<IUIAutomation>) -> Result<(), Error
                         .map_err(|_| err("targetSelectionUnavailable"))?
                         != 0
                 {
-                    return Err(err("targetChanged"));
+                    return Err(rejected(t, "providerSelection"));
                 }
             }
             if let (Some(pattern), Some(old)) = (pattern, context)
                 && uia_parts(pattern)? != *old
             {
-                return Err(err("targetChanged"));
+                return Err(rejected(t, "providerContent"));
             }
             if selection.is_none()
                 && position.is_none()
@@ -938,8 +956,17 @@ fn unchanged(t: &Target, automation: &Option<IUIAutomation>) -> Result<(), Error
     if same(&t.anchor) {
         Ok(())
     } else {
-        Err(err("targetChanged"))
+        Err(rejected(t, "finalIdentity"))
     }
+}
+fn rejected(t: &Target, basis: &'static str) -> Error {
+    let task = WATCH
+        .lock()
+        .ok()
+        .and_then(|w| w.as_ref().and_then(|w| w.task.clone()))
+        .unwrap_or_default();
+    log::info!(target:"sayweave", "operation=input_target_rejected task_id={task} basis={basis} activity_same={} provider_dirty={}", crate::input_state::activity() == t.anchor.activity, t.dirty.load(Ordering::Acquire));
+    err("targetChanged")
 }
 fn verified(t: &Target, text: &str) -> Result<bool, Error> {
     match &t.proof {

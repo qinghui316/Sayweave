@@ -1,0 +1,4 @@
+LIBRARY sayweave_text_service
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE

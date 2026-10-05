@@ -89,6 +89,12 @@ impl DeliveryGate {
         self.0.load(Ordering::Acquire) == 2
     }
 }
+pub(crate) fn observe_pointer(window: usize, event_tick: u32) {
+    #[cfg(windows)]
+    native::observe_pointer(window, event_tick);
+    #[cfg(not(windows))]
+    let _ = (window, event_tick);
+}
 pub(crate) fn observe(event: u32, window: usize, object: i32, event_tick: u32) {
     #[cfg(windows)]
     native::observe(event, window, object, event_tick);
