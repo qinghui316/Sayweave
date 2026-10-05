@@ -528,17 +528,16 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
                 }),
                 _ => false,
             };
-            let initially_empty =
-                pattern.as_ref().is_some_and(|pattern| {
-                    pattern
-                        .DocumentRange()
-                        .and_then(|doc| doc.GetText(1))
-                        .is_ok_and(|text| text.is_empty())
-                }) || context.as_ref().is_some_and(|(prefix, selected, suffix)| {
-                    // An empty Chromium field may expose a virtual newline in DocumentRange.
-                    [prefix, selected, suffix]
-                        .iter()
-                        .all(|part| part.chars().all(|c| c == '\r' || c == '\n'))
+            let document_probe = pattern
+                .as_ref()
+                .and_then(|pattern| pattern.DocumentRange().and_then(|doc| doc.GetText(4)).ok());
+            let initially_empty = document_probe.as_ref().is_some_and(|text| text.is_empty())
+                || context.as_ref().is_some_and(|(prefix, selected, _)| {
+                    // Empty text controls can expose a virtual object in their TextPattern.
+                    // Probe only short documents before reading the independently empty value.
+                    prefix.is_empty()
+                        && selected.is_empty()
+                        && document_probe.as_ref().is_some_and(|text| text.len() < 4)
                         && element
                             .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
                             .and_then(|value| value.CurrentValue())
