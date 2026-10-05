@@ -329,14 +329,31 @@ fn uia_position(pattern: &IUIAutomationTextPattern) -> Result<(i32, i32), Error>
 }
 // Read only the selection and bounded adjacent context, independently of editability.
 type UiaContext = ((String, String, String), IUIAutomationTextRange);
+fn empty_value_candidate(prefix: &str, selected: &str, suffix: &str) -> bool {
+    prefix.is_empty()
+        && selected.is_empty()
+        && suffix
+            .chars()
+            .all(|c| matches!(c, '\u{fffc}' | '\r' | '\n'))
+}
+#[cfg(test)]
+mod empty_value_tests {
+    use super::empty_value_candidate;
+    #[test]
+    fn virtual_objects_are_candidates_but_real_text_is_not() {
+        assert!(empty_value_candidate("", "", "\u{fffc}\r\n\u{fffc}"));
+        assert!(!empty_value_candidate("", "", "\u{fffc}tail"));
+        assert!(!empty_value_candidate("before", "", "\u{fffc}"));
+        assert!(!empty_value_candidate("", "selected", "\u{fffc}"));
+    }
+}
 fn uia_context(pattern: &IUIAutomationTextPattern) -> Result<UiaContext, Error> {
     unsafe {
+        let doc = probe!(pattern.DocumentRange()).map_err(|_| err("targetReadUnavailable"))?;
         let selected = match uia_selection(pattern) {
             Ok(range) => range,
             Err(error) => {
                 // Some providers expose no selected range until the empty editor contains text.
-                let doc =
-                    probe!(pattern.DocumentRange()).map_err(|_| err("targetReadUnavailable"))?;
                 if !probe!(doc.GetText(1))
                     .map_err(|_| err("targetReadUnavailable"))?
                     .is_empty()
@@ -359,6 +376,23 @@ fn uia_context(pattern: &IUIAutomationTextPattern) -> Result<UiaContext, Error> 
             -2048
         ))
         .map_err(|_| err("targetReadUnavailable"))?;
+        // Chromium ranges can move into sibling controls even though DocumentRange belongs
+        // to this editor. Bound context to that document before reading any surrounding text.
+        if probe!(prefix.CompareEndpoints(
+            TextPatternRangeEndpoint_Start,
+            &doc,
+            TextPatternRangeEndpoint_Start
+        ))
+        .map_err(|_| err("targetReadUnavailable"))?
+            < 0
+        {
+            probe!(prefix.MoveEndpointByRange(
+                TextPatternRangeEndpoint_Start,
+                &doc,
+                TextPatternRangeEndpoint_Start
+            ))
+            .map_err(|_| err("targetReadUnavailable"))?;
+        }
         let prefix_start = probe!(prefix.Clone()).map_err(|_| err("targetReadUnavailable"))?;
         probe!(prefix_start.MoveEndpointByRange(
             TextPatternRangeEndpoint_End,
@@ -375,6 +409,21 @@ fn uia_context(pattern: &IUIAutomationTextPattern) -> Result<UiaContext, Error> 
         .map_err(|_| err("targetReadUnavailable"))?;
         probe!(suffix.MoveEndpointByUnit(TextPatternRangeEndpoint_End, TextUnit_Character, 2048))
             .map_err(|_| err("targetReadUnavailable"))?;
+        if probe!(suffix.CompareEndpoints(
+            TextPatternRangeEndpoint_End,
+            &doc,
+            TextPatternRangeEndpoint_End
+        ))
+        .map_err(|_| err("targetReadUnavailable"))?
+            > 0
+        {
+            probe!(suffix.MoveEndpointByRange(
+                TextPatternRangeEndpoint_End,
+                &doc,
+                TextPatternRangeEndpoint_End
+            ))
+            .map_err(|_| err("targetReadUnavailable"))?;
+        }
         let prefix = probe!(prefix.GetText(8193))
             .map_err(|_| err("targetReadUnavailable"))?
             .to_string();
@@ -530,14 +579,13 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<Target, Erro
             };
             let document_probe = pattern
                 .as_ref()
-                .and_then(|pattern| pattern.DocumentRange().and_then(|doc| doc.GetText(4)).ok());
+                .and_then(|pattern| pattern.DocumentRange().and_then(|doc| doc.GetText(1)).ok());
             let initially_empty = document_probe.as_ref().is_some_and(|text| text.is_empty())
-                || context.as_ref().is_some_and(|(prefix, selected, _)| {
+                || context.as_ref().is_some_and(|(prefix, selected, suffix)| {
                     // Empty text controls can expose a virtual object in their TextPattern.
-                    // Probe only short documents before reading the independently empty value.
-                    prefix.is_empty()
-                        && selected.is_empty()
-                        && document_probe.as_ref().is_some_and(|text| text.len() < 4)
+                    // The bounded context must contain only virtual content, then the actual
+                    // ValuePattern must independently be strictly empty.
+                    empty_value_candidate(prefix, selected, suffix)
                         && element
                             .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
                             .and_then(|value| value.CurrentValue())
