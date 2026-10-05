@@ -78,34 +78,29 @@ fn read(app: &tauri::AppHandle) -> Result<Snapshot, RuntimeError> {
 }
 #[derive(Clone, PartialEq)]
 struct VoiceLayout {
-    view: Option<(Option<String>, Option<String>, Presentation, bool)>,
+    view: Option<(Option<String>, Option<String>, Presentation)>,
     size: (f64, f64),
     instance: Option<u64>,
 }
 fn voice_view(
     snapshot: dictation::Snapshot,
-) -> Option<(Option<String>, Option<String>, Presentation, bool)> {
-    (snapshot.source == "external" && snapshot.presentation != Presentation::Idle).then(|| {
-        (
-            snapshot.task_id,
-            snapshot.presentation_id,
-            snapshot.presentation,
-            snapshot.delivery.is_some_and(|d| d.restore_error),
-        )
-    })
+) -> Option<(Option<String>, Option<String>, Presentation)> {
+    (snapshot.source == "external" && snapshot.presentation != Presentation::Idle).then_some((
+        snapshot.task_id,
+        snapshot.presentation_id,
+        snapshot.presentation,
+    ))
 }
 fn voice_layout(app: &tauri::AppHandle, phase: Phase) -> VoiceLayout {
     let view = app
         .try_state::<dictation::DictationCoordinator>()
         .and_then(|c| c.snapshot().ok())
         .and_then(voice_view);
-    let size = if let Some((_, _, presentation, recovery)) = &view {
+    let size = if let Some((_, _, presentation)) = &view {
         match presentation {
             Presentation::Completed => (120.0, 112.0),
-            Presentation::Result => (384.0, if *recovery { 284.0 } else { 232.0 }),
-            Presentation::Notice | Presentation::Error => {
-                (384.0, if *recovery { 240.0 } else { 152.0 })
-            }
+            Presentation::Result => (384.0, 232.0),
+            Presentation::Notice | Presentation::Error => (384.0, 112.0),
             Presentation::Recording => (240.0, 112.0),
             _ => (280.0, 150.0),
         }
@@ -565,7 +560,7 @@ pub fn run() {
             dictation_control,
             dictation_copy,
             dictation_dismiss,
-            dictation_restore,
+            dictation_settings,
             runtime_snapshot,
             runtime_demo,
             runtime_window,

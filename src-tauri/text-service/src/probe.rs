@@ -375,7 +375,7 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
             let context = manager.GetFocus()?.GetTop()?;
             println!(
                 "owned TSF context available; readonly={}",
-                context.GetStatus()?.dwStaticFlags & TF_SD_READONLY != 0
+                context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0
             );
             let pipe = Pipe::client(std::process::id(), GetCurrentThreadId())?;
             let task = uuid::Uuid::new_v4().to_string();

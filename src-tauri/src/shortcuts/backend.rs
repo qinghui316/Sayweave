@@ -251,7 +251,6 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             let pressed = [WM_KEYDOWN, WM_SYSKEYDOWN].contains(&(w.0 as u32));
             let released = [WM_KEYUP, WM_SYSKEYUP].contains(&(w.0 as u32));
             let value = key.vkCode as u16;
-            crate::input_state::key(value, pressed);
             let (repeated, consumed_release) = track_key(b, value, pressed, released);
             if pressed && edits_target(b, value) {
                 crate::input_state::edited();
@@ -395,7 +394,6 @@ pub struct Backend {
     thread: u32,
 }
 fn interrupt(b: &mut Bridge) {
-    crate::input_state::ready(false);
     crate::input_state::edited();
     send(b, Event::Interrupt(b.task_active.clone()));
     b.generation += 1;
@@ -409,7 +407,6 @@ fn interrupt(b: &mut Bridge) {
 }
 fn rearm(b: &mut Bridge, physical: HashSet<u16>) {
     // The resume sample is logical state, not a witnessed physical down event.
-    crate::input_state::ready(true);
     b.pressed = physical;
     b.consumed.retain(|key| b.pressed.contains(key));
     b.armed = b.pressed.is_empty();
@@ -551,7 +548,6 @@ impl Backend {
                 }
                 let keyboard = keyboard.unwrap();
                 let mouse = mouse.unwrap();
-                crate::input_state::ready(true);
                 let window = window.unwrap();
                 let _ = tx.send(Ok(GetCurrentThreadId()));
                 while GetMessageW(&mut message, None, 0, 0).0 > 0 {
@@ -570,7 +566,6 @@ impl Backend {
                 let _ = WTSUnRegisterSessionNotification(window);
                 let _ = UnhookWindowsHookEx(keyboard);
                 let _ = UnhookWindowsHookEx(mouse);
-                crate::input_state::ready(false);
                 let _ = UnhookWinEvent(foreground);
                 let _ = UnhookWinEvent(objects);
                 let _ = UnhookWinEvent(destroyed);

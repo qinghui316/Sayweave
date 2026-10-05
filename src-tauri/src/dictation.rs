@@ -19,9 +19,27 @@ mod presentation;
 use crate::windows_input::composition::{Draft, Finish};
 pub use presentation::Presentation;
 use presentation::{final_presentation, speech_presentation};
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InputRoute {
+    #[default]
+    None,
+    Live,
+    ResultOnly,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Admission {
+    #[default]
+    Pending,
+    Ready,
+    Rejected,
+}
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
+    pub input_route: InputRoute,
+    pub admission: Admission,
     pub sequence: u64,
     pub task_id: Option<String>,
     pub source: String,
@@ -35,6 +53,8 @@ pub struct Snapshot {
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
+            input_route: InputRoute::None,
+            admission: Admission::Pending,
             sequence: 1,
             task_id: None,
             source: "trial".into(),
@@ -401,6 +421,46 @@ impl DictationCoordinator {
         app.state::<ShortcutService>().active_task(Some(id.clone()));
         self.update(&app, &id, |_| {});
         let input = app.state::<WindowsInputService>();
+        let mut anchor = anchor;
+        self.update(&app, &id, |s| {
+            s.input_route = if source != "external" {
+                InputRoute::None
+            } else if anchor.is_some() {
+                InputRoute::Live
+            } else {
+                InputRoute::ResultOnly
+            };
+        });
+        // Assess shared password/read-only/identity evidence before acquiring our own range.
+        // UIA readback limitations do not select another writing strategy.
+        if source == "external"
+            && let Some(target) = anchor.clone()
+        {
+            let assessment = input.capture(id.clone(), target).await;
+            if let Some(code) = crate::windows_input::draft_rejection(&assessment) {
+                let error = Error::new(&code);
+                self.reject_preparation(&app, &id, &error, &gate).await;
+                return Err(error);
+            }
+        }
+        #[cfg(windows)]
+        let raw_draft = if source == "external"
+            && let Some(target) = anchor.clone()
+        {
+            match Draft::begin(id.clone(), 1, target, gate.clone()).await {
+                Ok(draft) => Some(draft),
+                Err(error) if error.code == "targetReadonlyContext" => {
+                    anchor = None;
+                    None
+                }
+                Err(error) => {
+                    self.reject_preparation(&app, &id, &error, &gate).await;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let continuous = (source == "external" && anchor.is_some()).then(|| {
             let flow =
                 crate::speech::continuous::Control::new(crate::input_state::activity_evidence());
@@ -414,31 +474,17 @@ impl DictationCoordinator {
         }
         let session_anchor = anchor.clone();
         let session_cancel = tx.clone();
-        #[cfg(windows)]
-        let composition = if source == "external" {
-            anchor.clone().map(|anchor| {
-                let task = id.clone();
-                let gate = gate.clone();
-                tauri::async_runtime::spawn(
-                    async move { Draft::begin(task, 1, anchor, gate).await },
-                )
-            })
-        } else {
-            None
-        };
-        let capture = if source == "external" {
-            let service = input.inner().clone();
-            let task = id.clone();
-            Some(tauri::async_runtime::spawn(async move {
-                if let Some(anchor) = anchor {
-                    service.capture(task, anchor).await
-                } else {
-                    Err(Error::new("targetUnavailable"))
-                }
-            }))
-        } else {
-            None
-        };
+        self.update(&app, &id, |s| {
+            s.input_route = if source != "external" {
+                InputRoute::None
+            } else if anchor.is_some() {
+                InputRoute::Live
+            } else {
+                InputRoute::ResultOnly
+            }
+        });
+        // The microphone cannot start until the target has acknowledged Begin.
+        self.update(&app, &id, |s| s.admission = Admission::Ready);
         let (terminal_tx, terminal_rx) = oneshot::channel();
         let result = app
             .state::<SpeechService>()
@@ -456,13 +502,8 @@ impl DictationCoordinator {
             )
             .await;
         if result.is_err() {
-            if let Some(c) = capture {
-                let _ = c.await;
-            }
             #[cfg(windows)]
-            if let Some(composition) = composition
-                && let Ok(Ok(draft)) = composition.await
-            {
+            if let Some(draft) = raw_draft {
                 let _ = draft.finish(String::new(), Finish::Abort).await;
             }
             input.forget(id.clone());
@@ -484,28 +525,11 @@ impl DictationCoordinator {
         self.update(&app, &id, |s| s.stage = "recognizing".into());
         let source = source.to_string();
         tauri::async_runtime::spawn(async move {
-            let capture_result = match capture {
-                Some(c) => c
-                    .await
-                    .unwrap_or_else(|_| Err(Error::new("targetProbeFailed"))),
-                None => Err(Error::new("targetUnavailable")),
-            };
             let coordinator = app.state::<Self>();
-            #[cfg(windows)]
-            let capture_rejection = crate::windows_input::draft_rejection(&capture_result);
-            #[cfg(windows)]
-            let raw_draft = match composition {
-                Some(composition) => Some(
-                    composition
-                        .await
-                        .unwrap_or_else(|_| Err(Error::new("compositionWorker"))),
-                ),
-                None => None,
-            };
             #[cfg(windows)]
             let mut journal_ok = true;
             #[cfg(windows)]
-            if let Some(Ok(_)) = &raw_draft {
+            if raw_draft.is_some() {
                 let initial = app
                     .state::<SpeechService>()
                     .snapshot()
@@ -530,22 +554,19 @@ impl DictationCoordinator {
                 };
             }
             #[cfg(windows)]
-            let draft = raw_draft.map(|result| {
-                result.map(|draft| {
-                    drafts::SessionDraft::new(
-                        id.clone(),
-                        session_anchor.clone().unwrap(),
-                        draft,
-                        gate.clone(),
-                        continuous.clone().unwrap(),
-                        session_cancel.clone(),
-                    )
-                })
+            let draft = raw_draft.map(|draft| {
+                drafts::SessionDraft::new(
+                    id.clone(),
+                    session_anchor.clone().unwrap(),
+                    draft,
+                    gate.clone(),
+                    continuous.clone().unwrap(),
+                    session_cancel.clone(),
+                )
             });
             #[cfg(windows)]
-            if let Some(Ok(draft)) = &draft
+            if let Some(draft) = &draft
                 && journal_ok
-                && capture_rejection.is_none()
                 && !gate.cancelled()
             {
                 draft.activate();
@@ -572,33 +593,28 @@ impl DictationCoordinator {
                         })
                         .await;
                 });
-            } else if let Some(flow) = &continuous {
-                // No live range is writable. Recognition remains complete; final-delivery
-                // target checks decide whether any result can be submitted.
-                flow.use_final_delivery();
+            } else if continuous.is_some() && !journal_ok && !gate.cancelled() {
+                // A failed journal may never turn a live task into a different input path.
+                coordinator.update(&app, &id, |s| s.error = Some("saveFailed".into()));
+                session_cancel.send_replace(3);
             }
             if let Ok(terminal) = terminal_rx.await {
                 coordinator.update(&app, &id, |s| {
                     s.text = terminal.text.clone();
                     s.stage = "result".into();
-                    s.error = terminal.error.clone();
+                    s.error = s.error.take().or_else(|| terminal.error.clone());
                     s.presentation = Presentation::Recognizing;
                 });
                 if source == "external" && !terminal.text.is_empty() {
                     #[cfg(windows)]
                     let inline = match &draft {
-                        Some(Ok(draft)) => {
-                            let mut mode = composition_finish(
+                        Some(draft) => {
+                            let mode = composition_finish(
                                 terminal.phase,
                                 journal_ok,
                                 !terminal.persistent || terminal.saved,
                                 gate.cancelled(),
                             );
-                            if mode == Finish::Commit
-                                && let Some(error) = &capture_rejection
-                            {
-                                mode = Finish::Handoff(error.clone());
-                            }
                             let latest = app
                                 .state::<SpeechService>()
                                 .subscribe_transcripts()
@@ -606,66 +622,23 @@ impl DictationCoordinator {
                                 .clone();
                             Some(draft.finish(&latest, mode).await)
                         }
-                        Some(Err(error)) if error.code != "compositionNotEnabled" => {
-                            Some(Delivery::not_submitted(&error.code))
-                        }
-                        _ => None,
+                        None => None,
                     };
                     #[cfg(not(windows))]
                     let inline: Option<Delivery> = None;
-                    let mut delivery = if let Some(inline) = inline {
-                        inline
-                    } else if terminal.phase == Phase::Completed
-                        && !gate.cancelled()
-                        && capture_result.is_ok()
-                    {
-                        let journal = if terminal.persistent {
-                            coordinator
-                                .journal(&app, &id, terminal.attempt_id.as_deref(), "pending", None)
-                                .await
-                        } else {
-                            Ok(())
-                        };
-                        if journal.is_err() || terminal.persistent && !terminal.saved {
-                            Delivery::not_submitted("saveFailed")
-                        } else {
-                            coordinator.update(&app, &id, |s| {
-                                s.stage = "delivering".into();
-                                s.presentation = Presentation::Delivering;
-                            });
-                            let preparing = if terminal.persistent {
-                                coordinator
-                                    .journal(
-                                        &app,
-                                        &id,
-                                        terminal.attempt_id.as_deref(),
-                                        "delivering",
-                                        None,
-                                    )
-                                    .await
-                            } else {
-                                Ok(())
-                            };
-                            if preparing.is_err() {
-                                Delivery::not_submitted("saveFailed")
-                            } else {
-                                app.state::<WindowsInputService>()
-                                    .deliver(id.clone(), terminal.text.clone(), gate.clone())
-                                    .await
-                            }
-                        }
-                    } else {
+                    let mut delivery = inline.unwrap_or_else(|| {
                         Delivery::not_submitted(if gate.cancelled() {
                             "cancelled"
-                        } else if terminal.phase != Phase::Completed {
-                            "recognitionFailed"
-                        } else if let Err(error) = &capture_result {
-                            &error.code
                         } else {
                             "targetUnavailable"
                         })
-                    };
+                    });
                     if terminal.persistent {
+                        if session_anchor.is_none() {
+                            let _ = coordinator
+                                .journal(&app, &id, terminal.attempt_id.as_deref(), "pending", None)
+                                .await;
+                        }
                         let result = coordinator
                             .journal(
                                 &app,
@@ -691,7 +664,7 @@ impl DictationCoordinator {
                 });
                 #[cfg(windows)]
                 if terminal.text.is_empty()
-                    && let Some(Ok(draft)) = &draft
+                    && let Some(draft) = &draft
                 {
                     let mode = if terminal.phase == Phase::Cancelled {
                         Finish::Abort
@@ -733,7 +706,7 @@ impl DictationCoordinator {
                 }
             } else {
                 #[cfg(windows)]
-                let abandoned_delivery = if let Some(Ok(draft)) = &draft {
+                let abandoned_delivery = if let Some(draft) = &draft {
                     let latest = app
                         .state::<SpeechService>()
                         .subscribe_transcripts()
@@ -772,6 +745,32 @@ impl DictationCoordinator {
             coordinator.release(&app, &id).await;
         });
         result
+    }
+    async fn reject_preparation(
+        &self,
+        app: &tauri::AppHandle,
+        id: &str,
+        error: &Error,
+        gate: &DeliveryGate,
+    ) {
+        if gate.cancelled() || matches!(error.code.as_str(), "cancelled" | "staleSession") {
+            self.update(app, id, |s| {
+                s.stage = "idle".into();
+                s.error = Some("cancelled".into());
+            });
+            app.state::<WindowsInputService>().forget(id.into());
+            self.release(app, id).await;
+            return;
+        }
+        log::info!(target:"sayweave", "operation=dictation_admission task_id={id} result=rejected error={}", error.code);
+        self.update(app, id, |s| {
+            s.admission = Admission::Rejected;
+            s.stage = "result".into();
+            s.error = Some(error.code.clone());
+        });
+        app.state::<WindowsInputService>().forget(id.into());
+        app.state::<SpeechService>().start_error(app, id, error);
+        self.release(app, id).await;
     }
     async fn journal(
         &self,
@@ -816,8 +815,12 @@ impl DictationCoordinator {
             *a = None;
             // Publish actionable recovery only after admission and native resources are settled.
             self.update(app, id, |s| {
-                s.presentation =
-                    final_presentation(false, &s.text, s.delivery.as_ref(), s.error.as_deref());
+                s.presentation = final_presentation(
+                    s.input_route == InputRoute::ResultOnly,
+                    &s.text,
+                    s.delivery.as_ref(),
+                    s.error.as_deref(),
+                );
             });
         }
         if let Some(old) = old
@@ -1152,11 +1155,25 @@ pub fn dictation_dismiss(
     caller(window.label())?;
     service.dismiss(&app, &task_id, &presentation_id)
 }
+
 #[tauri::command]
-pub async fn dictation_restore(
+pub fn dictation_settings(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
+    service: tauri::State<'_, DictationCoordinator>,
+    task_id: String,
+    presentation_id: String,
 ) -> Result<(), Error> {
     caller(window.label())?;
-    app.state::<WindowsInputService>().restore().await
+    let current = service.snapshot()?;
+    if current.task_id.as_deref() != Some(&task_id)
+        || current.presentation_id.as_deref() != Some(&presentation_id)
+        || current.admission != Admission::Rejected
+    {
+        return Err(Error::new("staleSession"));
+    }
+    crate::window_action(&app, "main", "show").map_err(|_| Error::new("unavailable"))?;
+    app.emit_to("main", "dictation:settings", ())
+        .map_err(|_| Error::new("unavailable"))?;
+    service.dismiss(&app, &task_id, &presentation_id)
 }

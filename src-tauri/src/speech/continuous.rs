@@ -120,10 +120,6 @@ impl Control {
                 && self.draft_activity.load(Ordering::Acquire)
                     != self.audio.evidence.load(Ordering::Acquire)
     }
-    /// No live draft exists: legacy final delivery owns its own target-change protection.
-    pub fn use_final_delivery(&self) {
-        self.audio.editing_gate.store(false, Ordering::Release);
-    }
     fn record(&self, turn: u64, transcript: Transcript) -> Result<(), Error> {
         self.raw
             .lock()
@@ -518,7 +514,7 @@ impl Drop for Continuous {
 mod tests {
     use super::*;
     #[test]
-    fn edit_evidence_retains_raw_history_before_async_handoff_and_final_delivery_does_not_stall() {
+    fn edit_evidence_retains_raw_history_before_async_handoff() {
         let evidence = Arc::new(AtomicU64::new(3));
         let control = Control::new(evidence.clone());
         control.resume(1, 3);
@@ -531,8 +527,6 @@ mod tests {
         evidence.fetch_add(1, Ordering::AcqRel);
         assert!(control.preserve_history());
         assert_eq!(control.audio.current(), 0);
-        control.use_final_delivery();
-        assert_eq!(control.audio.current(), 1);
         control.request_finish();
         control.resume(2, 4);
         control.enabled(Route {
@@ -540,7 +534,7 @@ mod tests {
             activity: 4,
         });
         assert_ne!(*control.readiness().borrow(), 2);
-        assert_eq!(control.audio.current(), 1); // accepted tail can still drain
+        assert_eq!(control.audio.current(), 0); // editing stopped this turn
     }
     #[tokio::test]
     async fn cancelling_worker_also_drops_the_pending_connection_future() {
@@ -845,22 +839,6 @@ mod tests {
         })
         .await
         .unwrap();
-    }
-    #[test]
-    fn failed_initial_draft_does_not_mute_the_final_delivery_compatibility_path() {
-        let evidence = Arc::new(AtomicU64::new(9));
-        let control = Control::new(evidence.clone());
-        control.resume(1, 9);
-        control.enabled(Route {
-            turn: 1,
-            activity: 9,
-        });
-        // A physical edit while Begin is pending must not mute ASR before we own a draft.
-        evidence.fetch_add(1, Ordering::AcqRel);
-        assert_eq!(control.audio.current(), 1);
-        assert!(!control.preserve_history());
-        control.use_final_delivery();
-        assert_eq!(control.audio.current(), 1);
     }
     #[tokio::test]
     async fn hard_cancellation_keeps_parsed_retired_tail_before_the_final_packet() {

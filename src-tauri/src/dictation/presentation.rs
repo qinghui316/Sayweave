@@ -37,7 +37,7 @@ pub fn speech_presentation(phase: Phase, stop: u8) -> Option<Presentation> {
 }
 
 pub fn final_presentation(
-    _absent_target: bool,
+    absent_target: bool,
     text: &str,
     delivery: Option<&Delivery>,
     error: Option<&str>,
@@ -64,7 +64,11 @@ pub fn final_presentation(
         }
     }
     if !text.trim().is_empty() {
-        Presentation::Result
+        if absent_target {
+            Presentation::Result
+        } else {
+            Presentation::Notice
+        }
     } else if error.is_some_and(|e| e != "cancelled" && e != "staleSession") {
         Presentation::Error
     } else {
@@ -93,7 +97,7 @@ mod tests {
         let mut delivery = Delivery::not_submitted("targetChanged");
         assert_eq!(
             final_presentation(false, "文字", Some(&delivery), None),
-            Presentation::Result
+            Presentation::Notice
         );
         assert_eq!(
             final_presentation(true, "文字", Some(&delivery), None),

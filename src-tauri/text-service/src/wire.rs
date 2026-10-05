@@ -76,13 +76,15 @@ impl DraftVersion {
     }
     pub fn accepts(&self, request: &Request) -> bool {
         request.valid()
-            && request.operation > self.operation
             && if request.action == Action::Begin {
+                // Operation counters belong to a turn, not to the lifetime of the
+                // loaded text service. A new host/turn starts its own counter.
                 !self.owned && (self.task != request.task || request.turn > self.turn)
             } else {
                 self.owned
                     && self.task == request.task
                     && self.turn == request.turn
+                    && request.operation > self.operation
                     && request.revision >= self.revision
                     && (request.action != Action::Update || request.revision > self.revision)
             }
@@ -146,6 +148,31 @@ mod tests {
         let mut next = request(Action::Begin, 7, 0);
         next.turn = 2;
         assert!(draft.accepts(&next));
+    }
+    #[test]
+    fn a_reused_service_accepts_new_tasks_and_turns_with_fresh_counters() {
+        let mut draft = DraftVersion::default();
+        draft.applied(&request(Action::Begin, 1, 0));
+        draft.applied(&request(Action::Update, 2, 1));
+        let mut next = request(Action::Begin, 1, 0);
+        next.turn = 2;
+        assert!(!draft.accepts(&next)); // an owned range must first be released
+        draft.applied(&request(Action::Handoff, 3, 1));
+        assert!(draft.accepts(&next));
+        draft.applied(&next);
+        assert!(!draft.accepts(&request(Action::Update, 99, 99)));
+        assert!(!draft.accepts(&next));
+        let mut commit = next.clone();
+        commit.action = Action::Commit;
+        commit.operation = 2;
+        assert!(draft.accepts(&commit));
+        draft.applied(&commit);
+        assert!(!draft.accepts(&request(Action::Begin, 100, 0)));
+        next.task = uuid::Uuid::new_v4().to_string();
+        next.turn = 1;
+        assert!(draft.accepts(&next));
+        draft.applied(&next);
+        assert!(!draft.accepts(&commit));
     }
     #[test]
     fn bounds_count_utf16_and_reject_unknown_fields() {

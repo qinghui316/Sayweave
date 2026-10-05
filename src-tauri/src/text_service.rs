@@ -52,28 +52,51 @@ fn status() -> Result<Status, Error> {
         .is_some();
     let matches = deployment::matches_payload(PAYLOAD);
     let cleanup = deployment::cleanup_pending();
-    let profiles = registration::profiles().map_err(|_| Error::new("componentUnavailable"))?;
     let enabled = if installed && matches.is_ok() {
-        unsafe {
+        (|| unsafe {
+            let profiles =
+                registration::profiles().map_err(|_| Error::new("componentQueryFailed"))?;
             let language = profiles
                 .GetCurrentLanguage()
-                .map_err(|_| Error::new("componentUnavailable"))?;
+                .map_err(|_| Error::new("componentQueryFailed"))?;
             profiles
                 .IsEnabledLanguageProfile(&registration::CLASS, language, &registration::PROFILE)
                 .map(|v| v.as_bool())
-                .unwrap_or(false)
-        }
+                .map_err(|_| Error::new("componentQueryFailed"))
+        })()
     } else {
-        false
+        Ok(false)
     };
     Ok(Status {
         installed,
-        enabled,
+        enabled: enabled.as_ref().copied().unwrap_or(false),
         update_available: installed && !PAYLOAD.is_empty() && !matches!(matches, Ok(Some(true))),
         payload_available: !PAYLOAD.is_empty(),
         cleanup_pending: cleanup.as_ref().copied().unwrap_or(false),
-        error: (matches.is_err() || cleanup.is_err()).then(|| "componentRegistration".into()),
+        error: if matches.is_err() || cleanup.is_err() {
+            Some("componentRegistration".into())
+        } else {
+            enabled.err().map(|e| e.code)
+        },
     })
+}
+/// Called in the host's COM apartment, using exactly the status shown by settings.
+#[cfg(windows)]
+pub(crate) fn require_ready() -> Result<(), Error> {
+    let value = status()?;
+    if let Some(code) = value.error {
+        return Err(Error::new(&code));
+    }
+    if !value.installed {
+        return Err(Error::new("componentMissing"));
+    }
+    if value.update_available {
+        return Err(Error::new("componentVersionMismatch"));
+    }
+    if !value.enabled {
+        return Err(Error::new("componentNotEnabled"));
+    }
+    Ok(())
 }
 #[cfg(not(windows))]
 fn status() -> Result<Status, Error> {
@@ -114,26 +137,31 @@ fn operate(
     maintenance: crate::dictation::ComponentMaintenance,
 ) -> Result<(), Error> {
     use sayweave_text_service::{client, registration};
-    if matches!(action, Action::Install | Action::Remove) {
-        return elevate(action, maintenance);
-    }
+    let maintenance = if matches!(action, Action::Install | Action::Remove) {
+        // Registration is machine-wide. Enablement belongs to this ordinary initiating
+        // user's process, not to the elevated helper or a diagnostic launch environment.
+        let maintenance = elevate(action, maintenance)?;
+        if matches!(action, Action::Remove) {
+            return Ok(());
+        }
+        maintenance
+    } else {
+        maintenance
+    };
     let _maintenance = maintenance;
     let _lease =
         registration::host_capability(std::process::id(), &uuid::Uuid::new_v4().to_string())
             .map_err(|_| Error::new("busy"))?;
-    if client::input_profiles()
-        .map_err(|_| Error::new("componentUnavailable"))?
-        .iter()
-        .any(|p| {
-            p.catid == windows::Win32::UI::TextServices::GUID_TFCAT_TIP_SPEECH
-                && p.dwFlags & windows::Win32::UI::TextServices::TF_IPP_FLAG_ACTIVE != 0
-        })
+    if client::speech_activation()
+        .map_err(|_| Error::new("componentQueryFailed"))?
+        .0
+        == client::SpeechActivation::Other
     {
         return Err(Error::new("busy"));
     }
     match action {
-        Action::Install | Action::Remove => unreachable!(),
-        Action::Enable | Action::Disable => {
+        Action::Remove => unreachable!(),
+        Action::Install | Action::Enable | Action::Disable => {
             if !status()?.installed {
                 return Err(Error::new("componentMissing"));
             }
@@ -146,9 +174,16 @@ fn operate(
                     &registration::CLASS,
                     lang,
                     &registration::PROFILE,
-                    matches!(action, Action::Enable),
+                    !matches!(action, Action::Disable),
                 )
                 .map_err(|_| Error::new("componentEnableFailed"))?;
+            }
+            let enabled = status()?;
+            if let Some(code) = enabled.error {
+                return Err(Error::new(&code));
+            }
+            if enabled.enabled != !matches!(action, Action::Disable) {
+                return Err(Error::new("componentEnableFailed"));
             }
             Ok(())
         }
@@ -165,7 +200,7 @@ fn operate(
 fn elevate(
     action: Action,
     maintenance: crate::dictation::ComponentMaintenance,
-) -> Result<(), Error> {
+) -> Result<crate::dictation::ComponentMaintenance, Error> {
     use windows::{
         Win32::{Foundation::*, System::Threading::*, UI::Shell::*},
         core::{PCWSTR, w},
@@ -231,7 +266,7 @@ fn elevate(
         if exit != 0 {
             return Err(Error::new("componentInstallFailed"));
         }
-        Ok(())
+        Ok(maintenance)
     }
 }
 /// The fixed elevated entry runs before Tauri/window/data startup. No general install paths.
@@ -258,13 +293,10 @@ pub fn helper_entry() -> Option<i32> {
                 &uuid::Uuid::new_v4().to_string(),
             )
             .map_err(|_| Error::new("busy"))?;
-            if sayweave_text_service::client::input_profiles()
-                .map_err(|_| Error::new("componentUnavailable"))?
-                .iter()
-                .any(|p| {
-                    p.catid == windows::Win32::UI::TextServices::GUID_TFCAT_TIP_SPEECH
-                        && p.dwFlags & windows::Win32::UI::TextServices::TF_IPP_FLAG_ACTIVE != 0
-                })
+            if sayweave_text_service::client::speech_activation()
+                .map_err(|_| Error::new("componentQueryFailed"))?
+                .0
+                == sayweave_text_service::client::SpeechActivation::Other
             {
                 return Err(Error::new("busy"));
             }

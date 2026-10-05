@@ -232,6 +232,12 @@ fn main() {
                         LPARAM(value["end"].as_i64().unwrap_or(0) as isize),
                     );
                 }
+                if value["action"] == "caret-home" && GetForegroundWindow() == top {
+                    // EM_SETSEL can be ignored while TSF owns a composition. Exercise
+                    // the editor's normal caret navigation and assert its real selection.
+                    message(editor, WM_KEYDOWN, WPARAM(VK_HOME.0 as usize), LPARAM(0));
+                    message(editor, WM_KEYUP, WPARAM(VK_HOME.0 as usize), LPARAM(0));
+                }
                 if value["action"] == "type"
                     && let Some(text) = value["text"].as_str()
                 {

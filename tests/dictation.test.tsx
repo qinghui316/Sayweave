@@ -89,15 +89,6 @@ describe('shortcut settings',()=>{
   await user.click(screen.getByRole('button',{name:'放弃修改'}));expect(closed).toHaveBeenCalledOnce();
  });
 });
-it('separates confirmed input from a failed clipboard restore',async()=>{
- const restore=vi.fn().mockResolvedValue(undefined),user=userEvent.setup();
- render(<VoiceSurface phase="idle" text="你好" delivery={{state:'confirmed',submission:'submitted',verification:'confirmed',stage:'verify',submittedEvents:4,error:null,restoreError:true,elapsedMs:10}} start={()=>{}} finish={()=>{}} cancel={()=>{}} restore={restore}/>);
- expect(screen.getByText('已填入')).toBeVisible();
- await user.click(screen.getByRole('button',{name:'重试恢复剪贴板'}));
- await waitFor(()=>expect(screen.queryByText('剪贴板恢复未完成。')).not.toBeInTheDocument());
- expect(restore).toHaveBeenCalledOnce();
-});
-
 it('keeps external completion pending only for the matching nonempty successful task',()=>{
  const result={...initialDictation(),taskId:'A',source:'external' as const,stage:'result' as const,text:'你好',presentationId:'view-A'};
  const speech={taskId:'A',text:'你好'};
@@ -156,7 +147,7 @@ it.each(['editing','resuming'] as const)('keeps finish available while the conti
 it('dismissed preparation failures and clipboard notices remain closed when the overlay reopens',()=>{
  const dismissed={...initialDictation(),source:'external' as const,taskId:'failed',error:'network'};
  expect(dictationPhase(dismissed,'failed',{taskId:'failed',text:''})).toBe('idle');
- const view=render(<VoiceSurface presentation="idle" phase="idle" error="连接失败" delivery={{state:'confirmed',submission:'submitted',verification:'confirmed',stage:'verify',submittedEvents:4,error:null,restoreError:true,elapsedMs:10}} start={()=>{}} finish={()=>{}} cancel={()=>{}} restore={vi.fn()}/>);
+ const view=render(<VoiceSurface presentation="idle" phase="idle" error="连接失败" delivery={{state:'confirmed',submission:'submitted',verification:'confirmed',stage:'verify',submittedEvents:4,error:null,restoreError:true,elapsedMs:10}} start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
  expect(screen.queryByRole('region',{name:'口述提示'})).not.toBeInTheDocument();
  expect(screen.queryByRole('button',{name:'重试恢复剪贴板'})).not.toBeInTheDocument();
  view.rerender(<VoiceSurface presentation="idle" phase={dictationPhase(dismissed,'failed',{taskId:'failed',text:''})} error="连接失败" start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
@@ -183,4 +174,15 @@ it('cancels a delayed capture start when the settings window loses focus',async(
  await act(start);await waitFor(async()=>expect((await base.status()).capturing).toBe(false));
  fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('右 Alt');
  expect(screen.getByRole('button',{name:'保存快捷键'})).toBeDisabled();
+});
+
+it('reports rejected live admission without a copy card and exposes settings',async()=>{
+ const settings=vi.fn(),user=userEvent.setup();
+ const state=parseDictation({...initialDictation(),source:'external',inputRoute:'live',admission:'rejected',taskId:'task',presentationId:'view',presentation:'error',error:'componentNotEnabled'});
+ render(<VoiceSurface presentation={state.presentation} phase="failed" error="请在设置中启用实时输入组件。" configure={settings} dismiss={()=>{}} start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
+ expect(screen.queryByRole('region',{name:'口述结果'})).not.toBeInTheDocument();
+ expect(screen.queryByRole('button',{name:'复制'})).not.toBeInTheDocument();
+ await user.click(screen.getByRole('button',{name:'设置'}));expect(settings).toHaveBeenCalledOnce();
+ expect(()=>parseDictation({...state,inputRoute:'paste'})).toThrow();
+ expect(()=>parseDictation({...state,admission:'unknown'})).toThrow();
 });

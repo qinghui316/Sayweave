@@ -56,13 +56,17 @@ impl Draft {
         std::thread::Builder::new()
             .name("sayweave-composition-sta".into())
             .spawn(move || {
+                let began = Instant::now();
+                let diagnostic_task = task.clone();
                 let mut host = match Host::open(task, turn, anchor, gate) {
                     Ok(host) => host,
                     Err(error) => {
+                        log::info!(target:"sayweave", "operation=draft_admission task_id={} turn={} result=rejected error={} elapsed_ms={}", diagnostic_task,turn,error.code,began.elapsed().as_millis());
                         let _ = ready.send(Err(error));
                         return;
                     }
                 };
+                log::info!(target:"sayweave", "operation=draft_admission task_id={} turn={} result=ready elapsed_ms={}", diagnostic_task,turn,began.elapsed().as_millis());
                 if ready.send(Ok(())).is_err() {
                     return;
                 }
@@ -207,22 +211,11 @@ impl Host {
         let capability = uuid::Uuid::new_v4().to_string();
         let lease = registration::host_capability(std::process::id(), &capability)
             .map_err(|_| Error::new("compositionBusy"))?;
-        let profiles =
-            registration::profiles().map_err(|_| Error::new("compositionUnavailable"))?;
-        let language = unsafe { profiles.GetCurrentLanguage() }
-            .map_err(|_| Error::new("compositionUnavailable"))?;
-        let enabled = unsafe {
-            profiles.IsEnabledLanguageProfile(
-                &registration::CLASS,
-                language,
-                &registration::PROFILE,
-            )
-        }
-        .map_err(|_| Error::new("compositionNotEnabled"))?;
-        if !enabled.as_bool() {
-            return Err(Error::new("compositionNotEnabled"));
-        }
-        let profile = ProfileLease::open().map_err(|_| Error::new("compositionUnavailable"))?;
+        crate::text_service::require_ready()?;
+        let profile = ProfileLease::open().map_err(|error| {
+            log::info!(target:"sayweave", "operation=draft_activation task_id={} turn={} hresult={:08x}", task, turn, error.code().0 as u32);
+            Error::new("compositionActivationFailed")
+        })?;
         if gate.cancelled() {
             return Err(Error::new("cancelled"));
         }
@@ -397,6 +390,16 @@ impl Host {
     }
 }
 fn reply_error(code: &str) -> &'static str {
+    if code
+        == format!(
+            "editLease:{:08x}",
+            windows::Win32::UI::TextServices::TF_E_READONLY.0 as u32
+        )
+    {
+        // An acknowledged read-only TSF context has no writable range. This is
+        // distinct from a missing/disabled component or a failed edit request.
+        return "targetReadonlyContext";
+    }
     let edit_lock = ["edit:", "requestEdit:", "requestEditResult:"]
         .iter()
         .any(|prefix| code.starts_with(prefix))
@@ -419,6 +422,13 @@ mod tests {
     use super::reply_error;
     #[test]
     fn foreign_ime_lock_remains_temporary_at_each_edit_boundary() {
+        assert_eq!(
+            reply_error(&format!(
+                "editLease:{:08x}",
+                windows::Win32::UI::TextServices::TF_E_READONLY.0 as u32
+            )),
+            "targetReadonlyContext"
+        );
         let locked = format!(
             "{:08x}",
             windows::Win32::UI::TextServices::TF_E_LOCKED.0 as u32

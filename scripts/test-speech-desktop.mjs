@@ -14,7 +14,7 @@ const directory=path.join(root,'.local','data-acceptance',id),data=path.join(dir
 const exe=path.join(root,'src-tauri','target','release','desktop-acceptance.exe'),port=9241,key='fixture-'+randomUUID();
 const report={id,passed:false,checks:[],connections:[],handshakes:[]},delay=ms=>new Promise(r=>setTimeout(r,ms));
 let app,browser,server,mode='normal',expectedProtocol='qwen',expectedModel='qwen-audio-3.1-asr-flash-streaming';const sockets=new Set();
-async function command(args){const child=spawn('cargo',args,{cwd:root,windowsHide:true,env:{...process.env,SAYWEAVE_DATA_ACCEPTANCE_ID:id},stdio:['ignore','pipe','pipe']});const log=createWriteStream(path.join(directory,'fixture.log'),{flags:'a'});child.stdout.pipe(log);child.stderr.pipe(log);if(await new Promise((r,j)=>{child.on('exit',r);child.on('error',j);})!==0)throw Error('Fixture operation failed');}
+async function command(args,extraEnv={}){const child=spawn('cargo',args,{cwd:root,windowsHide:true,env:{...process.env,...extraEnv,SAYWEAVE_DATA_ACCEPTANCE_ID:id},stdio:['ignore','pipe','pipe']});const log=createWriteStream(path.join(directory,'fixture.log'),{flags:'a'});child.stdout.pipe(log);child.stderr.pipe(log);if(await new Promise((r,j)=>{child.on('exit',r);child.on('error',j);})!==0)throw Error('Fixture operation failed');}
 function frame(value,opcode=1){const payload=Buffer.isBuffer(value)?value:Buffer.from(JSON.stringify(value));const header=Buffer.alloc(payload.length<126?2:4);header[0]=0x80|opcode;header[1]=payload.length<126?payload.length:126;if(payload.length>=126)header.writeUInt16BE(payload.length,2);return Buffer.concat([header,payload]);}
 function websocket(req,socket,head){
  const doubao=expectedProtocol==='doubao';
@@ -35,11 +35,11 @@ function websocket(req,socket,head){
    if(kind===1){const value=JSON.parse(body.toString());expect(value.audio).toMatchObject({format:'pcm',rate:16000,bits:16,channel:1});expect(value.request).toMatchObject({model_name:'bigmodel',result_type:'full',show_utterances:true});connection.model='Doubao-Seed-ASR-2.0';connection.started=true;binaryResult('',false);return;}
    expect(kind).toBe(2);expect(connection.started).toBe(true);
    if(flags&2){connection.finished=true;if(connection.mode==='pending')return;if(connection.mode==='empty'||connection.mode==='empty-ack'){binaryResult('',true,true);return;}if(connection.mode==='malformed-terminal'){binaryPayload({code:20000000,result:{text:123}},true);return;}const complete=()=>{const text=connection.mode==='single-a'?'a':connection.mode==='unicode'?'中文，🙂\n第二行 e\u0301。':'原生受控识别完成。';binaryResult(text,true);binaryResult('旧暂定不能覆盖。',false);binaryResult(text,true,true);};if(connection.mode==='delayed-final')setTimeout(complete,650);else complete();return;}
-   connection.frames++;connection.bytes+=body.length;if(connection.frames===1)binaryResult('正在识别',false);return;
+   connection.frames++;connection.bytes+=body.length;if(connection.frames===1)binaryResult('正在',false);if(connection.frames===8)binaryResult('正在识别',false);return;
   }
 
   if(opcode===8){socket.end(frame(payload,8));return;}if(opcode===9){socket.write(frame(payload,10));return;}
-  if(opcode===2){if(!connection.started)throw Error('Audio arrived before task-started');connection.frames++;connection.bytes+=payload.length;if(connection.frames===1){if(connection.mode==='failure'){socket.write(frame({header:{task_id:task,event:'task-failed',error_code:'SERVICE_ERROR',error_message:'PRIVATE FIXTURE ERROR'}}));return;}result('正在识别',false);}return;}
+  if(opcode===2){if(!connection.started)throw Error('Audio arrived before task-started');connection.frames++;connection.bytes+=payload.length;if(connection.frames===1){if(connection.mode==='failure'){socket.write(frame({header:{task_id:task,event:'task-failed',error_code:'SERVICE_ERROR',error_message:'PRIVATE FIXTURE ERROR'}}));return;}result('正在',false);}if(connection.frames===8)result('正在识别',false);return;}
   if(opcode!==1)return;const value=JSON.parse(payload.toString());if(value.header.action==='run-task'){task=value.header.task_id;expect(value.payload.parameters.sample_rate).toBe(16000);expect(value.payload.parameters.format).toBe('pcm');expect(value.payload.model).toBe(expectedModel);connection.model=value.payload.model;connection.started=true;send('task-started');}
   else if(value.header.action==='finish-task'){connection.finished=true;if(connection.mode==='pending')return;if(connection.mode==='empty'){send('task-finished');return;}result('原生受控识别完成。',true);result('重复最终结果不应覆盖。',true);send('task-finished');}
  }
@@ -110,6 +110,13 @@ async function waitPhase(page,phase){
  await expect.poll(async()=>(await invoke(page,'speech_snapshot')).phase,{timeout}).toBe(phase);return invoke(page,'speech_snapshot');
 }
 try{
+ // This entry is also invoked directly. Never reuse a stale acceptance executable.
+ await buildFixture({logLevel:'error'});
+ await command(['build','--manifest-path','src-tauri/text-service/Cargo.toml','--release']);
+ const payload=path.join(root,'src-tauri/text-service/target/release/sayweave_text_service.dll');report.componentSha256=createHash('sha256').update(readFileSync(payload)).digest('hex');
+ await command(['build','--manifest-path','src-tauri/Cargo.toml','--release','--features','desktop-acceptance,tauri/custom-protocol','--bin','desktop-acceptance'],{SAYWEAVE_TSF_PAYLOAD:payload});
+ await command(['build','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance','--bin','input-fixture']);
+ report.targetGroup=process.env.SAYWEAVE_INPUT_TARGET_GROUP??'all';
  await command(['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_fixture','--','--ignored']);server=createServer({cert:readFileSync(path.join(data,'fixture-ca.pem')),key:readFileSync(path.join(data,'fixture-key.pem'))});server.on('upgrade',websocket);await new Promise(r=>server.listen(0,'127.0.0.1',r));const base='https://localhost:'+server.address().port;
  let page=await start(1);await expect(page.getByRole('link',{name:'组件展示'})).toHaveCount(0);await page.getByRole('button',{name:'配置模型',exact:true}).click();const dialog=page.getByRole('dialog');await delay(250);await page.screenshot({path:path.join(directory,'settings-speech-native.png')});await dialog.getByRole('button',{name:'更多设置'}).click();await dialog.getByLabel('名称',{exact:true}).fill('隔离语音验收');await dialog.getByLabel('服务地址（URL）',{exact:true}).fill(base);await dialog.getByLabel('API 密钥',{exact:true}).fill(key);await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(dialog.getByText('已保存。')).toBeVisible();await dialog.getByRole('button',{name:'关闭',exact:true}).click();await expect(dialog).toHaveCount(0);
  const devices=await invoke(page,'speech_devices');report.microphoneCount=devices.length;expect(devices.some(d=>d.isDefault)).toBe(true);
@@ -172,6 +179,8 @@ try{
  await stop(page);page=await start(4);const doubaoReopened=(await readModels(page)).configs[0];expect(doubaoReopened.protocol).toBe('doubao-asr-streaming');expect(doubaoReopened.credentialStatus).toBe('present');expect((await invoke(page,'history_detail',{id:doubaoRecord.id})).audio.status).toBe('ready');
  report.checks.push('Doubao selection, credential and history survive a real process restart');
  mode='normal';
+ report.componentStatus=await invoke(page,'text_service_status');
+ expect(report.componentStatus,'Installed component must match this build; update through the normal app before testing.').toMatchObject({installed:true,enabled:true,payloadAvailable:true,updateAvailable:false,error:null});
  const keys=await invoke(page,'shortcut_status');expect(keys.active.binding).toBe('AltRight');
  const captureToken=randomUUID();const capturingKeys=await invoke(page,'shortcut_capture',{begin:true,token:captureToken});expect(capturingKeys.captureToken).toBe(captureToken);expect(capturingKeys.capturing).toBe(true);expect(capturingKeys.sequence).toBeGreaterThan(keys.sequence);
  const stoppedCapture=await invoke(page,'shortcut_capture',{begin:false});expect(stoppedCapture.captureToken).toBe(captureToken);expect(stoppedCapture.capturing).toBe(false);expect(stoppedCapture.sequence).toBeGreaterThan(capturingKeys.sequence);
@@ -179,10 +188,11 @@ try{
  const savedKeys=await invoke(page,'shortcut_save',{config:{...keys.saved,binding:'Control+Shift+F10',mode:'hold'}});expect(savedKeys.active.mode).toBe('hold');
  overlay=await overlayPage();
  for(const command of ['shortcut_status','shortcut_save','history_delivery'])expect((await rejected(overlay,command,command==='history_delivery'?{id:doubaoRecord.id}:command==='shortcut_save'?{config:savedKeys.saved}:{})).code).toBe('forbidden');
+ if(process.env.SAYWEAVE_INPUT_TARGET_GROUP!=='browser'){
  const editor=await ownedEditor();try{
   expect((await editor.command({action:'focus',text:'before tail',start:7,end:11})).foreground).toBe(true);
   await invoke(page,'runtime_window',{surface:'overlay',action:'show'});mode='delayed-final';
-  const result=await externalRound(page,async()=>{await expect.poll(async()=>(await editor.command({action:'read'})).text,{timeout:5000}).toBe('before 正在识别');const before=await editor.command({action:'read'});expect(before.foreground).toBe(true);await invoke(page,'shortcut_capture',{begin:false});await invoke(page,'shortcut_capture',{begin:false});await delay(180);const after=await editor.command({action:'read'});report.externalFocus={beforeProcess:before.foregroundProcess,afterProcess:after.foregroundProcess,applicationProcess:app.pid};report.streamingInput={beforeFinishActualText:true,clipboardUsed:false,taskId:(await invoke(page,'dictation_snapshot')).taskId};expect(after.foreground).toBe(true);},async()=>{report.nativeEndClick=await nativeOverlayClick(overlay,editor,'结束录音');});
+  const result=await externalRound(page,async()=>{await expect.poll(async()=>(await editor.command({action:'read'})).text,{timeout:5000}).toBe('before 正在识别');const before=await editor.command({action:'read'});expect(before.foreground).toBe(true);await invoke(page,'shortcut_capture',{begin:false});await invoke(page,'shortcut_capture',{begin:false});await delay(180);const after=await editor.command({action:'read'});report.externalFocus={beforeProcess:before.foregroundProcess,afterProcess:after.foregroundProcess,applicationProcess:app.pid};const taskId=(await invoke(page,'dictation_snapshot')).taskId;const updates=report.taskTrace.filter(e=>e.line.includes('task_id='+taskId+' ')&&e.line.includes('action=Update applied=true')).length;expect(updates).toBeGreaterThanOrEqual(2);report.streamingInput={beforeFinishActualText:true,acknowledgedUpdatesBeforeFinish:updates,clipboardUsed:false,taskId};expect(after.foreground).toBe(true);},async()=>{report.nativeEndClick=await nativeOverlayClick(overlay,editor,'结束录音');});
   report.externalEdit=result.dictation.delivery;expect(result.dictation.delivery.state).toBe('confirmed');expect((await rejected(page,'dictation_copy',{taskId:'stale-task',presentationId:randomUUID()})).code).toBe('staleSession');expect((await editor.command({action:'read'})).text).toBe('before 原生受控识别完成。');
   expect(result.dictation.presentation).toBe('completed');await expect(overlay.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);await expect.poll(async()=>(await invoke(page,'runtime_snapshot')).windows.overlay,{timeout:2500}).toBe(false);expect((await invoke(page,'dictation_snapshot')).presentation).toBe('idle');mode='normal';
   expect((await rejected(page,'speech_retry_current',{taskId:'stale-displayed-task'})).code).toBe('staleSession');
@@ -207,7 +217,7 @@ try{
    expect((await legacy.command({action:'read'})).text,'Plain EDIT compatibility must actually receive its final text: '+JSON.stringify(legacyResult.dictation.delivery)).toBe('legacy 原生受控识别完成。');
    expect(legacyResult.dictation.delivery.submission).toBe('submitted');
    report.plainEditCompatibility=legacyResult.dictation.delivery;
-  }finally{await legacy.close();}
+  }catch(error){report.compatibilityFailures??=[];report.compatibilityFailures.push({control:'Win32 EDIT',error:String(error)});}finally{await legacy.close();}
   const other=await ownedEditor();
   try{
    await editor.command({action:'focus',text:'protected',start:9,end:9});
@@ -224,7 +234,7 @@ try{
   expect((await editor.command({action:'read'})).text).toBe('protected正在识别');
   await invoke(page,'dictation_dismiss',{taskId:mainSwitch.dictation.taskId,presentationId:mainSwitch.dictation.presentationId});report.mainSwitchBack=mainSwitch.dictation.delivery;
   await editor.command({action:'focus',text:'protected',start:9,end:9});
-  const caret=await externalRound(page,async()=>{await expect.poll(async()=>(await editor.command({action:'read'})).text).toBe('protected正在识别');await editor.command({action:'selection',start:0,end:0});},undefined,true);
+  const caret=await externalRound(page,async()=>{await expect.poll(async()=>(await editor.command({action:'read'})).text).toBe('protected正在识别');report.caretSelection=await editor.command({action:'caret-home'});expect(report.caretSelection.start).toBe(0);expect(report.caretSelection.end).toBe(0);},undefined,true);
   expect(caret.dictation.delivery.state).not.toBe('confirmed');
   expect((await editor.command({action:'read'})).text).toBe('protected正在识别');
   await invoke(page,'dictation_dismiss',{taskId:caret.dictation.taskId,presentationId:caret.dictation.presentationId});report.caretChange=caret.dictation.delivery;
@@ -233,26 +243,36 @@ try{
   expect(changed.dictation.delivery.state).not.toBe('confirmed');await invoke(page,'dictation_dismiss',{taskId:changed.dictation.taskId,presentationId:changed.dictation.presentationId});expect((await editor.command({action:'read'})).text).toBe('user changed');
   report.checks.push('ASR partial enters actual native selection before finish; real Win32 mouse end click updates one range with final Unicode/multiline/emoji and retains foreground; external/main switches preserve handed-off visible text without further writes after switching back; programmatic target edits retain user text; delayed provider tail waits and overlay hides; journal and overlay permissions verified');
  }finally{await editor.close();}
+ }
  const targetBrowser=await chromium.launch({headless:false,args:['--force-renderer-accessibility']});
  const focusHelper=await ownedEditor();
  try{const session=await targetBrowser.newBrowserCDPSession();const process=(await session.send('SystemInfo.getProcessInfo')).processInfo.find(p=>p.type==='browser').id;await session.detach();const target=await targetBrowser.newPage();await target.setContent('<input id="input"/><textarea id="area"></textarea><div id="editable" contenteditable="true"></div><textarea id="readonly" readonly></textarea><input id="password" type="password"/><div id="mixed" contenteditable="true"></div><div id="body" tabindex="0"></div>');
   report.inputCompatibility=[];
   for(const id of ['input','area','editable','readonly','password','mixed','body']){const nonce='fixture-'+randomUUID(),original=id==='mixed'?nonce+' fixed':nonce;await target.locator('#'+id).evaluate((node,nonce)=>{if('value'in node)node.value=nonce;else if(node.id==='mixed')node.innerHTML=nonce+'<span contenteditable="false"> fixed</span>';else node.textContent=nonce;},nonce);await target.bringToFront();await target.locator('#'+id).focus();await target.locator('#'+id).evaluate(node=>{if(node instanceof HTMLInputElement||node instanceof HTMLTextAreaElement)node.setSelectionRange(node.value.length,node.value.length);else{const selection=getSelection(),range=document.createRange();if(node.id==='mixed'){range.setStart(node.firstChild,node.firstChild.textContent.length);range.collapse(true);}else{range.selectNodeContents(node);range.collapse(false);}selection.removeAllRanges();selection.addRange(range);}});
-   expect((await focusHelper.command({action:'focus-process',process})).foregroundProcess).toBe(process);await delay(200);const result=await externalRound(page,async()=>delay(150),['input','area','editable','mixed'].includes(id)?async()=>nativeOverlayClick(overlay,focusHelper,'结束录音'):undefined);const actual=await target.locator('#'+id).evaluate(node=>'value'in node?node.value:node.textContent);
+   expect((await focusHelper.command({action:'focus-process',process})).foregroundProcess).toBe(process);await delay(200);
+   if(['readonly','password'].includes(id)) {
+    const connections=report.connections.length,total=(await invoke(page,'history_browse',{query:{search:'',cursor:null}})).total;
+    const failure=await rejected(page,'dictation_start');const expectedError=id==='password'?'targetPassword':'targetReadonly';if(failure.code!==expectedError){report.compatibilityFailures??=[];report.compatibilityFailures.push({control:id,error:failure.code,expectedError});}
+    const rejectedView=await invoke(page,'dictation_snapshot');expect(rejectedView.admission).toBe('rejected');expect(rejectedView.inputRoute).toBe('live');expect(rejectedView.delivery).toBeNull();
+    expect(report.connections.length).toBe(connections);expect((await invoke(page,'history_browse',{query:{search:'',cursor:null}})).total).toBe(total);expect((await invoke(page,'speech_snapshot')).recordId).toBeNull();
+    expect(await target.locator('#'+id).inputValue()).toBe(original);await invoke(page,'dictation_dismiss',{taskId:rejectedView.taskId,presentationId:rejectedView.presentationId});report.inputCompatibility.push({app:'Chromium',control:id,admission:'rejected',error:failure.code,noRecording:true});continue;
+   }
+   const result=await externalRound(page,async()=>delay(150),['input','area','editable','mixed'].includes(id)?async()=>nativeOverlayClick(overlay,focusHelper,'结束录音'):undefined);const actual=await target.locator('#'+id).evaluate(node=>'value'in node?node.value:node.textContent);
    const expected=id==='mixed'?nonce+'原生受控识别完成。 fixed':original+'原生受控识别完成。';if(['readonly','password','body'].includes(id)){expect(result.dictation.delivery.submission).toBe('notSubmitted');expect(actual).toBe(original);}else{expect(actual,'Writable '+id+' must actually receive text: '+JSON.stringify(result.dictation.delivery)).toBe(expected);expect(result.dictation.delivery.submission).toBe('submitted');}
    if(result.dictation.delivery.state==='confirmed'||result.dictation.delivery.state==='unconfirmed')expect(result.dictation.presentation).not.toBe('result');
    if(result.dictation.presentation==='result'){await expect(overlay.getByRole('button',{name:'复制',exact:true})).toBeVisible();await expect(overlay.getByRole('button',{name:'关闭',exact:true})).toBeVisible();}
    if(result.dictation.presentationId)await invoke(page,'dictation_dismiss',{taskId:result.dictation.taskId,presentationId:result.dictation.presentationId});
    report.inputCompatibility.push({app:'Chromium',control:id,presentation:result.dictation.presentation,delivery:result.dictation.delivery.state,error:result.dictation.delivery.error,observedWrite:actual===expected});
   }
- // Repeated bounded context is not enough to prove either location or a successful paste.
+ // A changed caret hands off already visible text; the final snapshot cannot overwrite it.
   await target.bringToFront();await target.locator('#area').evaluate(node=>{node.value='a'.repeat(6000);node.focus();node.setSelectionRange(3000,3000);});
   await focusHelper.command({action:'focus-process',process});await delay(100);
-  const moved=await externalRound(page,async()=>{await target.locator('#area').evaluate(node=>node.setSelectionRange(3500,3500));await delay(100);});
-  expect(moved.dictation.delivery.submission).toBe('notSubmitted');expect(moved.dictation.delivery.error).toBe('targetChanged');expect(await target.locator('#area').inputValue()).toBe('a'.repeat(6000));
+  const partialLong='a'.repeat(3000)+'正在识别'+'a'.repeat(3000);
+  const moved=await externalRound(page,async()=>{await expect.poll(()=>target.locator('#area').inputValue()).toBe(partialLong);const selection=await target.locator('#area').evaluate(node=>{node.setSelectionRange(3500,3500);return [node.selectionStart,node.selectionEnd];});expect(selection).toEqual([3500,3500]);await delay(100);},undefined,true);
+  const movedText=await target.locator('#area').inputValue();report.programmaticCaret={selection:[3500,3500],partialRetained:movedText===partialLong,delivery:moved.dictation.delivery};if(moved.dictation.delivery.state==='confirmed'||movedText!==partialLong){report.compatibilityFailures??=[];report.compatibilityFailures.push({control:'long textarea programmatic selection',error:'late draft update after DOM caret move'});}
   await invoke(page,'dictation_dismiss',{taskId:moved.dictation.taskId,presentationId:moved.dictation.presentationId});
   mode='single-a';await target.locator('#area').evaluate(node=>{node.value='a'.repeat(3000);node.maxLength=3000;node.focus();node.setSelectionRange(3000,3000);});await focusHelper.command({action:'focus-process',process});await delay(100);
-  const refused=await externalRound(page,async()=>delay(100));expect(await target.locator('#area').inputValue()).toBe('a'.repeat(3000));expect(refused.dictation.delivery.submission).toBe('submitted');expect(refused.dictation.delivery.state).toBe('unconfirmed');expect(refused.dictation.delivery.verification).not.toBe('confirmed');
+  const refused=await externalRound(page,async()=>delay(100),undefined,true);const refusedText=await target.locator('#area').inputValue();report.maxLength={unchanged:refusedText==='a'.repeat(3000),delivery:refused.dictation.delivery};if(refusedText!=='a'.repeat(3000)||refused.dictation.delivery.state==='confirmed'){report.compatibilityFailures??=[];report.compatibilityFailures.push({control:'maxlength textarea',error:'composition constraint or confirmation mismatch'});}
   report.inputProtection={moved:moved.dictation.delivery,refused:refused.dictation.delivery};
   await invoke(page,'dictation_dismiss',{taskId:refused.dictation.taskId,presentationId:refused.dictation.presentationId});mode='normal';
  const bundle=await buildFixture({configFile:false,logLevel:'error',build:{write:false,lib:{entry:path.join(root,'tests/fixtures/input-target.ts'),name:'InputFixture',formats:['iife']}}});
@@ -306,7 +326,7 @@ for(const r of (await invoke(page,'history_list',{query:{search:'',page:1}})).re
  await page.getByRole('listitem').first().getByRole('button',{name:'收起记录'}).click();await page.getByRole('button',{name:'保存设置',exact:true}).click();await expect(page.getByRole('combobox',{name:'录音保留时间'})).toBeVisible();await page.screenshot({path:path.join(directory,'history-minimum-settings.png')});expect(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth)).toBe(false);await page.getByRole('button',{name:'保存设置',exact:true}).first().click();
  await invoke(page,'acceptance_main_size',{minimum:false});
  report.checks.push('10k native summaries through IPC;1000 rows continuously loaded; cached reading restored by real routes');
- await stop(page);expect(readFileSync(path.join(data,'dictionary.sqlite')).includes(Buffer.from(key))).toBe(false);for(let round=1;round<=5;round++)for(const suffix of ['.log','-errors.log'])expect(readFileSync(path.join(directory,'round-'+round+suffix),'utf8')).not.toContain(key);report.passed=true;
+ await stop(page);expect(readFileSync(path.join(data,'dictionary.sqlite')).includes(Buffer.from(key))).toBe(false);for(let round=1;round<=5;round++)for(const suffix of ['.log','-errors.log'])expect(readFileSync(path.join(directory,'round-'+round+suffix),'utf8')).not.toContain(key);if(report.compatibilityFailures?.length)throw Error('Actual input compatibility failures remain; see compatibilityFailures.');report.passed=true;
 }catch(e){report.error=String(e).replaceAll(key,'[redacted]');report.errorStack=e.stack?.replaceAll(key,'[redacted]');if(browser){const main=browser.contexts().flatMap(c=>c.pages()).find(p=>!p.url().includes('surface=overlay'));if(main){await main.screenshot({path:path.join(directory,'failure.png')}).catch(()=>{});report.failureDialogs=await main.getByRole('dialog').count().catch(()=>null);const speech=await invoke(main,'speech_snapshot').catch(()=>null);report.failureSpeechPhase=speech?.phase??null;report.failureSpeechError=speech?.error??null;}}process.exitCode=1;}finally{
  if(browser){const page=browser.contexts().flatMap(c=>c.pages()).find(p=>!p.url().includes('surface=overlay'));await stop(page).catch(()=>stop(null,false));}else await stop(null,false);for(const socket of sockets)socket.destroy();if(server)await new Promise(r=>server.close(r));
  try{await command(['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_cleanup','--','--ignored']);report.credentialCleanup=true;}catch{report.credentialCleanup=false;report.passed=false;process.exitCode=1;}

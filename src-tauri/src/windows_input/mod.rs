@@ -49,8 +49,6 @@ pub enum Verification {
     NotAttempted,
     Confirmed,
     Unavailable,
-    Mismatch,
-    Timeout,
 }
 impl Delivery {
     pub fn not_submitted(code: &str) -> Self {
@@ -75,7 +73,8 @@ pub(crate) fn draft_rejection(result: &Result<(), Error>) -> Option<String> {
         .filter(|e| {
             matches!(
                 e.code.as_str(),
-                "targetPassword"
+                "targetSafetyUnknown"
+                    | "targetPassword"
                     | "targetReadonly"
                     | "targetPermission"
                     | "inputComposition"
@@ -111,9 +110,6 @@ impl DeliveryGate {
             .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
-    pub fn committed(&self) -> bool {
-        self.0.load(Ordering::Acquire) == 2
-    }
 }
 pub(crate) fn observe_pointer(window: usize, event_tick: u32) {
     #[cfg(windows)]
@@ -130,13 +126,11 @@ fn event_after_capture(event_tick: u32, captured_tick: u32) -> bool {
 }
 enum Request {
     Capture(String, Anchor, oneshot::Sender<Result<(), Error>>),
-    Deliver(String, String, Arc<DeliveryGate>, oneshot::Sender<Delivery>),
     Copy(
         String,
         Option<Arc<DeliveryGate>>,
         oneshot::Sender<Result<(), Error>>,
     ),
-    Restore(oneshot::Sender<Result<(), Error>>),
     Forget(String),
     Stop,
 }
@@ -193,14 +187,8 @@ impl WindowsInputService {
                         Request::Capture(_, _, r) => {
                             let _ = r.send(Err(Error::new("targetUnsupported")));
                         }
-                        Request::Deliver(_, _, _, r) => {
-                            let _ = r.send(Delivery::not_submitted("targetUnsupported"));
-                        }
                         Request::Copy(_, _, r) => {
                             let _ = r.send(Err(Error::new("copyFailed")));
-                        }
-                        Request::Restore(r) => {
-                            let _ = r.send(Ok(()));
                         }
                         Request::Stop => break,
                         Request::Forget(_) => {}
@@ -266,24 +254,6 @@ impl WindowsInputService {
         self.send(Request::Capture(id, anchor, tx))?;
         rx.await.map_err(|_| Error::new("targetProbeFailed"))?
     }
-    pub async fn deliver(&self, id: String, text: String, cancel: Arc<DeliveryGate>) -> Delivery {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .send(Request::Deliver(id, text, cancel.clone(), tx))
-            .is_err()
-        {
-            return Delivery::not_submitted("busy");
-        }
-        rx.await.unwrap_or_else(|_| {
-            let mut result = Delivery::not_submitted("inputWorkerLost");
-            result.stage = "worker".into();
-            if cancel.committed() {
-                result.submission = Submission::Uncertain;
-                result.state = "unconfirmed".into();
-            }
-            result
-        })
-    }
     pub async fn copy(&self, text: String) -> Result<(), Error> {
         if text.len() > 1024 * 1024 {
             return Err(Error::new("invalid"));
@@ -304,11 +274,6 @@ impl WindowsInputService {
         #[cfg(windows)]
         native::release_watch(&id);
         let _ = self.send(Request::Forget(id));
-    }
-    pub async fn restore(&self) -> Result<(), Error> {
-        let (tx, rx) = oneshot::channel();
-        self.send(Request::Restore(tx))?;
-        rx.await.map_err(|_| Error::new("clipboardRestore"))?
     }
     pub fn shutdown(&self) {
         let _guard = self.admission.lock().ok();
@@ -334,55 +299,9 @@ impl Default for WindowsInputService {
     }
 }
 
-pub(crate) fn normalize(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
-}
-pub(crate) fn expected_text(before: &str, start: usize, end: usize, text: &str) -> Option<String> {
-    let mut units: Vec<u16> = before.encode_utf16().collect();
-    if start > end || end > units.len() {
-        return None;
-    }
-    let insert: Vec<u16> = text.encode_utf16().collect();
-    units.splice(start..end, insert);
-    String::from_utf16(&units).ok().map(|s| normalize(&s))
-}
-pub(crate) fn insertion_prefix(before: &str, start: usize, text: &str) -> Option<String> {
-    let units: Vec<u16> = before.encode_utf16().collect();
-    let mut prefix = units.get(..start)?.to_vec();
-    prefix.extend(text.encode_utf16());
-    String::from_utf16(&prefix).ok().map(|s| normalize(&s))
-}
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn selection_semantics() {
-        assert_eq!(expected_text("abc", 1, 2, "中文"), Some("a中文c".into()));
-        assert_eq!(expected_text("a😀b", 3, 3, "\nZ"), Some("a😀\nZb".into()));
-        assert_eq!(expected_text("a😀b", 2, 2, "Z"), None);
-        assert_eq!(expected_text("a😀b", 1, 3, "好"), Some("a好b".into()));
-        assert_eq!(
-            expected_text("a\r\nb", 4, 4, "\r\nc"),
-            Some("a\nb\nc".into())
-        );
-        assert_eq!(expected_text("abc", 0, 3, "abc"), Some("abc".into()));
-    }
-    #[test]
-    fn readback_caret_uses_actual_newline_representation_and_utf16_boundaries() {
-        assert_eq!(
-            insertion_prefix("a😀b", 3, "中文，\n🙂"),
-            Some("a😀中文，\n🙂".into())
-        );
-        assert_eq!(
-            insertion_prefix("a😀中文，\r\n🙂b", 10, ""),
-            Some("a😀中文，\n🙂".into())
-        );
-        assert_eq!(insertion_prefix("a😀b", 2, ""), None);
-        assert_ne!(
-            insertion_prefix("a😀中文，\r\n🙂b", 11, ""),
-            Some("a😀中文，\n🙂".into())
-        );
-    }
     #[test]
     fn delayed_events_before_capture_do_not_invalidate_a_new_target() {
         assert!(!event_after_capture(99, 100));

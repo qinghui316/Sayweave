@@ -385,7 +385,7 @@ fn lease(
         if !view.0.is_null() && GetAncestor(view, GA_ROOT) != GetForegroundWindow() {
             return Err(failure(TF_E_DISCONNECTED));
         }
-        if context.GetStatus()?.dwStaticFlags & TF_SD_READONLY != 0 {
+        if context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0 {
             return Err(failure(TF_E_READONLY));
         }
         // COM providers may reenter the apartment. Recheck after the last COM call.

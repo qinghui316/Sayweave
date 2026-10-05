@@ -11,13 +11,14 @@ class NativeShortcuts implements ShortcutConfigPort {
  async subscribe(callback:(s:ShortcutStatus)=>void){return listen<unknown>('shortcut:status',e=>callback(parseShortcut(e.payload)));}
 }
 class NativeDictation implements DictationPort {
+ async onSettings(callback:()=>void){return listen('dictation:settings',callback);}
+ async settings(taskId:string,presentationId:string){await invoke('dictation_settings',{taskId,presentationId});}
  async snapshot(){return parseDictation(await invoke('dictation_snapshot'));}
  async subscribe(callback:(s:DictationSnapshot)=>void){return listen<unknown>('dictation:snapshot',e=>callback(parseDictation(e.payload)));}
  async start(){return parseSpeech(await invoke('dictation_start'));}
  async control(taskId:string,action:'finish'|'cancel'){await invoke('dictation_control',{taskId,action});}
  async copy(taskId:string,presentationId:string){await invoke('dictation_copy',{taskId,presentationId});}
  async dismiss(taskId:string,presentationId:string){await invoke('dictation_dismiss',{taskId,presentationId});}
- async restoreClipboard(){await invoke('dictation_restore');}
 }
 export class BrowserShortcuts implements ShortcutConfigPort {
  readonly mode='simulation' as const;
