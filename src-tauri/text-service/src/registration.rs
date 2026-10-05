@@ -13,7 +13,6 @@ pub const PROFILE: GUID = GUID::from_u128(0x6cd26440_e770_471e_8212_b5a565e816f5
 const COM_ROOT: &str = "Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}";
 const COM_PATH: &str =
     "Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}\\InprocServer32";
-const CONTROL: &str = "Software\\Sayweave\\TextService\\Probe";
 const OWNER: &str = "SayweaveStageA-v1";
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
@@ -59,28 +58,36 @@ fn string(k: &Key, name: &str, value: &str) -> windows::core::Result<()> {
 }
 /// A live lease serializes probes and cannot clear a newer host on drop.
 pub struct HostLease {
-    pid: u32,
-    capability: String,
+    publication: Option<crate::host_identity::Publication>,
     mutex: HANDLE,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
 }
+thread_local! { static HOST_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 impl Drop for HostLease {
     fn drop(&mut self) {
         unsafe {
-            if read_host() == Some((self.pid, self.capability.clone())) {
-                let _ = RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(wide(CONTROL).as_ptr()));
-            }
+            drop(self.publication.take());
             let _ = ReleaseMutex(self.mutex);
             let _ = CloseHandle(self.mutex);
+            HOST_HELD.set(false);
         }
     }
 }
 pub fn host_capability(pid: u32, capability: &str) -> windows::core::Result<HostLease> {
     unsafe {
+        if HOST_HELD.get() {
+            return Err(windows::core::Error::new(
+                E_ACCESSDENIED,
+                "hostAlreadyActive",
+            ));
+        }
         let name = wide(&format!(
             "Local\\Sayweave.TSF.Host.{}",
             crate::transport::current_user_sid()?
         ));
-        let mutex = CreateMutexW(None, false, PCWSTR(name.as_ptr()))?;
+        let security = crate::host_identity::UserSecurity::new()?;
+        let attributes = security.attributes();
+        let mutex = CreateMutexW(Some(&attributes), false, PCWSTR(name.as_ptr()))?;
         if !matches!(
             WaitForSingleObject(mutex, 0),
             WAIT_OBJECT_0 | WAIT_ABANDONED
@@ -91,36 +98,18 @@ pub fn host_capability(pid: u32, capability: &str) -> windows::core::Result<Host
                 "hostAlreadyActive",
             ));
         }
-        let lease = HostLease {
-            pid,
-            capability: capability.into(),
+        HOST_HELD.set(true);
+        let mut lease = HostLease {
+            publication: None,
             mutex,
+            _thread: std::marker::PhantomData,
         };
-        let k = key(HKEY_CURRENT_USER, CONTROL)?;
-        let value = serde_json::to_vec(&(pid, capability))
-            .map_err(|_| windows::core::Error::from_hresult(E_INVALIDARG))?;
-        RegSetValueExW(k.0, w!("Host"), Some(0), REG_BINARY, Some(&value)).ok()?;
+        lease.publication = Some(crate::host_identity::Publication::new(pid, capability)?);
         Ok(lease)
     }
 }
 pub fn read_host() -> Option<(u32, String)> {
-    unsafe {
-        let mut data = [0u8; 128];
-        let mut size = data.len() as u32;
-        RegGetValueW(
-            HKEY_CURRENT_USER,
-            PCWSTR(wide(CONTROL).as_ptr()),
-            w!("Host"),
-            RRF_RT_REG_BINARY,
-            None,
-            Some(data.as_mut_ptr().cast()),
-            Some(&mut size),
-        )
-        .ok()
-        .ok()?;
-        let value: (u32, String) = serde_json::from_slice(&data[..size as usize]).ok()?;
-        (value.0 != 0 && uuid::Uuid::parse_str(&value.1).is_ok()).then_some(value)
-    }
+    crate::host_identity::read()
 }
 pub fn profiles() -> windows::core::Result<ITfInputProcessorProfiles> {
     unsafe { CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER) }

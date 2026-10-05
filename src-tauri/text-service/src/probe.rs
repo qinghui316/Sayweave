@@ -64,6 +64,39 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let args: Vec<_> = std::env::args().collect();
         match args.get(1).map(String::as_str) {
             #[cfg(feature = "acceptance")]
+            Some("host-identity-hold") => {
+                let capability = uuid::Uuid::new_v4().to_string();
+                let host = registration::host_capability(std::process::id(), &capability)?;
+                if registration::host_capability(std::process::id(), &capability).is_ok()
+                    || registration::read_host() != Some((std::process::id(), capability))
+                {
+                    return Err("host identity/reentry guard failed".into());
+                }
+                println!("host_identity_ready pid={}", std::process::id());
+                pump(Duration::from_secs(20));
+                drop(host);
+                if registration::read_host().is_some() {
+                    return Err("released host identity remained visible".into());
+                }
+                println!("host_identity_cleanup=true");
+            }
+            #[cfg(feature = "acceptance")]
+            Some("host-identity-absent") => {
+                if registration::read_host().is_some() {
+                    return Err("inactive host identity remained visible".into());
+                }
+                println!("host_identity_absent=true");
+            }
+            #[cfg(feature = "acceptance")]
+            Some("host-identity-read") => {
+                let expected: u32 = args.get(2).ok_or("expected PID required")?.parse()?;
+                let actual = registration::read_host().map(|p| p.0);
+                println!("host_identity_match={}", actual == Some(expected));
+                if actual != Some(expected) {
+                    return Err("host identity was not visible in reader context".into());
+                }
+            }
+            #[cfg(feature = "acceptance")]
             Some("fixture") => fixture()?,
             Some("register") => {
                 let path = std::fs::canonicalize(args.get(2).ok_or("DLL path required")?)?;

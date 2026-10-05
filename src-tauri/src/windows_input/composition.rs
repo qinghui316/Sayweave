@@ -291,14 +291,20 @@ impl Host {
         }
         self.pipe
             .send(&serde_json::to_vec(&request).map_err(|_| Error::new("compositionProtocol"))?)
-            .map_err(|_| Error::new("compositionDisconnected"))?;
+            .map_err(|error| {
+                log::info!(target:"sayweave", "operation=draft_transport task_id={} turn={} action={:?} phase=send hresult={:08x}", self.task,self.turn,action,error.code().0 as u32);
+                Error::new("compositionDisconnected")
+            })?;
         let at = Instant::now();
         loop {
             pump();
             if let Some(frame) = self
                 .pipe
                 .receive()
-                .map_err(|_| Error::new("compositionDisconnected"))?
+                .map_err(|error| {
+                    log::info!(target:"sayweave", "operation=draft_transport task_id={} turn={} action={:?} phase=receive hresult={:08x}", self.task,self.turn,action,error.code().0 as u32);
+                    Error::new("compositionDisconnected")
+                })?
             {
                 let reply: Reply = serde_json::from_slice(&frame)
                     .map_err(|_| Error::new("compositionProtocol"))?;

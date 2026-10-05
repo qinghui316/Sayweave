@@ -19,7 +19,14 @@ pub struct Identity {
 }
 pub fn identity(pid: u32) -> windows::core::Result<Identity> {
     unsafe {
-        let handle = Pipe(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)?);
+        let handle = Pipe(OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )?);
+        if WaitForSingleObject(handle.0, 0) != WAIT_TIMEOUT {
+            return Err(windows::core::Error::from_hresult(E_ACCESSDENIED));
+        }
         let (mut created, mut exited, mut kernel, mut user) = (
             FILETIME::default(),
             FILETIME::default(),
@@ -27,6 +34,9 @@ pub fn identity(pid: u32) -> windows::core::Result<Identity> {
             FILETIME::default(),
         );
         GetProcessTimes(handle.0, &mut created, &mut exited, &mut kernel, &mut user)?;
+        if WaitForSingleObject(handle.0, 0) != WAIT_TIMEOUT {
+            return Err(windows::core::Error::from_hresult(E_ACCESSDENIED));
+        }
         Ok(Identity {
             pid,
             session: session(pid)?,
@@ -216,5 +226,26 @@ impl Pipe {
         } else {
             Err(windows::core::Error::from_hresult(E_FAIL))
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::process::CommandExt;
+    #[test]
+    fn retained_process_handle_does_not_make_a_terminated_host_live() {
+        let mut child = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(identity(pid).is_ok());
+        let held =
+            unsafe { Pipe(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).unwrap()) };
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(identity(pid).is_err());
+        drop(held);
     }
 }
