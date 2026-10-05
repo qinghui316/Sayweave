@@ -606,6 +606,10 @@ pub(super) fn backup() -> Result<Vec<(u32, Vec<u8>)>, Error> {
             format("CanIncludeInClipboardHistory"),
             format("CanUploadToCloudClipboard"),
             format("ExcludeClipboardContentFromMonitorProcessing"),
+            // Chromium text/HTML copies carry opaque source metadata in global memory.
+            // Preserve the complete payload without interpreting or reporting its content.
+            format("Chromium internal source URL"),
+            format("Chromium internal source RFH token"),
         ];
         loop {
             budget()?;

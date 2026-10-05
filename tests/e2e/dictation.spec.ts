@@ -40,6 +40,11 @@ test('device and shortcut controls fit both window sizes with shared styles and 
   await page.setViewportSize({width,height});
   const device=dialog.getByRole('combobox',{name:'录音设备'});
   await expect(device).toBeVisible();await device.click();await expect(page.getByRole('option',{name:'系统默认麦克风',exact:true})).toBeVisible();await page.keyboard.press('Escape');
+  const keyField=dialog.getByRole('button',{name:'更改快捷键'});await keyField.focus();await page.keyboard.press('Enter');
+  await expect(keyField).toHaveAttribute('aria-pressed','true');await expect(keyField).toHaveText('按下快捷键…');
+  await expect(dialog.getByRole('button',{name:'取消录入'})).toBeVisible();await expect(dialog.getByRole('button',{name:'保存快捷键'})).toBeDisabled();
+  await dialog.getByRole('button',{name:'取消录入'}).click();await expect(keyField).toHaveAttribute('aria-pressed','false');await expect(keyField).toHaveText('右 Alt');
+  await keyField.click();await expect(keyField).toHaveAttribute('aria-pressed','true');await dialog.getByRole('heading',{name:'麦克风',exact:true}).click();await expect(keyField).toHaveAttribute('aria-pressed','false');
   const chosen=width===1120?'按住':'点按';await dialog.getByRole('tab',{name:chosen,exact:true}).click();await expect(dialog.getByRole('tab',{name:chosen,exact:true})).toHaveAttribute('aria-selected','true');
   await expect(dialog.getByText(chosen==='按住'?'按下开始，松开结束。':'按一下开始，再按一下结束。')).toBeVisible();
   for(const control of [device,dialog.getByRole('button',{name:'更改快捷键'}),dialog.getByRole('tab',{name:'点按',exact:true}),dialog.getByRole('tab',{name:'按住',exact:true}),dialog.getByRole('button',{name:'保存快捷键'})]){

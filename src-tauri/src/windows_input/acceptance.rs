@@ -124,6 +124,14 @@ pub(super) fn run(exe: &std::path::Path) -> Result<(), String> {
             (format("HTML Format"), b"Version:1.0\r\nfragment\0".to_vec()),
             (format("Rich Text Format"), b"{\\rtf1 retained}\0".to_vec()),
             (
+                format("Chromium internal source URL"),
+                b"https://fixture.invalid/clipboard\0".to_vec(),
+            ),
+            (
+                format("Chromium internal source RFH token"),
+                vec![0, 255, 11, 38, 42, 9, 0, 17, 128, 3, 7, 99, 0, 4, 8, 12],
+            ),
+            (
                 format("PNG"),
                 vec![
                     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0,
@@ -286,6 +294,40 @@ pub(super) fn run(exe: &std::path::Path) -> Result<(), String> {
         return Err("late clipboard read delivered text".into());
     }
     println!("SAYWEAVE_INPUT_ACCEPTANCE delayed_owner_bounded_no_late_input: PASS");
+    fixture.command(serde_json::json!({"action":"focus","text":"safe","start":4,"end":4}))?;
+    let id = uuid::Uuid::new_v4().to_string();
+    runtime
+        .block_on(service.capture(
+            id.clone(),
+            WindowsInputService::anchor().ok_or("fixture target")?,
+        ))
+        .map_err(|e| e.code)?;
+    {
+        let _lock = open(owner.0 as usize).map_err(|e| e.code)?;
+        install(&[
+            (13, text_bytes("retained")),
+            (format("Sayweave.UnknownFixture"), vec![1, 2, 3, 4]),
+        ])
+        .map_err(|e| e.code)?;
+    }
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    let result = runtime.block_on(service.deliver(
+        id,
+        "never pasted".into(),
+        Arc::new(DeliveryGate::default()),
+    ));
+    if result.state != "copy"
+        || result.error.as_deref() != Some("clipboardUnsupported")
+        || unsafe { GetClipboardSequenceNumber() } != sequence
+        || fixture.command(serde_json::json!({"action":"read"}))?["text"] != "safe"
+    {
+        return Err("unknown clipboard format was changed or delivered".into());
+    }
+    {
+        let _lock = open(owner.0 as usize).map_err(|e| e.code)?;
+        install(&[(13, text_bytes("retained"))]).map_err(|e| e.code)?;
+    }
+    println!("SAYWEAVE_INPUT_ACCEPTANCE unknown_format_preserved_no_input: PASS");
     fixture.command(serde_json::json!({"action":"focus","text":"unchanged","start":9,"end":9}))?;
     let id = uuid::Uuid::new_v4().to_string();
     runtime

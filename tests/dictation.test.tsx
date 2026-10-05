@@ -25,21 +25,21 @@ describe('shortcut settings',()=>{
   const unrelated={...await base.status(),captureToken:crypto.randomUUID(),capturedBinding:'Control+KeyX'};
   await user.click(screen.getByRole('button',{name:'更改快捷键'}));
   await act(async()=>{resolveRead(unrelated);});
-  expect(screen.queryByText('Ctrl + X')).not.toBeInTheDocument();expect(screen.getByRole('button',{name:'保存快捷键'})).toBeDisabled();
+  expect(screen.getByRole('button',{name:'更改快捷键'})).not.toHaveTextContent('Ctrl + X');expect(screen.getByRole('button',{name:'保存快捷键'})).toBeDisabled();
   await act(async()=>{await startCapture();});fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});
-  await screen.findByText('Ctrl + D');expect(screen.getByRole('button',{name:'保存快捷键'})).toBeEnabled();
+  await waitFor(()=>expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('Ctrl + D'));expect(screen.getByRole('button',{name:'保存快捷键'})).toBeEnabled();
  });
  it('keeps a discarded captured key out of a reopened editor and can record the same key again',async()=>{
   const port=new BrowserShortcuts(),user=userEvent.setup();let guard:((action:()=>void)=>void)|null=null;const closed=vi.fn();
   const view=render(<ShortcutSettings port={port} onGuardChange={g=>{guard=g;}}/>);
   await screen.findByText('已启用：右 Alt');await user.click(screen.getByRole('button',{name:'更改快捷键'}));
-  fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});await screen.findByText('Ctrl + D');
+  fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});await waitFor(()=>expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('Ctrl + D'));
   act(()=>guard!(closed));await screen.findByRole('alertdialog',{name:'快捷键尚未保存'});
   await user.click(screen.getByRole('button',{name:'放弃修改'}));expect(closed).toHaveBeenCalledOnce();view.unmount();
   render(<ShortcutSettings port={port}/>);await screen.findByText('已启用：右 Alt');
-  expect(screen.queryByText('Ctrl + D')).not.toBeInTheDocument();expect(screen.getByRole('button',{name:'保存快捷键'})).toBeDisabled();
+  expect(screen.getByRole('button',{name:'更改快捷键'})).not.toHaveTextContent('Ctrl + D');expect(screen.getByRole('button',{name:'保存快捷键'})).toBeDisabled();
   await user.click(screen.getByRole('button',{name:'更改快捷键'}));fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});
-  await screen.findByText('Ctrl + D');expect(screen.getByRole('button',{name:'保存快捷键'})).toBeEnabled();
+  await waitFor(()=>expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('Ctrl + D'));expect(screen.getByRole('button',{name:'保存快捷键'})).toBeEnabled();
  });
  it('ignores a capture response and initial read that arrive after newer completion events',async()=>{
   const base=new BrowserShortcuts();let resolveRead!:(value:ShortcutStatus)=>void,resolveCapture!:(value:ShortcutStatus)=>void;
@@ -48,10 +48,10 @@ describe('shortcut settings',()=>{
   const user=userEvent.setup();render(<ShortcutSettings port={port}/>);
   act(()=>{void base.capture(false);});await screen.findByText('已启用：右 Alt');
   await user.click(screen.getByRole('button',{name:'更改快捷键'}));await waitFor(()=>expect(captured).toBeDefined());
-  fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});await screen.findByText('Ctrl + D');
+  fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});await waitFor(()=>expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('Ctrl + D'));
   await act(async()=>{resolveCapture(captured!);resolveRead(initial);});
   expect(screen.getByRole('button',{name:'更改快捷键'})).toBeVisible();expect(screen.getByRole('button',{name:'保存快捷键'})).toBeEnabled();
-  expect(screen.getByText('Ctrl + D')).toBeVisible();
+  expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('Ctrl + D');
  });
  it('records a key, saves its mode, and releases capture on unmount',async()=>{
   const port=new BrowserShortcuts(),capture=vi.spyOn(port,'capture');
@@ -59,7 +59,7 @@ describe('shortcut settings',()=>{
   await screen.findByText('已启用：右 Alt');
   await user.click(screen.getByRole('button',{name:'更改快捷键'}));
   fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});
-  await screen.findByText('Ctrl + D');
+  await waitFor(()=>expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('Ctrl + D'));
   await user.click(screen.getByRole('tab',{name:'按住'}));
   await user.click(screen.getByRole('button',{name:'保存快捷键'}));
   await screen.findByText('已启用：Ctrl + D');
@@ -145,4 +145,25 @@ it('dismissed preparation failures and clipboard notices remain closed when the 
  view.rerender(<VoiceSurface presentation="idle" phase={dictationPhase(dismissed,'failed',{taskId:'failed',text:''})} error="连接失败" start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
  expect(screen.queryByText('连接失败')).not.toBeInTheDocument();
  expect(screen.queryByRole('button',{name:'重新开始录音'})).not.toBeInTheDocument();
+});
+
+it('records from the key field and cancels capture on outside interaction or window blur',async()=>{
+ const port=new BrowserShortcuts(),user=userEvent.setup();render(<><ShortcutSettings port={port}/><button>其他设置</button></>);
+ await screen.findByText('已启用：右 Alt');const field=screen.getByRole('button',{name:'更改快捷键'});
+ field.focus();await user.keyboard('{Enter}');await screen.findByText('按下快捷键…');
+ await user.click(screen.getByRole('button',{name:'其他设置'}));await waitFor(()=>expect(field).toHaveAttribute('aria-pressed','false'));
+ expect(field).toHaveTextContent('右 Alt');expect(screen.getByRole('button',{name:'保存快捷键'})).toBeDisabled();
+ await user.click(field);await screen.findByText('按下快捷键…');fireEvent(window,new Event('blur'));
+ await waitFor(()=>expect(field).toHaveAttribute('aria-pressed','false'));
+ expect(field).toHaveTextContent('右 Alt');
+});
+
+it('cancels a delayed capture start when the settings window loses focus',async()=>{
+ const base=new BrowserShortcuts();let start!:()=>Promise<void>;
+ const port:ShortcutConfigPort={mode:'simulation',status:()=>base.status(),subscribe:cb=>base.subscribe(cb),save:v=>base.save(v),capture:(begin,token)=>begin?new Promise(resolve=>{start=async()=>resolve(await base.capture(true,token));}):base.capture(false)};
+ const user=userEvent.setup();render(<ShortcutSettings port={port}/>);await screen.findByText('已启用：右 Alt');
+ await user.click(screen.getByRole('button',{name:'更改快捷键'}));fireEvent(window,new Event('blur'));
+ await act(start);await waitFor(async()=>expect((await base.status()).capturing).toBe(false));
+ fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('右 Alt');
+ expect(screen.getByRole('button',{name:'保存快捷键'})).toBeDisabled();
 });
