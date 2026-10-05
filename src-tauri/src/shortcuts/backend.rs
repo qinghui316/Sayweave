@@ -204,6 +204,27 @@ fn release(b: &mut Bridge) {
         let _ = KillTimer(None, 1);
     }
 }
+// Settle each physical key pair before any capture/focus branch can return.
+fn track_key(b: &mut Bridge, value: u16, pressed: bool, released: bool) -> (bool, bool) {
+    let repeated = pressed && !b.pressed.insert(value);
+    let consumed_release = if released {
+        b.pressed.remove(&value);
+        b.consumed.remove(&value)
+    } else {
+        false
+    };
+    (repeated, consumed_release)
+}
+fn reconcile_keys(b: &mut Bridge, mut is_down: impl FnMut(u16) -> bool) {
+    // A swallowed down never reaches Windows async state. Only its physical hook up
+    // can release it; polling remains a fallback for unconsumed combo members.
+    b.pressed
+        .retain(|key| b.consumed.contains(key) || is_down(*key));
+    if b.held.is_some() && !matches(b) {
+        release(b);
+        b.armed = b.pressed.is_empty();
+    }
+}
 unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if n >= 0 {
         let key = unsafe { &*(l.0 as *const KBDLLHOOKSTRUCT) };
@@ -224,15 +245,13 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             let pressed = [WM_KEYDOWN, WM_SYSKEYDOWN].contains(&(w.0 as u32));
             let released = [WM_KEYUP, WM_SYSKEYUP].contains(&(w.0 as u32));
             let value = key.vkCode as u16;
-            if pressed && !b.pressed.insert(value) {
+            let (repeated, consumed_release) = track_key(b, value, pressed, released);
+            if repeated {
                 return if b.consumed.contains(&value) {
                     LRESULT(1)
                 } else {
                     unsafe { CallNextHookEx(None, n, w, l) }
                 };
-            }
-            if released {
-                b.pressed.remove(&value);
             }
             if b.capturing {
                 let mut pid = 0;
@@ -243,7 +262,11 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                     b.capturing = false;
                     b.capture_key = None;
                     send(b, Event::Cancel(b.task_active.clone(), b.generation));
-                    return unsafe { CallNextHookEx(None, n, w, l) };
+                    return if consumed_release {
+                        LRESULT(1)
+                    } else {
+                        unsafe { CallNextHookEx(None, n, w, l) }
+                    };
                 }
 
                 if value == VK_ESCAPE.0 && pressed {
@@ -327,7 +350,7 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                     return LRESULT(1);
                 }
             }
-            if released && b.consumed.remove(&value) {
+            if consumed_release {
                 return LRESULT(1);
             }
         }
@@ -506,11 +529,7 @@ impl Backend {
                         && let Ok(mut state) = state().lock()
                         && let Some(b) = state.as_mut()
                     {
-                        b.pressed.retain(|key| GetAsyncKeyState(*key as i32) < 0);
-                        if b.held.is_some() && !matches(b) {
-                            release(b);
-                            b.armed = b.pressed.is_empty();
-                        }
+                        reconcile_keys(b, |key| GetAsyncKeyState(key as i32) < 0);
                     }
                     let _ = TranslateMessage(&message);
                     DispatchMessageW(&message);
@@ -658,6 +677,64 @@ mod tests {
         };
         assert_eq!((epoch, revision, pressed), (7, 4, false));
         assert!(receiver.try_recv().is_err());
+    }
+    #[test]
+    fn swallowed_modifier_waits_for_hook_release_instead_of_async_state() {
+        let (mut b, mut receiver) = bridge();
+        assert_eq!(track_key(&mut b, VK_RMENU.0, true, false), (false, false));
+        b.consumed.insert(VK_RMENU.0);
+        b.held = Some(7);
+        for _ in 0..5 {
+            reconcile_keys(&mut b, |_| false);
+        }
+        assert_eq!(b.held, Some(7));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(track_key(&mut b, VK_RMENU.0, false, true), (false, true));
+        reconcile_keys(&mut b, |_| false);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::Key {
+                pressed: false,
+                epoch: 7,
+                ..
+            })
+        ));
+        reconcile_keys(&mut b, |_| false);
+        assert!(receiver.try_recv().is_err());
+    }
+    #[test]
+    fn capture_focus_loss_settles_the_pair_before_a_later_capture() {
+        let (mut b, _) = bridge();
+        b.capturing = true;
+        track_key(&mut b, VK_RMENU.0, true, false);
+        b.consumed.insert(VK_RMENU.0);
+        // Focus-loss return sees the already settled ownership and swallows only this up.
+        let (_, consume_up) = track_key(&mut b, VK_RMENU.0, false, true);
+        assert!(consume_up);
+        b.capturing = false;
+        assert!(b.consumed.is_empty() && b.pressed.is_empty());
+        // A later down passed through after focus loss has no ownership to swallow its up.
+        b.capturing = true;
+        track_key(&mut b, VK_RMENU.0, true, false);
+        b.capturing = false;
+        assert_eq!(track_key(&mut b, VK_RMENU.0, false, true), (false, false));
+    }
+    #[test]
+    fn combo_polling_still_detects_an_unconsumed_modifier_release() {
+        let (mut b, mut receiver) = bridge();
+        b.binding = Binding::parse("Control+Shift+KeyD").unwrap();
+        b.pressed.extend([VK_LCONTROL.0, VK_RSHIFT.0, VK_D.0]);
+        b.held = Some(8);
+        reconcile_keys(&mut b, |key| key != VK_LCONTROL.0);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(Event::Key {
+                pressed: false,
+                epoch: 8,
+                ..
+            })
+        ));
+        assert!(b.held.is_none());
     }
     #[test]
     fn task_stamps_distinguish_idle_periods_and_queued_task_events() {
