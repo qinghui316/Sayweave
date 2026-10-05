@@ -6,3 +6,8 @@
 .scroll { flex: 1; overflow-y: auto; overflow-x: hidden; min-height: 0; min-width: 0; padding: var(--space-8) var(--space-8) var(--space-24); margin: 0 calc(-1 * var(--space-8)); }.scroll section { margin-bottom: var(--space-28); }.scroll h3,.scroll h4 { font-size: var(--text-mode); line-height: var(--line-mode); font-weight: 500; }.scroll p { margin-top: var(--space-8); color: var(--text-secondary); }.scroll section>button { margin-top: var(--space-16); }.notice { padding-top: var(--space-16); font-size: var(--text-small); }
 .settingRow { display: flex; align-items: center; justify-content: space-between; gap: var(--space-20); padding-top: var(--space-24); }.settingRow p { font-size: var(--text-small); max-width: 360px; }.settingRow button { flex: none; }
 .aboutRow { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-24); }.aboutRow span { color: var(--text-secondary); font-size: var(--text-small); }
+
+.deviceRow { display: flex; align-items: flex-end; gap: var(--space-12); margin-top: var(--space-16); }.deviceRow>div { flex: 1; min-width: 0; }.deviceRow>button { flex: none; }
+.shortcutSection .settingRow { padding-top: var(--space-16); }.recordingMode { margin-top: var(--space-20); }.settingLabel { display: block; font-size: var(--text-body); margin-bottom: var(--space-8); }.recordingMode p { font-size: var(--text-small); }.shortcutSection>p[role="status"] { font-size: var(--text-small); }
+
+.scroll .deviceSection { margin-bottom: var(--space-24); }.deviceSection>p { font-size: var(--text-small); }.deviceRow { margin-top: var(--space-12); }.shortcutSection .recordingMode { margin-top: var(--space-12); }.recordingMode [role="tablist"] { margin-bottom: var(--space-8); }

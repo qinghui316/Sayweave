@@ -287,7 +287,10 @@ mod tests {
                     .unwrap(),
                 Message::Pong(_)
             ));
+            // Final tail arrives after finish; the receiver and heartbeat remain alive.
+            tokio::time::sleep(Duration::from_millis(180)).await;
             let mut result = result;
+            result["payload"]["output"]["sentence"]["text"] = "你好，尾字。".into();
             result["payload"]["output"]["sentence"]["sentence_end"] = true.into();
             socket
                 .send(Message::Text(result.to_string().into()))
@@ -316,7 +319,7 @@ mod tests {
         );
         session.finish().await.unwrap();
         assert!(
-            matches!(session.next_event().await.unwrap(),Event::Update(t) if t.confirmed_text=="你好")
+            matches!(session.next_event().await.unwrap(),Event::Update(t) if t.confirmed_text=="你好，尾字。")
         );
         assert!(matches!(
             session.next_event().await.unwrap(),

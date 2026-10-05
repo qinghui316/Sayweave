@@ -60,7 +60,7 @@ describe('shortcut settings',()=>{
   await user.click(screen.getByRole('button',{name:'更改快捷键'}));
   fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});
   await screen.findByText('Ctrl + D');
-  await user.selectOptions(screen.getByRole('combobox',{name:'录音方式'}),'hold');
+  await user.click(screen.getByRole('tab',{name:'按住'}));
   await user.click(screen.getByRole('button',{name:'保存快捷键'}));
   await screen.findByText('已启用：Ctrl + D');
   expect((await port.status()).saved).toEqual({binding:'Control+KeyD',mode:'hold',revision:2});
@@ -71,10 +71,10 @@ describe('shortcut settings',()=>{
   let guard:((action:()=>void)=>void)|null=null;const closed=vi.fn(),user=userEvent.setup();
   render(<ShortcutSettings port={port} onGuardChange={g=>{guard=g;}}/>);
   await screen.findByText('已启用：右 Alt');
-  await user.selectOptions(screen.getByRole('combobox',{name:'录音方式'}),'hold');
+  await user.click(screen.getByRole('tab',{name:'按住'}));
   await user.click(screen.getByRole('button',{name:'保存快捷键'}));
   await screen.findByText('此快捷键已被占用，请换一个。');
-  expect(screen.getByRole('combobox')).toHaveValue('hold');
+  expect(screen.getByRole('tab',{name:'按住'})).toHaveAttribute('aria-selected','true');
   fireEvent.click(screen.getByRole('button',{name:'更改快捷键'}));
   await waitFor(()=>expect(guard).not.toBeNull());
   guard!(closed);await screen.findByRole('alertdialog',{name:'快捷键尚未保存'});
@@ -92,7 +92,7 @@ it('separates confirmed input from a failed clipboard restore',async()=>{
 });
 
 it('keeps external completion pending only for the matching nonempty successful task',()=>{
- const result={...initialDictation(),taskId:'A',source:'external' as const,stage:'result' as const,text:'你好'};
+ const result={...initialDictation(),taskId:'A',source:'external' as const,stage:'result' as const,text:'你好',presentationId:'view-A'};
  const speech={taskId:'A',text:'你好'};
  expect(dictationPhase(result,'completed',speech)).toBe('processing');
  expect(dictationPhase({...result,delivery:{state:'confirmed',error:null,restoreError:false,elapsedMs:10}},'completed',speech)).toBe('completed');
@@ -110,4 +110,28 @@ it('offers stopping delivery after recognition without a discard label',async()=
  await user.click(screen.getByRole('button',{name:'停止填入'}));
  expect(cancel).toHaveBeenCalledOnce();
  expect(screen.queryByRole('button',{name:'取消并丢弃'})).not.toBeInTheDocument();
+});
+
+it('shows only recognition feedback while final text is pending and clears completed captions',()=>{
+ const view=render(<VoiceSurface presentation="recognizing" phase="processing" text="尾字尚在返回" start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
+ expect(screen.getByText('识别中')).toBeVisible();expect(screen.queryByLabelText('实时字幕')).not.toBeInTheDocument();
+ view.rerender(<VoiceSurface presentation="completed" phase="completed" text="完整结果" start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
+ expect(screen.getByText('已填入')).toBeVisible();expect(screen.queryByText('完整结果')).not.toBeInTheDocument();
+ expect(screen.queryByRole('button',{name:'复制'})).not.toBeInTheDocument();
+});
+it('submitted input offers a closeable notice without a copy card',async()=>{
+ const dismiss=vi.fn(),copy=vi.fn(),user=userEvent.setup();
+ render(<VoiceSurface presentation="notice" phase="completed" text="已填入文字" delivery={{state:'unconfirmed',error:'inputUnconfirmed',restoreError:false,elapsedMs:1000}} start={()=>{}} finish={()=>{}} cancel={()=>{}} dismiss={dismiss} copy={copy}/>);
+ expect(screen.getByText('请确认输入结果。')).toBeVisible();expect(screen.queryByRole('region',{name:'口述结果'})).not.toBeInTheDocument();
+ expect(screen.queryByRole('button',{name:'复制'})).not.toBeInTheDocument();await user.click(screen.getByRole('button',{name:'关闭'}));expect(dismiss).toHaveBeenCalledOnce();expect(copy).not.toHaveBeenCalled();
+});
+it('no-target result retains its content and close action after copy failure',async()=>{
+ const dismiss=vi.fn(),copy=vi.fn().mockRejectedValue(Error('clipboard busy')),user=userEvent.setup();
+ render(<VoiceSurface presentation="result" phase="completed" text="完整结果" start={()=>{}} finish={()=>{}} cancel={()=>{}} dismiss={dismiss} copy={copy}/>);
+ await user.click(screen.getByRole('button',{name:'复制'}));await screen.findByRole('button',{name:'复制失败，重试'});
+ expect(screen.getByText('完整结果')).toBeVisible();await user.click(screen.getByRole('button',{name:'关闭'}));expect(dismiss).toHaveBeenCalledOnce();
+});
+it('dismissed external feedback does not replay its completed state when shown later',()=>{
+ expect(dictationPhase({...initialDictation(),source:'external',taskId:'old',stage:'result',text:'old'},'completed',{taskId:'old',text:'old'})).toBe('idle');
+ expect(()=>parseDictation({...initialDictation(),presentation:'recording'})).toThrow();
 });

@@ -1,11 +1,16 @@
-import {it,expect,vi} from 'vitest';
-import {render,renderHook,screen,fireEvent,act} from '@testing-library/react';
+import {it,expect,vi,beforeAll,afterAll} from 'vitest';
+import userEvent from '@testing-library/user-event';
+import {render,renderHook,screen,act} from '@testing-library/react';
 import {DeviceSettings} from '../src/features/settings/DeviceSettings';
 import {audioLabel} from '../src/features/history/HistoryRow';
 import {useHistoryPlayback} from '../src/features/history/usePlayback';
 import {initialSpeech,parseSpeech,speechError,type SpeechPort,type RecordingPreferences} from '../src/contracts/speech';
 import type {HistoryPort,HistoryRecord,PlaybackState} from '../src/contracts/history';
 import {speechMessages} from '../src/locales/speech';
+// jsdom has no layout; native menus and scrolling are covered by browser/desktop checks.
+const originalScroll=HTMLElement.prototype.scrollIntoView;
+beforeAll(()=>{HTMLElement.prototype.scrollIntoView=vi.fn();});
+afterAll(()=>{if(originalScroll)HTMLElement.prototype.scrollIntoView=originalScroll;else Reflect.deleteProperty(HTMLElement.prototype,'scrollIntoView');});
 function deferred<T>(){let resolve!:(v:T)=>void;const promise=new Promise<T>(r=>resolve=r);return {promise,resolve};}
 it('connection timeout survives snapshot parsing separately from recognition timeout',()=>{
  const value={...initialSpeech(),phase:'failed',error:'connectionTimeout'};
@@ -23,11 +28,11 @@ it('a late device refresh cannot overwrite a committed selection',async()=>{
  const old:RecordingPreferences={deviceId:null,historyEnabled:true,audioEnabled:true,retentionDays:30,revision:1};
  const refresh=deferred<RecordingPreferences>(),save=deferred<RecordingPreferences>();
  const port={mode:'native',devices:vi.fn().mockResolvedValue([{id:'mic',name:'Mic',isDefault:false}]),preferences:vi.fn().mockResolvedValueOnce(old).mockReturnValueOnce(refresh.promise),savePreferences:vi.fn().mockReturnValue(save.promise)} as unknown as SpeechPort;
- render(<DeviceSettings port={port}/>);const select=await screen.findByRole('combobox');
- fireEvent.click(screen.getByRole('button',{name:'刷新设备'}));fireEvent.change(select,{target:{value:'mic'}});
+ const user=userEvent.setup();render(<DeviceSettings port={port}/>);const select=await screen.findByRole('combobox');
+ await user.click(screen.getByRole('button',{name:'刷新设备'}));select.focus();await user.keyboard('[ArrowDown][End][Enter]');
  expect(screen.getByRole('button',{name:'刷新设备'})).toBeDisabled();
- await act(async()=>{save.resolve({...old,deviceId:'mic',revision:2});});expect(select).toHaveValue('mic');
- await act(async()=>{refresh.resolve(old);});expect(select).toHaveValue('mic');
+ await act(async()=>{save.resolve({...old,deviceId:'mic',revision:2});});expect(select).toHaveTextContent('Mic');
+ await act(async()=>{refresh.resolve(old);});expect(select).toHaveTextContent('Mic');
  expect(port.savePreferences).toHaveBeenCalledWith({...old,deviceId:'mic'});
 });
 it('late playback polling cannot overwrite a newer play action',async()=>{

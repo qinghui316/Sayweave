@@ -109,3 +109,16 @@ test('native window motion scope stops all nested feedback loops without changin
   expect(container.querySelector('[style*="animation-play-state"]')).toHaveStyle({ animationPlayState: 'paused' });
   expect(screen.getByRole('status')).toHaveTextContent('等待');
 });
+
+test('live waveform follows audible input even with reduced motion and stops updates while hidden',()=>{
+ vi.useFakeTimers();
+ vi.stubGlobal('matchMedia',vi.fn(()=>({matches:true,addEventListener:vi.fn(),removeEventListener:vi.fn()})));
+ const actions={onStart:vi.fn(),onFinish:vi.fn(),onCancel:vi.fn()};
+ const {container,rerender}=render(<MotionScope enabled><VoiceControl mode="speech" phase="recording" level={0} {...actions}/></MotionScope>);
+ const bars=()=>Array.from(container.querySelectorAll('[data-live="true"] i')).map(bar=>(bar as HTMLElement).style.transform);
+ const quiet=bars();rerender(<MotionScope enabled><VoiceControl mode="speech" phase="recording" level={.05} {...actions}/></MotionScope>);
+ act(()=>vi.advanceTimersByTime(50));const loud=bars();expect(loud).not.toEqual(quiet);expect(container.querySelector('[data-motion]')).toHaveAttribute('data-motion','static');
+ rerender(<MotionScope enabled={false}><VoiceControl mode="speech" phase="recording" level={0} {...actions}/></MotionScope>);
+ act(()=>vi.advanceTimersByTime(500));expect(bars()).toEqual(loud);expect(vi.getTimerCount()).toBe(0);
+ rerender(<MotionScope enabled><VoiceControl mode="speech" phase="recording" level={0} {...actions}/></MotionScope>);expect(bars()).toEqual(quiet);
+});

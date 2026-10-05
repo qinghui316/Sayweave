@@ -541,8 +541,16 @@ fn unwatch(t: &Target, auto: &Option<IUIAutomation>) {
 }
 fn selection_confirmed(t: &Target, text: &str) -> bool {
     match &t.proof {
-        Proof::Edit { start, .. } => native_selection(hwnd(t.anchor.focus))
-            .is_ok_and(|(a, b)| a == b && a == start + text.encode_utf16().count()),
+        Proof::Edit { before, start, .. } => {
+            native_selection(hwnd(t.anchor.focus)).is_ok_and(|(a, b)| {
+                a == b
+                    && native_text(hwnd(t.anchor.focus)).is_ok_and(|actual| {
+                        insertion_prefix(&actual, a, "").is_some_and(|prefix| {
+                            Some(prefix) == insertion_prefix(before, *start, text)
+                        })
+                    })
+            })
+        }
         Proof::Uia {
             pattern, prefix, ..
         } => uia_parts(pattern).is_ok_and(|(_, now, selected)| {
@@ -1070,7 +1078,7 @@ pub(super) fn worker(
         busy.store(true, Ordering::Release);
         if stopping.load(Ordering::Acquire) {
             match request {
-                Request::Capture(_, _, r) | Request::Copy(_, r) | Request::Restore(r) => {
+                Request::Capture(_, _, r) | Request::Copy(_, _, r) | Request::Restore(r) => {
                     let _ = r.send(Err(err("stopping")));
                 }
                 Request::Deliver(_, _, _, r) => {
@@ -1118,9 +1126,13 @@ pub(super) fn worker(
                     .unwrap_or_else(|| Delivery::copy("targetUnavailable"));
                 let _ = response.send(result);
             }
-            Request::Copy(text, response) => {
-                let result = open(owner.load(Ordering::Acquire))
-                    .and_then(|_lock| install(&[(13, text_bytes(&text))]));
+            Request::Copy(text, gate, response) => {
+                let result = open(owner.load(Ordering::Acquire)).and_then(|_lock| {
+                    if gate.is_some_and(|gate| !gate.commit()) {
+                        return Err(err("staleSession"));
+                    }
+                    install(&[(13, text_bytes(&text))])
+                });
                 let _ = response.send(result);
             }
             Request::Forget(id) => {

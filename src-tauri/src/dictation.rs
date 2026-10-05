@@ -15,6 +15,9 @@ use std::sync::{
 };
 use tauri::{Emitter, Manager};
 use tokio::sync::{oneshot, watch};
+mod presentation;
+pub use presentation::Presentation;
+use presentation::{final_presentation, speech_presentation};
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
@@ -25,6 +28,8 @@ pub struct Snapshot {
     pub text: String,
     pub delivery: Option<Delivery>,
     pub error: Option<String>,
+    pub presentation_id: Option<String>,
+    pub presentation: Presentation,
 }
 impl Default for Snapshot {
     fn default() -> Self {
@@ -36,6 +41,8 @@ impl Default for Snapshot {
             text: String::new(),
             delivery: None,
             error: None,
+            presentation_id: None,
+            presentation: Presentation::Idle,
         }
     }
 }
@@ -47,8 +54,8 @@ struct Active {
     origin: Option<TaskStamp>,
     cancel: watch::Sender<u8>,
     gate: Arc<DeliveryGate>,
-    original_overlay: bool,
     overlay_revision: u64,
+    began: std::time::Instant,
 }
 struct Reservation {
     id: String,
@@ -60,6 +67,7 @@ pub struct DictationCoordinator {
     active: Mutex<Option<Active>>,
     snapshot: Mutex<Snapshot>,
     stopping: AtomicBool,
+    copy_gate: Mutex<Option<Arc<DeliveryGate>>>,
 }
 impl Default for DictationCoordinator {
     fn default() -> Self {
@@ -67,6 +75,7 @@ impl Default for DictationCoordinator {
             active: Mutex::new(None),
             snapshot: Mutex::new(Snapshot::default()),
             stopping: AtomicBool::new(false),
+            copy_gate: Mutex::new(None),
         }
     }
 }
@@ -107,11 +116,11 @@ impl DictationCoordinator {
             && s.task_id.as_deref() == Some(id)
         {
             let old_stage = s.stage.clone();
-            let old_text = s.text.is_empty();
+            let old_presentation = s.presentation;
             let old_recovery = s.delivery.as_ref().is_some_and(|d| d.restore_error);
             change(&mut s);
             let layout = old_stage != s.stage
-                || old_text != s.text.is_empty()
+                || old_presentation != s.presentation
                 || old_recovery != s.delivery.as_ref().is_some_and(|d| d.restore_error);
             s.sequence += 1;
             let copy = s.clone();
@@ -121,6 +130,36 @@ impl DictationCoordinator {
             }
             let _ = app.emit_to("main", "dictation:snapshot", &copy);
             let _ = app.emit_to("voice-overlay", "dictation:snapshot", &copy);
+        }
+    }
+    pub fn observe_speech(&self, app: &tauri::AppHandle, speech: &SpeechSnapshot) {
+        let Some(id) = speech.task_id.as_deref() else {
+            return;
+        };
+        let Ok(current) = self.snapshot() else {
+            return;
+        };
+        if current.task_id.as_deref() != Some(id)
+            || current.source != "external"
+            || !matches!(current.stage.as_str(), "preparing" | "recognizing")
+        {
+            return;
+        }
+        let Ok(active) = self.active.lock() else {
+            return;
+        };
+        let Some(task) = active.as_ref().filter(|a| a.id == id) else {
+            return;
+        };
+        let Some(next) = speech_presentation(speech.phase, *task.cancel.borrow()) else {
+            return;
+        };
+        if next != current.presentation {
+            self.update(app, id, |s| {
+                if matches!(s.stage.as_str(), "preparing" | "recognizing") {
+                    s.presentation = next;
+                }
+            });
         }
     }
     pub fn key(
@@ -158,6 +197,7 @@ impl DictationCoordinator {
                     .state::<SpeechService>()
                     .snapshot()
                     .ok()
+                    .filter(|s| s.task_id.as_deref() == Some(&id))
                     .map(|s| s.phase);
                 if phase == Some(Phase::Recording) {
                     self.finish_bound(app, &id).ok();
@@ -225,7 +265,7 @@ impl DictationCoordinator {
             if event.is_some_and(|event| !app.state::<ShortcutService>().task_is_current(event)) {
                 return Err(Error::new("staleSession"));
             }
-            let runtime = crate::read(app).map_err(|_| Error::new("unavailable"))?;
+            self.invalidate_copy()?;
             *a = Some(Active {
                 id: id.clone(),
                 source: source.into(),
@@ -233,8 +273,8 @@ impl DictationCoordinator {
                 origin: event.cloned(),
                 cancel: tx.clone(),
                 gate: gate.clone(),
-                original_overlay: runtime.windows.overlay,
                 overlay_revision: crate::OVERLAY_VISIBILITY.load(Ordering::Acquire),
+                began: std::time::Instant::now(),
             });
         }
         app.state::<ShortcutService>().active_task(Some(id.clone()));
@@ -247,8 +287,16 @@ impl DictationCoordinator {
             source: source.into(),
             sequence,
             stage: "preparing".into(),
+            presentation_id: Some(uuid::Uuid::new_v4().to_string()),
+            presentation: Presentation::Preparing,
             ..Snapshot::default()
         };
+        self.update(app, &id, |_| {});
+        if source == "external" {
+            // Keydown owns the view before model, credential or provider preparation begins.
+            let _ = crate::window_action_internal(app, "overlay", "show");
+            log::info!(target:"sayweave","operation=dictation_phase task_id={} phase=preparing elapsed_ms=0",id);
+        }
         Ok(Reservation {
             id,
             expected_task: None,
@@ -287,9 +335,6 @@ impl DictationCoordinator {
         } else {
             None
         };
-        if source == "external" {
-            let _ = crate::window_action_internal(&app, "overlay", "show");
-        }
         let (terminal_tx, terminal_rx) = oneshot::channel();
         let result = app
             .state::<SpeechService>()
@@ -313,6 +358,7 @@ impl DictationCoordinator {
             self.update(&app, &id, |s| {
                 s.stage = "idle".into();
                 s.error = result.as_ref().err().map(|e| e.code.clone());
+                s.presentation = final_presentation(false, "", None, s.error.as_deref());
             });
             if !gate.cancelled()
                 && let Err(error) = &result
@@ -334,11 +380,15 @@ impl DictationCoordinator {
                 None => Err(Error::new("targetUnavailable")),
             };
             let coordinator = app.state::<Self>();
+            let absent_target = capture_result.as_ref().err().is_some_and(|e| {
+                matches!(e.code.as_str(), "targetUnavailable" | "targetUnsupported")
+            });
             if let Ok(terminal) = terminal_rx.await {
                 coordinator.update(&app, &id, |s| {
                     s.text = terminal.text.clone();
                     s.stage = "result".into();
                     s.error = terminal.error.clone();
+                    s.presentation = Presentation::Recognizing;
                 });
                 if source == "external" && !terminal.text.is_empty() {
                     let mut delivery = if terminal.phase == Phase::Completed
@@ -356,7 +406,10 @@ impl DictationCoordinator {
                         if journal.is_err() || terminal.persistent && !terminal.saved {
                             Delivery::copy("saveFailed")
                         } else {
-                            coordinator.update(&app, &id, |s| s.stage = "delivering".into());
+                            coordinator.update(&app, &id, |s| {
+                                s.stage = "delivering".into();
+                                s.presentation = Presentation::Delivering;
+                            });
                             let preparing = if terminal.persistent {
                                 coordinator
                                     .journal(
@@ -407,8 +460,17 @@ impl DictationCoordinator {
                         log::info!(target:"sayweave", "operation=dictation_delivery task_id={} state={} elapsed_ms={} error={}", id, delivery.state, delivery.elapsed_ms, delivery.error.as_deref().unwrap_or("none"));
                         s.delivery = Some(delivery);
                         s.stage = "result".into();
+                        s.presentation = final_presentation(absent_target,&s.text,s.delivery.as_ref(),s.error.as_deref());
                     });
                 }
+                coordinator.update(&app, &id, |s| {
+                    s.presentation = final_presentation(
+                        absent_target,
+                        &s.text,
+                        s.delivery.as_ref(),
+                        s.error.as_deref(),
+                    );
+                });
             } else {
                 let partial = app
                     .state::<SpeechService>()
@@ -424,6 +486,12 @@ impl DictationCoordinator {
                     if source == "external" && !s.text.is_empty() {
                         s.delivery = Some(Delivery::copy("recognitionFailed"));
                     }
+                    s.presentation = final_presentation(
+                        absent_target,
+                        &s.text,
+                        s.delivery.as_ref(),
+                        s.error.as_deref(),
+                    );
                 });
             }
             app.state::<WindowsInputService>().forget(id.clone());
@@ -473,34 +541,95 @@ impl DictationCoordinator {
         }
         if let Some(old) = old
             && old.source == "external"
-            && !old.original_overlay
-            && old.overlay_revision == crate::OVERLAY_VISIBILITY.load(Ordering::Acquire)
         {
-            let hide = self.snapshot().is_ok_and(|s| {
-                s.delivery
-                    .as_ref()
-                    .is_some_and(|d| d.state == "confirmed" && !d.restore_error)
-                    || s.text.is_empty()
-                        && (s.error.is_none() || s.error.as_deref() == Some("cancelled"))
-            });
-            if hide {
-                let app = app.clone();
-                let id = id.to_string();
-                let visibility = old.overlay_revision;
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                    if app
-                        .state::<Self>()
-                        .snapshot()
-                        .is_ok_and(|s| s.task_id.as_ref() == Some(&id))
-                        && !app.state::<Self>().busy()
-                        && visibility == crate::OVERLAY_VISIBILITY.load(Ordering::Acquire)
-                    {
-                        let _ = crate::window_action_internal(&app, "overlay", "hide");
-                    }
-                });
+            log::info!(target:"sayweave","operation=dictation_phase task_id={} phase=released elapsed_ms={}",id,old.began.elapsed().as_millis());
+            if let Ok(s) = self.snapshot()
+                && let Some(ms) = s.presentation.hide_after()
+                && let Some(presentation) = s.presentation_id
+            {
+                self.schedule_hide(app, id, presentation, old.overlay_revision, ms);
             }
         }
+    }
+    fn schedule_hide(
+        &self,
+        app: &tauri::AppHandle,
+        id: &str,
+        presentation: String,
+        visibility: u64,
+        ms: u64,
+    ) {
+        let app = app.clone();
+        let id = id.to_string();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            if visibility == crate::OVERLAY_VISIBILITY.load(Ordering::Acquire)
+                && !app.state::<Self>().busy()
+            {
+                let _ = app.state::<Self>().dismiss(&app, &id, &presentation);
+            }
+        });
+    }
+    pub fn dismiss(
+        &self,
+        app: &tauri::AppHandle,
+        id: &str,
+        presentation: &str,
+    ) -> Result<(), Error> {
+        // Hold admission until the bound view has been hidden, so it cannot hide a new task.
+        let active = self.active.lock().map_err(|_| Error::new("unavailable"))?;
+        let current = self.snapshot()?;
+        if current.task_id.as_deref() != Some(id)
+            || current.presentation_id.as_deref() != Some(presentation)
+        {
+            return Err(Error::new("staleSession"));
+        }
+        self.invalidate_copy()?;
+        crate::window_action(app, "overlay", "hide").map_err(|_| Error::new("unavailable"))?;
+        if active.is_none() {
+            self.update(app, id, |s| {
+                s.presentation = Presentation::Idle;
+                s.presentation_id = None;
+            });
+        }
+        log::info!(target:"sayweave","operation=dictation_phase task_id={} phase=hidden",id);
+        Ok(())
+    }
+    fn invalidate_copy(&self) -> Result<(), Error> {
+        if let Some(gate) = self
+            .copy_gate
+            .lock()
+            .map_err(|_| Error::new("unavailable"))?
+            .take()
+        {
+            gate.cancel();
+        }
+        Ok(())
+    }
+    fn begin_copy(
+        &self,
+        task: &str,
+        presentation: &str,
+    ) -> Result<(String, Arc<DeliveryGate>), Error> {
+        let active = self.active.lock().map_err(|_| Error::new("unavailable"))?;
+        let snapshot = self.snapshot()?;
+        if active.is_some()
+            || snapshot.task_id.as_deref() != Some(task)
+            || snapshot.presentation_id.as_deref() != Some(presentation)
+            || snapshot.presentation != Presentation::Result
+        {
+            return Err(Error::new("staleSession"));
+        }
+        if snapshot.text.is_empty() {
+            return Err(Error::new("invalid"));
+        }
+        self.invalidate_copy()?;
+        let gate = Arc::new(DeliveryGate::default());
+        *self
+            .copy_gate
+            .lock()
+            .map_err(|_| Error::new("unavailable"))? = Some(gate.clone());
+        Ok((snapshot.text, gate))
     }
     pub fn finish_bound(&self, app: &tauri::AppHandle, id: &str) -> Result<(), Error> {
         let active = self.active.lock().map_err(|_| Error::new("unavailable"))?;
@@ -510,7 +639,10 @@ impl DictationCoordinator {
             .ok_or_else(|| Error::new("staleSession"))?;
         let s = app.state::<SpeechService>().snapshot()?;
         if s.task_id.as_ref() == Some(&a.id) && s.phase == Phase::Recording {
-            a.cancel.send(1).map_err(|_| Error::new("staleSession"))
+            a.cancel.send(1).map_err(|_| Error::new("staleSession"))?;
+            self.update(app, id, |s| s.presentation = Presentation::Recognizing);
+            log::info!(target:"sayweave","operation=dictation_phase task_id={} phase=finish_requested elapsed_ms={}",id,a.began.elapsed().as_millis());
+            Ok(())
         } else {
             Err(Error::new("busy"))
         }
@@ -537,6 +669,7 @@ impl DictationCoordinator {
     }
     pub fn shutdown(&self) {
         self.stopping.store(true, Ordering::Release);
+        let _ = self.invalidate_copy();
         if let Ok(a) = self.active.lock()
             && let Some(a) = a.as_ref()
         {
@@ -562,6 +695,25 @@ fn key_matches_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queued_copy_is_invalidated_by_dismiss_or_new_task_before_commit() {
+        let coordinator = DictationCoordinator::default();
+        *coordinator.snapshot.lock().unwrap() = Snapshot {
+            task_id: Some("A".into()),
+            presentation_id: Some("view-A".into()),
+            presentation: Presentation::Result,
+            text: "文字".into(),
+            ..Snapshot::default()
+        };
+        let (_, gate) = coordinator.begin_copy("A", "view-A").unwrap();
+        coordinator.invalidate_copy().unwrap();
+        assert!(!gate.commit());
+        assert!(coordinator.begin_copy("A", "old-view").is_err());
+        let (_, old) = coordinator.begin_copy("A", "view-A").unwrap();
+        let (_, latest) = coordinator.begin_copy("A", "view-A").unwrap();
+        assert!(!old.commit());
+        assert!(latest.commit());
+    }
     #[test]
     fn queued_release_and_second_toggle_can_only_cancel_the_task_they_started() {
         let initial = TaskStamp {
@@ -643,17 +795,27 @@ pub async fn dictation_copy(
     window: tauri::WebviewWindow,
     service: tauri::State<'_, DictationCoordinator>,
     task_id: String,
+    presentation_id: String,
 ) -> Result<(), Error> {
     caller(window.label())?;
-    let snapshot = service.snapshot()?;
-    if snapshot.task_id.as_deref() != Some(&task_id) {
-        return Err(Error::new("staleSession"));
-    }
-    let text = snapshot.text;
-    if text.is_empty() {
-        return Err(Error::new("invalid"));
-    }
-    app.state::<WindowsInputService>().copy(text).await
+    let (text, gate) = service.begin_copy(&task_id, &presentation_id)?;
+    app.state::<WindowsInputService>()
+        .copy_bound(text, gate)
+        .await?;
+    let visibility = crate::OVERLAY_VISIBILITY.load(Ordering::Acquire);
+    service.schedule_hide(&app, &task_id, presentation_id, visibility, 600);
+    Ok(())
+}
+#[tauri::command]
+pub fn dictation_dismiss(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    service: tauri::State<'_, DictationCoordinator>,
+    task_id: String,
+    presentation_id: String,
+) -> Result<(), Error> {
+    caller(window.label())?;
+    service.dismiss(&app, &task_id, &presentation_id)
 }
 #[tauri::command]
 pub async fn dictation_restore(

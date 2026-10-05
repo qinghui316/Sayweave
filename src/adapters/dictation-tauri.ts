@@ -14,7 +14,8 @@ class NativeDictation implements DictationPort {
  async subscribe(callback:(s:DictationSnapshot)=>void){return listen<unknown>('dictation:snapshot',e=>callback(parseDictation(e.payload)));}
  async start(){return parseSpeech(await invoke('dictation_start'));}
  async control(taskId:string,action:'finish'|'cancel'){await invoke('dictation_control',{taskId,action});}
- async copy(taskId:string){await invoke('dictation_copy',{taskId});}
+ async copy(taskId:string,presentationId:string){await invoke('dictation_copy',{taskId,presentationId});}
+ async dismiss(taskId:string,presentationId:string){await invoke('dictation_dismiss',{taskId,presentationId});}
  async restoreClipboard(){await invoke('dictation_restore');}
 }
 export class BrowserShortcuts implements ShortcutConfigPort {

@@ -137,8 +137,60 @@ impl Converter {
 }
 pub struct Packet {
     pub pcm: Vec<i16>,
+    pub duration_ms: u64,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocalMeter {
     pub level: f32,
     pub duration_ms: u64,
+}
+#[derive(Default)]
+struct MeterWindow {
+    energy: f64,
+    samples: usize,
+}
+impl MeterWindow {
+    fn push(&mut self, pcm: &[i16]) {
+        self.energy += pcm
+            .iter()
+            .map(|s| (*s as f64 / 32768.0).powi(2))
+            .sum::<f64>();
+        self.samples += pcm.len();
+    }
+    fn take(&mut self) -> f32 {
+        let level = if self.samples == 0 {
+            0.0
+        } else {
+            (self.energy / self.samples as f64).sqrt() as f32
+        };
+        self.energy = 0.0;
+        self.samples = 0;
+        level
+    }
+}
+pub fn publish_meter(
+    mut reading: watch::Receiver<LocalMeter>,
+    mut signal: watch::Receiver<u8>,
+    mut publish: impl FnMut(LocalMeter) + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            if *signal.borrow() >= 1 {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _=signal.changed()=>{if *signal.borrow()>=1 {break;}},
+                _=tick.tick()=>{
+                    let sample=*reading.borrow_and_update();
+                    publish(sample);
+                    if reading.has_changed().is_err(){break;}
+                }
+            }
+        }
+    })
 }
 pub struct CaptureResult {
     pub pcm: Vec<i16>,
@@ -151,6 +203,7 @@ pub struct Capture {
     stop: Arc<AtomicBool>,
     stop_watcher: tokio::task::JoinHandle<()>,
     pub packets: mpsc::Receiver<Packet>,
+    pub meter: watch::Receiver<LocalMeter>,
     pub done: oneshot::Receiver<CaptureResult>,
 }
 impl Drop for Capture {
@@ -173,6 +226,15 @@ impl Capture {
         let (sender, packets) = mpsc::channel(100);
         let (done_tx, done) = oneshot::channel();
         let (ready_tx, ready) = oneshot::channel();
+        let (meter_tx, meter) = watch::channel(LocalMeter::default());
+        // Construct the owner before awaiting device readiness: dropping the future stops capture.
+        let capture = Self {
+            stop_watcher: watch_stop(stop.clone(), signal),
+            stop,
+            packets,
+            meter,
+            done,
+        };
         std::thread::Builder::new()
             .name("sayweave-capture".into())
             .spawn(move || {
@@ -247,6 +309,7 @@ impl Capture {
                         },
                         None => None,
                     };
+                    if stopper.load(Ordering::Acquire) {return Err(Error::new("cancelled"));}
                     stream.play().map_err(|_| Error::new("deviceAccess"))?;
                     if ready_tx.take().unwrap().send(Ok(())).is_err() {
                         stopper.store(true, Ordering::Release);
@@ -256,6 +319,8 @@ impl Capture {
                     let mut pcm = Vec::with_capacity(16000 * 10);
                     let mut peak = 0;
                     let mut error = None;
+                    let mut meter_window=MeterWindow::default();
+                    let mut meter_at=Instant::now();
                     let mut accept = |chunk: Vec<i16>| {
                         if chunk.is_empty() {
                             return;
@@ -274,17 +339,15 @@ impl Capture {
                                 flushed = Instant::now();
                             }
                         }
-                        let level = (chunk
-                            .iter()
-                            .map(|s| (*s as f32 / 32768.0).powi(2))
-                            .sum::<f32>()
-                            / chunk.len() as f32)
-                            .sqrt();
+                        meter_window.push(&chunk);
                         pcm.extend_from_slice(&chunk);
+                        if meter_at.elapsed()>=Duration::from_millis(50) {
+                            meter_tx.send_replace(LocalMeter{level:meter_window.take(),duration_ms:pcm.len() as u64/16});
+                            meter_at=Instant::now();
+                        }
                         if sender
                             .try_send(Packet {
                                 pcm: chunk,
-                                level,
                                 duration_ms: pcm.len() as u64 / 16,
                             })
                             .is_err()
@@ -354,12 +417,7 @@ impl Capture {
             })
             .map_err(|_| Error::new("deviceAccess"))?;
         ready.await.map_err(|_| Error::new("deviceAccess"))??;
-        Ok(Self {
-            stop_watcher: watch_stop(stop.clone(), signal),
-            stop,
-            packets,
-            done,
-        })
+        Ok(capture)
     }
 }
 mod supported_config {
@@ -368,6 +426,45 @@ mod supported_config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn meter_aggregates_samples_without_turning_an_empty_packet_into_silence() {
+        let mut window = MeterWindow::default();
+        window.push(&[16384; 800]);
+        window.push(&[]);
+        window.push(&[0; 800]);
+        assert!((window.take() - (0.125f32).sqrt()).abs() < 0.0001);
+        assert_eq!(window.take(), 0.0);
+    }
+    #[tokio::test]
+    async fn local_meter_keeps_publishing_during_network_backpressure_and_stops_on_finish() {
+        let (tx, rx) = watch::channel(LocalMeter {
+            level: 0.2,
+            duration_ms: 50,
+        });
+        let (control, signal) = watch::channel(0);
+        let (seen, mut samples) = mpsc::unbounded_channel();
+        let task = publish_meter(rx, signal, move |v| {
+            let _ = seen.send(v);
+        });
+        let first = tokio::time::timeout(Duration::from_millis(100), samples.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.level, 0.2);
+        tx.send_replace(LocalMeter {
+            level: 0.8,
+            duration_ms: 100,
+        });
+        let next = tokio::time::timeout(Duration::from_millis(150), samples.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.level, 0.8);
+        control.send(1).unwrap();
+        task.await.unwrap();
+        while samples.try_recv().is_ok() {}
+        assert!(samples.recv().await.is_none());
+    }
     #[tokio::test]
     async fn finish_stops_capture_while_the_audio_sender_is_blocked() {
         let (tx, _rx) = mpsc::channel(1);

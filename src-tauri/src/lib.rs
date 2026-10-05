@@ -68,22 +68,20 @@ fn read(app: &tauri::AppHandle) -> Result<Snapshot, RuntimeError> {
         .map_err(|_| RuntimeError::new("unavailable"))
 }
 fn voice_size(app: &tauri::AppHandle, phase: Phase) -> (f64, f64) {
-    if app
-        .try_state::<dictation::DictationCoordinator>()
-        .is_some_and(|c| {
-            c.snapshot().is_ok_and(|s| {
-                s.source == "external"
-                    && s.stage != "idle"
-                    && (!s.text.is_empty()
-                        || matches!(s.stage.as_str(), "preparing" | "recognizing" | "delivering"))
-            })
-        })
+    if let Some(coordinator) = app.try_state::<dictation::DictationCoordinator>()
+        && let Ok(snapshot) = coordinator.snapshot()
+        && snapshot.source == "external"
+        && snapshot.presentation != Presentation::Idle
     {
-        let recovery = app
-            .state::<dictation::DictationCoordinator>()
-            .snapshot()
-            .is_ok_and(|s| s.delivery.is_some_and(|d| d.restore_error));
-        (384.0, if recovery { 284.0 } else { 220.0 })
+        let recovery = snapshot.delivery.is_some_and(|d| d.restore_error);
+        match snapshot.presentation {
+            Presentation::Completed => (120.0, 112.0),
+            Presentation::Result => (384.0, if recovery { 284.0 } else { 232.0 }),
+            Presentation::Notice | Presentation::Error => {
+                (384.0, if recovery { 240.0 } else { 152.0 })
+            }
+            _ => (384.0, 220.0),
+        }
     } else {
         overlay_size(phase)
     }
@@ -522,6 +520,7 @@ pub fn run() {
             dictation_start,
             dictation_control,
             dictation_copy,
+            dictation_dismiss,
             dictation_restore,
             runtime_snapshot,
             runtime_demo,

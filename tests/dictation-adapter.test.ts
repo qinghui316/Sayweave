@@ -9,8 +9,10 @@ test('native actions carry the displayed task identity and reject stale operatio
  const dictation=createDictationPorts().dictation!;
  await dictation.control('displayed-A','cancel');
  expect(call).toHaveBeenLastCalledWith('dictation_control',{taskId:'displayed-A',action:'cancel'});
- await dictation.copy('displayed-A');
- expect(call).toHaveBeenLastCalledWith('dictation_copy',{taskId:'displayed-A'});
+ await dictation.copy('displayed-A','presentation-A');
+ expect(call).toHaveBeenLastCalledWith('dictation_copy',{taskId:'displayed-A',presentationId:'presentation-A'});
+ await dictation.dismiss('displayed-A','presentation-A');
+ expect(call).toHaveBeenLastCalledWith('dictation_dismiss',{taskId:'displayed-A',presentationId:'presentation-A'});
  const speech=createSpeechPorts().speech;call.mockResolvedValue(initialSpeech());
  await speech.retryCurrent('displayed-A');
  expect(call).toHaveBeenLastCalledWith('speech_retry_current',{taskId:'displayed-A'});

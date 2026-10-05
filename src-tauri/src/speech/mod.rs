@@ -199,6 +199,11 @@ impl SpeechService {
             let _ = app.emit_to("main", "speech:snapshot", &s);
             let _ = app.emit_to("voice-overlay", "speech:snapshot", &s);
             if phase_changed
+                && let Some(coordinator) = app.try_state::<crate::dictation::DictationCoordinator>()
+            {
+                coordinator.observe_speech(app, &s);
+            }
+            if phase_changed
                 && let Some(runtime) = app.try_state::<crate::Runtime>()
                 && let Ok(mut r) = runtime.0.lock()
             {
@@ -529,6 +534,7 @@ impl SpeechService {
         let began = Instant::now();
         let mut transcript = recognition::Transcript::default();
         let mut capture: Option<audio::Capture> = None;
+        let mut meter_task: Option<tokio::task::JoinHandle<()>> = None;
         let mut duration = 0;
         let mut save_error = false;
         let mut abort = cancel.clone();
@@ -557,6 +563,27 @@ impl SpeechService {
                     Phase::Recording
                 }
             });
+            if let Some(c) = capture.as_ref() {
+                let handle = app.clone();
+                let id = task.id.clone();
+                let mut sequence = 0;
+                meter_task = Some(audio::publish_meter(
+                    c.meter.clone(),
+                    cancel.clone(),
+                    move |sample| {
+                        sequence += 1;
+                        let meter = Meter {
+                            task_id: id.clone(),
+                            sequence,
+                            level: sample.level,
+                            duration_ms: sample.duration_ms,
+                        };
+                        let _ = handle.emit_to("main", "speech:meter", &meter);
+                        let _ = handle.emit_to("voice-overlay", "speech:meter", &meter);
+                    },
+                ));
+            }
+            log::info!(target:"sayweave","operation=speech_phase task_id={} phase=ready elapsed_ms={}",task.id,began.elapsed().as_millis());
             if task.persistent
                 && self
                     .history
@@ -581,7 +608,6 @@ impl SpeechService {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut published = Instant::now();
             let mut checkpoint = Instant::now();
-            let mut meter_seq = 0;
             let mut dirty = false;
             loop {
                 if *cancel.borrow() >= 2 {
@@ -592,26 +618,24 @@ impl SpeechService {
                 }
                 tokio::select! {
                                    biased;
-                                   _=cancel.changed()=>{if *cancel.borrow()==1 {if let Some(c)=&capture{c.stop();}self.update(app,&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}},
+                                   _=cancel.changed()=>{if *cancel.borrow()==1 {if let Some(c)=&capture{c.stop();}log::info!(target:"sayweave","operation=speech_phase task_id={} phase=capture_stopped elapsed_ms={}",task.id,began.elapsed().as_millis());self.update(app,&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}},
                                    message=session.next_event()=>{match message? {
                                        recognition::Event::Update(value)=>{transcript=value;dirty=true;if !transcript.confirmed_text.is_empty()&&task.persistent&&checkpoint.elapsed()>Duration::from_secs(1){if self.history.db(DbOperation::Checkpoint{attempt_id:task.attempt_id.clone(),text:transcript.text(true)}).await.is_err(){save_error=true;}checkpoint=Instant::now();}},
                                        recognition::Event::Finished=>{if sending{return Err(Error::new("protocol"));}
-                if transcript.text(true).trim().is_empty(){return Err(Error::new("emptyText"));}break;},
+                if transcript.text(true).trim().is_empty(){return Err(Error::new("emptyText"));}log::info!(target:"sayweave","operation=speech_phase task_id={} phase=final_received elapsed_ms={}",task.id,began.elapsed().as_millis());break;},
                                        recognition::Event::Heartbeat=>{}
                                    }},
                                    _=tick.tick()=>{
                                        if began.elapsed()>Duration::from_secs(650){return Err(Error::new("timeout"));}
-                                       let mut level=0.0;
                                        if sending {
                                            if let Some(pcm)=&task.replay {
                                                let end=(replay_at+800).min(pcm.len());if replay_at<end {session.send_pcm(&pcm[replay_at..end]).await?;replay_at=end;duration=replay_at as u64/16;}else{sending=false;}
                                            } else if let Some(c)=capture.as_mut(){
-                                               for _ in 0..16 {let Ok(packet)=c.packets.try_recv() else {break};duration=packet.duration_ms;level=packet.level;session.send_pcm(&packet.pcm).await?;}
+                                               for _ in 0..16 {let Ok(packet)=c.packets.try_recv() else {break};duration=packet.duration_ms;session.send_pcm(&packet.pcm).await?;}
                                                if c.packets.is_closed()&&c.packets.is_empty(){sending=false;}
                                            }
-                                           if !sending {session.finish().await?;final_at=Some(Instant::now());self.update(app,&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}
+                                           if !sending {session.finish().await?;final_at=Some(Instant::now());log::info!(target:"sayweave","operation=speech_phase task_id={} phase=audio_drained elapsed_ms={}",task.id,began.elapsed().as_millis());self.update(app,&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}
                                        }
-                                       meter_seq+=1;let meter=Meter{task_id:task.id.clone(),sequence:meter_seq,level,duration_ms:duration};let _=app.emit_to("main","speech:meter",&meter);let _=app.emit_to("voice-overlay","speech:meter",&meter);
                                        if published.elapsed()>=Duration::from_millis(100)&&(dirty||sending){self.update(app,&task.id,|s|{s.text=transcript.text(false);s.segments=transcript.segments();s.duration_ms=duration;});published=Instant::now();dirty=false;}
                                    }
                                }
@@ -624,6 +648,9 @@ impl SpeechService {
             _=async {loop{if *abort.borrow()>=2{break;}
  if abort.changed().await.is_err(){break;}}}=>Err(crate::models::types::ModelError::new("cancelled"))
         }}).await.map_err(|e|Error::new(&e.code));
+        if let Some(task) = meter_task {
+            task.abort();
+        }
         // Stop and finalize outside the cancelled network future; never abandon an admitted file journal.
         if let Some(c) = capture.as_mut() {
             c.stop();

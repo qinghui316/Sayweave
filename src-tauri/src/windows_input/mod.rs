@@ -70,7 +70,11 @@ fn event_after_capture(event_tick: u32, captured_tick: u32) -> bool {
 enum Request {
     Capture(String, Anchor, oneshot::Sender<Result<(), Error>>),
     Deliver(String, String, Arc<DeliveryGate>, oneshot::Sender<Delivery>),
-    Copy(String, oneshot::Sender<Result<(), Error>>),
+    Copy(
+        String,
+        Option<Arc<DeliveryGate>>,
+        oneshot::Sender<Result<(), Error>>,
+    ),
     Restore(oneshot::Sender<Result<(), Error>>),
     Forget(String),
     Stop,
@@ -131,7 +135,7 @@ impl WindowsInputService {
                         Request::Deliver(_, _, _, r) => {
                             let _ = r.send(Delivery::copy("targetUnsupported"));
                         }
-                        Request::Copy(_, r) => {
+                        Request::Copy(_, _, r) => {
                             let _ = r.send(Err(Error::new("copyFailed")));
                         }
                         Request::Restore(r) => {
@@ -201,7 +205,15 @@ impl WindowsInputService {
             return Err(Error::new("invalid"));
         }
         let (tx, rx) = oneshot::channel();
-        self.send(Request::Copy(text, tx))?;
+        self.send(Request::Copy(text, None, tx))?;
+        rx.await.map_err(|_| Error::new("copyFailed"))?
+    }
+    pub async fn copy_bound(&self, text: String, gate: Arc<DeliveryGate>) -> Result<(), Error> {
+        if text.len() > 1024 * 1024 {
+            return Err(Error::new("invalid"));
+        }
+        let (tx, rx) = oneshot::channel();
+        self.send(Request::Copy(text, Some(gate), tx))?;
         rx.await.map_err(|_| Error::new("copyFailed"))?
     }
     pub fn forget(&self, id: String) {
@@ -248,6 +260,12 @@ pub(crate) fn expected_text(before: &str, start: usize, end: usize, text: &str) 
     units.splice(start..end, insert);
     String::from_utf16(&units).ok().map(|s| normalize(&s))
 }
+pub(crate) fn insertion_prefix(before: &str, start: usize, text: &str) -> Option<String> {
+    let units: Vec<u16> = before.encode_utf16().collect();
+    let mut prefix = units.get(..start)?.to_vec();
+    prefix.extend(text.encode_utf16());
+    String::from_utf16(&prefix).ok().map(|s| normalize(&s))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +280,22 @@ mod tests {
             Some("a\nb\nc".into())
         );
         assert_eq!(expected_text("abc", 0, 3, "abc"), Some("abc".into()));
+    }
+    #[test]
+    fn readback_caret_uses_actual_newline_representation_and_utf16_boundaries() {
+        assert_eq!(
+            insertion_prefix("a😀b", 3, "中文，\n🙂"),
+            Some("a😀中文，\n🙂".into())
+        );
+        assert_eq!(
+            insertion_prefix("a😀中文，\r\n🙂b", 10, ""),
+            Some("a😀中文，\n🙂".into())
+        );
+        assert_eq!(insertion_prefix("a😀b", 2, ""), None);
+        assert_ne!(
+            insertion_prefix("a😀中文，\r\n🙂b", 11, ""),
+            Some("a😀中文，\n🙂".into())
+        );
     }
     #[test]
     fn delayed_events_before_capture_do_not_invalidate_a_new_target() {
