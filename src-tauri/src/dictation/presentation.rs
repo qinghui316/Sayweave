@@ -42,6 +42,19 @@ pub fn final_presentation(
     delivery: Option<&Delivery>,
     error: Option<&str>,
 ) -> Presentation {
+    // A completed TSF commit ends the gesture even without an independent
+    // renderer confirmation fence. Keep that distinction in Delivery/history;
+    // do not turn every normal streaming task into a persistent warning.
+    if error.is_none()
+        && delivery.is_some_and(|d| {
+            d.stage == "composition"
+                && d.submission == Submission::Submitted
+                && d.error.as_deref() == Some("inputUnconfirmed")
+                && !d.restore_error
+        })
+    {
+        return Presentation::Completed;
+    }
     // A failed rollback can leave visible text even when recognition itself was cancelled.
     if delivery.is_some_and(|d| {
         d.submission != Submission::NotSubmitted
@@ -79,6 +92,23 @@ pub fn final_presentation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_stream_has_short_feedback_without_claiming_readback() {
+        let mut delivery = Delivery::not_submitted("inputUnconfirmed");
+        delivery.stage = "composition".into();
+        delivery.state = "unconfirmed".into();
+        delivery.submission = Submission::Submitted;
+        assert_eq!(
+            final_presentation(false, "text", Some(&delivery), None),
+            Presentation::Completed
+        );
+        assert_eq!(Presentation::Completed.hide_after(), Some(600));
+        delivery.error = Some("compositionRejected".into());
+        assert_eq!(
+            final_presentation(false, "text", Some(&delivery), None),
+            Presentation::Notice
+        );
+    }
     #[test]
     fn late_recording_projection_cannot_reverse_finish_or_cancel() {
         assert_eq!(

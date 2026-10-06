@@ -49,8 +49,8 @@ test('normal finish shows recognition feedback and hides terminal captions',asyn
  await expect(page.getByText('识别中',{exact:true})).toBeVisible();
  await expect(page.getByLabel('实时字幕')).toHaveCount(0);await expect(page.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);
  await page.setViewportSize({width:120,height:112});await page.goto('/tests/fixtures/voice-recovery.html?presentation=completed');
- await expect(page.getByText('已填入',{exact:true})).toBeVisible();
- const rect=await page.getByText('已填入',{exact:true}).boundingBox();expect(rect!.y+rect!.height).toBeLessThanOrEqual(112);
+ await expect(page.getByText('口述完成',{exact:true})).toBeVisible();
+ const rect=await page.getByText('口述完成',{exact:true}).boundingBox();expect(rect!.y+rect!.height).toBeLessThanOrEqual(112);
 });
 
 test('device and shortcut controls fit both window sizes with shared styles and keyboard operation',async({page})=>{

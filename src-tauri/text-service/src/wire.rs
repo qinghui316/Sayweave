@@ -2,6 +2,15 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_FRAME: usize = 128 * 1024;
 pub const MAX_TEXT_UTF16: usize = 16 * 1024;
+// v2 requires native disabled-context checks. Never send edits to a v1 target.
+pub const PROTOCOL: u32 = 2;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Runtime {
+    pub protocol: u32,
+    pub process: u32,
+    pub thread: u32,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -19,6 +28,7 @@ pub struct Request {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum Action {
+    Inspect,
     Begin,
     Update,
     Commit,
@@ -32,6 +42,17 @@ pub struct Reply {
     pub applied: bool,
     pub code: String,
     pub mutation: Mutation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<Runtime>,
+}
+impl Reply {
+    pub fn compatible_runtime(&self, process: u32, thread: u32) -> bool {
+        self.applied
+            && self.mutation == Mutation::NotAttempted
+            && self.runtime.as_ref().is_some_and(|r| {
+                r.protocol == PROTOCOL && r.process == process && r.thread == thread
+            })
+    }
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -43,7 +64,7 @@ pub enum Mutation {
 }
 impl Request {
     pub fn valid(&self) -> bool {
-        self.protocol == 1
+        self.protocol == PROTOCOL
             && uuid::Uuid::parse_str(&self.task).is_ok()
             && uuid::Uuid::parse_str(&self.capability).is_ok()
             && self.turn > 0
@@ -76,6 +97,7 @@ impl DraftVersion {
     }
     pub fn accepts(&self, request: &Request) -> bool {
         request.valid()
+            && request.action != Action::Inspect
             && if request.action == Action::Begin {
                 // Operation counters belong to a turn, not to the lifetime of the
                 // loaded text service. A new host/turn starts its own counter.
@@ -102,7 +124,7 @@ mod tests {
     use super::*;
     fn request(action: Action, operation: u64, revision: u64) -> Request {
         Request {
-            protocol: 1,
+            protocol: crate::wire::PROTOCOL,
             capability: uuid::Uuid::new_v4().to_string(),
             task: "3923cd50-c588-49b5-9895-ce2e23e21b5b".into(),
             turn: 1,
@@ -112,6 +134,33 @@ mod tests {
             action,
             text: "中文🙂".into(),
         }
+    }
+    #[test]
+    fn runtime_admission_rejects_old_or_different_targets_without_edits() {
+        let mut r = request(Action::Inspect, 1, 0);
+        assert!(r.valid());
+        assert!(!DraftVersion::default().accepts(&r));
+        r.protocol = 1;
+        assert!(!r.valid());
+        let mut reply = Reply {
+            operation: 1,
+            revision: 0,
+            applied: true,
+            code: "runtime".into(),
+            mutation: Mutation::NotAttempted,
+            runtime: None,
+        };
+        assert!(!reply.compatible_runtime(10, 20));
+        reply.runtime = Some(Runtime {
+            protocol: PROTOCOL,
+            process: 10,
+            thread: 20,
+        });
+        assert!(reply.compatible_runtime(10, 20));
+        assert!(!reply.compatible_runtime(11, 20));
+        assert!(!reply.compatible_runtime(10, 21));
+        reply.mutation = Mutation::Changed;
+        assert!(!reply.compatible_runtime(10, 20));
     }
     #[test]
     fn released_ranges_acknowledge_only_their_own_handoff_and_never_mutate_again() {

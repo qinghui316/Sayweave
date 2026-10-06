@@ -1,5 +1,5 @@
 //! Session-owned host. TSF ranges stay in the target's apartment, never in this worker.
-use super::{Anchor, Delivery, DeliveryGate, Submission, Verification, WindowsInputService, proof};
+use super::{Anchor, Delivery, DeliveryGate, Submission, Verification, WindowsInputService};
 use crate::history::types::Error;
 use sayweave_text_service::{
     client::ProfileLease,
@@ -55,13 +55,12 @@ impl Draft {
         let desired = Arc::new(Mutex::new(Desired::default()));
         let (ready, result) = oneshot::channel();
         let shared = desired.clone();
-        let worker_input = input.clone();
         std::thread::Builder::new()
             .name("sayweave-composition-sta".into())
             .spawn(move || {
                 let began = Instant::now();
                 let diagnostic_task = task.clone();
-                let mut host = match Host::open(task, turn, anchor, gate, worker_input) {
+                let mut host = match Host::open(task, turn, anchor, gate) {
                     Ok(host) => host,
                     Err(error) => {
                         log::info!(target:"sayweave", "operation=draft_admission task_id={} turn={} result=rejected error={} elapsed_ms={}", diagnostic_task,turn,error.code,began.elapsed().as_millis());
@@ -198,8 +197,6 @@ struct Host {
     attempted: bool,
     visible: bool,
     failure: Option<String>,
-    input: WindowsInputService,
-    proof_available: bool,
     profile: ProfileLease,
     _lease: registration::HostLease,
     _apartment: Apartment,
@@ -210,7 +207,6 @@ impl Host {
         turn: u64,
         anchor: Anchor,
         gate: Arc<DeliveryGate>,
-        input: WindowsInputService,
     ) -> Result<Self, Error> {
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED)
@@ -260,83 +256,26 @@ impl Host {
             attempted: false,
             visible: false,
             failure: None,
-            input,
-            proof_available: false,
             profile,
             _lease: lease,
             _apartment: apartment,
         };
-        super::native::composition_begin_target(&host.task, &host.anchor)?;
-        host.proof_available = match host.observe(proof::Action::Begin) {
-            Ok(available) => available,
-            // UIA is optional position evidence, not the editable TSF context.
-            // Only initial discovery may be unavailable: the component still
-            // checks disabled/password/readonly context and range ownership on
-            // every operation. Loss of acquired proof remains a hard stop.
-            Err(error) if error.code == "targetTimeout" => {
-                log::info!(target:"sayweave", "operation=draft_proof task_id={} turn={} phase=begin unavailable_reason=targetTimeout", host.task,host.turn);
-                false
+        // Inspect the component executing in this target, not the registered file.
+        // An old loaded DLL rejects v2 before any edit; there is no downgrade.
+        host.exchange(Action::Inspect, "", false).map_err(|error| {
+            log::info!(target:"sayweave", "operation=draft_runtime task_id={} turn={} result=rejected error={}", host.task,host.turn,error.code);
+            if matches!(error.code.as_str(), "compositionDisconnected" | "compositionTimeout" | "compositionProtocol") {
+                Error::new("compositionRuntimeUnavailable")
+            } else {
+                error
             }
-            Err(error) => return Err(error),
-        };
-        log::info!(target:"sayweave", "operation=draft_proof task_id={} turn={} phase=begin available={}", host.task, host.turn, host.proof_available);
+        })?;
+        super::native::composition_begin_target(&host.task, &host.anchor)?;
         host.exchange(Action::Begin, "", false)?;
         // Begin itself does not change text. Do not publish a writable draft if input moved
         // while the target's asynchronous edit session was being scheduled/executed.
         super::native::composition_begin_target(&host.task, &host.anchor)?;
-        host.check_position()?;
         Ok(host)
-    }
-    fn observe(&self, action: proof::Action) -> Result<bool, Error> {
-        self.observe_until(action, Instant::now() + Duration::from_millis(500))
-    }
-    fn observe_until(&self, action: proof::Action, expires: Instant) -> Result<bool, Error> {
-        let response = self.input.proof(proof::Request {
-            task: self.task.clone(),
-            turn: self.turn,
-            anchor: self.anchor.clone(),
-            expires,
-            action,
-        })?;
-        loop {
-            if Instant::now() >= expires {
-                return Err(Error::new("targetTimeout"));
-            }
-            if self.gate.cancelled() {
-                return Err(Error::new("cancelled"));
-            }
-            match response.try_recv() {
-                Ok(value) => return value,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    return Err(Error::new("targetProbeFailed"));
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-            pump();
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
-    fn check_position(&self) -> Result<(), Error> {
-        if self.proof_available {
-            let text = self.visible.then(|| self.text.clone());
-            let expires = Instant::now() + Duration::from_millis(500);
-            let observed = loop {
-                let value = self.observe_until(proof::Action::Check(text.clone()), expires);
-                if matches!(&value, Err(e) if matches!(e.code.as_str(), "targetObservationPending" | "targetProbeFailed"))
-                    && Instant::now() < expires
-                {
-                    pump();
-                    std::thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                break value;
-            };
-            log::info!(target:"sayweave", "operation=draft_proof task_id={} turn={} revision={} phase=check matched={} error={}", self.task,self.turn,self.revision,matches!(observed,Ok(true)),observed.as_ref().err().map(|e|e.code.as_str()).unwrap_or("none"));
-            if !observed? {
-                return Err(Error::new("targetProbeFailed"));
-            }
-        }
-        Ok(())
     }
     fn exchange(&mut self, action: Action, text: &str, cleanup: bool) -> Result<(), Error> {
         if !cleanup {
@@ -350,7 +289,7 @@ impl Host {
             self.revision += 1;
         }
         let request = Request {
-            protocol: 1,
+            protocol: sayweave_text_service::wire::PROTOCOL,
             capability: self.capability.clone(),
             task: self.task.clone(),
             turn: self.turn,
@@ -388,6 +327,14 @@ impl Host {
                 if reply.operation != request.operation || reply.revision != request.revision {
                     return Err(Error::new("compositionProtocol"));
                 }
+                if action == Action::Inspect {
+                    let mut pid = 0;
+                    let thread = unsafe { GetWindowThreadProcessId(HWND(self.anchor.window as *mut _), Some(&mut pid)) };
+                    if pid != self.anchor.process || !reply.compatible_runtime(pid, thread) {
+                        return Err(Error::new("compositionTargetVersion"));
+                    }
+                    log::info!(target:"sayweave", "operation=draft_runtime task_id={} turn={} result=ready protocol={} process={} thread={}", self.task,self.turn,sayweave_text_service::wire::PROTOCOL,pid,thread);
+                }
                 if reply.mutation == Mutation::Changed {
                     self.visible = true;
                 }
@@ -405,10 +352,6 @@ impl Host {
         }
     }
     fn update(&mut self, text: &str) -> Result<(), Error> {
-        if let Err(error) = self.check_position() {
-            self.failure = Some(error.code.clone());
-            return Err(error);
-        }
         if text == self.text {
             return Ok(());
         }
@@ -433,7 +376,6 @@ impl Host {
                 .and(Err(Error::new(self.failure.as_deref().unwrap())))
         } else {
             self.update(text).and_then(|_| {
-                self.check_position()?;
                 if !self.gate.commit() {
                     return self
                         .exchange(Action::Abort, "", true)

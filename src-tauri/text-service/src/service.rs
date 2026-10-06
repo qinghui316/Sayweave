@@ -238,6 +238,26 @@ fn poll(shared: &Shared) {
             return;
         }
     };
+    if r.action == Action::Inspect {
+        // Authenticated connection only; no context, selection or edit session is touched.
+        let idle = {
+            let s = shared.borrow();
+            s.pending.is_none()
+                && !s.cleanup
+                && !s.version.owned
+                && r.text.is_empty()
+                && r.live(unsafe { GetTickCount64() })
+        };
+        reply(
+            shared,
+            &r,
+            connection,
+            idle,
+            "runtime",
+            Mutation::NotAttempted,
+        );
+        return;
+    }
     let pending = shared.borrow().pending.clone();
     if let Some(p) = pending {
         if r.action != Action::Abort
@@ -335,6 +355,11 @@ fn reply(
             applied,
             code: code.into(),
             mutation,
+            runtime: (r.action == Action::Inspect).then(|| Runtime {
+                protocol: PROTOCOL,
+                process: std::process::id(),
+                thread: unsafe { windows::Win32::System::Threading::GetCurrentThreadId() },
+            }),
         };
         if let Ok(data) = serde_json::to_vec(&reply) {
             let _ = pipe.send(&data);
@@ -1104,7 +1129,7 @@ fn apply(
                 composition.EndComposition(ec)?;
                 release_composition(shared, epoch, Some(&composition));
             }
-            Action::Begin => unreachable!(),
+            Action::Begin | Action::Inspect => unreachable!(),
         }
         Ok(())
     }
@@ -1235,7 +1260,7 @@ mod tests {
             ..Default::default()
         }));
         let old = Request {
-            protocol: 1,
+            protocol: crate::wire::PROTOCOL,
             capability: uuid::Uuid::new_v4().to_string(),
             task,
             turn: 1,

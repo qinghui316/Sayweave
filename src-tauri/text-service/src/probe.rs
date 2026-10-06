@@ -146,10 +146,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("probe interval exceeds limit".into());
                 }
                 for (op, revision, action, text) in [
-                    (1, 0, Action::Begin, ""),
-                    (2, 1, Action::Update, "Sayweave 原位"),
+                    (1, 0, Action::Inspect, ""),
+                    (2, 0, Action::Begin, ""),
+                    (3, 1, Action::Update, "Sayweave 原位"),
                     (
-                        3,
+                        4,
                         2,
                         Action::Update,
                         if multiline {
@@ -158,13 +159,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             "Sayweave 原位验证，🙂"
                         },
                     ),
-                    (4, 2, Action::Commit, ""),
+                    (5, 2, Action::Commit, ""),
                 ] {
                     if GetForegroundWindow() != window {
                         return Err("target foreground changed; stopped without retry".into());
                     }
                     let r = Request {
-                        protocol: 1,
+                        protocol: sayweave_text_service::wire::PROTOCOL,
                         capability: capability.clone(),
                         task: task.clone(),
                         turn: 1,
@@ -194,6 +195,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     if reply.operation != op || !reply.applied {
                         return Err("target did not apply edit".into());
+                    }
+                    if action == Action::Inspect && !reply.compatible_runtime(pid, thread) {
+                        return Err("target runtime mismatch; no input attempted".into());
                     }
                     pump(Duration::from_millis(interval));
                 }
@@ -402,7 +406,7 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                 (4, 2, Action::Commit, ""),
             ] {
                 let request = Request {
-                    protocol: 1,
+                    protocol: sayweave_text_service::wire::PROTOCOL,
                     capability: capability.clone(),
                     task: task.clone(),
                     turn: 1,
@@ -951,7 +955,7 @@ fn exchange(
 ) -> Result<Reply, Box<dyn std::error::Error>> {
     let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
     let r = Request {
-        protocol: 1,
+        protocol: sayweave_text_service::wire::PROTOCOL,
         capability: capability.into(),
         task: task.into(),
         turn,

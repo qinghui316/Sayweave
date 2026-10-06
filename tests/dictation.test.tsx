@@ -114,7 +114,7 @@ it('shows only recognition feedback while final text is pending and clears compl
  const view=render(<VoiceSurface presentation="recognizing" phase="processing" text="尾字尚在返回" start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
  expect(screen.getByText('识别中')).toBeVisible();expect(screen.queryByLabelText('实时字幕')).not.toBeInTheDocument();
  view.rerender(<VoiceSurface presentation="completed" phase="completed" text="完整结果" start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
- expect(screen.getByText('已填入')).toBeVisible();expect(screen.queryByText('完整结果')).not.toBeInTheDocument();
+ expect(screen.getByText('口述完成')).toBeVisible();expect(screen.queryByText('完整结果')).not.toBeInTheDocument();
  expect(screen.queryByRole('button',{name:'复制'})).not.toBeInTheDocument();
 });
 it('submitted input offers a closeable notice without a copy card',async()=>{
