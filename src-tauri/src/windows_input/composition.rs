@@ -368,7 +368,13 @@ impl Host {
         self.visible = false;
         self.exchange(Action::Begin, "", false)?;
         self.range_open = true;
-        super::native::composition_begin_target(&self.task, &self.anchor)?;
+        if let Err(error) = super::native::composition_begin_target(&self.task, &self.anchor) {
+            // No text was written. Retire this unpublished range before a retry can
+            // acquire another one; never leave an acknowledged Begin orphaned.
+            self.exchange(Action::Handoff, "", true)?;
+            self.range_open = false;
+            return Err(error);
+        }
         Ok(())
     }
     fn exchange(&mut self, action: Action, text: &str, cleanup: bool) -> Result<(), Error> {

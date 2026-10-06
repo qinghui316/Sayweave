@@ -342,7 +342,11 @@ try{
     const read=()=>control==='area'?target.locator('#area').inputValue():target.evaluate(()=>window.fixtureEditor.read());
     const result=await externalRound(page,async(start)=>{
      await expect.poll(read).toBe('abc正在识别');
-     await keyEvent('Backspace',true);await keyEvent('Backspace',false);
+     await keyEvent('Backspace',true);
+     // A held edit key must not acquire a new range halfway through editing.
+     await delay(700);
+     expect(report.taskTrace.some(e=>e.line.includes('task_id='+start.taskId+' ')&&e.line.includes('turn=2')&&e.line.includes('action=Begin'))).toBe(false);
+     await keyEvent('Backspace',false);
      await expect.poll(()=>report.taskTrace.some(e=>e.line.includes('task_id='+start.taskId+' ')&&e.line.includes('turn=2')&&e.line.includes('action=Update applied=true')),{timeout:8000}).toBe(true);
      expect(await read()).toBe('abc正在识正在识别');
      expect(report.taskTrace.some(e=>e.line.includes('task_id='+start.taskId+' ')&&e.line.includes('keyboardHandedOff'))).toBe(true);

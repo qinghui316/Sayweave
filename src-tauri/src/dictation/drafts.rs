@@ -101,6 +101,9 @@ impl SessionDraft {
         }
     }
     async fn handoff(&self, activity: u64) {
+        if self.state.lock().is_ok_and(|s| s.activity == activity) {
+            return; // The tick may already have consumed this watch notification.
+        }
         self.control.handoff_started();
         self.control.pause();
         let _operation = self.operation.lock().await;
@@ -148,7 +151,7 @@ impl SessionDraft {
             }
             (state.turn, state.activity)
         };
-        if activity != input_state::activity() {
+        if activity != input_state::activity() || input_state::editing_key_held() {
             return Ok(());
         }
         let anchor = windows_input::reanchor_turn(&self.task, &self.anchor)?;
@@ -161,6 +164,17 @@ impl SessionDraft {
                 if let Ok(mut state) = self.state.lock() {
                     state.paused_at = Some(Instant::now());
                 }
+                return Ok(());
+            }
+            Err(error) if error.code == "editing" => {
+                // Editing may resume while the asynchronous, no-text Begin is pending.
+                // The connection has retired that range before reporting this result.
+                if let Ok(mut state) = self.state.lock() {
+                    state.turn += 1;
+                    state.activity = input_state::activity();
+                    state.paused_at = Some(Instant::now());
+                }
+                self.feedback(publish, Presentation::Editing);
                 return Ok(());
             }
             Err(error) => return Err(error),

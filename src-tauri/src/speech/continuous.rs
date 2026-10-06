@@ -9,7 +9,7 @@ use crate::{
 use std::{
     collections::BTreeMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
@@ -63,6 +63,7 @@ pub struct Control {
     draft_armed: Arc<AtomicBool>,
     handed_off: Arc<AtomicBool>,
     raw: Arc<Mutex<RawTurns>>,
+    task: Arc<OnceLock<String>>,
 }
 impl Control {
     pub fn new(evidence: Arc<AtomicU64>) -> Self {
@@ -78,6 +79,7 @@ impl Control {
             draft_armed: Arc::new(AtomicBool::new(false)),
             handed_off: Arc::new(AtomicBool::new(false)),
             raw: Arc::new(Mutex::new(RawTurns::default())),
+            task: Arc::new(OnceLock::new()),
         }
     }
     pub fn pause(&self) {
@@ -144,6 +146,11 @@ impl Control {
     pub fn readiness(&self) -> watch::Receiver<u64> {
         self.ready.subscribe()
     }
+    fn trace(&self, turn: u64, phase: &str) {
+        if let Some(task) = self.task.get() {
+            log::info!(target:"sayweave", "operation=speech_turn task_id={task} turn={turn} phase={phase} audio_route={}", self.audio.current());
+        }
+    }
     pub(super) fn enabled(&self, route: Route) {
         let Ok(_transition) = self.transition.lock() else {
             return;
@@ -151,6 +158,7 @@ impl Control {
         if !self.stopping() && *self.requested.borrow() == route {
             self.audio.set(route);
             self.ready.send_replace(route.turn);
+            self.trace(route.turn, "ready");
         }
     }
 }
@@ -176,6 +184,7 @@ impl Stream {
     ) -> Result<Self, Error> {
         let first = RecognitionSession::open(cfg, task).await?;
         Ok(if let Some(control) = control {
+            let _ = control.task.set(task.into());
             let route = *control.requested.borrow();
             control.enabled(route);
             Self::Continuous(Continuous::spawn(first, cfg, control, route, requests))
@@ -342,6 +351,8 @@ impl Continuous {
             let mut ended = false;
             let mut final_route = Route::default();
             let mut failure = None;
+            let mut first_audio = 0;
+            let mut first_text = 0;
             let outcome = async {
                 loop {
                     let desired = *changes.borrow_and_update();
@@ -384,7 +395,10 @@ impl Continuous {
                             Command::Audio(turn,pcm)=> {
                                 if !ended && turn > 0 && control.audio.current() == turn
                                     && let Some(connection) = active.as_ref().filter(|c| c.turn == turn)
-                                { connection.session.send_pcm(&pcm).await?; }
+                                {
+                                    connection.session.send_pcm(&pcm).await?;
+                                    if first_audio != turn { first_audio = turn; control.trace(turn,"first_audio_sent"); }
+                                }
                             },
                             Command::Finish(ack)=> {
                                 final_route = *changes.borrow();
@@ -405,6 +419,7 @@ impl Continuous {
                             match value? {
                                 Event::Update(value)=> {
                                     let text = value.text(false);
+                                    if first_text != turn && !text.is_empty() { first_text = turn; control.trace(turn,"first_transcript"); }
                                     control.record(turn,value)?;
                                     // Editing evidence immediately closes the write gate, even before Pause arrives.
                                     let draft = (control.audio.current() == turn).then_some((turn,text));

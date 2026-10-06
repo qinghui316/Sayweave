@@ -111,10 +111,16 @@ pub(super) fn composition_begin_target(id: &str, expected: &Anchor) -> Result<()
         return Err(err("targetChanged"));
     }
     let current = anchor()?;
-    if current.focus != expected.focus
-        || current.activity != expected.activity
-        || current.generation != expected.generation
-    {
+    if current.focus != expected.focus {
+        log::info!(target:"sayweave", "operation=draft_begin_guard task_id={id} reason=targetChanged focus_same=false");
+        return Err(err("targetChanged"));
+    }
+    if current.activity != expected.activity {
+        log::info!(target:"sayweave", "operation=draft_begin_guard task_id={id} reason=editing focus_same={} generation_same={}", current.focus == expected.focus, current.generation == expected.generation);
+        return Err(err("editing"));
+    }
+    if current.generation != expected.generation {
+        log::info!(target:"sayweave", "operation=draft_begin_guard task_id={id} reason=targetChanged focus_same={} generation_same={}", current.focus == expected.focus, current.generation == expected.generation);
         return Err(err("targetChanged"));
     }
     Ok(())

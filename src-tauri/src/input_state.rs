@@ -1,8 +1,36 @@
 //! Physical input evidence shared by shortcut admission and text delivery.
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
+
+fn held_edits() -> &'static Mutex<HashSet<u16>> {
+    static KEYS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+    KEYS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+pub fn edit_key_pressed(key: u16) {
+    if let Ok(mut keys) = held_edits().lock() {
+        keys.insert(key);
+    }
+    edited();
+}
+pub fn key_released(key: u16) {
+    let changed = held_edits().lock().is_ok_and(|mut keys| keys.remove(&key));
+    if changed {
+        edited();
+    }
+}
+pub fn editing_key_held() -> bool {
+    held_edits().lock().map_or(true, |keys| !keys.is_empty())
+}
+pub fn reset_edit_keys() {
+    if let Ok(mut keys) = held_edits().lock() {
+        keys.clear();
+    }
+}
 
 fn evidence() -> &'static Arc<AtomicU64> {
     static ACTIVITY: OnceLock<Arc<AtomicU64>> = OnceLock::new();

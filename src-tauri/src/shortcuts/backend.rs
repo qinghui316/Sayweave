@@ -224,8 +224,13 @@ fn track_key(b: &mut Bridge, value: u16, pressed: bool, released: bool) -> (bool
 fn reconcile_keys(b: &mut Bridge, mut is_down: impl FnMut(u16) -> bool) {
     // A swallowed down never reaches Windows async state. Only its physical hook up
     // can release it; polling remains a fallback for unconsumed combo members.
-    b.pressed
-        .retain(|key| b.consumed.contains(key) || is_down(*key));
+    b.pressed.retain(|key| {
+        let retained = b.consumed.contains(key) || is_down(*key);
+        if !retained {
+            crate::input_state::key_released(*key);
+        }
+        retained
+    });
     if b.held.is_some() && !matches(b) {
         release(b);
         b.armed = b.pressed.is_empty();
@@ -259,7 +264,18 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             let value = key.vkCode as u16;
             let (repeated, consumed_release) = track_key(b, value, pressed, released);
             if pressed && edits_target(b, value) {
-                crate::input_state::edited();
+                crate::input_state::edit_key_pressed(value);
+                if let Some(task) = &b.task_active {
+                    let kind = match value {
+                        0x08 => "backspace",
+                        0x2e => "delete",
+                        _ => "other",
+                    };
+                    log::info!(target:"sayweave", "operation=input_edit task_id={task} kind={kind} repeated={repeated} activity={}", crate::input_state::activity());
+                }
+            }
+            if released {
+                crate::input_state::key_released(value);
             }
             if repeated {
                 return if b.consumed.contains(&value) {
@@ -400,6 +416,7 @@ pub struct Backend {
     thread: u32,
 }
 fn interrupt(b: &mut Bridge) {
+    crate::input_state::reset_edit_keys();
     crate::input_state::edited();
     send(b, Event::Interrupt(b.task_active.clone()));
     b.generation += 1;
@@ -577,6 +594,7 @@ impl Backend {
                 let _ = UnhookWinEvent(destroyed);
                 let _ = DestroyWindow(window);
                 *state().lock().unwrap() = None;
+                crate::input_state::reset_edit_keys();
             })
             .map_err(|_| Error::new("shortcutUnavailable"))?;
         Ok(Self {
