@@ -2,9 +2,10 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_FRAME: usize = 128 * 1024;
 pub const MAX_TEXT_UTF16: usize = 16 * 1024;
-// v4 separates marked representation from semantic commit in one owned edit session.
+// v5 settles a processed prefix without changing source offsets or ending the
+// logical draft. The remaining tail can be an owned empty insertion lease.
 // A registered upgrade is insufficient: the target must be running this version.
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Runtime {
@@ -25,6 +26,15 @@ pub struct Request {
     pub deadline_tick: u64,
     pub action: Action,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<Prefix>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Prefix {
+    pub text: String,
+    pub expected_revision: u64,
+    pub range_epoch: u64,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +42,7 @@ pub enum Action {
     Inspect,
     Begin,
     Update,
+    Settle,
     Commit,
     Handoff,
     Abort,
@@ -45,6 +56,17 @@ pub struct Reply {
     pub mutation: Mutation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<Runtime>,
+    #[serde(default)]
+    pub range_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement: Option<Settlement>,
+}
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+pub struct Settlement {
+    pub prefix: Mutation,
+    /// The tail's logical write lease remains valid, including an empty tail.
+    /// This is not independent confirmation of target rendering.
+    pub tail_owned: bool,
 }
 impl Reply {
     pub fn compatible_runtime(&self, process: u32, thread: u32) -> bool {
@@ -70,7 +92,21 @@ impl Request {
             && uuid::Uuid::parse_str(&self.capability).is_ok()
             && self.turn > 0
             && self.operation > 0
-            && self.text.encode_utf16().count() <= MAX_TEXT_UTF16
+            && self.text.encode_utf16().count()
+                + self
+                    .prefix
+                    .as_ref()
+                    .map_or(0, |p| p.text.encode_utf16().count())
+                <= MAX_TEXT_UTF16
+            && match (self.action, &self.prefix) {
+                (Action::Settle, Some(prefix)) => {
+                    !prefix.text.is_empty()
+                        && prefix.range_epoch > 0
+                        && prefix.expected_revision < self.revision
+                }
+                (Action::Settle, None) => false,
+                (_, prefix) => prefix.is_none(),
+            }
     }
     pub fn live(&self, now: u64) -> bool {
         self.deadline_tick >= now && self.deadline_tick - now <= 2000
@@ -109,7 +145,13 @@ impl DraftVersion {
                     && self.turn == request.turn
                     && request.operation > self.operation
                     && request.revision >= self.revision
-                    && (request.action != Action::Update || request.revision > self.revision)
+                    && (request.action != Action::Settle
+                        || request
+                            .prefix
+                            .as_ref()
+                            .is_some_and(|p| p.expected_revision == self.revision))
+                    && (!matches!(request.action, Action::Update | Action::Settle)
+                        || request.revision > self.revision)
             }
     }
     pub fn applied(&mut self, request: &Request) {
@@ -117,7 +159,10 @@ impl DraftVersion {
         self.turn = request.turn;
         self.operation = request.operation;
         self.revision = request.revision;
-        self.owned = matches!(request.action, Action::Begin | Action::Update);
+        self.owned = matches!(
+            request.action,
+            Action::Begin | Action::Update | Action::Settle
+        );
     }
 }
 #[cfg(test)]
@@ -134,6 +179,7 @@ mod tests {
             deadline_tick: 1000,
             action,
             text: "中文🙂".into(),
+            prefix: None,
         }
     }
     #[test]
@@ -144,6 +190,8 @@ mod tests {
         r.protocol = 1;
         assert!(!r.valid());
         let mut reply = Reply {
+            range_epoch: 0,
+            settlement: None,
             operation: 1,
             revision: 0,
             applied: true,
@@ -162,6 +210,30 @@ mod tests {
         assert!(!reply.compatible_runtime(10, 21));
         reply.mutation = Mutation::Changed;
         assert!(!reply.compatible_runtime(10, 20));
+    }
+    #[test]
+    fn prefix_settlement_requires_the_live_write_revision_and_retains_tail_ownership() {
+        let mut state = DraftVersion::default();
+        state.applied(&request(Action::Begin, 1, 0));
+        state.applied(&request(Action::Update, 2, 1));
+        let mut settle = request(Action::Settle, 3, 2);
+        settle.prefix = Some(Prefix {
+            text: "已整理".into(),
+            expected_revision: 1,
+            range_epoch: 4,
+        });
+        assert!(state.accepts(&settle));
+        state.applied(&settle);
+        assert!(state.owned);
+        assert!(!state.accepts(&settle));
+        let update = request(Action::Update, 4, 3);
+        assert!(state.accepts(&update));
+        state.applied(&update);
+        settle.operation = 5;
+        settle.revision = 4;
+        assert!(!state.accepts(&settle)); // Old generation result needs a fresh write transaction.
+        settle.prefix.as_mut().unwrap().expected_revision = 3;
+        assert!(state.accepts(&settle));
     }
     #[test]
     fn released_ranges_acknowledge_only_their_own_handoff_and_never_mutate_again() {

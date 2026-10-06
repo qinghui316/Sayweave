@@ -398,6 +398,7 @@ impl Host {
             deadline_tick: unsafe { GetTickCount64() } + 2000,
             action,
             text: text.into(),
+            prefix: None,
         };
         if !request.valid() {
             return Err(Error::new("compositionTextLimit"));

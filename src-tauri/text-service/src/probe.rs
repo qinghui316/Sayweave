@@ -137,6 +137,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let task = uuid::Uuid::new_v4().to_string();
                 let multiline = args.get(4).map(String::as_str) == Some("multiline");
+                let prefix_probe = matches!(
+                    args.get(4).map(String::as_str),
+                    Some("prefix" | "prefix-multiline")
+                );
+                let prefix_multiline = args.get(4).map(String::as_str) == Some("prefix-multiline");
                 let interval = args
                     .get(5)
                     .map(|s| s.parse::<u64>())
@@ -145,22 +150,61 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if interval > 1000 {
                     return Err("probe interval exceeds limit".into());
                 }
-                for (op, revision, action, text) in [
-                    (1, 0, Action::Inspect, ""),
-                    (2, 0, Action::Begin, ""),
-                    (3, 1, Action::Update, "Sayweave 原位"),
-                    (
-                        4,
-                        2,
-                        Action::Update,
-                        if multiline {
-                            "中文，🙂\n第二行 e\u{0301}。"
-                        } else {
-                            "Sayweave 原位验证，🙂"
-                        },
-                    ),
-                    (5, 2, Action::Commit, ""),
-                ] {
+                let steps = if prefix_probe {
+                    vec![
+                        (1, 0, Action::Inspect, "", None),
+                        (2, 0, Action::Begin, "", None),
+                        (3, 1, Action::Update, "ASR 第一段，第二段临时", None),
+                        (
+                            4,
+                            2,
+                            Action::Settle,
+                            "第二段临时",
+                            Some(if prefix_multiline {
+                                "第一段。\n"
+                            } else {
+                                "第一段。"
+                            }),
+                        ),
+                        (5, 3, Action::Update, "第二段续写🙂", None),
+                        (
+                            6,
+                            4,
+                            Action::Settle,
+                            "尾部🙂",
+                            Some(if prefix_multiline {
+                                "第二段。\n"
+                            } else {
+                                "第二段。"
+                            }),
+                        ),
+                        (7, 5, Action::Update, "尾部完成🙂", None),
+                        (8, 5, Action::Commit, "", None),
+                    ]
+                } else {
+                    vec![
+                        (1, 0, Action::Inspect, ""),
+                        (2, 0, Action::Begin, ""),
+                        (3, 1, Action::Update, "Sayweave 原位"),
+                        (
+                            4,
+                            2,
+                            Action::Update,
+                            if multiline {
+                                "中文，🙂\n第二行 e\u{0301}。"
+                            } else {
+                                "Sayweave 原位验证，🙂"
+                            },
+                        ),
+                        (5, 2, Action::Commit, ""),
+                    ]
+                    .into_iter()
+                    .map(|(op, revision, action, text)| (op, revision, action, text, None))
+                    .collect()
+                };
+                let mut range_epoch = 0;
+                let mut previous_revision = 0;
+                for (op, revision, action, text, processed) in steps {
                     if GetForegroundWindow() != window {
                         return Err("target foreground changed; stopped without retry".into());
                     }
@@ -175,6 +219,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             + 2000,
                         action,
                         text: text.into(),
+                        prefix: processed.map(|text| Prefix {
+                            text: text.into(),
+                            expected_revision: previous_revision,
+                            range_epoch,
+                        }),
                     };
                     pipe.send(&serde_json::to_vec(&r)?)?;
                     let wait = Instant::now();
@@ -193,12 +242,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "task={task} operation={} revision={} applied={} code={}",
                         reply.operation, reply.revision, reply.applied, reply.code
                     );
-                    if reply.operation != op || !reply.applied {
+                    if reply.operation != op || reply.revision != revision || !reply.applied {
                         return Err("target did not apply edit".into());
                     }
                     if action == Action::Inspect && !reply.compatible_runtime(pid, thread) {
                         return Err("target runtime mismatch; no input attempted".into());
                     }
+                    if action == Action::Settle
+                        && !reply
+                            .settlement
+                            .is_some_and(|s| s.prefix == Mutation::Changed && s.tail_owned)
+                    {
+                        return Err("target did not retain a writable settled tail".into());
+                    }
+                    range_epoch = reply.range_epoch;
+                    previous_revision = revision;
                     pump(Duration::from_millis(interval));
                 }
                 if keyboard()? != keyboard_before {
@@ -416,6 +474,7 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                         + 2000,
                     action,
                     text: text.into(),
+                    prefix: None,
                 };
                 pipe.send(&serde_json::to_vec(&request)?)?;
                 let started = Instant::now();
@@ -455,7 +514,17 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 );
             }
+            prefix_fixture(editor, &manager, &pipe, &capability)?;
+            prefix_fault_fixture(component, editor, &pipe, &capability)?;
             if plain {
+                let end = editor_text(editor)?.encode_utf16().count();
+                SendMessageW(
+                    editor,
+                    0x00B1,
+                    Some(WPARAM(end)),
+                    Some(LPARAM(end as isize)),
+                );
+                pump(Duration::from_millis(20));
                 println!(
                     "owned plain EDIT cumulative replacement and single commit actual text=true"
                 );
@@ -482,7 +551,7 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                     || abort.mutation != Mutation::NotAttempted
                     || editor_text(editor)? != format!("{before}取消保留")
                 {
-                    return Err("plain property-affected cancellation lost visible text".into());
+                    return Err(format!("plain property-affected cancellation lost visible text: code={} applied={} mutation={:?} owned_fixture_expected={:?} owned_fixture_actual={:?}", abort.code, abort.applied, abort.mutation, format!("{before}取消保留"), editor_text(editor)?).into());
                 }
                 println!(
                     "owned plain EDIT cancellation retains property-affected text and ends composition=true"
@@ -1086,6 +1155,7 @@ fn exchange(
         deadline_tick: if expired { now - 1 } else { now + 2000 },
         action,
         text: text.into(),
+        prefix: None,
     };
     pipe.send(&serde_json::to_vec(&r)?)?;
     let start = Instant::now();
@@ -1102,6 +1172,354 @@ fn exchange(
             return Err("owned acknowledgement timeout".into());
         }
     }
+}
+#[cfg(feature = "acceptance")]
+fn prefix_fixture(
+    editor: windows::Win32::Foundation::HWND,
+    manager: &ITfThreadMgr,
+    pipe: &Pipe,
+    capability: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use windows::{Win32::Foundation::*, core::w};
+    for (committed, tail_text, move_caret) in [
+        ("整理前段🙂", "尾🙂", false),
+        ("整理\n前段🙂", "尾🙂", false),
+        ("整理前段🙂", "", false),
+        ("整理前段🙂", "", true),
+    ] {
+        unsafe {
+            SendMessageW(
+                editor,
+                WM_SETTEXT,
+                None,
+                Some(LPARAM(w!("左原选区右").as_ptr() as isize)),
+            );
+            SendMessageW(editor, 0x00B1, Some(WPARAM(1)), Some(LPARAM(4)));
+        }
+        let task = uuid::Uuid::new_v4().to_string();
+        let begin = exchange(pipe, capability, &task, 1, 1, 0, Action::Begin, "", false)?;
+        if !begin.applied {
+            return Err(format!("prefix begin rejected: {}", begin.code).into());
+        }
+        let context = unsafe { manager.GetFocus()?.GetTop()? };
+        println!(
+            "prefix fixture begin epoch={} context_selected=true",
+            begin.range_epoch
+        );
+        let initial = exchange(
+            pipe,
+            capability,
+            &task,
+            1,
+            2,
+            1,
+            Action::Update,
+            "原文尾🙂",
+            false,
+        )?;
+        if !initial.applied {
+            return Err("prefix initial update failed".into());
+        }
+        println!(
+            "prefix initial epoch={} applied={}",
+            initial.range_epoch, initial.applied
+        );
+        if composition_text(&context).is_err() {
+            return Err(
+                "prefix fixture initial composition already missing before settlement".into(),
+            );
+        }
+        let settle = Request {
+            protocol: PROTOCOL,
+            capability: capability.into(),
+            task: task.clone(),
+            turn: 1,
+            operation: 3,
+            revision: 2,
+            deadline_tick: unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+                + 2000,
+            action: Action::Settle,
+            text: tail_text.into(),
+            prefix: Some(Prefix {
+                text: committed.into(),
+                expected_revision: 1,
+                range_epoch: begin.range_epoch,
+            }),
+        };
+        pipe.send(&serde_json::to_vec(&settle)?)?;
+        let started = Instant::now();
+        let reply = loop {
+            pump(Duration::from_millis(10));
+            if let Some(data) = pipe.receive()? {
+                break serde_json::from_slice::<Reply>(&data)?;
+            }
+            if started.elapsed() > Duration::from_secs(2) {
+                return Err("prefix response timeout".into());
+            }
+        };
+        if reply.operation != 3
+            || !reply.applied
+            || !reply
+                .settlement
+                .is_some_and(|s| s.prefix == Mutation::Changed && s.tail_owned)
+        {
+            return Err(format!(
+                "prefix settle rejected: {} mutation={:?} settlement={:?}",
+                reply.code, reply.mutation, reply.settlement
+            )
+            .into());
+        }
+        println!(
+            "prefix reply epoch={} same_context={} settlement={:?}",
+            reply.range_epoch,
+            unsafe { manager.GetFocus()?.GetTop()? } == context,
+            reply.settlement
+        );
+        if !tail_text.is_empty() && composition_text(&context)? != tail_text {
+            return Err("prefix left committed text in composition range".into());
+        }
+        if tail_text.is_empty() && composition_text(&context).is_ok() {
+            return Err("empty tail retained a dummy composition".into());
+        }
+        let prefix = format!("左{committed}");
+        if !editor_text(editor)?
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .starts_with(&prefix)
+        {
+            return Err("settled prefix is not actual committed control text".into());
+        }
+        if move_caret {
+            let before = editor_text(editor)?;
+            let before_selection = editor_selection(editor);
+            unsafe {
+                SendMessageW(editor, 0x00B1, Some(WPARAM(0)), Some(LPARAM(0)));
+            }
+            pump(Duration::from_millis(50));
+            if before_selection == (0, 0) || editor_selection(editor) != (0, 0) {
+                return Err("owned fixture did not move the actual caret to0".into());
+            }
+            let rejected = exchange(
+                pipe,
+                capability,
+                &task,
+                1,
+                4,
+                3,
+                Action::Update,
+                "不得写入",
+                false,
+            )?;
+            if rejected.applied
+                || rejected.mutation != Mutation::NotAttempted
+                || editor_text(editor)? != before
+            {
+                return Err("empty insertion lease survived a real caret move".into());
+            }
+            println!(
+                "owned empty-tail caret change revokes continuation with unchanged actual text=true"
+            );
+            continue;
+        }
+        let updated = exchange(
+            pipe,
+            capability,
+            &task,
+            1,
+            4,
+            3,
+            Action::Update,
+            "尾部继续🙂",
+            false,
+        )?;
+        if !updated.applied || composition_text(&context)? != "尾部继续🙂" {
+            return Err(format!(
+                "prefix tail update failed: code={} applied={} mutation={:?}",
+                updated.code, updated.applied, updated.mutation
+            )
+            .into());
+        }
+        let next = Request {
+            operation: 5,
+            revision: 4,
+            deadline_tick: unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+                + 2000,
+            text: "待撤销尾部".into(),
+            prefix: Some(Prefix {
+                text: "尾部继续🙂".into(),
+                expected_revision: 3,
+                range_epoch: updated.range_epoch,
+            }),
+            ..settle
+        };
+        pipe.send(&serde_json::to_vec(&next)?)?;
+        let started = Instant::now();
+        let second = loop {
+            pump(Duration::from_millis(10));
+            if let Some(data) = pipe.receive()? {
+                break serde_json::from_slice::<Reply>(&data)?;
+            }
+            if started.elapsed() > Duration::from_secs(2) {
+                return Err("second prefix response timeout".into());
+            }
+        };
+        if second.operation != 5
+            || !second.applied
+            || !second
+                .settlement
+                .is_some_and(|s| s.prefix == Mutation::Changed && s.tail_owned)
+        {
+            return Err(format!("second prefix rejected: {}", second.code).into());
+        }
+        if composition_text(&context)? != "待撤销尾部" {
+            return Err("second prefix did not retain latest tail".into());
+        }
+        let aborted = exchange(pipe, capability, &task, 1, 6, 4, Action::Abort, "", false)?;
+        if !aborted.applied {
+            return Err(format!("prefix tail abort rejected: {}", aborted.code).into());
+        }
+        if editor_text(editor)?
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            != format!("{prefix}尾部继续🙂右")
+        {
+            return Err(
+                "prefix cancellation erased committed text or restored replaced selection".into(),
+            );
+        }
+    }
+    println!("owned prefix settle, live tail, Unicode/newline and cancel actual text=true");
+    Ok(())
+}
+#[cfg(feature = "acceptance")]
+fn editor_selection(window: windows::Win32::Foundation::HWND) -> (u32, u32) {
+    use windows::Win32::Foundation::*;
+    let (mut start, mut end) = (0u32, 0u32);
+    unsafe {
+        SendMessageW(
+            window,
+            0x00B0,
+            Some(WPARAM((&mut start as *mut u32) as usize)),
+            Some(LPARAM((&mut end as *mut u32) as isize)),
+        );
+    }
+    (start, end)
+}
+#[cfg(feature = "acceptance")]
+fn prefix_fault_fixture(
+    component: windows::Win32::Foundation::HMODULE,
+    editor: windows::Win32::Foundation::HWND,
+    pipe: &Pipe,
+    capability: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use windows::{
+        Win32::{Foundation::*, System::LibraryLoader::*},
+        core::{s, w},
+    };
+    unsafe {
+        let entry = GetProcAddress(component, s!("SayweaveSettleFixtureFault"))
+            .ok_or("missing owned acceptance-only checkpoint")?;
+        let inject: unsafe extern "system" fn(usize) = std::mem::transmute(entry);
+        for mode in [1, 2] {
+            SendMessageW(
+                editor,
+                WM_SETTEXT,
+                None,
+                Some(LPARAM(w!("左原选区右").as_ptr() as isize)),
+            );
+            SendMessageW(editor, 0x00B1, Some(WPARAM(1)), Some(LPARAM(4)));
+            let task = uuid::Uuid::new_v4().to_string();
+            let begin = exchange(pipe, capability, &task, 1, 1, 0, Action::Begin, "", false)?;
+            if !begin.applied
+                || !exchange(
+                    pipe,
+                    capability,
+                    &task,
+                    1,
+                    2,
+                    1,
+                    Action::Update,
+                    "原文尾🙂",
+                    false,
+                )?
+                .applied
+            {
+                return Err("prefix fault fixture setup failed".into());
+            }
+            inject(mode);
+            let request = Request {
+                protocol: PROTOCOL,
+                capability: capability.into(),
+                task: task.clone(),
+                turn: 1,
+                operation: 3,
+                revision: 2,
+                deadline_tick: windows::Win32::System::SystemInformation::GetTickCount64() + 2000,
+                action: Action::Settle,
+                text: "原文尾🙂".into(),
+                prefix: Some(Prefix {
+                    text: "提交前段🙂".into(),
+                    expected_revision: 1,
+                    range_epoch: begin.range_epoch,
+                }),
+            };
+            pipe.send(&serde_json::to_vec(&request)?)?;
+            let started = Instant::now();
+            let reply = loop {
+                pump(Duration::from_millis(10));
+                if let Some(frame) = pipe.receive()? {
+                    break serde_json::from_slice::<Reply>(&frame)?;
+                }
+                if started.elapsed() > Duration::from_secs(2) {
+                    return Err("prefix fault reply missing".into());
+                }
+            };
+            if reply.applied || reply.operation != if mode == 1 { 4 } else { 3 } {
+                return Err("prefix fault was falsely reported as fully applied".into());
+            }
+            if mode == 2
+                && !reply
+                    .settlement
+                    .is_some_and(|s| s.prefix == Mutation::Changed && !s.tail_owned)
+            {
+                return Err("partial prefix outcome lost its irreversible effect".into());
+            }
+            pump(Duration::from_millis(30));
+            let actual = editor_text(editor)?
+                .replace("\r\n", "\n")
+                .replace('\r', "\n");
+            if actual != "左提交前段🙂原文尾🙂右" {
+                return Err(
+                    "post-prefix cancellation/failure erased prefix or restored original selection"
+                        .into(),
+                );
+            }
+            let stale = exchange(
+                pipe,
+                capability,
+                &task,
+                1,
+                5,
+                3,
+                Action::Update,
+                "不得重复",
+                false,
+            )?;
+            if stale.applied
+                || stale.mutation != Mutation::NotAttempted
+                || editor_text(editor)?
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n")
+                    != actual
+            {
+                return Err("partial prefix failure allowed replay into target".into());
+            }
+            println!(
+                "owned prefix checkpoint={mode} preserves actual prefix and denies replay=true"
+            );
+        }
+    }
+    Ok(())
 }
 fn pump(duration: Duration) {
     let until = Instant::now() + duration;
