@@ -189,6 +189,7 @@ fn main() {
         );
         io::stdout().flush().unwrap();
         let mut msg = MSG::default();
+        let mut injected_keys = Vec::new();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.message == WM_APP + 7 {
                 let value = r.recv().unwrap();
@@ -244,6 +245,53 @@ fn main() {
                     // Test-only foreign edit, delivered to this owned target's message loop.
                     for unit in text.encode_utf16() {
                         message(editor, WM_CHAR, WPARAM(unit as usize), LPARAM(0));
+                    }
+                }
+                if value["action"] == "fixture-key" {
+                    let mut pid = 0;
+                    GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
+                    let key = match value["key"].as_str() {
+                        Some("AltRight") => Some(VK_RMENU),
+                        Some("Backspace") => Some(VK_BACK),
+                        Some("Delete") => Some(VK_DELETE),
+                        _ => None,
+                    };
+                    if let Some(key) = key {
+                        let down = value["down"].as_bool() == Some(true);
+                        let allowed = if down {
+                            value["process"].as_u64() == Some(pid as u64)
+                        } else {
+                            injected_keys.contains(&key)
+                        };
+                        let flags = if value["down"].as_bool() == Some(true) {
+                            KEYBD_EVENT_FLAGS(0)
+                        } else {
+                            KEYEVENTF_KEYUP
+                        } | if key == VK_RMENU || key == VK_DELETE {
+                            KEYEVENTF_EXTENDEDKEY
+                        } else {
+                            KEYBD_EVENT_FLAGS(0)
+                        };
+                        let event = INPUT {
+                            r#type: INPUT_KEYBOARD,
+                            Anonymous: INPUT_0 {
+                                ki: KEYBDINPUT {
+                                    wVk: key,
+                                    dwFlags: flags,
+                                    dwExtraInfo: 0x53595754,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        if allowed && SendInput(&[event], std::mem::size_of::<INPUT>() as i32) == 1
+                        {
+                            if down && !injected_keys.contains(&key) {
+                                injected_keys.push(key);
+                            }
+                            if !down {
+                                injected_keys.retain(|held| *held != key);
+                            }
+                        }
                     }
                 }
                 if value["action"] == "delayClipboard" {
@@ -347,6 +395,29 @@ fn main() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+        let mut release_failed = false;
+        for key in injected_keys {
+            let event = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: key,
+                        dwFlags: KEYEVENTF_KEYUP
+                            | if key == VK_RMENU || key == VK_DELETE {
+                                KEYEVENTF_EXTENDEDKEY
+                            } else {
+                                KEYBD_EVENT_FLAGS(0)
+                            },
+                        dwExtraInfo: 0x53595754,
+                        ..Default::default()
+                    },
+                },
+            };
+            if SendInput(&[event], std::mem::size_of::<INPUT>() as i32) != 1 {
+                eprintln!("owned fixture key release failed");
+                release_failed = true;
+            }
+        }
         if let Some(manager) = tsf_manager {
             let _ = manager.Deactivate();
             drop(manager);
@@ -355,5 +426,8 @@ fn main() {
             let _ = FreeLibrary(library);
         }
         CoUninitialize();
+        if release_failed {
+            std::process::exit(1);
+        }
     }
 }

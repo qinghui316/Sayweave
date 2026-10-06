@@ -238,6 +238,7 @@ impl DictationCoordinator {
         } else {
             next
         };
+        drop(active);
         if next != current.presentation {
             self.update(app, id, |s| {
                 if matches!(s.stage.as_str(), "preparing" | "recognizing") {
@@ -447,7 +448,7 @@ impl DictationCoordinator {
         let raw_draft = if source == "external"
             && let Some(target) = anchor.clone()
         {
-            match Draft::begin(id.clone(), 1, target, gate.clone(), input.inner().clone()).await {
+            match Draft::begin(id.clone(), 1, target, gate.clone()).await {
                 Ok(draft) => Some(draft),
                 Err(error) if error.code == "targetReadonlyContext" => {
                     anchor = None;
@@ -559,7 +560,6 @@ impl DictationCoordinator {
                     id.clone(),
                     session_anchor.clone().unwrap(),
                     draft,
-                    gate.clone(),
                     continuous.clone().unwrap(),
                     session_cancel.clone(),
                 )
@@ -793,6 +793,7 @@ impl DictationCoordinator {
             .map(|_| ())
     }
     async fn release(&self, app: &tauri::AppHandle, id: &str) {
+        log::info!(target:"sayweave", "operation=dictation_cleanup task_id={id} step=begin");
         let old = {
             let Ok(a) = self.active.lock() else {
                 return;
@@ -803,6 +804,7 @@ impl DictationCoordinator {
             a.clone()
         };
         app.state::<ShortcutService>().settle(app).await;
+        log::info!(target:"sayweave", "operation=dictation_cleanup task_id={id} step=shortcuts_settled");
         crate::voice_window::release(id);
         {
             let Ok(mut a) = self.active.lock() else {
@@ -813,16 +815,18 @@ impl DictationCoordinator {
             }
             app.state::<ShortcutService>().active_task(None);
             *a = None;
-            // Publish actionable recovery only after admission and native resources are settled.
-            self.update(app, id, |s| {
-                s.presentation = final_presentation(
-                    s.input_route == InputRoute::ResultOnly,
-                    &s.text,
-                    s.delivery.as_ref(),
-                    s.error.as_deref(),
-                );
-            });
+            log::info!(target:"sayweave", "operation=dictation_cleanup task_id={id} step=admission_released");
         }
+        // Projection can schedule window work. Never retain admission across it;
+        // update checks the task identity again if a new task won the boundary.
+        self.update(app, id, |s| {
+            s.presentation = final_presentation(
+                s.input_route == InputRoute::ResultOnly,
+                &s.text,
+                s.delivery.as_ref(),
+                s.error.as_deref(),
+            );
+        });
         if let Some(old) = old
             && old.source == "external"
         {
@@ -927,8 +931,10 @@ impl DictationCoordinator {
                 flow.request_finish();
             }
             a.cancel.send(1).map_err(|_| Error::new("staleSession"))?;
+            let elapsed = a.began.elapsed().as_millis();
+            drop(active);
             self.update(app, id, |s| s.presentation = Presentation::Recognizing);
-            log::info!(target:"sayweave","operation=dictation_phase task_id={} phase=finish_requested elapsed_ms={}",id,a.began.elapsed().as_millis());
+            log::info!(target:"sayweave","operation=dictation_phase task_id={} phase=finish_requested elapsed_ms={}",id,elapsed);
             Ok(())
         } else {
             Err(Error::new("busy"))

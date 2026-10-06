@@ -719,6 +719,66 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             println!("owned multiline and emoji update/commit actual text=true");
+            // Exercise TSF's actual key dispatcher, not a direct call to our sink.
+            // It must hand off before the application edits, without eating the key.
+            for (op, revision, action, text) in [
+                (16, 0, Action::Begin, ""),
+                (17, 1, Action::Update, "删除字"),
+            ] {
+                if !exchange(
+                    &pipe,
+                    &capability,
+                    &task,
+                    9,
+                    op,
+                    revision,
+                    action,
+                    text,
+                    false,
+                )?
+                .applied
+                {
+                    return Err("keyboard handoff setup rejected".into());
+                }
+            }
+            let keys = manager.cast::<ITfKeystrokeMgr>()?;
+            if !keys
+                .TestKeyDown(WPARAM(VK_BACK.0 as usize), LPARAM(1))?
+                .as_bool()
+            {
+                return Err("owned composition did not receive Backspace test".into());
+            }
+            if keys
+                .KeyDown(WPARAM(VK_BACK.0 as usize), LPARAM(1))?
+                .as_bool()
+            {
+                return Err("composition handoff swallowed Backspace".into());
+            }
+            SendMessageW(
+                editor,
+                WM_KEYDOWN,
+                Some(WPARAM(VK_BACK.0 as usize)),
+                Some(LPARAM(1)),
+            );
+            pump(Duration::from_millis(100));
+            let handoff = exchange(
+                &pipe,
+                &capability,
+                &task,
+                9,
+                18,
+                1,
+                Action::Handoff,
+                "",
+                false,
+            )?;
+            if !handoff.applied
+                || handoff.code != "keyboardHandedOff"
+                || !editor_text(editor)?.ends_with("删除")
+            {
+                return Err(format!("keyboard handoff restored deleted text or missed pre-edit dispatch: code={} applied={} fixture_text={:?}", handoff.code, handoff.applied, editor_text(editor)?).into());
+            }
+            println!("owned pre-edit Backspace handoff preserves actual deletion=true");
             Ok(())
         })();
         drop(host);

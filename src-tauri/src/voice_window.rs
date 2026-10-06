@@ -109,6 +109,13 @@ mod native {
             .filter(|s| s.root == root && root != 0)
             .map(|s| s.instance)
     }
+    pub(super) fn registered() -> Option<(usize, u64)> {
+        WINDOW
+            .lock()
+            .ok()
+            .filter(|s| s.root != 0)
+            .map(|s| (s.root, s.instance))
+    }
     unsafe extern "system" fn procedure(
         window: HWND,
         message: u32,
@@ -267,7 +274,13 @@ fn trace(action: &str, task: Option<&str>) {
 pub(crate) fn instance(window: &WebviewWindow) -> Option<u64> {
     #[cfg(windows)]
     {
-        native::instance(window.hwnd().ok()?.0 as usize)
+        // The owning thread registers this identity at creation and clears it at
+        // WM_NCDESTROY. A dispatcher HWND getter here would synchronously wait for
+        // the UI thread while a caller can still own a task/state lock.
+        (window.label() == "voice-overlay")
+            .then(native::registered)
+            .flatten()
+            .map(|(_, instance)| instance)
     }
     #[cfg(not(windows))]
     {
@@ -293,13 +306,16 @@ pub(crate) fn visibility(
 ) -> tauri::Result<()> {
     #[cfg(windows)]
     {
-        let handle = window.hwnd()?.0 as usize;
-        let instance = native::instance(handle);
+        let registered = (window.label() == "voice-overlay")
+            .then(native::registered)
+            .flatten();
+        let Some((handle, instance)) = registered else {
+            return Ok(());
+        };
         let operation = VISIBILITY_OPERATION.fetch_add(1, Ordering::AcqRel) + 1;
         window.run_on_main_thread(move || unsafe {
             use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::*};
-            if instance.is_none()
-                || native::instance(handle) != instance
+            if native::instance(handle) != Some(instance)
                 || VISIBILITY_OPERATION.load(Ordering::Acquire) != operation
             {
                 return;

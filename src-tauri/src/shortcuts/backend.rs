@@ -234,6 +234,12 @@ fn reconcile_keys(b: &mut Bridge, mut is_down: impl FnMut(u16) -> bool) {
 unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if n >= 0 {
         let key = unsafe { &*(l.0 as *const KBDLLHOOKSTRUCT) };
+        #[cfg(feature = "desktop-acceptance")]
+        let fixture_event = key.dwExtraInfo == 0x53595754
+            && std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID")
+                .is_ok_and(|id| uuid::Uuid::parse_str(&id).is_ok());
+        #[cfg(not(feature = "desktop-acceptance"))]
+        let fixture_event = false;
         // Track the synthetic Ctrl used by AltGr without turning injected keys into triggers.
         if key.flags.0 & LLKHF_INJECTED.0 != 0
             && key.vkCode == VK_LCONTROL.0 as u32
@@ -244,7 +250,7 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             b.altgr = [WM_KEYDOWN, WM_SYSKEYDOWN].contains(&(w.0 as u32));
         }
         // Ignore synthetic injection, including our paste. Hooks never release user-held keys.
-        if key.flags.0 & LLKHF_INJECTED.0 == 0
+        if (key.flags.0 & LLKHF_INJECTED.0 == 0 || fixture_event)
             && let Ok(mut state) = state().lock()
             && let Some(b) = state.as_mut()
         {

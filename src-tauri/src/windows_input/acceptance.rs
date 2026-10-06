@@ -166,7 +166,6 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
                 1,
                 anchor,
                 Arc::new(DeliveryGate::default()),
-                input.clone(),
             ))
             .map_err(|e| e.code)?;
         draft.update(1, 1, prefix);
@@ -236,7 +235,6 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
                 1,
                 anchor,
                 Arc::new(DeliveryGate::default()),
-                input.clone(),
             ))
             .map_err(|e| e.code)?;
         draft.update(1, 1, "正在识别");
@@ -284,25 +282,12 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         bind_watch(&id, &anchor, None).map_err(|e| e.code)?;
         let gate = Arc::new(DeliveryGate::default());
         let draft = runtime
-            .block_on(Draft::begin(
-                id.clone(),
-                1,
-                anchor.clone(),
-                gate.clone(),
-                input.clone(),
-            ))
+            .block_on(Draft::begin(id.clone(), 1, anchor.clone(), gate.clone()))
             .map_err(|e| e.code)?;
         let flow = Control::new(crate::input_state::activity_evidence());
         flow.resume(1, anchor.activity);
         let (cancel, _) = tokio::sync::watch::channel(0);
-        let manager = SessionDraft::new(
-            id.clone(),
-            anchor,
-            draft,
-            gate,
-            flow.clone(),
-            cancel.clone(),
-        );
+        let manager = SessionDraft::new(id.clone(), anchor, draft, flow.clone(), cancel.clone());
         manager.activate();
         let ongoing = manager.clone();
         let actor = runtime.spawn(async move {
@@ -377,7 +362,6 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             1,
             anchor,
             Arc::new(DeliveryGate::default()),
-            input.clone(),
         ))
         .map_err(|e| e.code)?;
     draft.update(1, 1, "已有草稿");

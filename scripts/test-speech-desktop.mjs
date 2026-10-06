@@ -85,7 +85,7 @@ async function ownedEditor(composition=true){
  const child=spawn(path.join(root,'src-tauri/target/debug/input-fixture.exe'),composition?['composition']:[],{cwd:root,windowsHide:true,env:{...process.env,SAYWEAVE_INPUT_ACCEPTANCE:'1'},stdio:['pipe','pipe','pipe']});
  let buffer='',queue=[],waiting=[];child.stdout.on('data',data=>{buffer+=data.toString('utf8');let at;while((at=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,at);buffer=buffer.slice(at+1);const value=JSON.parse(line);if(waiting.length)waiting.shift()(value);else queue.push(value);}});
  const next=()=>queue.length?Promise.resolve(queue.shift()):Promise.race([new Promise(resolve=>waiting.push(resolve)),delay(3000).then(()=>{throw Error('Owned editor response timeout');})]);
- await next();return {command:async value=>{child.stdin.write(JSON.stringify(value)+'\n');const result=await next();if(['focus','focus-process'].includes(value.action))await delay(80);return result;},close:async()=>{if(child.exitCode===null){child.stdin.write('{"action":"exit"}\n');for(let n=0;n<20&&child.exitCode===null;n++)await delay(50);if(child.exitCode===null)child.kill();}}};
+ await next();return {command:async value=>{child.stdin.write(JSON.stringify(value)+'\n');const result=await next();if(['focus','focus-process'].includes(value.action))await delay(80);return result;},close:async()=>{if(child.exitCode===null){child.stdin.write('{"action":"exit"}\n');for(let n=0;n<20&&child.exitCode===null;n++)await delay(50);if(child.exitCode===null)child.kill();}expect(child.exitCode,'Owned fixture cleanup must finish successfully').toBe(0);}};
 }
 async function nativeOverlayClick(view,editor,name){
  const owned=await editor.command({action:'inspect-overlay',process:app.pid});expect(owned.overlayWindow).toBeGreaterThan(0);
@@ -94,8 +94,8 @@ async function nativeOverlayClick(view,editor,name){
  const click=await editor.command({action:'click-window',process:app.pid,window:owned.overlayWindow,x:Math.round((box.x+box.width/2)*scale),y:Math.round((box.y+box.height/2)*scale)});
  expect(click.clickCheck.pointRootMatches).toBe(true);expect(click.clicked).toBe(2);return click;
 }
-async function externalRound(page,finish,end,interrupted=false){
- const start=await invoke(page,'dictation_start');await waitPhase(page,'recording');
+async function externalRound(page,finish,end,interrupted=false,begin){
+ const start=begin?await begin():await invoke(page,'dictation_start');await waitPhase(page,'recording');
  for(const command of ['dictation_control','speech_control'])expect((await rejected(page,command,{taskId:'stale-task',action:'cancel'})).code).toBe('staleSession');
  await finish(start);
  if(!['completed','failed','cancelled'].includes((await invoke(page,'speech_snapshot')).phase)){
@@ -330,6 +330,33 @@ try{
    if(result.dictation.presentationId)await dismiss(page,{taskId:result.dictation.taskId,presentationId:result.dictation.presentationId});
   }
   mode='normal';
+  const shortcut=(await invoke(page,'shortcut_status')).saved;
+  await invoke(page,'shortcut_save',{config:{...shortcut,binding:'AltRight',mode:'hold'}});
+  const keyEvent=(key,down)=>focusHelper.command({action:'fixture-key',process,key,down});
+  try {
+   for(const control of ['area','ProseMirror']) {
+    await target.bringToFront();
+    if(control==='area'){await target.locator('#area').fill('abc');await target.locator('#area').focus();}
+    else await target.evaluate(()=>window.fixtureEditor.set('abc',3,3));
+    expect((await focusHelper.command({action:'focus-process',process})).foregroundProcess).toBe(process);
+    const read=()=>control==='area'?target.locator('#area').inputValue():target.evaluate(()=>window.fixtureEditor.read());
+    const result=await externalRound(page,async(start)=>{
+     await expect.poll(read).toBe('abc正在识别');
+     await keyEvent('Backspace',true);await keyEvent('Backspace',false);
+     await expect.poll(()=>report.taskTrace.some(e=>e.line.includes('task_id='+start.taskId+' ')&&e.line.includes('turn=2')&&e.line.includes('action=Update applied=true')),{timeout:8000}).toBe(true);
+     expect(await read()).toBe('abc正在识正在识别');
+     expect(report.taskTrace.some(e=>e.line.includes('task_id='+start.taskId+' ')&&e.line.includes('keyboardHandedOff'))).toBe(true);
+    },()=>keyEvent('AltRight',false),false,async()=>{
+     await keyEvent('AltRight',true);await waitPhase(page,'recording');return invoke(page,'dictation_snapshot');
+    });
+    expect(await read()).toBe('abc正在识原生受控识别完成。');
+    report.inputCompatibility.push({app:'Chromium',control,case:'held-backspace',eventSource:'tagged-injected-keyboard',exactDeletionPreserved:true,delivery:result.dictation.delivery});
+    if(result.dictation.presentationId)await dismiss(page,{taskId:result.dictation.taskId,presentationId:result.dictation.presentationId});
+   }
+  } finally {
+   await keyEvent('AltRight',false).catch(()=>{});
+   await invoke(page,'shortcut_save',{config:{...(await invoke(page,'shortcut_status')).saved,binding:shortcut.binding,mode:shortcut.mode}});
+  }
  }finally{await focusHelper.close();await targetBrowser.close();}
  await invoke(page,'shortcut_save',{config:{...(await invoke(page,'shortcut_status')).saved,binding:'AltRight',mode:'toggle'}});
 

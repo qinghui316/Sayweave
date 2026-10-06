@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_FRAME: usize = 128 * 1024;
 pub const MAX_TEXT_UTF16: usize = 16 * 1024;
-// v2 requires native disabled-context checks. Never send edits to a v1 target.
-pub const PROTOCOL: u32 = 2;
+// v3 adds pre-edit keyboard handoff to v2's native disabled-context checks.
+// A registered upgrade is insufficient: the target must be running this version.
+pub const PROTOCOL: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Runtime {

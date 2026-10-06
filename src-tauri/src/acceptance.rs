@@ -42,6 +42,24 @@ fn viewport(app: &tauri::AppHandle, expected: (f64, f64)) -> Result<(), String> 
     )
 }
 async fn verify(app: &tauri::AppHandle, menu_ids: Vec<String>) -> Result<(), String> {
+    step(app, "overlay-identity-without-ui-dispatch", |app| {
+        let window = app
+            .get_webview_window("voice-overlay")
+            .ok_or("missing overlay")?;
+        let expected = crate::voice_window::instance(&window);
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(crate::voice_window::instance(&window));
+        });
+        // The UI deliberately waits. A worker calling Tauri's synchronous hwnd()
+        // getter cannot pass; a registered identity lookup must not dispatch here.
+        require(
+            expected.is_some()
+                && receive.recv_timeout(Duration::from_millis(500)).ok() == Some(expected),
+            "overlay identity blocks on UI thread",
+        )
+    })
+    .await?;
     step(app, "tray-and-menu", move |app| {
         require(app.tray_by_id("sayweave-tray").is_some(), "missing tray")?;
         require(

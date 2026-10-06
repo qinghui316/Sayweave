@@ -5,8 +5,8 @@ use crate::{
     input_state,
     speech::{NativeTranscript, continuous::Control},
     windows_input::{
-        self, Anchor, Delivery, DeliveryGate,
-        composition::{Draft, Finish},
+        self, Anchor, Delivery,
+        composition::{Connection, Draft, Finish},
     },
 };
 use std::{
@@ -24,12 +24,12 @@ struct State {
     closing: bool,
     paused_at: Option<Instant>,
     last_delivery: Option<Delivery>,
+    stop_error: Option<String>,
 }
 pub(crate) struct SessionDraft {
-    input: windows_input::WindowsInputService,
+    connection: Arc<Connection>,
     task: String,
     anchor: Anchor,
-    gate: Arc<DeliveryGate>,
     control: Control,
     cancel: watch::Sender<u8>,
     state: Mutex<State>,
@@ -54,15 +54,13 @@ impl SessionDraft {
         task: String,
         anchor: Anchor,
         draft: Arc<Draft>,
-        gate: Arc<DeliveryGate>,
         control: Control,
         cancel: watch::Sender<u8>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            input: draft.input(),
+            connection: draft.connection(),
             task,
             anchor: anchor.clone(),
-            gate,
             control,
             cancel,
             state: Mutex::new(State {
@@ -74,6 +72,7 @@ impl SessionDraft {
                 closing: false,
                 paused_at: None,
                 last_delivery: None,
+                stop_error: None,
             }),
             operation: AsyncMutex::new(()),
         })
@@ -126,9 +125,7 @@ impl SessionDraft {
             draft
         };
         if let Some(draft) = draft {
-            let delivery = draft
-                .finish(String::new(), Finish::Handoff("editing".into()))
-                .await;
+            let delivery = draft.handoff().await;
             if let Ok(mut state) = self.state.lock() {
                 state.last_delivery = Some(delivery);
             }
@@ -156,15 +153,7 @@ impl SessionDraft {
         }
         let anchor = windows_input::reanchor_turn(&self.task, &self.anchor)?;
         self.feedback(publish, Presentation::Resuming);
-        let draft = match Draft::begin(
-            self.task.clone(),
-            turn,
-            anchor.clone(),
-            self.gate.clone(),
-            self.input.clone(),
-        )
-        .await
-        {
+        let draft = match self.connection.begin_turn(turn, anchor.clone()).await {
             Ok(draft) => draft,
             // Begin does not write text. Wait for the foreign IME composition to actually
             // end; the300ms debounce alone is not permission to acquire its range.
@@ -180,9 +169,7 @@ impl SessionDraft {
             || self.control.stopping()
             || input_state::activity() != activity
         {
-            let _ = draft
-                .finish(String::new(), Finish::Handoff("editing".into()))
-                .await;
+            self.retire_unpublished(&draft, turn).await;
             return Ok(());
         }
         let accepted = if let Ok(mut state) = self.state.lock() {
@@ -200,11 +187,18 @@ impl SessionDraft {
             self.control.resume(turn, activity);
             log::info!(target:"sayweave", "operation=dictation_turn task_id={} turn={turn} state=resuming", self.task);
         } else {
-            let _ = draft
-                .finish(String::new(), Finish::Handoff("editing".into()))
-                .await;
+            self.retire_unpublished(&draft, turn).await;
         }
         Ok(())
+    }
+    async fn retire_unpublished(&self, draft: &Draft, turn: u64) {
+        let delivery = draft.handoff().await;
+        if let Ok(mut state) = self.state.lock() {
+            if state.turn == turn {
+                state.turn += 1;
+            }
+            state.last_delivery = Some(delivery);
+        }
     }
     pub async fn maintain(self: Arc<Self>, publish: impl Fn(Presentation) + Send + Sync + 'static) {
         let mut edits = input_state::subscribe_edits();
@@ -240,10 +234,12 @@ impl SessionDraft {
                     }
                     let failure = self.state.lock().ok().and_then(|s|s.draft.as_ref().and_then(|d|d.failure()));
                     if let Some(error) = failure {
+                        if let Ok(mut state) = self.state.lock() { state.stop_error = Some(error.clone()); }
                         log::info!(target:"sayweave", "operation=dictation_turn task_id={} state=stopped error={error}", self.task);
                         self.control.request_finish(); self.control.pause(); self.cancel.send_replace(1); break;
                     }
                     if let Err(error) = self.resume(&publish).await {
+                        if let Ok(mut state) = self.state.lock() { state.stop_error = Some(error.code.clone()); }
                         log::info!(target:"sayweave", "operation=dictation_turn task_id={} state=stopped error={}", self.task,error.code);
                         self.control.request_finish(); self.control.pause(); self.cancel.send_replace(1); break;
                     }
@@ -255,7 +251,7 @@ impl SessionDraft {
     /// history text contains earlier turns and must never be pasted into this draft.
     pub async fn finish(&self, latest: &NativeTranscript, mode: Finish) -> Delivery {
         let _operation = self.operation.lock().await;
-        let (draft, text, old, edited) = {
+        let (draft, text, old, edited, stop_error) = {
             let Ok(mut state) = self.state.lock() else {
                 return Delivery::not_submitted("unavailable");
             };
@@ -273,9 +269,10 @@ impl SessionDraft {
                 text,
                 state.last_delivery.take(),
                 state.activity != input_state::activity(),
+                state.stop_error.take(),
             )
         };
-        if let Some(draft) = draft {
+        let mut delivery = if let Some(draft) = draft {
             let mode = if mode == Finish::Abort && edited {
                 self.control.handoff_started();
                 Finish::Handoff("editing".into())
@@ -284,7 +281,16 @@ impl SessionDraft {
             };
             draft.finish(text, mode).await
         } else {
-            old.unwrap_or_else(|| Delivery::not_submitted("editing"))
+            let mut delivery = old.unwrap_or_else(|| Delivery::not_submitted("editing"));
+            if let Err(error) = self.connection.close().await {
+                log::info!(target:"sayweave", "operation=dictation_cleanup task_id={} error={}", self.task, error.code);
+                delivery.error = Some("compositionCleanup".into());
+            }
+            delivery
+        };
+        if let Some(error) = stop_error {
+            delivery.error = Some(error);
         }
+        delivery
     }
 }

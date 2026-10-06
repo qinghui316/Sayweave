@@ -83,6 +83,9 @@ struct State {
     selection: Option<ITfRange>,
     preserved_attributes: Vec<(GUID, i32)>,
     text_cookie: Option<u32>,
+    key_sink: bool,
+    key_handoff: bool,
+    key_failure: bool,
 }
 type Shared = Rc<RefCell<State>>;
 #[implement(ITfTextInputProcessor)]
@@ -134,6 +137,31 @@ impl ITfTextInputProcessor_Impl for Service_Impl {
                 self.Deactivate()?;
                 return Err(failure(E_FAIL));
             }
+            let (manager, generation) = {
+                let s = self.state.borrow();
+                (
+                    s.manager.clone().ok_or_else(|| failure(E_UNEXPECTED))?,
+                    s.generation,
+                )
+            };
+            let keys = manager.cast::<ITfKeystrokeMgr>();
+            let sink: ITfKeyEventSink = KeySink {
+                state: Rc::downgrade(&self.state),
+                _lease: Lease::new(),
+            }
+            .into();
+            if let Err(error) = keys.and_then(|keys| keys.AdviseKeyEventSink(client, &sink, false))
+            {
+                self.Deactivate()?;
+                return Err(error);
+            }
+            if !self.state.borrow().active || self.state.borrow().generation != generation {
+                if let Ok(keys) = manager.cast::<ITfKeystrokeMgr>() {
+                    let _ = keys.UnadviseKeyEventSink(client);
+                }
+                return Err(failure(E_UNEXPECTED));
+            }
+            self.state.borrow_mut().key_sink = true;
             Ok(())
         }
     }
@@ -145,6 +173,12 @@ impl ITfTextInputProcessor_Impl for Service_Impl {
                 std::mem::take(&mut *s)
             };
             unwatch(old.context.as_ref(), old.text_cookie);
+            if old.key_sink
+                && let Some(manager) = &old.manager
+                && let Ok(keys) = manager.cast::<ITfKeystrokeMgr>()
+            {
+                let _ = keys.UnadviseKeyEventSink(old.client);
+            }
             let _ = DestroyWindow(HWND(old.window as *mut _));
             drop(old);
             let _ = UnregisterClassW(w!("SayweaveTsfBridge"), Some(module()?));
@@ -304,16 +338,25 @@ fn poll(shared: &Shared) {
             && s.version.acknowledges_handoff(&r)
             && r.live(unsafe { GetTickCount64() })
     };
-    if already_handed_off {
-        shared.borrow_mut().version.applied(&r);
+    if shared.borrow().key_failure {
         reply(
             shared,
             &r,
             connection,
-            true,
-            "alreadyHandedOff",
+            false,
+            "keyboardHandoffFailed",
             Mutation::NotAttempted,
         );
+        return;
+    }
+    if already_handed_off {
+        let code = if shared.borrow().key_handoff {
+            "keyboardHandedOff"
+        } else {
+            "alreadyHandedOff"
+        };
+        shared.borrow_mut().version.applied(&r);
+        reply(shared, &r, connection, true, code, Mutation::NotAttempted);
         return;
     }
     if let Err((stage, e)) = schedule(shared, &r, connection) {
@@ -532,6 +575,7 @@ fn release_composition(shared: &Shared, epoch: u64, composition: Option<&ITfComp
         s.generation = next_generation();
         s.version.owned = false;
         s.cleanup = false;
+        s.key_failure = false;
         (
             s.context.take(),
             s.text_cookie.take(),
@@ -546,6 +590,9 @@ fn release_composition(shared: &Shared, epoch: u64, composition: Option<&ITfComp
 /// End only this service's existing composition. No text, selection or backup restoration.
 /// This also runs after disconnect; it is resource handoff, not a new external write.
 fn end_owned(shared: &Shared) {
+    end_owned_with_flags(shared, TF_ES_ASYNCDONTCARE);
+}
+fn end_owned_with_flags(shared: &Shared, flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS) -> bool {
     let (data, backup) = {
         let mut s = shared.borrow_mut();
         s.version.owned = false;
@@ -574,13 +621,82 @@ fn end_owned(shared: &Shared) {
             }
             .into();
             if context
-                .RequestEditSession(client, &edit, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE)
+                .RequestEditSession(client, &edit, flags | TF_ES_READWRITE)
                 .and_then(|h| h.ok())
                 .is_err()
             {
-                release_composition(shared, epoch, None);
+                mark_handoff_failed(shared, epoch);
+                return false;
             }
         }
+        return true;
+    }
+    false
+}
+fn mark_handoff_failed(shared: &Shared, epoch: u64) {
+    let mut s = shared.borrow_mut();
+    if s.epoch == epoch && s.composition.is_some() {
+        // Neither lock refusal nor EndComposition failure proves termination.
+        // Preserve the real range, block writes/resume and await actual teardown.
+        s.key_failure = true;
+        s.cleanup = true;
+        s.version.owned = false;
+    }
+}
+// A non-foreground sink only participates while this service owns text. Hand off
+// before the application consumes the key: ending a Chromium composition after
+// Backspace can restore its cached pre-edit text. The original key is never eaten
+// or replayed, and OnTestKeyDown has no side effects.
+#[implement(ITfKeyEventSink)]
+struct KeySink {
+    state: std::rc::Weak<RefCell<State>>,
+    _lease: Lease,
+}
+impl KeySink {
+    fn owns_key(&self, context: Ref<ITfContext>, key: WPARAM) -> Option<Shared> {
+        if matches!(key.0, 0x10..=0x14 | 0x1b | 0x5b..=0x5c | 0xa0..=0xa5) {
+            return None;
+        }
+        let shared = self.state.upgrade()?;
+        let owns = {
+            let s = shared.borrow();
+            s.active && s.version.owned && !s.cleanup && s.context.as_ref() == context.as_ref()
+        };
+        owns.then_some(shared)
+    }
+}
+impl ITfKeyEventSink_Impl for KeySink_Impl {
+    fn OnSetFocus(&self, _: BOOL) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn OnTestKeyDown(
+        &self,
+        context: Ref<ITfContext>,
+        key: WPARAM,
+        _: LPARAM,
+    ) -> windows::core::Result<BOOL> {
+        Ok(self.owns_key(context, key).is_some().into())
+    }
+    fn OnKeyDown(
+        &self,
+        context: Ref<ITfContext>,
+        key: WPARAM,
+        _: LPARAM,
+    ) -> windows::core::Result<BOOL> {
+        if let Some(shared) = self.owns_key(context, key) {
+            let ended = end_owned_with_flags(&shared, TF_ES_SYNC);
+            shared.borrow_mut().key_handoff = ended;
+        }
+        Ok(false.into())
+    }
+    fn OnTestKeyUp(&self, _: Ref<ITfContext>, _: WPARAM, _: LPARAM) -> windows::core::Result<BOOL> {
+        Ok(false.into())
+    }
+    fn OnKeyUp(&self, _: Ref<ITfContext>, _: WPARAM, _: LPARAM) -> windows::core::Result<BOOL> {
+        Ok(false.into())
+    }
+    fn OnPreservedKey(&self, _: Ref<ITfContext>, _: *const GUID) -> windows::core::Result<BOOL> {
+        Ok(false.into())
     }
 }
 #[implement(ITfEditSession)]
@@ -593,7 +709,11 @@ struct EndOwned {
 impl ITfEditSession_Impl for EndOwned_Impl {
     fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
         let result = unsafe { self.composition.EndComposition(ec) };
-        release_composition(&self.state, self.epoch, Some(&self.composition));
+        if result.is_ok() {
+            release_composition(&self.state, self.epoch, Some(&self.composition));
+        } else {
+            mark_handoff_failed(&self.state, self.epoch);
+        }
         result
     }
 }
@@ -928,6 +1048,7 @@ fn apply(
 ) -> windows::core::Result<()> {
     unsafe {
         if r.action == Action::Begin {
+            shared.borrow_mut().key_handoff = false;
             *phase = "beginSelection";
             let range = selection(context, ec)?;
             *phase = "beginProperties";
@@ -1200,6 +1321,62 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[implement(ITfComposition)]
+    struct RefusingComposition;
+    impl ITfComposition_Impl for RefusingComposition_Impl {
+        fn GetRange(&self) -> windows::core::Result<ITfRange> {
+            Err(failure(E_NOTIMPL))
+        }
+        fn ShiftStart(&self, _: u32, _: Ref<ITfRange>) -> windows::core::Result<()> {
+            Err(failure(E_NOTIMPL))
+        }
+        fn ShiftEnd(&self, _: u32, _: Ref<ITfRange>) -> windows::core::Result<()> {
+            Err(failure(E_NOTIMPL))
+        }
+        fn EndComposition(&self, _: u32) -> windows::core::Result<()> {
+            Err(failure(E_FAIL))
+        }
+    }
+    #[test]
+    fn failed_end_keeps_the_real_range_and_cannot_acknowledge_handoff() {
+        let composition: ITfComposition = RefusingComposition.into();
+        let state = Rc::new(RefCell::new(State {
+            epoch: 7,
+            composition: Some(composition.clone()),
+            ..Default::default()
+        }));
+        let edit: ITfEditSession = EndOwned {
+            state: state.clone(),
+            composition: composition.clone(),
+            epoch: 7,
+            _lease: Lease::new(),
+        }
+        .into();
+        assert!(unsafe { edit.DoEditSession(0) }.is_err());
+        let s = state.borrow();
+        assert_eq!(s.composition.as_ref(), Some(&composition));
+        assert!(s.key_failure && s.cleanup && !s.version.owned);
+        drop(s);
+        // A termination callback, rather than a failed API return, releases it.
+        release_composition(&state, 7, Some(&composition));
+        assert!(state.borrow().composition.is_none());
+        assert!(!state.borrow().key_failure);
+    }
+    #[test]
+    fn refused_lock_retains_its_range_but_cannot_poison_a_new_epoch() {
+        let composition: ITfComposition = RefusingComposition.into();
+        let state = Rc::new(RefCell::new(State {
+            epoch: 2,
+            composition: Some(composition.clone()),
+            ..Default::default()
+        }));
+        mark_handoff_failed(&state, 1);
+        assert!(!state.borrow().key_failure);
+        mark_handoff_failed(&state, 2);
+        assert!(state.borrow().key_failure && state.borrow().cleanup);
+        assert_eq!(state.borrow().composition.as_ref(), Some(&composition));
+        release_composition(&state, 2, Some(&composition));
+    }
     #[test]
     fn owned_context_compartments_enforce_native_admission() {
         // An application owns these flags. Test a real, isolated TSF context,

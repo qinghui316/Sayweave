@@ -1,5 +1,5 @@
 //! Session-owned host. TSF ranges stay in the target's apartment, never in this worker.
-use super::{Anchor, Delivery, DeliveryGate, Submission, Verification, WindowsInputService};
+use super::{Anchor, Delivery, DeliveryGate, Submission, Verification};
 use crate::history::types::Error;
 use sayweave_text_service::{
     client::ProfileLease,
@@ -29,7 +29,14 @@ struct Desired {
 }
 enum Command {
     Wake,
-    Finish(String, Finish, oneshot::Sender<Delivery>),
+    Begin(
+        u64,
+        Anchor,
+        Arc<Mutex<Desired>>,
+        oneshot::Sender<Result<(), Error>>,
+    ),
+    Finish(u64, String, Finish, bool, oneshot::Sender<Delivery>),
+    Close(oneshot::Sender<Result<(), Error>>),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Finish {
@@ -38,10 +45,42 @@ pub enum Finish {
     Abort,
 }
 pub struct Draft {
-    input: WindowsInputService,
+    connection: Arc<Connection>,
     turn: u64,
-    sender: mpsc::SyncSender<Command>,
     desired: Arc<Mutex<Desired>>,
+}
+/// One apartment, activation lease and authenticated pipe for the entire session.
+/// Editing retires only the range; it does not toggle the process-wide TSF service.
+pub(crate) struct Connection {
+    sender: mpsc::SyncSender<Command>,
+}
+impl Connection {
+    pub async fn begin_turn(
+        self: &Arc<Self>,
+        turn: u64,
+        anchor: Anchor,
+    ) -> Result<Arc<Draft>, Error> {
+        let desired = Arc::new(Mutex::new(Desired::default()));
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .try_send(Command::Begin(turn, anchor, desired.clone(), reply))
+            .map_err(|_| Error::new("compositionWorker"))?;
+        result
+            .await
+            .map_err(|_| Error::new("compositionWorker"))??;
+        Ok(Arc::new(Draft {
+            connection: self.clone(),
+            turn,
+            desired,
+        }))
+    }
+    pub async fn close(&self) -> Result<(), Error> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .try_send(Command::Close(reply))
+            .map_err(|_| Error::new("compositionWorker"))?;
+        result.await.map_err(|_| Error::new("compositionWorker"))?
+    }
 }
 impl Draft {
     pub async fn begin(
@@ -49,12 +88,11 @@ impl Draft {
         turn: u64,
         anchor: Anchor,
         gate: Arc<DeliveryGate>,
-        input: WindowsInputService,
     ) -> Result<Arc<Self>, Error> {
         let (sender, commands) = mpsc::sync_channel(4);
         let desired = Arc::new(Mutex::new(Desired::default()));
         let (ready, result) = oneshot::channel();
-        let shared = desired.clone();
+        let mut shared = desired.clone();
         std::thread::Builder::new()
             .name("sayweave-composition-sta".into())
             .spawn(move || {
@@ -77,13 +115,37 @@ impl Draft {
                 loop {
                     pump();
                     match commands.recv_timeout(Duration::from_millis(5)) {
-                        Ok(Command::Finish(text, mode, reply)) => {
+                        Ok(Command::Begin(turn, anchor, desired, reply)) => {
+                            let result = host.begin_turn(turn, anchor);
+                            if result.is_ok() {
+                                shared = desired;
+                                applied = 0;
+                                last_update = None;
+                            }
+                            let _ = reply.send(result);
+                        }
+                        Ok(Command::Close(reply)) => {
+                            let result = host.close();
+                            drop(host);
+                            let _ = reply.send(result);
+                            return;
+                        }
+                        Ok(Command::Finish(turn, text, mode, keep, reply)) => {
+                            if turn != host.turn {
+                                let _ = reply.send(Delivery::not_submitted("staleSession"));
+                                continue;
+                            }
                             let mut delivery = host.finish(&text, mode);
+                            if keep {
+                                let _ = reply.send(delivery);
+                                continue;
+                            }
                             if host.close().is_err() {
                                 delivery.error = Some("compositionCleanup".into());
                             }
+                            drop(host);
                             let _ = reply.send(delivery);
-                            break;
+                            return;
                         }
                         Ok(Command::Wake) => {
                             if let Ok(mut desired) = shared.lock() {
@@ -116,14 +178,13 @@ impl Draft {
             .await
             .map_err(|_| Error::new("compositionWorker"))??;
         Ok(Arc::new(Self {
-            input,
+            connection: Arc::new(Connection { sender }),
             turn,
-            sender,
             desired,
         }))
     }
-    pub(crate) fn input(&self) -> WindowsInputService {
-        self.input.clone()
+    pub(crate) fn connection(&self) -> Arc<Connection> {
+        self.connection.clone()
     }
     /// One replaceable snapshot; a blocked target cannot create an unbounded edit queue.
     pub fn update(&self, turn: u64, sequence: u64, text: &str) {
@@ -137,7 +198,7 @@ impl Draft {
         desired.text = text.into();
         if !desired.notified {
             desired.notified = true;
-            if self.sender.try_send(Command::Wake).is_err() {
+            if self.connection.sender.try_send(Command::Wake).is_err() {
                 desired.notified = false;
             }
         }
@@ -151,6 +212,13 @@ impl Draft {
         self.desired.lock().ok().and_then(|d| d.failure.clone())
     }
     pub async fn finish(&self, text: String, mode: Finish) -> Delivery {
+        self.finish_range(text, mode, false).await
+    }
+    pub async fn handoff(&self) -> Delivery {
+        self.finish_range(String::new(), Finish::Handoff("editing".into()), true)
+            .await
+    }
+    async fn finish_range(&self, text: String, mode: Finish, keep: bool) -> Delivery {
         if let Ok(mut desired) = self.desired.lock() {
             if desired.closed {
                 return Delivery::not_submitted("staleSession");
@@ -159,8 +227,9 @@ impl Draft {
         }
         let (reply, result) = oneshot::channel();
         if self
+            .connection
             .sender
-            .try_send(Command::Finish(text, mode, reply))
+            .try_send(Command::Finish(self.turn, text, mode, keep, reply))
             .is_err()
         {
             let mut outcome = Delivery::not_submitted("compositionWorker");
@@ -197,6 +266,7 @@ struct Host {
     attempted: bool,
     visible: bool,
     failure: Option<String>,
+    range_open: bool,
     profile: ProfileLease,
     _lease: registration::HostLease,
     _apartment: Apartment,
@@ -256,6 +326,7 @@ impl Host {
             attempted: false,
             visible: false,
             failure: None,
+            range_open: false,
             profile,
             _lease: lease,
             _apartment: apartment,
@@ -272,10 +343,33 @@ impl Host {
         })?;
         super::native::composition_begin_target(&host.task, &host.anchor)?;
         host.exchange(Action::Begin, "", false)?;
+        host.range_open = true;
         // Begin itself does not change text. Do not publish a writable draft if input moved
         // while the target's asynchronous edit session was being scheduled/executed.
         super::native::composition_begin_target(&host.task, &host.anchor)?;
         Ok(host)
+    }
+    fn begin_turn(&mut self, turn: u64, anchor: Anchor) -> Result<(), Error> {
+        if self.range_open
+            || turn < self.turn
+            || self.failure.is_some()
+            || anchor.window != self.anchor.window
+            || anchor.process != self.anchor.process
+            || anchor.lifetime != self.anchor.lifetime
+            || anchor.capture_id != self.anchor.capture_id
+        {
+            return Err(Error::new("staleSession"));
+        }
+        self.anchor = anchor;
+        self.turn = turn;
+        self.revision = 0;
+        self.text.clear();
+        self.attempted = false;
+        self.visible = false;
+        self.exchange(Action::Begin, "", false)?;
+        self.range_open = true;
+        super::native::composition_begin_target(&self.task, &self.anchor)?;
+        Ok(())
     }
     fn exchange(&mut self, action: Action, text: &str, cleanup: bool) -> Result<(), Error> {
         if !cleanup {
@@ -369,8 +463,13 @@ impl Host {
         let result = if aborted {
             self.exchange(Action::Abort, "", true)
         } else if let Finish::Handoff(reason) = &mode {
-            self.exchange(Action::Handoff, "", true)
-                .and(Err(Error::new(reason)))
+            let result = self.exchange(Action::Handoff, "", true);
+            if result.is_ok() {
+                self.range_open = false;
+            } else {
+                self.failure = result.as_ref().err().map(|e| e.code.clone());
+            }
+            result.and(Err(Error::new(reason)))
         } else if self.failure.is_some() {
             self.exchange(Action::Handoff, "", true)
                 .and(Err(Error::new(self.failure.as_deref().unwrap())))
@@ -423,6 +522,9 @@ impl Host {
     }
 }
 fn reply_error(code: &str) -> &'static str {
+    if code == "keyboardHandoffFailed" {
+        return "compositionHandoffFailed";
+    }
     if code
         == format!(
             "editLease:{:08x}",
