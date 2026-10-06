@@ -267,7 +267,18 @@ impl Host {
             _apartment: apartment,
         };
         super::native::composition_begin_target(&host.task, &host.anchor)?;
-        host.proof_available = host.observe(proof::Action::Begin)?;
+        host.proof_available = match host.observe(proof::Action::Begin) {
+            Ok(available) => available,
+            // UIA is optional position evidence, not the editable TSF context.
+            // Only initial discovery may be unavailable: the component still
+            // checks disabled/password/readonly context and range ownership on
+            // every operation. Loss of acquired proof remains a hard stop.
+            Err(error) if error.code == "targetTimeout" => {
+                log::info!(target:"sayweave", "operation=draft_proof task_id={} turn={} phase=begin unavailable_reason=targetTimeout", host.task,host.turn);
+                false
+            }
+            Err(error) => return Err(error),
+        };
         log::info!(target:"sayweave", "operation=draft_proof task_id={} turn={} phase=begin available={}", host.task, host.turn, host.proof_available);
         host.exchange(Action::Begin, "", false)?;
         // Begin itself does not change text. Do not publish a writable draft if input moved
@@ -431,30 +442,12 @@ impl Host {
                 self.exchange(Action::Commit, "", false)
             })
         };
-        // A TSF applied acknowledgement is submission, not proof that the application
-        // accepted the text after releasing its edit lock (e.g. maxlength constraints).
+        // A TSF acknowledgement is submission, not renderer completion. Even a
+        // matching fresh UIA call can return the final Update's pre-commit cache.
+        // There is no provider-correlated completion fence in this protocol, so
+        // do not promote an acknowledged commit to independently confirmed input.
         let committed = result.is_ok() && mode == Finish::Commit;
-        let verification_started = Instant::now();
-        let mut confirmed = false;
-        if committed && self.proof_available {
-            let expires = verification_started + Duration::from_millis(500);
-            loop {
-                match self.observe_until(proof::Action::Confirm(text.into()), expires) {
-                    Ok(true) => {
-                        confirmed = true;
-                        break;
-                    }
-                    Err(_) => break,
-                    Ok(false) => {}
-                }
-                if verification_started.elapsed() >= Duration::from_millis(500) {
-                    break;
-                }
-                pump();
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-        log::info!(target:"sayweave", "operation=draft_proof task_id={} turn={} revision={} phase=confirm submitted={} confirmed={} elapsed_ms={}", self.task,self.turn,self.revision,committed,confirmed,verification_started.elapsed().as_millis());
+        log::info!(target:"sayweave", "operation=draft_proof task_id={} turn={} revision={} phase=confirm submitted={} confirmed=false completion_boundary=unavailable", self.task,self.turn,self.revision,committed);
         let mut delivery = Delivery::not_submitted(
             result
                 .as_ref()
@@ -467,15 +460,10 @@ impl Host {
         }
         delivery.stage = "composition".into();
         delivery.elapsed_ms = began.elapsed().as_millis() as u64;
-        if confirmed {
-            delivery.state = "confirmed".into();
-            delivery.error = None;
-            delivery.submission = Submission::Submitted;
-            delivery.verification = Verification::Confirmed;
-        } else if committed || self.visible && !aborted || self.attempted && result.is_err() {
+        if committed || self.visible && !aborted || self.attempted && result.is_err() {
             delivery.state = "unconfirmed".into();
             if committed {
-                delivery.error = Some("compositionUnconfirmed".into());
+                delivery.error = Some("inputUnconfirmed".into());
             }
             delivery.submission = if self.visible {
                 Submission::Submitted

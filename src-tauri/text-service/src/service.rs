@@ -389,6 +389,7 @@ fn lease(
         if context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0 {
             return Err(failure(TF_E_READONLY));
         }
+        ensure_enabled_context(context)?;
         // COM providers may reenter the apartment. Recheck after the last COM call.
         let s = shared.borrow();
         if !s.active
@@ -845,6 +846,27 @@ fn range_text(range: &ITfRange, ec: u32) -> windows::core::Result<String> {
     }
     String::from_utf16(&data[..fetched as usize]).map_err(|_| failure(E_FAIL))
 }
+// Disabled/empty contexts can still expose writable TSF ranges (for example
+// browser password fields). InputScope alone is not an admission decision.
+fn ensure_enabled_context(context: &ITfContext) -> windows::core::Result<()> {
+    use windows::Win32::System::Variant::{VT_EMPTY, VT_I4};
+    unsafe {
+        let compartments: ITfCompartmentMgr = context.cast()?;
+        for id in [
+            GUID_COMPARTMENT_KEYBOARD_DISABLED,
+            GUID_COMPARTMENT_EMPTYCONTEXT,
+        ] {
+            let value = compartments.GetCompartment(&id)?.GetValue()?;
+            match value.vt() {
+                VT_EMPTY => (), // Not set by the context owner.
+                VT_I4 if i32::try_from(&value)? == 0 => (),
+                VT_I4 => return Err(failure(E_ACCESSDENIED)),
+                _ => return Err(failure(E_INVALIDARG)),
+            }
+        }
+        Ok(())
+    }
+}
 fn password(context: &ITfContext, range: &ITfRange, ec: u32) -> windows::core::Result<bool> {
     unsafe {
         let window = context.GetActiveView()?.GetWnd()?;
@@ -1153,6 +1175,48 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owned_context_compartments_enforce_native_admission() {
+        // An application owns these flags. Test a real, isolated TSF context,
+        // rather than trying to overwrite the flags of an existing edit control.
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+            let result = (|| -> windows::core::Result<()> {
+                let manager: ITfThreadMgr =
+                    CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
+                let client = manager.Activate()?;
+                let result = (|| -> windows::core::Result<()> {
+                    let document = manager.CreateDocumentMgr()?;
+                    let mut context = None;
+                    let mut cookie = 0;
+                    document.CreateContext(client, 0, None, &mut context, &mut cookie)?;
+                    let context = context.ok_or_else(|| failure(E_FAIL))?;
+                    let compartments: ITfCompartmentMgr = context.cast()?;
+                    ensure_enabled_context(&context)?;
+                    for id in [
+                        GUID_COMPARTMENT_KEYBOARD_DISABLED,
+                        GUID_COMPARTMENT_EMPTYCONTEXT,
+                    ] {
+                        let compartment = compartments.GetCompartment(&id)?;
+                        compartment.SetValue(client, &1i32.into())?;
+                        assert_eq!(
+                            ensure_enabled_context(&context).unwrap_err().code(),
+                            E_ACCESSDENIED
+                        );
+                        compartment.SetValue(client, &0i32.into())?;
+                        ensure_enabled_context(&context)?;
+                        compartments.ClearCompartment(client, &id)?;
+                        ensure_enabled_context(&context)?;
+                    }
+                    Ok(())
+                })();
+                manager.Deactivate()?;
+                result
+            })();
+            CoUninitialize();
+            result.unwrap();
+        }
+    }
     #[test]
     fn a_late_reply_cannot_clear_a_new_connections_operation() {
         let capability = uuid::Uuid::new_v4().to_string();

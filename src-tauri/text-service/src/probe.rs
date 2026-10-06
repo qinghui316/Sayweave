@@ -8,41 +8,6 @@ use windows::{
     },
     core::Interface,
 };
-struct Host {
-    language: Option<u16>,
-    manager: Option<ITfThreadMgr>,
-    _lease: registration::HostLease,
-}
-impl Host {
-    fn close(&mut self) -> windows::core::Result<()> {
-        if let Some(language) = self.language {
-            if own_profile_active(language)? {
-                registration::deactivate(language, true)?;
-                if own_profile_active(language)? {
-                    return Err(windows::core::Error::new(
-                        windows::Win32::Foundation::E_FAIL,
-                        "speech profile remains active",
-                    ));
-                }
-            }
-            self.language = None;
-        }
-        if let Some(manager) = &self.manager {
-            unsafe {
-                manager.Deactivate()?;
-            }
-            self.manager = None;
-        }
-        Ok(())
-    }
-}
-impl Drop for Host {
-    fn drop(&mut self) {
-        if let Err(error) = self.close() {
-            eprintln!("probe_cleanup_failed hresult={:08x}", error.code().0 as u32);
-        }
-    }
-}
 struct Apartment;
 impl Drop for Apartment {
     fn drop(&mut self) {
@@ -116,40 +81,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Removed Sayweave speech profile.");
             }
             Some("probe" | "activation-check") => {
-                if input_profiles()?.iter().any(|p| {
-                    p.catid == GUID_TFCAT_TIP_SPEECH && p.dwFlags & TF_IPP_FLAG_ACTIVE != 0
-                }) {
-                    return Err(
-                        "an existing speech profile is active; probe made no changes".into(),
-                    );
-                }
                 let capability = uuid::Uuid::new_v4().to_string();
-                let mut host = Host {
-                    language: None,
-                    manager: None,
-                    _lease: registration::host_capability(std::process::id(), &capability)?,
-                };
+                let _host = registration::host_capability(std::process::id(), &capability)?;
                 let keyboard_before = keyboard()?;
-                let manager: ITfThreadMgr =
-                    CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
-                let _client = manager.Activate()?;
-                host.manager = Some(manager);
-                host.language = Some(registration::activate(true)?);
-                if !own_profile_active(host.language.unwrap())? {
-                    return Err("speech profile was not activated; no input attempted".into());
-                }
-                if keyboard()? != keyboard_before {
-                    return Err(
-                        "speech activation changed keyboard profile; acceptance failed".into(),
-                    );
-                }
+                let activation_before = sayweave_text_service::client::speech_activation()?;
+                let mut host = sayweave_text_service::client::ProfileLease::open()?;
                 if args[1] == "activation-check" {
                     host.close()?;
                     if keyboard()? != keyboard_before {
                         return Err("keyboard profile changed during cleanup".into());
                     }
+                    if sayweave_text_service::client::speech_activation()? != activation_before {
+                        return Err("speech activation was not restored".into());
+                    }
                     println!(
-                        "speech activation/deactivation verified; keyboard unchanged; no input attempted"
+                        "speech lease and prior activation restored ({:?}); keyboard unchanged; no input attempted",
+                        activation_before.0
                     );
                     return Ok(());
                 }
@@ -189,10 +136,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     pump(Duration::from_millis(50));
                 };
                 let task = uuid::Uuid::new_v4().to_string();
+                let multiline = args.get(4).map(String::as_str) == Some("multiline");
+                let interval = args
+                    .get(5)
+                    .map(|s| s.parse::<u64>())
+                    .transpose()?
+                    .unwrap_or(700);
+                if interval > 1000 {
+                    return Err("probe interval exceeds limit".into());
+                }
                 for (op, revision, action, text) in [
                     (1, 0, Action::Begin, ""),
                     (2, 1, Action::Update, "Sayweave 原位"),
-                    (3, 2, Action::Update, "Sayweave 原位验证，🙂"),
+                    (
+                        3,
+                        2,
+                        Action::Update,
+                        if multiline {
+                            "中文，🙂\n第二行 e\u{0301}。"
+                        } else {
+                            "Sayweave 原位验证，🙂"
+                        },
+                    ),
                     (4, 2, Action::Commit, ""),
                 ] {
                     if GetForegroundWindow() != window {
@@ -230,7 +195,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if reply.operation != op || !reply.applied {
                         return Err("target did not apply edit".into());
                     }
-                    pump(Duration::from_millis(700));
+                    pump(Duration::from_millis(interval));
                 }
                 if keyboard()? != keyboard_before {
                     return Err("keyboard profile changed during probe".into());
@@ -288,18 +253,6 @@ fn input_profiles() -> windows::core::Result<Vec<TF_INPUTPROCESSORPROFILE>> {
                 return Ok(result);
             }
         }
-    }
-}
-fn own_profile_active(language: u16) -> windows::core::Result<bool> {
-    unsafe {
-        let mut active_language = 0;
-        let mut active_profile = windows::core::GUID::zeroed();
-        registration::profiles()?.GetActiveLanguageProfile(
-            &registration::CLASS,
-            &mut active_language,
-            &mut active_profile,
-        )?;
-        Ok(active_language == language && active_profile == registration::PROFILE)
     }
 }
 fn keyboard() -> windows::core::Result<(u32, u16, windows::core::GUID, windows::core::GUID, isize)>

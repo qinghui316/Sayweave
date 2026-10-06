@@ -193,10 +193,10 @@ try{
   expect((await editor.command({action:'focus',text:'before tail',start:7,end:11})).foreground).toBe(true);
   await invoke(page,'runtime_window',{surface:'overlay',action:'show'});mode='delayed-final';
   const result=await externalRound(page,async()=>{await expect.poll(async()=>(await editor.command({action:'read'})).text,{timeout:5000}).toBe('before 正在识别');const before=await editor.command({action:'read'});expect(before.foreground).toBe(true);await invoke(page,'shortcut_capture',{begin:false});await invoke(page,'shortcut_capture',{begin:false});await delay(180);const after=await editor.command({action:'read'});report.externalFocus={beforeProcess:before.foregroundProcess,afterProcess:after.foregroundProcess,applicationProcess:app.pid};const taskId=(await invoke(page,'dictation_snapshot')).taskId;const updates=report.taskTrace.filter(e=>e.line.includes('task_id='+taskId+' ')&&e.line.includes('action=Update applied=true')).length;expect(updates).toBeGreaterThanOrEqual(2);report.streamingInput={beforeFinishActualText:true,acknowledgedUpdatesBeforeFinish:updates,clipboardUsed:false,taskId};expect(after.foreground).toBe(true);},async()=>{report.nativeEndClick=await nativeOverlayClick(overlay,editor,'结束录音');});
-  report.externalEdit=result.dictation.delivery;expect(result.dictation.delivery.state).toBe('confirmed');expect((await rejected(page,'dictation_copy',{taskId:'stale-task',presentationId:randomUUID()})).code).toBe('staleSession');expect((await editor.command({action:'read'})).text).toBe('before 原生受控识别完成。');
-  expect(result.dictation.presentation).toBe('completed');await expect(overlay.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);await expect.poll(async()=>(await invoke(page,'runtime_snapshot')).windows.overlay,{timeout:2500}).toBe(false);expect((await invoke(page,'dictation_snapshot')).presentation).toBe('idle');mode='normal';
+  report.externalEdit=result.dictation.delivery;expect(result.dictation.delivery.state).toBe('unconfirmed');expect(result.dictation.delivery.verification).toBe('unavailable');expect((await rejected(page,'dictation_copy',{taskId:'stale-task',presentationId:randomUUID()})).code).toBe('staleSession');expect((await editor.command({action:'read'})).text).toBe('before 原生受控识别完成。');
+  expect(result.dictation.presentation).toBe('notice');await expect(overlay.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);await expect.poll(async()=>(await invoke(page,'runtime_snapshot')).windows.overlay,{timeout:5000}).toBe(false);expect((await invoke(page,'dictation_snapshot')).presentation).toBe('idle');mode='normal';
   expect((await rejected(page,'speech_retry_current',{taskId:'stale-displayed-task'})).code).toBe('staleSession');
-  expect((await invoke(page,'history_delivery',{id:result.speech.recordId}))[0].state).toBe('confirmed');
+  expect((await invoke(page,'history_delivery',{id:result.speech.recordId}))[0].state).toBe('unconfirmed');
   expect((await editor.command({action:'read'})).foreground).toBe(true);
   report.overlayInsertion=[];
   mode='unicode';
@@ -205,8 +205,8 @@ try{
    const result=await externalRound(page,async()=>delay(180),async()=>nativeOverlayClick(overlay,editor,'结束录音'));
    const actual=await editor.command({action:'read'});
    expect(actual.text.replace(/\r\n/g,'\n')).toBe(sample.before.slice(0,sample.start)+'中文，🙂\n第二行 e\u0301。'+sample.before.slice(sample.end));
-   expect(actual.foreground).toBe(true);expect(result.dictation.delivery.state).toBe('confirmed');
-   await expect.poll(async()=>(await invoke(page,'runtime_snapshot')).windows.overlay,{timeout:2500}).toBe(false);
+   expect(actual.foreground).toBe(true);expect(result.dictation.delivery.state).toBe('unconfirmed');expect(result.dictation.delivery.verification).toBe('unavailable');
+   await expect.poll(async()=>(await invoke(page,'runtime_snapshot')).windows.overlay,{timeout:5000}).toBe(false);
    report.overlayInsertion.push({taskId:result.dictation.taskId,beforeLength:sample.before.length,actualWrite:true,delivery:result.dictation.delivery});
   }
   mode='normal';
@@ -301,7 +301,7 @@ try{
    const result=await externalRound(page,async()=>delay(100));
    const actual=control==='ProseMirror'?await target.evaluate(()=>window.fixtureEditor.read()):await target.locator('#'+control).evaluate(node=>'value'in node?node.value:node.innerText);
    expect(actual.replace(/\r\n/g,'\n')).toBe(sample.before.slice(0,sample.start)+'中文，🙂\n第二行 e\u0301。'+sample.before.slice(sample.end));
-   expect(result.dictation.delivery.state,'Unicode range confirmation: '+JSON.stringify(result.dictation.delivery)).toBe('confirmed');
+   expect(result.dictation.delivery.state,'Commit has no provider completion fence: '+JSON.stringify(result.dictation.delivery)).toBe('unconfirmed');expect(result.dictation.delivery.verification).toBe('unavailable');
    report.inputCompatibility.push({app:'Chromium',control,case:'unicode-multiline',start:sample.start,beforeLength:sample.before.length,delivery:result.dictation.delivery});
    if(result.dictation.presentationId)await invoke(page,'dictation_dismiss',{taskId:result.dictation.taskId,presentationId:result.dictation.presentationId});
   }

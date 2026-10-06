@@ -49,7 +49,6 @@ pub enum Submission {
 #[serde(rename_all = "camelCase")]
 pub enum Verification {
     NotAttempted,
-    Confirmed,
     Unavailable,
 }
 impl Delivery {

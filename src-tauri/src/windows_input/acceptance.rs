@@ -202,7 +202,10 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             std::thread::sleep(Duration::from_millis(20));
         }
         let delivery = runtime.block_on(draft.finish(text.into(), Finish::Commit));
-        if delivery.verification != Verification::Confirmed {
+        if delivery.verification != Verification::Unavailable
+            || delivery.submission != Submission::Submitted
+            || delivery.error.as_deref() != Some("inputUnconfirmed")
+        {
             return Err(format!("composition commit failed: {:?}", delivery.error));
         }
         let actual = fixture.command(serde_json::json!({"action":"read"}))?;
@@ -256,8 +259,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         draft.update(1, 2, "不应覆盖");
         let delivery = runtime.block_on(draft.finish("不应覆盖".into(), Finish::Commit));
         let after = fixture.command(serde_json::json!({"action":"read"}))?;
-        if delivery.verification == Verification::Confirmed || after["text"] != "protected正在识别"
-        {
+        if delivery.state == "confirmed" || after["text"] != "protected正在识别" {
             return Err(format!(
                 "caret protection failed: state={} error={:?}",
                 delivery.state, delivery.error
@@ -347,7 +349,10 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         let delivery = runtime.block_on(manager.finish(&latest, Finish::Commit));
         runtime.block_on(actor).map_err(|e| e.to_string())?;
         let actual = fixture.command(serde_json::json!({"action":"read"}))?;
-        if delivery.verification != Verification::Confirmed || actual["text"] != "a你好X新🙂bc"
+        if delivery.verification != Verification::Unavailable
+            || delivery.submission != Submission::Submitted
+            || delivery.error.as_deref() != Some("inputUnconfirmed")
+            || actual["text"] != "a你好X新🙂bc"
         {
             return Err(format!(
                 "handoff owned-fixture assertion failed delivery={:?} actual={}",
