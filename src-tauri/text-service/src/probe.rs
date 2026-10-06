@@ -779,6 +779,68 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("keyboard handoff restored deleted text or missed pre-edit dispatch: code={} applied={} fixture_text={:?}", handoff.code, handoff.applied, editor_text(editor)?).into());
             }
             println!("owned pre-edit Backspace handoff preserves actual deletion=true");
+            for semantic in [
+                "\n开头🙂",
+                "结尾\n",
+                "前\n\n后",
+                "前\r\n中\r后",
+                "前🙂\n组合 e\u{301}",
+            ] {
+                let original = "前 被选🙂 后";
+                SendMessageW(
+                    editor,
+                    WM_SETTEXT,
+                    None,
+                    Some(LPARAM(
+                        original
+                            .encode_utf16()
+                            .chain(Some(0))
+                            .collect::<Vec<_>>()
+                            .as_ptr() as isize,
+                    )),
+                );
+                SendMessageW(editor, 0xB1, Some(WPARAM(2)), Some(LPARAM(6)));
+                pump(Duration::from_millis(30));
+                let sample_task = uuid::Uuid::new_v4().to_string();
+                for (operation, revision, action, text) in [
+                    (1, 0, Action::Begin, ""),
+                    (2, 1, Action::Update, "临时\n片段"),
+                    (3, 2, Action::Update, semantic),
+                    (4, 2, Action::Commit, ""),
+                ] {
+                    let reply = exchange(
+                        &pipe,
+                        &capability,
+                        &sample_task,
+                        1,
+                        operation,
+                        revision,
+                        action,
+                        text,
+                        false,
+                    )?;
+                    if !reply.applied {
+                        return Err(
+                            format!("multiline boundary case rejected: {}", reply.code).into()
+                        );
+                    }
+                }
+                let actual = editor_text(editor)?
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n");
+                let expected = format!(
+                    "前 {} 后",
+                    semantic.replace("\r\n", "\n").replace('\r', "\n")
+                );
+                if actual != expected {
+                    return Err(
+                        "multiline boundary commit changed original surroundings or text".into(),
+                    );
+                }
+            }
+            println!(
+                "owned leading/trailing/repeated/mixed breaks, revised snapshots and Unicode exact text=true"
+            );
             Ok(())
         })();
         drop(host);

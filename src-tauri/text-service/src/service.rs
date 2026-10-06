@@ -1,5 +1,6 @@
 //! All TSF state stays on the target apartment. IPC never carries COM pointers.
 use crate::{
+    composition_text::{CompositionText, TextPhase, equivalent_native_text},
     registration,
     transport::{Identity, Pipe, identity},
     wire::*,
@@ -75,11 +76,14 @@ struct State {
     pending: Option<Pending>,
     epoch: u64,
     cleanup: bool,
+    cleanup_id: u64,
+    materialize_allowed: bool,
     version: DraftVersion,
     context: Option<ITfContext>,
     composition: Option<ITfComposition>,
     backup: Option<ITfRangeBackup>,
     expected: String,
+    text: Option<CompositionText>,
     selection: Option<ITfRange>,
     preserved_attributes: Vec<(GUID, i32)>,
     text_cookie: Option<u32>,
@@ -96,7 +100,10 @@ struct Service {
 impl ITfTextInputProcessor_Impl for Service_Impl {
     fn Activate(&self, manager: Ref<ITfThreadMgr>, client: u32) -> windows::core::Result<()> {
         unsafe {
-            if self.state.borrow().active {
+            if self.state.borrow().active
+                || self.state.borrow().composition.is_some()
+                || self.state.borrow().cleanup
+            {
                 return Err(failure(E_UNEXPECTED));
             }
             let manager = manager.as_ref().ok_or_else(|| failure(E_POINTER))?.clone();
@@ -130,6 +137,8 @@ impl ITfTextInputProcessor_Impl for Service_Impl {
                 s.client = client;
                 s.window = window.0 as usize;
                 s.active = true;
+                s.key_failure = false;
+                s.key_handoff = false;
                 s.generation = next_generation();
                 s.pipe = Some(pipe);
             }
@@ -168,19 +177,26 @@ impl ITfTextInputProcessor_Impl for Service_Impl {
     fn Deactivate(&self) -> windows::core::Result<()> {
         unsafe {
             end_owned(&self.state);
-            let old = {
+            let (manager, client, key_sink, window) = {
                 let mut s = self.state.borrow_mut();
-                std::mem::take(&mut *s)
+                s.active = false;
+                s.connected = false;
+                s.pending = None;
+                s.pipe.take();
+                s.peer = None;
+                s.capability = None;
+                let values = (s.manager.clone(), s.client, s.key_sink, s.window);
+                s.key_sink = false;
+                s.window = 0;
+                values
             };
-            unwatch(old.context.as_ref(), old.text_cookie);
-            if old.key_sink
-                && let Some(manager) = &old.manager
+            if key_sink
+                && let Some(manager) = &manager
                 && let Ok(keys) = manager.cast::<ITfKeystrokeMgr>()
             {
-                let _ = keys.UnadviseKeyEventSink(old.client);
+                let _ = keys.UnadviseKeyEventSink(client);
             }
-            let _ = DestroyWindow(HWND(old.window as *mut _));
-            drop(old);
+            let _ = DestroyWindow(HWND(window as *mut _));
             let _ = UnregisterClassW(w!("SayweaveTsfBridge"), Some(module()?));
             Ok(())
         }
@@ -567,6 +583,14 @@ fn unwatch(context: Option<&ITfContext>, cookie: Option<u32>) {
     }
 }
 fn release_composition(shared: &Shared, epoch: u64, composition: Option<&ITfComposition>) {
+    release_composition_with_failure(shared, epoch, composition, false);
+}
+fn release_composition_with_failure(
+    shared: &Shared,
+    epoch: u64,
+    composition: Option<&ITfComposition>,
+    semantic_failed: bool,
+) {
     let old = {
         let mut s = shared.borrow_mut();
         if s.epoch != epoch || composition.is_some_and(|c| s.composition.as_ref() != Some(c)) {
@@ -575,48 +599,58 @@ fn release_composition(shared: &Shared, epoch: u64, composition: Option<&ITfComp
         s.generation = next_generation();
         s.version.owned = false;
         s.cleanup = false;
-        s.key_failure = false;
+        s.cleanup_id = 0;
+        s.materialize_allowed = false;
+        s.key_failure = semantic_failed;
         (
             s.context.take(),
             s.text_cookie.take(),
             s.composition.take(),
             s.backup.take(),
             s.selection.take(),
+            s.text.take(),
         )
     };
     unwatch(old.0.as_ref(), old.1);
     drop(old);
 }
-/// End only this service's existing composition. No text, selection or backup restoration.
-/// This also runs after disconnect; it is resource handoff, not a new external write.
+/// Retire only the captured range. Semantic conversion has a separate guarded authority;
+/// it never searches a new target or restores a backup over user changes.
 fn end_owned(shared: &Shared) {
     end_owned_with_flags(shared, TF_ES_ASYNCDONTCARE);
 }
 fn end_owned_with_flags(shared: &Shared, flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS) -> bool {
     let (data, backup) = {
         let mut s = shared.borrow_mut();
+        if s.cleanup {
+            return true;
+        }
         s.version.owned = false;
         s.generation = next_generation();
         let backup = s.backup.take();
-        let data = if s.cleanup {
-            None
-        } else if let (Some(context), Some(composition)) = (&s.context, &s.composition) {
+        let data = if let (Some(context), Some(composition)) = (&s.context, &s.composition) {
             Some((context.clone(), composition.clone(), s.client, s.epoch))
         } else {
             None
         };
         if data.is_some() {
             s.cleanup = true;
+            s.cleanup_id = next_generation();
         }
+        let data = data.map(|(context, composition, client, epoch)| {
+            (context, composition, client, epoch, s.cleanup_id)
+        });
         (data, backup)
     };
     drop(backup);
-    if let Some((context, composition, client, epoch)) = data {
+    if let Some((context, composition, client, epoch, cleanup_id)) = data {
         unsafe {
             let edit: ITfEditSession = EndOwned {
                 state: shared.clone(),
+                context: Some(context.clone()),
                 composition,
                 epoch,
+                cleanup_id,
                 _lease: Lease::new(),
             }
             .into();
@@ -642,6 +676,171 @@ fn mark_handoff_failed(shared: &Shared, epoch: u64) {
         s.cleanup = true;
         s.version.owned = false;
     }
+}
+// Cleanup authority is limited to the captured composition, not the live host's next task.
+fn cleanup_identity(
+    shared: &Shared,
+    context: &Option<ITfContext>,
+    composition: &ITfComposition,
+    epoch: u64,
+    cleanup_id: u64,
+) -> windows::core::Result<()> {
+    let s = shared.borrow();
+    if s.epoch != epoch
+        || s.cleanup_id != cleanup_id
+        || !s.cleanup
+        || s.context != *context
+        || s.composition.as_ref() != Some(composition)
+    {
+        return Err(failure(TF_E_DISCONNECTED));
+    }
+    Ok(())
+}
+fn revoke_cleanup_conversion(shared: &Shared, epoch: u64) {
+    let mut s = shared.borrow_mut();
+    if s.epoch == epoch && s.cleanup {
+        s.materialize_allowed = false;
+    }
+}
+// Only the already-visible representation may be finalized. Never discover another range.
+#[allow(clippy::too_many_arguments)]
+fn materialize(
+    shared: &Shared,
+    context: &ITfContext,
+    composition: &ITfComposition,
+    epoch: u64,
+    ec: u32,
+    guard: &impl Fn() -> windows::core::Result<()>,
+    preserve_selection: bool,
+    mutation: &mut Mutation,
+) -> windows::core::Result<()> {
+    let (text, expected, manager, attributes) = {
+        let s = shared.borrow();
+        (
+            s.text.clone(),
+            s.expected.clone(),
+            s.manager.clone(),
+            s.preserved_attributes.clone(),
+        )
+    };
+    let Some(text) = text else {
+        return Ok(());
+    };
+    if text.phase == TextPhase::Semantic
+        || !text.needs_materialization() && text.phase == TextPhase::Marked
+    {
+        return Ok(());
+    }
+    if text.phase == TextPhase::Materializing {
+        return Err(failure(TF_E_DISCONNECTED));
+    }
+    let permitted = || {
+        guard()?;
+        if !shared.borrow().materialize_allowed {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        Ok(())
+    };
+    let manager = manager.ok_or_else(|| failure(TF_E_DISCONNECTED))?;
+    unsafe {
+        permitted()?;
+        if manager.GetFocus()?.GetTop()? != *context {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        let mut process = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut process));
+        let view = context.GetActiveView()?.GetWnd()?;
+        if process != std::process::id()
+            || !view.0.is_null() && GetAncestor(view, GA_ROOT) != GetForegroundWindow()
+            || context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0
+        {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        ensure_enabled_context(context)?;
+        let range = composition.GetRange()?;
+        if password(context, &range, ec)? || range_text(&range, ec)? != expected {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        let selected = if preserve_selection {
+            Some(selection(context, ec)?.Clone()?)
+        } else {
+            None
+        };
+        permitted()?;
+        {
+            let mut s = shared.borrow_mut();
+            if s.epoch != epoch {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            s.text
+                .as_mut()
+                .ok_or_else(|| failure(TF_E_DISCONNECTED))?
+                .phase = TextPhase::Materializing;
+        }
+        *mutation = Mutation::Uncertain;
+        let semantic = text.commit_text();
+        range.SetText(
+            ec,
+            TF_ST_CORRECTION,
+            &semantic.encode_utf16().collect::<Vec<_>>(),
+        )?;
+        *mutation = Mutation::Changed;
+        permitted()?;
+        let actual = range_text(&range, ec)?;
+        permitted()?;
+        if !equivalent_native_text(&actual, &semantic) {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        // Record the successful conversion before another COM call. End failures cannot replay it.
+        {
+            let mut s = shared.borrow_mut();
+            s.expected = actual;
+            s.text
+                .as_mut()
+                .ok_or_else(|| failure(TF_E_DISCONNECTED))?
+                .phase = TextPhase::Semantic;
+        }
+        for (id, value) in attributes {
+            let property = context.GetProperty(&id)?;
+            permitted()?;
+            property.SetValue(
+                ec,
+                &range,
+                &windows::Win32::System::Variant::VARIANT::from(value),
+            )?;
+            permitted()?;
+            let actual = property.GetValue(ec, &range)?;
+            permitted()?;
+            if actual.vt() != windows::Win32::System::Variant::VT_I4
+                || i32::try_from(&actual)? != value
+            {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+        }
+        let caret = match selected {
+            Some(selected) => selected,
+            None => {
+                let caret = range.Clone()?;
+                caret.Collapse(ec, TF_ANCHOR_END)?;
+                caret
+            }
+        };
+        permitted()?;
+        let mut selected = TF_SELECTION {
+            range: ManuallyDrop::new(Some(caret)),
+            style: TF_SELECTIONSTYLE {
+                ase: TF_AE_NONE,
+                fInterimChar: false.into(),
+            },
+        };
+        let result = context.SetSelection(ec, std::slice::from_ref(&selected));
+        ManuallyDrop::drop(&mut selected.range);
+        result?;
+        let current = selection(context, ec)?;
+        permitted()?;
+        shared.borrow_mut().selection = Some(current);
+    }
+    Ok(())
 }
 // A non-foreground sink only participates while this service owns text. Hand off
 // before the application consumes the key: ending a Chromium composition after
@@ -702,19 +901,54 @@ impl ITfKeyEventSink_Impl for KeySink_Impl {
 #[implement(ITfEditSession)]
 struct EndOwned {
     state: Shared,
+    context: Option<ITfContext>,
     composition: ITfComposition,
     epoch: u64,
+    cleanup_id: u64,
     _lease: Lease,
 }
 impl ITfEditSession_Impl for EndOwned_Impl {
     fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        let guard = || {
+            cleanup_identity(
+                &self.state,
+                &self.context,
+                &self.composition,
+                self.epoch,
+                self.cleanup_id,
+            )
+        };
+        guard()?;
+        let mut mutation = Mutation::NotAttempted;
+        let semantic = if let Some(context) = &self.context {
+            materialize(
+                &self.state,
+                context,
+                &self.composition,
+                self.epoch,
+                ec,
+                &guard,
+                true,
+                &mut mutation,
+            )
+        } else if self.state.borrow().text.is_none() {
+            Ok(())
+        } else {
+            Err(failure(TF_E_DISCONNECTED))
+        };
+        guard()?;
         let result = unsafe { self.composition.EndComposition(ec) };
         if result.is_ok() {
-            release_composition(&self.state, self.epoch, Some(&self.composition));
+            release_composition_with_failure(
+                &self.state,
+                self.epoch,
+                Some(&self.composition),
+                semantic.is_err(),
+            );
         } else {
             mark_handoff_failed(&self.state, self.epoch);
         }
-        result
+        semantic.and(result)
     }
 }
 #[implement(ITfCompositionSink)]
@@ -726,7 +960,7 @@ struct CompositionSink {
 impl ITfCompositionSink_Impl for CompositionSink_Impl {
     fn OnCompositionTerminated(
         &self,
-        _: u32,
+        ec: u32,
         composition: Ref<ITfComposition>,
     ) -> windows::core::Result<()> {
         #[cfg(feature = "acceptance")]
@@ -736,8 +970,46 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
             self.state.borrow().generation,
             self.state.borrow().version.owned
         );
-        release_composition(&self.state, self.epoch, composition.as_ref());
-        Ok(())
+        let binding = {
+            let s = self.state.borrow();
+            (s.epoch == self.epoch && s.composition.as_ref() == composition.as_ref())
+                .then(|| (s.context.clone(), s.generation))
+        };
+        let owned = binding.is_some();
+        let mut semantic = Ok(());
+        if let Some((Some(context), generation)) = binding
+            && let Some(composition) = composition.as_ref()
+        {
+            let guard = || {
+                let s = self.state.borrow();
+                if s.epoch != self.epoch
+                    || s.generation != generation
+                    || s.context.as_ref() != Some(&context)
+                    || s.composition.as_ref() != Some(composition)
+                {
+                    Err(failure(TF_E_DISCONNECTED))
+                } else {
+                    Ok(())
+                }
+            };
+            semantic = materialize(
+                &self.state,
+                &context,
+                composition,
+                self.epoch,
+                ec,
+                &guard,
+                true,
+                &mut Mutation::NotAttempted,
+            );
+        }
+        release_composition_with_failure(
+            &self.state,
+            self.epoch,
+            composition.as_ref(),
+            owned && semantic.is_err(),
+        );
+        semantic
     }
 }
 // Uniform scalar attributes can be preserved through a cumulative text correction.
@@ -814,7 +1086,7 @@ impl ITfTextEditSink_Impl for TextSink_Impl {
     ) -> windows::core::Result<()> {
         let (client, generation, composition, expected, expected_selection) = {
             let s = self.state.borrow();
-            if s.epoch != self.epoch || !s.version.owned {
+            if s.epoch != self.epoch || !s.version.owned && !s.cleanup {
                 return Ok(());
             }
             (
@@ -825,6 +1097,32 @@ impl ITfTextEditSink_Impl for TextSink_Impl {
                 s.selection.clone(),
             )
         };
+        if self.state.borrow().cleanup {
+            let changed = (|| unsafe {
+                let context = context.as_ref().ok_or_else(|| failure(E_POINTER))?;
+                if context.InWriteSession(client)?.as_bool() {
+                    return Ok(false);
+                }
+                let record = record.as_ref().ok_or_else(|| failure(E_POINTER))?;
+                let range = composition
+                    .as_ref()
+                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?
+                    .GetRange()?;
+                let text = record.GetTextAndPropertyUpdates(TF_GTP_INCL_TEXT, &[])?;
+                let mut ranges = [None];
+                let mut count = 0;
+                text.Next(&mut ranges, &mut count)?;
+                Ok::<_, windows::core::Error>(
+                    record.GetSelectionStatus()?.as_bool()
+                        || count != 0
+                        || !changed_attributes(context, record, &range, ec)?.is_empty(),
+                )
+            })();
+            if !matches!(changed, Ok(false)) {
+                revoke_cleanup_conversion(&self.state, self.epoch);
+            }
+            return Ok(());
+        }
         let result: windows::core::Result<bool> = (|| unsafe {
             let context = context.as_ref().ok_or_else(|| failure(E_POINTER))?;
             if context.InWriteSession(client)?.as_bool() {
@@ -1107,6 +1405,8 @@ fn apply(
             s.backup = Some(backup);
             s.context = Some(context.clone());
             s.expected = expected;
+            s.text = None;
+            s.materialize_allowed = true;
             s.selection = Some(original_selection);
             s.text_cookie = Some(cookie);
             s.version.applied(r);
@@ -1149,10 +1449,11 @@ fn apply(
                 lease(shared, r, generation, context)?;
                 *mutation = Mutation::Uncertain;
                 *phase = "updateText";
+                let text = CompositionText::new(&r.text);
                 range.SetText(
                     ec,
                     TF_ST_CORRECTION,
-                    &r.text.encode_utf16().collect::<Vec<_>>(),
+                    &text.marked.encode_utf16().collect::<Vec<_>>(),
                 )?;
                 *mutation = Mutation::Changed;
                 *phase = "updateAttributes";
@@ -1179,9 +1480,19 @@ fn apply(
                 let actual = range_text(&range, ec)?;
                 // RichEdit and browser text stores can use different newline representations.
                 // Preserve the provider's range text; permit only equivalent line breaks.
-                if actual.replace("\r\n", "\n").replace('\r', "\n")
-                    != r.text.replace("\r\n", "\n").replace('\r', "\n")
-                {
+                if !text.matches_marked(&actual) {
+                    #[cfg(feature = "acceptance")]
+                    eprintln!(
+                        "marked readback mismatch: expected_units={} actual_units={} break_codes={:?}",
+                        text.marked.encode_utf16().count(),
+                        actual.encode_utf16().count(),
+                        actual
+                            .chars()
+                            .filter(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+                            .map(|c| c as u32)
+                            .take(16)
+                            .collect::<Vec<_>>()
+                    );
                     return Err(failure(TF_E_DISCONNECTED));
                 }
                 {
@@ -1190,6 +1501,7 @@ fn apply(
                         return Err(failure(TF_E_DISCONNECTED));
                     }
                     s.expected = actual;
+                    s.text = Some(text);
                     s.version.applied(r);
                     s.selection = None;
                 }
@@ -1229,6 +1541,16 @@ fn apply(
                 let backup = { shared.borrow().backup.clone() };
                 let Some(backup) = backup else {
                     // Finish even when property changes made rollback unsafe.
+                    materialize(
+                        shared,
+                        context,
+                        &composition,
+                        epoch,
+                        ec,
+                        &|| edit_identity(shared, r, generation, epoch),
+                        true,
+                        mutation,
+                    )?;
                     composition.EndComposition(ec)?;
                     release_composition(shared, epoch, Some(&composition));
                     return Err(failure(TF_E_DISCONNECTED));
@@ -1246,6 +1568,17 @@ fn apply(
             Action::Commit | Action::Handoff => {
                 *phase = "commit";
                 lease(shared, r, generation, context)?;
+                materialize(
+                    shared,
+                    context,
+                    &composition,
+                    epoch,
+                    ec,
+                    &|| edit_identity(shared, r, generation, epoch),
+                    r.action == Action::Handoff,
+                    mutation,
+                )?;
+                edit_identity(shared, r, generation, epoch)?;
                 shared.borrow_mut().version.applied(r);
                 composition.EndComposition(ec)?;
                 release_composition(shared, epoch, Some(&composition));
@@ -1322,8 +1655,10 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
 mod tests {
     use super::*;
     #[implement(ITfComposition)]
-    struct RefusingComposition;
-    impl ITfComposition_Impl for RefusingComposition_Impl {
+    struct TestComposition {
+        refuse_end: bool,
+    }
+    impl ITfComposition_Impl for TestComposition_Impl {
         fn GetRange(&self) -> windows::core::Result<ITfRange> {
             Err(failure(E_NOTIMPL))
         }
@@ -1334,21 +1669,112 @@ mod tests {
             Err(failure(E_NOTIMPL))
         }
         fn EndComposition(&self, _: u32) -> windows::core::Result<()> {
-            Err(failure(E_FAIL))
+            if self.refuse_end {
+                Err(failure(E_FAIL))
+            } else {
+                Ok(())
+            }
         }
     }
     #[test]
-    fn failed_end_keeps_the_real_range_and_cannot_acknowledge_handoff() {
-        let composition: ITfComposition = RefusingComposition.into();
+    fn external_edit_revokes_conversion_but_not_range_cleanup() {
+        let composition: ITfComposition = TestComposition { refuse_end: false }.into();
         let state = Rc::new(RefCell::new(State {
             epoch: 7,
+            cleanup: true,
+            cleanup_id: 42,
+            materialize_allowed: true,
+            text: Some(CompositionText::new("前\n后")),
+            composition: Some(composition.clone()),
+            ..Default::default()
+        }));
+        revoke_cleanup_conversion(&state, 6);
+        assert!(state.borrow().materialize_allowed);
+        revoke_cleanup_conversion(&state, 7);
+        assert!(!state.borrow().materialize_allowed);
+        assert!(cleanup_identity(&state, &None, &composition, 7, 42).is_ok());
+        let edit: ITfEditSession = EndOwned {
+            state: state.clone(),
+            context: None,
+            composition,
+            epoch: 7,
+            cleanup_id: 42,
+            _lease: Lease::new(),
+        }
+        .into();
+        assert!(unsafe { edit.DoEditSession(0) }.is_err());
+        assert!(state.borrow().composition.is_none());
+        assert!(state.borrow().key_failure);
+    }
+    #[test]
+    fn repeated_disconnect_preserves_the_pending_cleanup_identity() {
+        let composition: ITfComposition = TestComposition { refuse_end: false }.into();
+        let state = Rc::new(RefCell::new(State {
+            epoch: 7,
+            cleanup: true,
+            cleanup_id: 42,
+            generation: 3,
+            composition: Some(composition.clone()),
+            ..Default::default()
+        }));
+        disconnect(&state);
+        disconnect(&state);
+        assert!(end_owned_with_flags(&state, TF_ES_ASYNCDONTCARE));
+        assert_eq!(state.borrow().cleanup_id, 42);
+        let edit: ITfEditSession = EndOwned {
+            state: state.clone(),
+            context: None,
+            composition,
+            epoch: 7,
+            cleanup_id: 42,
+            _lease: Lease::new(),
+        }
+        .into();
+        unsafe {
+            edit.DoEditSession(0).unwrap();
+        }
+        assert!(state.borrow().composition.is_none());
+        assert!(!state.borrow().cleanup);
+    }
+    #[test]
+    fn old_cleanup_cannot_terminate_a_new_range() {
+        let old: ITfComposition = TestComposition { refuse_end: false }.into();
+        let current: ITfComposition = TestComposition { refuse_end: false }.into();
+        let state = Rc::new(RefCell::new(State {
+            epoch: 8,
+            cleanup: true,
+            cleanup_id: 43,
+            composition: Some(current.clone()),
+            ..Default::default()
+        }));
+        let edit: ITfEditSession = EndOwned {
+            state: state.clone(),
+            context: None,
+            composition: old,
+            epoch: 7,
+            cleanup_id: 42,
+            _lease: Lease::new(),
+        }
+        .into();
+        assert!(unsafe { edit.DoEditSession(0) }.is_err());
+        assert_eq!(state.borrow().composition.as_ref(), Some(&current));
+        assert_eq!(state.borrow().cleanup_id, 43);
+    }
+    #[test]
+    fn failed_end_keeps_the_real_range_and_cannot_acknowledge_handoff() {
+        let composition: ITfComposition = TestComposition { refuse_end: true }.into();
+        let state = Rc::new(RefCell::new(State {
+            epoch: 7,
+            cleanup: true,
             composition: Some(composition.clone()),
             ..Default::default()
         }));
         let edit: ITfEditSession = EndOwned {
             state: state.clone(),
+            context: None,
             composition: composition.clone(),
             epoch: 7,
+            cleanup_id: 0,
             _lease: Lease::new(),
         }
         .into();
@@ -1364,7 +1790,7 @@ mod tests {
     }
     #[test]
     fn refused_lock_retains_its_range_but_cannot_poison_a_new_epoch() {
-        let composition: ITfComposition = RefusingComposition.into();
+        let composition: ITfComposition = TestComposition { refuse_end: true }.into();
         let state = Rc::new(RefCell::new(State {
             epoch: 2,
             composition: Some(composition.clone()),
