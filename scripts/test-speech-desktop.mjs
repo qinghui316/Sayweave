@@ -118,7 +118,60 @@ async function waitPhase(page,phase){
  }
  await expect.poll(async()=>(await invoke(page,'speech_snapshot')).phase,{timeout}).toBe(phase);return invoke(page,'speech_snapshot');
 }
-try{
+async function homeTrialIsolation(page){
+ const overlay=await overlayPage(),editor=await ownedEditor();
+ const practice=page.getByRole('region',{name:'识别文字',exact:true});
+ const empty=await practice.textContent();
+ try{
+  async function external(expectedHome){
+   await editor.command({action:'focus',text:'prefix ',start:7,end:7});
+   const result=await externalRound(page,async()=>{
+    expect((await invoke(page,'speech_snapshot')).source).toBe('external');
+    await expect.poll(async()=>(await editor.command({action:'read'})).text).toBe('prefix 正在识别');
+    await expect(practice).toHaveText(expectedHome);
+    await expect(page.getByRole('button',{name:'开始录音',exact:true})).toBeDisabled();
+    await expect(page.getByRole('button',{name:'结束录音',exact:true})).toHaveCount(0);
+    await expect(page.getByRole('button',{name:'重新识别',exact:true})).toHaveCount(0);
+   });
+   expect(result.speech.source).toBe('external');
+   expect((await editor.command({action:'read'})).text).toBe('prefix 原生受控识别完成。');
+   await expect(practice).toHaveText(expectedHome);
+   await expect.poll(async()=>(await invoke(page,'runtime_snapshot')).windows.overlay,{timeout:3000}).toBe(false);
+   await expect(overlay.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);
+   report.checks.push('actual TSF external text inserted while Home trial text/phase/meter remained isolated');
+  }
+  await external(empty);
+  await invoke(page,'runtime_window',{surface:'main',action:'show'});
+  await page.getByRole('button',{name:'开始录音',exact:true}).click();
+  const trial=await waitPhase(page,'recording');expect(trial.source).toBe('trial');
+  await expect(practice).toContainText('正在识别');
+  await page.getByRole('button',{name:'结束录音',exact:true}).click();
+  const done=await waitPhase(page,'completed');expect(done.source).toBe('trial');expect(done.saved).toBe(true);
+  const retained=await practice.textContent();
+  await page.getByRole('group',{name:'识别完成',exact:true}).getByRole('button',{name:'开始录音',exact:true}).click();
+  const restarted=await waitPhase(page,'recording');expect(restarted.source).toBe('trial');expect(restarted.taskId).not.toBe(done.taskId);
+  await page.getByRole('button',{name:'结束录音',exact:true}).click();
+  const restartedDone=await waitPhase(page,'completed');
+  const model=(await readModels(page)).configs[0];
+  const retried=await invoke(page,'speech_retry_current',{taskId:restartedDone.taskId});expect(retried.source).toBe('trial');
+  await waitPhase(page,'completed');await waitPhase(page,'idle');
+  await external(retained);
+  mode='failure';await invoke(page,'history_retry',{id:done.recordId,configId:model.id,configRevision:model.revision});
+  const failed=await waitPhase(page,'failed');expect(failed.source).toBe('history');
+  await expect(practice).toHaveText(retained);await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(page.getByRole('button',{name:'重新识别',exact:true})).toHaveCount(0);
+  await page.getByRole('link',{name:'历史记录',exact:true}).click();
+  await page.getByRole('link',{name:'首页',exact:true}).click();await expect(practice).toHaveText(retained);
+  await invoke(page,'runtime_window',{surface:'main',action:'hide'});
+  await invoke(page,'runtime_window',{surface:'main',action:'show'});await expect(practice).toHaveText(retained);
+  await invoke(page,'speech_start');
+  const ownFailure=await waitPhase(page,'failed');expect(ownFailure.source).toBe('trial');
+  await expect(page.getByRole('alert')).toHaveCount(1);
+  report.homeTrial={initialExternalIgnored:true,ownStreaming:true,completedRestartActualClick:true,retrySourcePreserved:true,historyFailureIgnored:true,navigationRetained:true,originalUserDataUsed:false};
+  report.checks.push('Home active trial and current retry carry trial source; history errors, navigation and hide/resync preserve trial result');
+ }finally{await editor.close();}
+}
+async function run(){try{
  // This entry is also invoked directly. Never reuse a stale acceptance executable.
  await buildFixture({logLevel:'error'});
  await command(['build','--manifest-path','src-tauri/text-service/Cargo.toml','--release']);
@@ -129,7 +182,10 @@ try{
  await command(['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_fixture','--','--ignored']);server=createServer({cert:readFileSync(path.join(data,'fixture-ca.pem')),key:readFileSync(path.join(data,'fixture-key.pem'))});server.on('upgrade',websocket);await new Promise(r=>server.listen(0,'127.0.0.1',r));const base='https://localhost:'+server.address().port;
  let page=await start(1);await expect(page.getByRole('link',{name:'组件展示'})).toHaveCount(0);await page.getByRole('button',{name:'配置模型',exact:true}).click();const dialog=page.getByRole('dialog');await delay(250);await page.screenshot({path:path.join(directory,'settings-speech-native.png')});await dialog.getByRole('button',{name:'更多设置'}).click();await dialog.getByLabel('名称',{exact:true}).fill('隔离语音验收');await dialog.getByLabel('服务地址（URL）',{exact:true}).fill(base);await dialog.getByLabel('API 密钥',{exact:true}).fill(key);await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(dialog.getByText('已保存。')).toBeVisible();await dialog.getByRole('button',{name:'关闭',exact:true}).click();await expect(dialog).toHaveCount(0);
  const devices=await invoke(page,'speech_devices');report.microphoneCount=devices.length;expect(devices.some(d=>d.isDefault)).toBe(true);
- const began=performance.now();await page.getByRole('button',{name:'开始录音',exact:true}).click();const live=await waitPhase(page,'recording');await expect(page.getByRole('region',{name:'识别文字',exact:true})).toContainText('正在识别');report.firstFixtureTextMs=Math.round(performance.now()-began);
+ report.scope=process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE??'all';
+ if(report.scope==='home-trial'){await homeTrialIsolation(page);report.passed=true;return;}
+ if(report.scope!=='all')throw Error('Unknown speech acceptance scope');
+ const began=performance.now();await page.getByRole('button',{name:'开始录音',exact:true}).click();const live=await waitPhase(page,'recording');expect(live.source).toBe('trial');await expect(page.getByRole('region',{name:'识别文字',exact:true})).toContainText('正在识别');report.firstFixtureTextMs=Math.round(performance.now()-began);
  const nativeBefore=await processMetrics(),sampleStarted=performance.now();
  report.frames=await page.evaluate(()=>new Promise(resolve=>{const frames=[];let previous=performance.now();const end=previous+1000;function tick(now){frames.push(now-previous);previous=now;if(now<end)requestAnimationFrame(tick);else{frames.sort((a,b)=>a-b);resolve({count:frames.length,p95Ms:frames[Math.floor(frames.length*.95)]});}}requestAnimationFrame(tick);}));
  const nativeAfter=await processMetrics(),sampleMs=performance.now()-sampleStarted;report.nativeMetrics={sampleMs:Math.round(sampleMs),cpuMilliseconds:Math.round((nativeAfter.cpuSeconds-nativeBefore.cpuSeconds)*1000),cpuCorePercent:Math.round((nativeAfter.cpuSeconds-nativeBefore.cpuSeconds)/sampleMs*1000000)/10,workingSetBytes:nativeAfter.workingSetBytes,privateBytes:nativeAfter.privateBytes};
@@ -179,8 +235,8 @@ try{
  const doubaoTask=await invoke(page,'speech_start');await waitPhase(page,'recording');await expect(page.getByRole('region',{name:'识别文字',exact:true})).toContainText('正在识别');await delay(200);await invoke(page,'speech_control',{taskId:doubaoTask.taskId,action:'finish'});const doubaoDone=await waitPhase(page,'completed');expect(doubaoDone.text).toBe('原生受控识别完成。');expect(doubaoDone.saved).toBe(true);
  const doubaoRecord=await invoke(page,'history_detail',{id:doubaoDone.recordId});expect(doubaoRecord.audio.status).toBe('ready');
  mode='empty-ack';await invoke(page,'history_retry',{id:doubaoRecord.id,configId:doubaoConfig.id,configRevision:doubaoConfig.revision});const acknowledged=await waitPhase(page,'completed');expect(acknowledged.text).toBe('正在识别');expect(acknowledged.saved).toBe(true);
- const beforeMalformed=await invoke(page,'history_detail',{id:doubaoRecord.id});mode='malformed-terminal';await invoke(page,'history_retry',{id:doubaoRecord.id,configId:doubaoConfig.id,configRevision:doubaoConfig.revision});await waitPhase(page,'failed');expect((await invoke(page,'speech_snapshot')).error).toBe('protocol');expect((await invoke(page,'history_detail',{id:doubaoRecord.id})).currentAttempt).toBe(beforeMalformed.currentAttempt);await expect(page.getByRole('group',{name:'识别失败',exact:true})).toBeVisible();await expect(overlay.getByRole('group',{name:'识别失败',exact:true})).toHaveCount(1);await expect(page.getByText('演示失败',{exact:true})).toHaveCount(0);
- report.checks.push('negative terminal sentinel accepts final text and empty acknowledgement; malformed terminal stays failed, preserves prior success and uses real recognition labels in both windows');
+ const beforeMalformed=await invoke(page,'history_detail',{id:doubaoRecord.id});mode='malformed-terminal';await invoke(page,'history_retry',{id:doubaoRecord.id,configId:doubaoConfig.id,configRevision:doubaoConfig.revision});await waitPhase(page,'failed');expect((await invoke(page,'speech_snapshot')).error).toBe('protocol');expect((await invoke(page,'history_detail',{id:doubaoRecord.id})).currentAttempt).toBe(beforeMalformed.currentAttempt);await expect(page.getByRole('group',{name:'识别失败',exact:true})).toHaveCount(0);await expect(page.getByRole('region',{name:'识别文字',exact:true})).toContainText(doubaoDone.text);await expect(overlay.getByRole('group',{name:'识别失败',exact:true})).toHaveCount(1);await expect(page.getByText('演示失败',{exact:true})).toHaveCount(0);
+ report.checks.push('negative terminal sentinel accepts final text and empty acknowledgement; malformed terminal stays failed, preserves prior success and uses real recognition labels in overlay while retaining unrelated Home trial');
  mode='resource-denied';const handshakes=report.handshakes.length;await invoke(page,'history_retry',{id:doubaoRecord.id,configId:doubaoConfig.id,configRevision:doubaoConfig.revision});await waitPhase(page,'completed');expect(report.handshakes.slice(handshakes).map(h=>h.resource)).toEqual(['volc.seedasr.sauc.duration','volc.seedasr.sauc.concurrent']);
  mode='auth';const authHandshakes=report.handshakes.length;await invoke(page,'speech_start');await waitPhase(page,'failed');expect((await invoke(page,'speech_snapshot')).error).toBe('auth');expect(report.handshakes.length-authHandshakes).toBe(1);
  mode='pending';const doubaoCancel=await invoke(page,'history_retry',{id:doubaoRecord.id,configId:doubaoConfig.id,configRevision:doubaoConfig.revision});await waitPhase(page,'processing');await invoke(page,'speech_control',{taskId:doubaoCancel.taskId,action:'cancel'});await waitPhase(page,'cancelled');
@@ -387,4 +443,6 @@ for(const r of (await invoke(page,'history_list',{query:{search:'',page:1}})).re
  try{await command(['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_cleanup','--','--ignored']);report.credentialCleanup=true;}catch{report.credentialCleanup=false;report.passed=false;process.exitCode=1;}
  for(const name of ['fixture-ca.der','fixture-ca.pem','fixture-key.pem'])if(existsSync(path.join(data,name)))unlinkSync(path.join(data,name));writeFileSync(path.join(directory,'report.json'),JSON.stringify(report,null,2));writeFileSync(path.join(root,'.local','speech-desktop-report.json'),JSON.stringify(report,null,2));
 }
+}
+await run();
 console.log(JSON.stringify(report,null,2));

@@ -2,7 +2,7 @@ use crate::{
     coordinator::Phase,
     history::types::{DbOperation, Error},
     shortcuts::{ShortcutService, TaskStamp, types::Mode},
-    speech::{NativeStart, Snapshot as SpeechSnapshot, SpeechService},
+    speech::{NativeStart, Snapshot as SpeechSnapshot, Source as SpeechSource, SpeechService},
     windows_input::{Anchor, Delivery, DeliveryGate, WindowsInputService},
 };
 use serde::Serialize;
@@ -152,10 +152,12 @@ impl DictationCoordinator {
         app: tauri::AppHandle,
         record: String,
         task: String,
+        source: SpeechSource,
     ) -> Result<SpeechSnapshot, Error> {
-        let mut reserved = self.reserve(&app, "history", 0, None, None)?;
+        let source = source.retry_source().as_str();
+        let mut reserved = self.reserve(&app, source, 0, None, None)?;
         reserved.expected_task = Some(task);
-        self.start_reserved(app, "history", None, Some(record), None, reserved)
+        self.start_reserved(app, source, None, Some(record), None, reserved)
             .await
     }
     pub fn busy(&self) -> bool {
@@ -338,6 +340,7 @@ impl DictationCoordinator {
         event: Option<&TaskStamp>,
         anchor: Option<&Anchor>,
     ) -> Result<Reservation, Error> {
+        SpeechSource::try_from(source)?;
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, _) = watch::channel(0u8);
         let gate = Arc::new(DeliveryGate::default());
@@ -413,6 +416,7 @@ impl DictationCoordinator {
         expected: Option<(String, i64)>,
         reserved: Reservation,
     ) -> Result<SpeechSnapshot, Error> {
+        let speech_source = SpeechSource::try_from(source)?;
         let Reservation {
             id,
             expected_task,
@@ -440,7 +444,8 @@ impl DictationCoordinator {
             let assessment = input.capture(id.clone(), target).await;
             if let Some(code) = crate::windows_input::draft_rejection(&assessment) {
                 let error = Error::new(&code);
-                self.reject_preparation(&app, &id, &error, &gate).await;
+                self.reject_preparation(&app, &id, speech_source, &error, &gate)
+                    .await;
                 return Err(error);
             }
         }
@@ -455,7 +460,8 @@ impl DictationCoordinator {
                     None
                 }
                 Err(error) => {
-                    self.reject_preparation(&app, &id, &error, &gate).await;
+                    self.reject_preparation(&app, &id, speech_source, &error, &gate)
+                        .await;
                     return Err(error);
                 }
             }
@@ -495,6 +501,7 @@ impl DictationCoordinator {
                 expected,
                 NativeStart {
                     id: id.clone(),
+                    source: speech_source,
                     expected_task,
                     cancel: tx,
                     terminal: terminal_tx,
@@ -518,7 +525,8 @@ impl DictationCoordinator {
                 && error.code != "cancelled"
                 && error.code != "staleSession"
             {
-                app.state::<SpeechService>().start_error(&app, &id, error);
+                app.state::<SpeechService>()
+                    .start_error(&app, &id, speech_source, error);
             }
             self.release(&app, &id).await;
             return result;
@@ -750,6 +758,7 @@ impl DictationCoordinator {
         &self,
         app: &tauri::AppHandle,
         id: &str,
+        source: SpeechSource,
         error: &Error,
         gate: &DeliveryGate,
     ) {
@@ -769,7 +778,8 @@ impl DictationCoordinator {
             s.error = Some(error.code.clone());
         });
         app.state::<WindowsInputService>().forget(id.into());
-        app.state::<SpeechService>().start_error(app, id, error);
+        app.state::<SpeechService>()
+            .start_error(app, id, source, error);
         self.release(app, id).await;
     }
     async fn journal(

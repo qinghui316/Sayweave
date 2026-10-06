@@ -22,6 +22,39 @@ use std::{
 };
 use tauri::{Emitter, Manager};
 use tokio::sync::{Mutex as AsyncMutex, watch};
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Source {
+    Trial,
+    External,
+    History,
+}
+impl TryFrom<&str> for Source {
+    type Error = Error;
+    fn try_from(value: &str) -> Result<Self, Error> {
+        match value {
+            "trial" => Ok(Self::Trial),
+            "external" => Ok(Self::External),
+            "history" => Ok(Self::History),
+            _ => Err(Error::new("invalid")),
+        }
+    }
+}
+impl Source {
+    pub fn retry_source(self) -> Self {
+        match self {
+            Self::Trial => Self::Trial,
+            Self::External | Self::History => Self::History,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Trial => "trial",
+            Self::External => "external",
+            Self::History => "history",
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
@@ -33,6 +66,7 @@ pub struct Snapshot {
     pub sequence: u64,
     pub lifecycle: u64,
     pub task_id: Option<String>,
+    pub source: Option<Source>,
     pub attempt_id: Option<String>,
     pub record_id: Option<String>,
     pub phase: Phase,
@@ -56,6 +90,7 @@ impl Default for Snapshot {
             sequence: 1,
             lifecycle: 1,
             task_id: None,
+            source: None,
             attempt_id: None,
             record_id: None,
             phase: Phase::Idle,
@@ -104,6 +139,7 @@ impl std::ops::Deref for NativeTerminal {
 }
 pub struct NativeStart {
     pub id: String,
+    pub source: Source,
     pub expected_task: Option<String>,
     pub cancel: watch::Sender<u8>,
     pub terminal: tokio::sync::oneshot::Sender<NativeTerminal>,
@@ -449,6 +485,14 @@ impl SpeechService {
             return Err(e);
         }
         let continuous = context.as_ref().and_then(|c| c.continuous.clone());
+        let source = context.as_ref().map_or(
+            if retry_id.is_some() {
+                Source::History
+            } else {
+                Source::Trial
+            },
+            |context| context.source,
+        );
         let (tx, rx, terminal) = if let Some(c) = context {
             let rx = c.cancel.subscribe();
             (c.cancel, rx, Some(c.terminal))
@@ -469,6 +513,7 @@ impl SpeechService {
             runtime_id,
             source_record_id: Some(record_id.clone()),
             task_id: Some(task_id.clone()),
+            source: Some(source),
             attempt_id: Some(attempt_id.clone()),
             record_id: if persistent {
                 Some(record_id.clone())
@@ -848,7 +893,7 @@ impl SpeechService {
             });
         }
     }
-    pub fn start_error(&self, app: &tauri::AppHandle, id: &str, error: &Error) {
+    pub fn start_error(&self, app: &tauri::AppHandle, id: &str, source: Source, error: &Error) {
         let Ok(_gate) = self.gate.try_lock() else {
             return;
         };
@@ -865,6 +910,7 @@ impl SpeechService {
             let sequence = s.sequence + 1;
             *s = Snapshot::default();
             s.task_id = Some(id.into());
+            s.source = Some(source);
             s.runtime_id = runtime_id;
             s.sequence = sequence;
         }

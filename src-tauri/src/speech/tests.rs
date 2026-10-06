@@ -1,5 +1,18 @@
 use super::*;
 use serde_json::json;
+#[test]
+fn speech_source_wire_values_and_retry_ownership() {
+    let idle = serde_json::to_value(Snapshot::default()).unwrap();
+    assert_eq!(idle["source"], serde_json::Value::Null);
+    for source in [Source::Trial, Source::External, Source::History] {
+        assert_eq!(Source::try_from(source.as_str()).unwrap(), source);
+        assert_eq!(serde_json::to_value(source).unwrap(), source.as_str());
+    }
+    assert!(Source::try_from("unknown").is_err());
+    assert_eq!(Source::Trial.retry_source(), Source::Trial);
+    assert_eq!(Source::History.retry_source(), Source::History);
+    assert_eq!(Source::External.retry_source(), Source::History);
+}
 fn event(id: u64, text: &str, end: bool) -> serde_json::Value {
     json!({"header":{"task_id":"task","event":"result-generated"},"payload":{"output":{"sentence":{"sentence_id":id,"text":text,"sentence_end":end,"begin_time":0,"end_time":1000}}}})
 }

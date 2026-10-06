@@ -14,7 +14,7 @@ export class BrowserSpeech implements SpeechPort {
  private emit(){this.value.sequence++;for(const fn of this.listeners)fn(structuredClone(this.value));}
  async start(){
   if(this.active)throw new SpeechError('busy');clearTimeout(this.timer);this.active=true;
-  const prior=this.value;this.value={...initialSpeech(),sequence:prior.sequence+1,lifecycle:prior.lifecycle+1,taskId:crypto.randomUUID(),attemptId:crypto.randomUUID(),recordId:this.settings.historyEnabled?crypto.randomUUID():null,modelName:'模拟语音模型',deviceName:'模拟麦克风',phase:'connecting'};this.emit();
+  const prior=this.value;this.value={...initialSpeech(),sequence:prior.sequence+1,lifecycle:prior.lifecycle+1,taskId:crypto.randomUUID(),source:'trial',attemptId:crypto.randomUUID(),recordId:this.settings.historyEnabled?crypto.randomUUID():null,modelName:'模拟语音模型',deviceName:'模拟麦克风',phase:'connecting'};this.emit();
   this.timer=setTimeout(()=>{this.value.phase='recording';this.value.lifecycle++;this.value.text='这是浏览器模拟文字。';this.value.durationMs=1000;this.emit();},250);return this.snapshot();
  }
  async control(id:string,action:'finish'|'cancel'){

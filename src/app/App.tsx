@@ -46,6 +46,10 @@ function RuntimeApp() {
   const [reading]=useState(()=>new HistoryFeedStore(ports.history));
   const [speechStore]=useState(()=>new SpeechStore(ports.speech));
   const speech=useSyncExternalStore(speechStore.subscribe,speechStore.getSnapshot);
+  const trial=useSyncExternalStore(speechStore.subscribeTrial,speechStore.getTrialSnapshot);
+  const [trialFailure,setTrialFailure]=useState('');
+  const [trialPending,setTrialPending]=useState(false);
+  const trialRequest=useRef(0);
   const [speechFailure,setSpeechFailure]=useState('');
   const [usage,setUsage]=useState<Usage|null>(null);
   const [store] = useState(() => new RuntimeStore(createRuntime()));
@@ -94,6 +98,22 @@ function RuntimeApp() {
   },[ports,store,models,dataRevision,settingsOpen]);
   const startSpeech=()=>{setSpeechFailure('');void ports.speech.start().then(speechStore.accept).catch(e=>setSpeechFailure(speechMessages[speechError(e).code]));};
   const controlSpeech=(action:'finish'|'cancel')=>{const id=speech.snapshot.taskId;if(id)void ports.speech.control(id,action).catch(e=>setSpeechFailure(speechMessages[speechError(e).code]));};
+  const occupied=['connecting','recording','processing'].includes(speech.snapshot.phase)||['preparing','recognizing','delivering'].includes(dictation.stage)||dictation.stage==='result'&&['recognizing','delivering'].includes(dictation.presentation);
+  const trialCurrent=trial.snapshot.taskId!==null&&speech.snapshot.taskId===trial.snapshot.taskId&&speech.snapshot.source==='trial'&&(!dictationPorts.dictation||dictation.taskId===trial.snapshot.taskId);
+  const trialPhase=!trialCurrent&&['connecting','recording','processing'].includes(trial.snapshot.phase)?'idle':trial.snapshot.phase;
+  const startTrial=()=>{
+    if(occupied||trialPending)return;
+    const request=++trialRequest.current;setTrialFailure('');setTrialPending(true);
+    void ports.speech.start().then(speechStore.accept).catch(e=>{if(request===trialRequest.current)setTrialFailure(speechMessages[speechError(e).code]);}).finally(()=>{if(request===trialRequest.current)setTrialPending(false);});
+  };
+  const trialAction=(action:'finish'|'cancel'|'retry')=>{
+    const id=trial.snapshot.taskId,current=speechStore.getSnapshot().snapshot;
+    if(!trialCurrent||!id||current.taskId!==id||current.source!=='trial'||action==='retry'&&(occupied||trialPending||!current.canRetry))return;
+    const request=++trialRequest.current;setTrialFailure('');
+    if(action==='retry')setTrialPending(true);
+    const operation=action==='retry'?ports.speech.retryCurrent(id).then(speechStore.accept):ports.speech.control(id,action);
+    void operation.catch(e=>{if(request===trialRequest.current&&speechStore.getSnapshot().snapshot.source==='trial'&&speechStore.getTrialSnapshot().snapshot.taskId===id)setTrialFailure(speechMessages[speechError(e).code]);}).finally(()=>{if(request===trialRequest.current)setTrialPending(false);});
+  };
   const demo=useCallback((action: DemoAction) => { setError(null); store.port.demo(action,store.getSnapshot().session.id).then(store.accept).catch(report); },[store,report]);
   const windowAction=useCallback((surface: Surface,action: WindowAction) => { store.port.windowAction(surface,action).then(store.accept).catch(report); },[store,report]);
   const openSettings=(tab: SettingsTab) => { const action=()=>{setSettingsTab(tab);setSettingsOpen(true);};if(historyGuard.current)historyGuard.current(action);else action(); };
@@ -110,7 +130,7 @@ function RuntimeApp() {
     </aside>
     <div className={s.body}><header className={s.titlebar} data-tauri-drag-region><IconButton label={zh.window.minimize} onClick={()=>windowAction('main','minimize')}><Icon name="minus" size={16}/></IconButton><IconButton label={zh.window.maximize} onClick={()=>windowAction('main','toggleMaximize')}><Icon name="square" size={16}/></IconButton><IconButton label={zh.window.close} onClick={()=>windowAction('main','hide')}><Icon name="x" size={16}/></IconButton></header>
       <main className={`${s.content} ${location.pathname==='/history'?s.historyContent:''}`}>{speechFailure&&!speech.snapshot.error&&<InlineMessage status="error">{speechFailure}</InlineMessage>}{error && <div className={s.error}><InlineMessage status="error">{zh.error[error]}</InlineMessage><Button onClick={()=>{setError(null);setConnection(x=>x+1);}}>{zh.error.retry}</Button></div>}
-        <MotionScope enabled={!settingsOpen}><Routes><Route path="/" element={<Home shortcut={shortcut?.active?shortcutLabel(shortcut.active.binding):undefined} readyModel={ready.model} readyDevice={ready.device} motionEnabled={snapshot.windows.main && !settingsOpen} onShortcuts={()=>openSettings('device')} onModels={()=>openSettings('models')} retryCurrent={()=>{setSpeechFailure('');if(!speech.snapshot.taskId)return;void ports.speech.retryCurrent(speech.snapshot.taskId).then(speechStore.accept).catch(e=>setSpeechFailure(speechMessages[speechError(e).code]));}} speech={speech.snapshot} level={speech.level} usage={usage} simulation={ports.speech.mode==='simulation'} copy={text=>ports.speech.copy(text)} phase={phase} start={startSpeech} cancel={()=>controlSpeech('cancel')} finish={()=>controlSpeech('finish')}/>}/><Route path="/history" element={<History deliveryRevision={dictation.delivery?[dictation.taskId,dictation.delivery.state,dictation.delivery.error].join(':'):''} reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} onGuardChange={updateHistoryGuard} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/><Route path="/dictionary" element={<Dictionary port={dictionary}/>}/><Route path="/preferences" element={<Preferences/>}/><Route path="/onboarding" element={<Onboarding/>}/>{DevCatalogue && <Route path="/dev/components" element={<Suspense><DevCatalogue snapshot={snapshot} demo={demo} windowAction={windowAction} resync={()=>store.resync().catch(report)}/></Suspense>}/>}<Route path="*" element={<History deliveryRevision={dictation.delivery?[dictation.taskId,dictation.delivery.state,dictation.delivery.error].join(':'):''} reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} onGuardChange={updateHistoryGuard} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/></Routes></MotionScope>
+        <MotionScope enabled={!settingsOpen}><Routes><Route path="/" element={<Home shortcut={shortcut?.active?shortcutLabel(shortcut.active.binding):undefined} readyModel={ready.model} readyDevice={ready.device} motionEnabled={snapshot.windows.main && !settingsOpen} onShortcuts={()=>openSettings('device')} onModels={()=>openSettings('models')} retryCurrent={trialCurrent&&!occupied?()=>trialAction('retry'):undefined} startDisabled={occupied||trialPending} failure={trialFailure} speech={trial.snapshot} level={trialCurrent?trial.level:0} usage={usage} simulation={ports.speech.mode==='simulation'} copy={text=>ports.speech.copy(text)} phase={trialPhase} start={startTrial} cancel={()=>trialAction('cancel')} finish={()=>trialAction('finish')}/>}/><Route path="/history" element={<History deliveryRevision={dictation.delivery?[dictation.taskId,dictation.delivery.state,dictation.delivery.error].join(':'):''} reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} onGuardChange={updateHistoryGuard} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/><Route path="/dictionary" element={<Dictionary port={dictionary}/>}/><Route path="/preferences" element={<Preferences/>}/><Route path="/onboarding" element={<Onboarding/>}/>{DevCatalogue && <Route path="/dev/components" element={<Suspense><DevCatalogue snapshot={snapshot} demo={demo} windowAction={windowAction} resync={()=>store.resync().catch(report)}/></Suspense>}/>}<Route path="*" element={<History deliveryRevision={dictation.delivery?[dictation.taskId,dictation.delivery.state,dictation.delivery.error].join(':'):''} reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} onGuardChange={updateHistoryGuard} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/></Routes></MotionScope>
       </main>
     </div>
     <SettingsShell shortcutPort={dictationPorts.shortcuts} textServicePort={dictationPorts.textService} onShortcutGuardChange={updateShortcutGuard} speechPort={ports.speech} open={settingsOpen} tab={settingsTab}

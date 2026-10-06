@@ -6,7 +6,7 @@ import type { Phase } from '../contracts/runtime';
 import s from './voice.module.css';
 import { waveformSample } from './waveform';
 const heights = [10,18,12,26,32,16,24,36,18,30,22,14,28,18,8];
-export function VoiceControl({ phase, onStart, onCancel, onFinish, motionEnabled = true, level, cancelLabel, feedbackLabel, compact = false, mode = 'demo' }: { phase: Phase; onStart: () => void; onCancel: () => void; onFinish: () => void; motionEnabled?: boolean; level?: number; cancelLabel?: string; feedbackLabel?: string; compact?: boolean; mode?: 'demo' | 'speech' }) {
+export function VoiceControl({ phase, onStart, onCancel, onFinish, motionEnabled = true, level, cancelLabel, feedbackLabel, startDisabled = false, restartAvailable = false, compact = false, mode = 'demo' }: { phase: Phase; onStart: () => void; onCancel: () => void; onFinish: () => void; motionEnabled?: boolean; level?: number; cancelLabel?: string; feedbackLabel?: string; startDisabled?: boolean; restartAvailable?: boolean; compact?: boolean; mode?: 'demo' | 'speech' }) {
   const { ref, active, available } = useMotion<HTMLDivElement>(motionEnabled);
   const wave = useRef<HTMLDivElement>(null);
   const samples = useRef<number[]>([]);
@@ -45,14 +45,15 @@ export function VoiceControl({ phase, onStart, onCancel, onFinish, motionEnabled
   const live = mode === 'speech';
   const title = feedbackLabel ?? (live ? zh.voice.liveStatuses : zh.voice.statuses)[phase];
   return <div ref={ref} className={`${s.control} ${s[phase]} ${compact ? s.compact : ''}`} role="group" aria-label={title} data-phase={phase} data-motion={active ? 'active' : 'static'}>
-    {(phase === 'idle' || phase === 'cancelled') && <button className={s.round} aria-label={live?'开始录音':zh.voice.start} onClick={onStart}><AnimatedIcon icon="mic" size={compact?18:20} tone="inverse" enabled={active}/></button>}
+    {(phase === 'idle' || phase === 'cancelled') && <button disabled={startDisabled} className={s.round} aria-label={live?'开始录音':zh.voice.start} onClick={onStart}><AnimatedIcon icon="mic" size={compact?18:20} tone="inverse" enabled={active}/></button>}
     {working && <button className={s.cancelSmall} aria-label={cancelLabel??(live?'取消并丢弃':zh.voice.cancel)} onClick={onCancel}><AnimatedIcon icon="cancel" size={compact?18:16} tone="inverse" enabled={active}/></button>}
     {recording && <><button className={s.cancel} aria-label={cancelLabel??(live?'取消并丢弃':zh.voice.cancel)} onClick={onCancel}><AnimatedIcon icon="cancel" size={compact?18:22} tone="inverse" enabled={active}/></button><div ref={wave} className={s.wave} data-live={level!==undefined} aria-hidden="true">{heights.map((height,i) => <i key={i} style={{height:compact?height*2/3:height,animationDelay:`${i*50}ms`}}/>)}</div><button className={s.finish} aria-label={live?'结束录音':zh.voice.finish} onClick={onFinish}><AnimatedIcon icon="check" size={compact?18:22} enabled={active}/></button></>}
     {/* One persistent SVG preserves processing to completion/error continuity. */}
     <span ref={feedback} className={`${s.statusGlyph} ${complete ? s.done : failed ? s.failure : s.flow}`} data-status-glyph="" aria-hidden="true" style={{ visibility: working || complete || failed ? 'visible' : 'hidden' }}>
       <AnimatedIcon icon={complete ? 'check' : failed ? 'error' : 'pending'} size={compact?18:20} tone={working ? 'signal' : 'primary'} enabled={active && (working || complete || failed)} spinning={working}/>
     </span>
-    {failed && <><span className={s.failureText}>{title}</span><button className={s.retry} aria-label={live?'重新开始录音':zh.voice.retry} onClick={onStart}><AnimatedIcon icon="retry" size={20} enabled={active}/></button></>}
+    {complete && restartAvailable && <button disabled={startDisabled} className={s.round} style={{position: 'absolute'}} aria-label="开始录音" onClick={onStart}/> }
+    {failed && <><span className={s.failureText}>{title}</span><button disabled={startDisabled} className={s.retry} aria-label={live?'重新开始录音':zh.voice.retry} onClick={onStart}><AnimatedIcon icon="retry" size={20} enabled={active}/></button></>}
     {!feedbackLabel&&<span className={s.srOnly} role="status">{title}</span>}
   </div>;
 }

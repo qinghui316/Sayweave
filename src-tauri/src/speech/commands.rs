@@ -260,6 +260,7 @@ pub async fn speech_retry_current(
             app.clone(),
             id,
             current.task_id.ok_or_else(|| Error::new("staleSession"))?,
+            current.source.ok_or_else(|| Error::new("staleSession"))?,
         )
         .await
 }
