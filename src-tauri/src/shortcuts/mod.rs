@@ -2,7 +2,6 @@
 mod backend;
 pub use backend::TaskStamp;
 pub mod commands;
-mod repository;
 #[cfg(test)]
 mod tests;
 pub mod types;

@@ -1,4 +1,4 @@
-use super::types::*;
+use crate::contracts::shortcuts::*;
 use crate::data::{
     model::DataError,
     repository::{Repository, db_error},

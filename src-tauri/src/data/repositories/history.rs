@@ -1,4 +1,4 @@
-use super::types::*;
+use crate::contracts::history::*;
 use crate::data::repository::{Repository, db_error, now};
 use rusqlite::{Connection, OptionalExtension, params};
 fn audio(row: &rusqlite::Row<'_>) -> rusqlite::Result<Audio> {

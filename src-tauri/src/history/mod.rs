@@ -1,6 +1,5 @@
 pub mod files;
 pub mod playback;
-mod repository;
 #[cfg(test)]
 mod tests;
 pub mod types;

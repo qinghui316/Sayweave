@@ -1,6 +1,59 @@
 use super::*;
 use serde_json::json;
 #[test]
+fn terminal_output_survives_watch_coalescing_and_old_idle_cannot_mutate_new_task() {
+    let root = tempfile::tempdir().unwrap();
+    let worker = crate::data::DataWorker::start(root.path().to_path_buf()).unwrap();
+    let service = SpeechService::new(crate::history::HistoryService::new(worker, root.path()));
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    service
+        .set_output(Arc::new(move |event| {
+            if let NativeEvent::Snapshot(snapshot) = event {
+                sink.lock().unwrap().push(snapshot);
+            }
+        }))
+        .unwrap();
+    let mut watch = service.subscribe();
+    {
+        let mut snapshot = service.snapshot.lock().unwrap();
+        snapshot.task_id = Some("trial-A".into());
+        snapshot.source = Some(Source::Trial);
+        snapshot.phase = Phase::Recording;
+    }
+    service.update("trial-A", |s| {
+        s.text = "完整试说结果".into();
+        s.phase = Phase::Completed;
+    });
+    let terminal_lifecycle = service.snapshot().unwrap().lifecycle;
+    {
+        let mut snapshot = service.snapshot.lock().unwrap();
+        snapshot.task_id = Some("external-B".into());
+        snapshot.source = Some(Source::External);
+    }
+    service.update("external-B", |s| {
+        s.text.clear();
+        s.phase = Phase::Connecting;
+    });
+    assert_eq!(
+        watch.borrow_and_update().task_id.as_deref(),
+        Some("external-B")
+    );
+    let events = captured.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].source, Some(Source::Trial));
+    assert_eq!(events[0].text, "完整试说结果");
+    assert_eq!(events[0].phase, Phase::Completed);
+    assert!(events[0].sequence < events[1].sequence);
+    drop(events);
+    let before = service.snapshot().unwrap();
+    service.acknowledge_terminal("trial-A", terminal_lifecycle);
+    assert_eq!(service.snapshot().unwrap().sequence, before.sequence);
+    service.acknowledge_terminal("external-B", before.lifecycle - 1);
+    assert_eq!(service.snapshot().unwrap().sequence, before.sequence);
+    assert_eq!(service.snapshot().unwrap().phase, Phase::Connecting);
+}
+#[test]
 fn speech_source_wire_values_and_retry_ownership() {
     let idle = serde_json::to_value(Snapshot::default()).unwrap();
     assert_eq!(idle["source"], serde_json::Value::Null);

@@ -1,15 +1,5 @@
+pub use crate::contracts::speech::Phase;
 use serde::{Deserialize, Serialize};
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum Phase {
-    Idle,
-    Connecting,
-    Recording,
-    Processing,
-    Completed,
-    Cancelled,
-    Failed,
-}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Windows {
     pub main: bool,
@@ -22,6 +12,8 @@ pub struct Session {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Snapshot {
+    #[serde(skip)]
+    pub native_task: Option<String>,
     pub protocol: u8,
     pub revision: u64,
     pub windows: Windows,
@@ -39,6 +31,7 @@ impl RuntimeError {
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
+            native_task: None,
             protocol: 1,
             revision: 1,
             windows: Windows {
@@ -58,6 +51,7 @@ impl Snapshot {
         let active = matches!(self.session.phase, Connecting | Recording | Processing);
         let phase = match action {
             "start" if !active => {
+                self.native_task = None;
                 self.session.id += 1;
                 Connecting
             }
@@ -90,11 +84,40 @@ impl Snapshot {
         Ok(())
     }
     pub fn shutdown(&mut self) {
+        self.native_task = None;
         self.session.id += 1;
         self.session.phase = Phase::Idle;
         self.windows.main = false;
         self.windows.overlay = false;
         self.revision += 1;
+    }
+    pub fn demo_busy(&self) -> bool {
+        self.native_task.is_none()
+            && matches!(
+                self.session.phase,
+                Phase::Connecting | Phase::Recording | Phase::Processing
+            )
+    }
+    pub fn begin_native_projection(&mut self, task: &str, phase: Phase) -> Option<u64> {
+        if self.demo_busy() {
+            return None;
+        }
+        self.session.id += 1;
+        self.native_task = Some(task.into());
+        self.session.phase = phase;
+        self.revision += 1;
+        Some(self.session.id)
+    }
+    pub fn project_native(&mut self, task: &str, id: u64, phase: Phase) -> bool {
+        if !self.owns_native(task, id) || self.session.phase == phase {
+            return false;
+        }
+        self.session.phase = phase;
+        self.revision += 1;
+        true
+    }
+    pub fn owns_native(&self, task: &str, id: u64) -> bool {
+        self.native_task.as_deref() == Some(task) && self.session.id == id
     }
 }
 pub fn authorized_window(caller: &str, surface: &str, action: &str) -> bool {
@@ -113,6 +136,26 @@ pub fn resize_is_current(current: &Snapshot, requested: &Snapshot) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stale_native_display_does_not_block_admission_or_overwrite_demo() {
+        let mut runtime = Snapshot::default();
+        let old = runtime
+            .begin_native_projection("old", Phase::Processing)
+            .unwrap();
+        assert!(!runtime.demo_busy()); // Business admission owns actual native occupancy.
+        assert!(runtime.project_native("old", old, Phase::Completed));
+        runtime.demo("start", old).unwrap();
+        let demo = runtime.clone();
+        assert!(!runtime.owns_native("old", old));
+        assert!(!runtime.project_native("old", old, Phase::Idle));
+        assert_eq!(runtime, demo);
+        assert!(
+            serde_json::to_value(runtime)
+                .unwrap()
+                .get("native_task")
+                .is_none()
+        );
+    }
     #[test]
     fn resize_reserves_each_axis_and_rejects_stale_session_or_revision() {
         assert_eq!(reserve_size((240.0, 76.0), (108.0, 64.0)), (240.0, 76.0));

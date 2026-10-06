@@ -1,7 +1,6 @@
 pub mod commands;
 mod credentials;
 pub mod provider;
-mod repository;
 #[cfg(test)]
 mod tests;
 pub mod types;
@@ -14,6 +13,15 @@ use std::sync::{
 };
 use tokio::sync::Mutex;
 use types::*;
+impl From<crate::network::RequestError> for ModelError {
+    fn from(error: crate::network::RequestError) -> Self {
+        Self {
+            code: error.code,
+            field: error.field,
+            request_id: None,
+        }
+    }
+}
 pub struct ModelService {
     data: DataWorker,
     vault: Vault,
@@ -330,6 +338,10 @@ impl ModelService {
                 self.provider.models(&input, &key).await
             })
             .await
+            .map_err(|mut error| {
+                error.request_id = Some(id);
+                error
+            })
     }
     pub async fn test(
         &self,
@@ -346,6 +358,10 @@ impl ModelService {
                 self.provider.text(&input, &key).await
             })
             .await
+            .map_err(|mut error| {
+                error.request_id = Some(id);
+                error
+            })
     }
     pub fn begin_shutdown(&self) {
         self.data.begin_shutdown();

@@ -168,7 +168,7 @@ pub async fn history_remove(
         return Err(Error::new("busy"));
     }
     service.history.remove(&id, revision).await?;
-    service.forget_audio(&window.app_handle().clone(), &id);
+    service.forget_audio(&id);
     Ok(())
 }
 #[tauri::command]

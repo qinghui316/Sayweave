@@ -1,5 +1,6 @@
 #[cfg(feature = "desktop-acceptance")]
 mod acceptance;
+mod contracts;
 mod coordinator;
 mod data;
 mod dictation;
@@ -9,6 +10,7 @@ mod models;
 mod network;
 mod shortcuts;
 mod speech;
+mod speech_projection;
 mod text_service;
 mod voice_window;
 pub use text_service::helper_entry as text_service_helper_entry;
@@ -655,29 +657,8 @@ pub fn run() {
                                 .observe_transcript(&transcript);
                         }
                     });
-                    let handle = app.handle().clone();
-                    let mut states = handle.state::<speech::SpeechService>().subscribe();
-                    tauri::async_runtime::spawn(async move {
-                        while states.changed().await.is_ok() {
-                            if handle.state::<speech::SpeechService>().is_stopping() {
-                                break;
-                            }
-                            let state = states.borrow_and_update().clone();
-                            handle
-                                .state::<dictation::DictationCoordinator>()
-                                .observe_speech(&handle, &state);
-                            if let Ok(mut runtime) = handle.state::<Runtime>().0.lock()
-                                && runtime.session.id == state.runtime_id
-                                && runtime.session.phase != state.phase
-                            {
-                                runtime.session.phase = state.phase;
-                                runtime.revision += 1;
-                                let copy = runtime.clone();
-                                drop(runtime);
-                                publish(&handle, copy);
-                            }
-                        }
-                    });
+                    speech_projection::attach(app.handle())
+                        .map_err(|e| std::io::Error::other(e.code))?;
                     let handle = app.handle().clone();
                     tauri::async_runtime::spawn(async move {
                         // Recover before accepting speech; a data fault does not prevent the window opening.

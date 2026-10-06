@@ -16,7 +16,7 @@
     "test:native": "cargo test --manifest-path src-tauri/Cargo.toml",
     "test:e2e": "playwright test",
     "test:desktop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-desktop.ps1",
-    "check:native": "cargo fmt --manifest-path src-tauri/Cargo.toml -- --check && cargo check --manifest-path src-tauri/Cargo.toml && cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings && npm run test:native && npm run check:tsf",
+    "check:native": "node scripts/check-native-boundaries.mjs && cargo fmt --manifest-path src-tauri/Cargo.toml -- --check && cargo check --manifest-path src-tauri/Cargo.toml && cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings && npm run test:native && npm run check:tsf",
     "check:tsf": "cargo fmt --manifest-path src-tauri/text-service/Cargo.toml -- --check && cargo clippy --manifest-path src-tauri/text-service/Cargo.toml --all-targets --features acceptance -- -D warnings && cargo test --manifest-path src-tauri/text-service/Cargo.toml",
     "test:tsf": "cargo build --manifest-path src-tauri/text-service/Cargo.toml --features acceptance && powershell -NoProfile -ExecutionPolicy Bypass -File src-tauri/text-service/test-stage-a.ps1",
     "build": "tsc --noEmit && vite build",

@@ -1,4 +1,3 @@
-use crate::models::types::ModelError;
 use std::{
     collections::HashMap,
     sync::{
@@ -8,6 +7,26 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::watch;
+
+#[derive(Debug)]
+pub struct RequestError {
+    pub code: String,
+    pub field: Option<String>,
+}
+impl RequestError {
+    fn new(code: &str) -> Self {
+        Self {
+            code: code.into(),
+            field: None,
+        }
+    }
+    fn field(field: &str) -> Self {
+        Self {
+            code: "invalid".into(),
+            field: Some(field.into()),
+        }
+    }
+}
 #[derive(Default)]
 pub struct RequestCoordinator {
     requests: Mutex<HashMap<String, watch::Sender<bool>>>,
@@ -15,14 +34,14 @@ pub struct RequestCoordinator {
     stopping: AtomicBool,
 }
 impl RequestCoordinator {
-    pub fn cancel(&self, id: &str) -> Result<(), ModelError> {
+    pub fn cancel(&self, id: &str) -> Result<(), RequestError> {
         if uuid::Uuid::parse_str(id).is_err() {
-            return Err(ModelError::field("requestId"));
+            return Err(RequestError::field("requestId"));
         }
         if let Some(tx) = self
             .requests
             .lock()
-            .map_err(|_| ModelError::new("unavailable"))?
+            .map_err(|_| RequestError::new("unavailable"))?
             .get(id)
         {
             let _ = tx.send(true);
@@ -30,7 +49,7 @@ impl RequestCoordinator {
             let mut cancelled = self
                 .cancelled
                 .lock()
-                .map_err(|_| ModelError::new("unavailable"))?;
+                .map_err(|_| RequestError::new("unavailable"))?;
             cancelled.retain(|_, at| at.elapsed() < Duration::from_secs(30));
             if cancelled.len() >= 64
                 && let Some(old) = cancelled
@@ -53,30 +72,30 @@ impl RequestCoordinator {
         }
     }
     // Registration precedes draft credential resolution so cancellation also invalidates a waiting vault read.
-    pub fn register(self: &Arc<Self>, id: &str) -> Result<RequestGuard, ModelError> {
+    pub fn register(self: &Arc<Self>, id: &str) -> Result<RequestGuard, RequestError> {
         if uuid::Uuid::parse_str(id).is_err() {
-            return Err(ModelError::field("requestId"));
+            return Err(RequestError::field("requestId"));
         }
         let mut requests = self
             .requests
             .lock()
-            .map_err(|_| ModelError::new("unavailable"))?;
+            .map_err(|_| RequestError::new("unavailable"))?;
         let mut cancelled = self
             .cancelled
             .lock()
-            .map_err(|_| ModelError::new("unavailable"))?;
+            .map_err(|_| RequestError::new("unavailable"))?;
         cancelled.retain(|_, at| at.elapsed() < Duration::from_secs(30));
         if cancelled.remove(id).is_some() {
-            return Err(ModelError::new("cancelled"));
+            return Err(RequestError::new("cancelled"));
         }
         if self.stopping.load(Ordering::Acquire) {
-            return Err(ModelError::new("stopping"));
+            return Err(RequestError::new("stopping"));
         }
         if requests.contains_key(id) {
-            return Err(ModelError::new("conflict"));
+            return Err(RequestError::new("conflict"));
         }
         if requests.len() >= 4 {
-            return Err(ModelError::new("busy"));
+            return Err(RequestError::new("busy"));
         }
         let (tx, rx) = watch::channel(false);
         requests.insert(id.into(), tx);
@@ -93,21 +112,17 @@ pub struct RequestGuard {
     cancel: watch::Receiver<bool>,
 }
 impl RequestGuard {
-    pub async fn run<T>(
+    pub async fn run<T, E: From<RequestError>>(
         &mut self,
         seconds: u64,
-        future: impl std::future::Future<Output = Result<T, ModelError>>,
-    ) -> Result<T, ModelError> {
-        let result = if *self.cancel.borrow() {
-            Err(ModelError::new("cancelled"))
+        future: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
+        if *self.cancel.borrow() {
+            Err(RequestError::new("cancelled").into())
         } else {
-            tokio::select! {_ = self.cancel.changed()=>Err(ModelError::new("cancelled")),
-            value = tokio::time::timeout(Duration::from_secs(seconds),future)=>value.unwrap_or_else(|_|Err(ModelError::new("timeout")))}
-        };
-        result.map_err(|mut e| {
-            e.request_id = Some(self.id.clone());
-            e
-        })
+            tokio::select! {_ = self.cancel.changed()=>Err(RequestError::new("cancelled").into()),
+            value = tokio::time::timeout(Duration::from_secs(seconds),future)=>value.unwrap_or_else(|_|Err(RequestError::new("timeout").into()))}
+        }
     }
 }
 impl Drop for RequestGuard {

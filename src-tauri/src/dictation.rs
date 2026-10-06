@@ -341,6 +341,11 @@ impl DictationCoordinator {
         anchor: Option<&Anchor>,
     ) -> Result<Reservation, Error> {
         SpeechSource::try_from(source)?;
+        // Application admission includes the DEV demonstration session; the
+        // speech service itself owns no rendering Runtime or window state.
+        if crate::read(app).is_ok_and(|r| r.demo_busy()) {
+            return Err(Error::new("busy"));
+        }
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, _) = watch::channel(0u8);
         let gate = Arc::new(DeliveryGate::default());
@@ -526,7 +531,7 @@ impl DictationCoordinator {
                 && error.code != "staleSession"
             {
                 app.state::<SpeechService>()
-                    .start_error(&app, &id, speech_source, error);
+                    .start_error(&id, speech_source, error);
             }
             self.release(&app, &id).await;
             return result;
@@ -778,8 +783,7 @@ impl DictationCoordinator {
             s.error = Some(error.code.clone());
         });
         app.state::<WindowsInputService>().forget(id.into());
-        app.state::<SpeechService>()
-            .start_error(app, id, source, error);
+        app.state::<SpeechService>().start_error(id, source, error);
         self.release(app, id).await;
     }
     async fn journal(

@@ -8,19 +8,19 @@ mod recognition;
 mod tests;
 mod transport;
 use crate::{
-    coordinator::Phase,
+    contracts::speech::Phase,
     history::{HistoryService, playback::Playback, types::*},
     models::ModelService,
 };
 use serde::Serialize;
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tokio::sync::{Mutex as AsyncMutex, watch};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,8 +59,6 @@ impl Source {
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     #[serde(skip)]
-    pub runtime_id: u64,
-    #[serde(skip)]
     pub source_record_id: Option<String>,
     pub protocol: u8,
     pub sequence: u64,
@@ -84,7 +82,6 @@ pub struct Snapshot {
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
-            runtime_id: 0,
             source_record_id: None,
             protocol: 1,
             sequence: 1,
@@ -107,17 +104,22 @@ impl Default for Snapshot {
         }
     }
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Meter {
-    task_id: String,
+pub(crate) struct Meter {
+    pub(crate) task_id: String,
     sequence: u64,
     level: f32,
     duration_ms: u64,
 }
+#[derive(Clone)]
+pub(crate) enum NativeEvent {
+    Snapshot(Snapshot),
+    Meter(Meter),
+}
+type OutputObserver = Arc<dyn Fn(NativeEvent) + Send + Sync>;
 struct Task {
     id: String,
-    runtime_id: u64,
     record_id: String,
     attempt_id: String,
     persistent: bool,
@@ -159,6 +161,7 @@ pub struct SpeechService {
     snapshot: Mutex<Snapshot>,
     states: watch::Sender<Snapshot>,
     transcripts: watch::Sender<NativeTranscript>,
+    output: OnceLock<OutputObserver>,
     active: Mutex<Option<(String, watch::Sender<u8>)>>,
     gate: AsyncMutex<()>,
     stopping: AtomicBool,
@@ -185,6 +188,7 @@ impl SpeechService {
             snapshot: Mutex::new(Snapshot::default()),
             states,
             transcripts,
+            output: OnceLock::new(),
             active: Mutex::new(None),
             gate: AsyncMutex::new(()),
             stopping: AtomicBool::new(false),
@@ -219,6 +223,23 @@ impl SpeechService {
     pub fn subscribe_transcripts(&self) -> watch::Receiver<NativeTranscript> {
         self.transcripts.subscribe()
     }
+    pub(crate) fn set_output(&self, observer: OutputObserver) -> Result<(), Error> {
+        self.output
+            .set(observer)
+            .map_err(|_| Error::new("conflict"))
+    }
+    fn publish(&self, event: NativeEvent) {
+        if let Some(observer) = self.output.get() {
+            observer(event);
+        }
+    }
+    pub(crate) fn acknowledge_terminal(&self, id: &str, lifecycle: u64) {
+        self.update_if(
+            id,
+            |s| s.lifecycle == lifecycle && matches!(s.phase, Phase::Completed | Phase::Cancelled),
+            |s| s.phase = Phase::Idle,
+        );
+    }
     fn publish_transcript(&self, task: &str, turn: u64, text: String) {
         let sequence = self.transcripts.borrow().sequence + 1;
         self.transcripts.send_replace(NativeTranscript {
@@ -248,9 +269,17 @@ impl SpeechService {
         self.initialize().await?;
         self.history.cleanup().await
     }
-    fn update(&self, app: &tauri::AppHandle, id: &str, change: impl FnOnce(&mut Snapshot)) {
+    fn update(&self, id: &str, change: impl FnOnce(&mut Snapshot)) {
+        self.update_if(id, |_| true, change);
+    }
+    fn update_if(
+        &self,
+        id: &str,
+        predicate: impl FnOnce(&Snapshot) -> bool,
+        change: impl FnOnce(&mut Snapshot),
+    ) {
         let update = if let Ok(mut s) = self.snapshot.lock() {
-            if s.task_id.as_deref() != Some(id) {
+            if s.task_id.as_deref() != Some(id) || !predicate(&s) {
                 return;
             }
             let phase = s.phase;
@@ -259,16 +288,18 @@ impl SpeechService {
             if phase != s.phase {
                 s.lifecycle += 1;
             }
-            Some((s.clone(), phase != s.phase))
+            // The watch projection is published under this facts lock so a
+            // delayed older clone cannot replace a newer native task.
+            let copy = s.clone();
+            self.states.send_replace(copy.clone());
+            Some(copy)
         } else {
             None
         };
-        if let Some((s, phase_changed)) = update {
-            let _ = app.emit_to("main", "speech:snapshot", &s);
-            let _ = app.emit_to("voice-overlay", "speech:snapshot", &s);
-            if phase_changed {
-                self.states.send_replace(s);
-            }
+        if let Some(s) = update {
+            // The application sink receives every transition, including a Trial
+            // terminal before an External start. UI-specific projection is there.
+            self.publish(NativeEvent::Snapshot(s));
         }
     }
     pub async fn start_native(
@@ -441,24 +472,6 @@ impl SpeechService {
             .requests
             .register(&task_id)
             .map_err(|e| Error::new(&e.code))?;
-        let runtime_id = {
-            let runtime = app.state::<crate::Runtime>();
-            let mut r = runtime.0.lock().map_err(|_| Error::new("unavailable"))?;
-            if matches!(
-                r.session.phase,
-                Phase::Connecting | Phase::Recording | Phase::Processing
-            ) {
-                return Err(Error::new("busy"));
-            }
-            r.session.id += 1;
-            r.session.phase = Phase::Connecting;
-            r.revision += 1;
-            let copy = r.clone();
-            drop(r);
-            let id = copy.session.id;
-            crate::publish(&app, copy);
-            id
-        };
         if persistent
             && let Err(e) = self
                 .history
@@ -473,15 +486,6 @@ impl SpeechService {
                 })
                 .await
         {
-            if let Ok(mut r) = app.state::<crate::Runtime>().0.lock()
-                && r.session.id == runtime_id
-            {
-                r.session.phase = Phase::Idle;
-                r.revision += 1;
-                let copy = r.clone();
-                drop(r);
-                crate::publish(&app, copy);
-            }
             return Err(e);
         }
         let continuous = context.as_ref().and_then(|c| c.continuous.clone());
@@ -510,7 +514,6 @@ impl SpeechService {
             .snapshot
             .lock()
             .map_err(|_| Error::new("unavailable"))? = Snapshot {
-            runtime_id,
             source_record_id: Some(record_id.clone()),
             task_id: Some(task_id.clone()),
             source: Some(source),
@@ -533,10 +536,9 @@ impl SpeechService {
                 .lock()
                 .map_err(|_| Error::new("unavailable"))? = None;
         }
-        self.update(&app, &task_id, |s| s.phase = Phase::Connecting);
+        self.update(&task_id, |s| s.phase = Phase::Connecting);
         let task = Task {
             id: task_id,
-            runtime_id,
             record_id,
             attempt_id,
             persistent,
@@ -557,7 +559,7 @@ impl SpeechService {
                 .await;
             drop(_lease);
             if let Err(e) = result {
-                service.update(&app, &id, |s| {
+                service.update(&id, |s| {
                     s.error = Some(e.code);
                     s.phase = Phase::Failed;
                 });
@@ -574,15 +576,6 @@ impl SpeechService {
                 && a.as_ref().is_some_and(|(current, _)| current == &id)
             {
                 *a = None;
-            }
-            if service
-                .snapshot()
-                .is_ok_and(|s| matches!(s.phase, Phase::Completed | Phase::Cancelled))
-            {
-                tokio::time::sleep(Duration::from_millis(1000)).await;
-                if crate::read(&app).is_ok_and(|r| r.session.id == task.runtime_id) {
-                    service.update(&app, &id, |s| s.phase = Phase::Idle);
-                }
             }
         });
         self.snapshot()
@@ -627,7 +620,7 @@ impl SpeechService {
                     .await?,
                 );
             }
-            self.update(app, &task.id, |s| {
+            self.update(&task.id, |s| {
                 s.phase = if task.retry {
                     Phase::Processing
                 } else {
@@ -649,8 +642,15 @@ impl SpeechService {
                             level: sample.level,
                             duration_ms: sample.duration_ms,
                         };
-                        let _ = handle.emit_to("main", "speech:meter", &meter);
-                        let _ = handle.emit_to("voice-overlay", "speech:meter", &meter);
+                        if handle
+                            .state::<SpeechService>()
+                            .snapshot()
+                            .is_ok_and(|s| s.task_id.as_deref() == Some(&id))
+                        {
+                            handle
+                                .state::<SpeechService>()
+                                .publish(NativeEvent::Meter(meter));
+                        }
                     },
                 ));
             }
@@ -689,7 +689,7 @@ impl SpeechService {
                 }
                 tokio::select! {
                                    biased;
-                                   _=cancel.changed()=>{if *cancel.borrow()==1 {if let Some(c)=&capture{c.stop();}log::info!(target:"sayweave","operation=speech_phase task_id={} phase=capture_stopped elapsed_ms={}",task.id,began.elapsed().as_millis());self.update(app,&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}},
+                                   _=cancel.changed()=>{if *cancel.borrow()==1 {if let Some(c)=&capture{c.stop();}log::info!(target:"sayweave","operation=speech_phase task_id={} phase=capture_stopped elapsed_ms={}",task.id,began.elapsed().as_millis());self.update(&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}},
                                    message=session.next_event()=>{match message? {
                                        continuous::StreamEvent::Update(value)=>{
                                            transcript=value.raw;
@@ -710,9 +710,9 @@ impl SpeechService {
                                                for _ in 0..16 {let Ok(packet)=c.packets.try_recv() else {break};duration=packet.duration_ms;session.send_pcm(packet.turn,&packet.pcm).await?;}
                                                if c.packets.is_closed()&&c.packets.is_empty(){sending=false;}
                                            }
-                                           if !sending {session.finish().await?;final_at=Some(Instant::now());log::info!(target:"sayweave","operation=speech_phase task_id={} phase=audio_drained elapsed_ms={}",task.id,began.elapsed().as_millis());self.update(app,&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}
+                                           if !sending {session.finish().await?;final_at=Some(Instant::now());log::info!(target:"sayweave","operation=speech_phase task_id={} phase=audio_drained elapsed_ms={}",task.id,began.elapsed().as_millis());self.update(&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}
                                        }
-                                       if published.elapsed()>=Duration::from_millis(100)&&(dirty||sending){self.update(app,&task.id,|s|{s.text=transcript.text(false);s.segments=transcript.segments();s.duration_ms=duration;});published=Instant::now();dirty=false;}
+                                       if published.elapsed()>=Duration::from_millis(100)&&(dirty||sending){self.update(&task.id,|s|{s.text=transcript.text(false);s.segments=transcript.segments();s.duration_ms=duration;});published=Instant::now();dirty=false;}
                                    }
                                }
             }
@@ -795,7 +795,7 @@ impl SpeechService {
                 .is_some_and(|c| c.preserve_history())
         {
             save_error |= self.discard_new(&task.record_id, task.persistent).await;
-            self.update(app, &task.id, |s| {
+            self.update(&task.id, |s| {
                 s.text.clear();
                 s.segments.clear();
                 s.record_id = None;
@@ -840,7 +840,7 @@ impl SpeechService {
                 save_error = true;
             }
         }
-        self.update(app, &task.id, |s| {
+        self.update(&task.id, |s| {
             s.text = text;
             s.segments = transcript.segments();
             s.duration_ms = duration;
@@ -876,7 +876,7 @@ impl SpeechService {
         }
         failed
     }
-    pub fn forget_audio(&self, app: &tauri::AppHandle, record_id: &str) {
+    pub fn forget_audio(&self, record_id: &str) {
         if let Ok(mut last) = self.last_audio.lock()
             && last.as_ref().is_some_and(|(id, _)| id == record_id)
         {
@@ -886,35 +886,28 @@ impl SpeechService {
             && snapshot.record_id.as_deref() == Some(record_id)
             && let Some(task_id) = snapshot.task_id
         {
-            self.update(app, &task_id, |s| {
+            self.update(&task_id, |s| {
                 s.can_retry = false;
                 s.saved = false;
                 s.record_id = None;
             });
         }
     }
-    pub fn start_error(&self, app: &tauri::AppHandle, id: &str, source: Source, error: &Error) {
+    pub fn start_error(&self, id: &str, source: Source, error: &Error) {
         let Ok(_gate) = self.gate.try_lock() else {
             return;
         };
         if self.is_active() || self.is_stopping() || error.code == "busy" {
             return;
         }
-        let runtime_id = if let Ok(mut r) = app.state::<crate::Runtime>().0.lock() {
-            r.session.id += 1;
-            r.session.id
-        } else {
-            return;
-        };
         if let Ok(mut s) = self.snapshot.lock() {
             let sequence = s.sequence + 1;
             *s = Snapshot::default();
             s.task_id = Some(id.into());
             s.source = Some(source);
-            s.runtime_id = runtime_id;
             s.sequence = sequence;
         }
-        self.update(app, id, |s| {
+        self.update(id, |s| {
             s.error = Some(error.code.clone());
             s.phase = Phase::Failed;
         });

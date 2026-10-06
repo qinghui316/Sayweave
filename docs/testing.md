@@ -4,6 +4,8 @@
 
 ## 常规检查
 
+`check:native` 包含 `scripts/check-native-boundaries.mjs`：检查契约、数据、网络基础及语音展示归属，并禁止业务目录实现 SQL Repository。它检查相关静态依赖边界，不声称解析全项目的 Rust 宏或运行时调用图。语音输出测试还检查试说终结与外部启动的快照合并、旧收尾和演示归属；浏览器来源投影验证继续保留。
+
 | 命令 | 检查范围 |
 |---|---|
 | npm run check | TypeScript、ESLint、模块边界/循环、UTF-8、UI测试、Rust检查与前端构建 |

@@ -1,4 +1,4 @@
-use super::types::*;
+use crate::contracts::models::*;
 use crate::data::repository::{Repository, db_error, now};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 fn error(e: rusqlite::Error) -> ModelError {

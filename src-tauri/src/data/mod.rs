@@ -1,4 +1,5 @@
 pub mod model;
+mod repositories;
 pub mod repository;
 #[cfg(test)]
 mod tests;
@@ -23,9 +24,9 @@ pub enum Operation {
     Create(Input),
     Update(Input, String, i64),
     Delete(Kind, String, i64),
-    Models(crate::models::types::DbOperation),
-    History(crate::history::types::DbOperation),
-    Shortcuts(crate::shortcuts::types::DbOperation),
+    Models(crate::contracts::models::DbOperation),
+    History(crate::contracts::history::DbOperation),
+    Shortcuts(crate::contracts::shortcuts::DbOperation),
     Drain,
 }
 #[derive(Debug)]
@@ -34,9 +35,9 @@ pub enum Output {
     Page(Page),
     Record(Record),
     Deleted,
-    Models(Result<crate::models::types::DbOutput, crate::models::types::ModelError>),
-    History(crate::history::types::DbOutput),
-    Shortcuts(crate::shortcuts::types::DbOutput),
+    Models(Result<crate::contracts::models::DbOutput, crate::contracts::models::ModelError>),
+    History(crate::contracts::history::DbOutput),
+    Shortcuts(crate::contracts::shortcuts::DbOutput),
 }
 struct Request {
     operation: Operation,

@@ -142,5 +142,5 @@ pub fn model_cancel(
     request_id: String,
 ) -> Result<(), ModelError> {
     authorize(window.label())?;
-    state.requests.cancel(&request_id)
+    state.requests.cancel(&request_id).map_err(ModelError::from)
 }
