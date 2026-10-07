@@ -417,18 +417,19 @@ impl SessionDraft {
         }
         // Keep the frozen source identity of every irreversible prefix, not
         // merely its length. Never reinterpret an old commit as revised ASR.
+        let source = units::SourceIndex::new(&value.segments);
         if s.report
             .units
             .iter()
             .filter(|u| u.application == "applied" && u.unit.turn == s.turn)
-            .any(|u| !u.unit.matches(s.turn, &value.segments))
+            .any(|u| !u.unit.matches_in(s.turn, &source))
         {
             s.stop_error = Some("sourceChanged".into());
             return;
         }
         if s.unit
             .as_ref()
-            .is_some_and(|u| !u.source().matches(s.turn, &value.segments))
+            .is_some_and(|u| !u.source().matches_in(s.turn, &source))
         {
             self.cancel_generation(s);
         }
@@ -436,7 +437,7 @@ impl SessionDraft {
             kind: NativeKind::Settle { record, permit, .. },
             ..
         }) = &s.native
-            && !record.unit.matches(s.turn, &value.segments)
+            && !record.unit.matches_in(s.turn, &source)
         {
             permit.store(false, Ordering::Release);
         }

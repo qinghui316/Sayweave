@@ -1,5 +1,7 @@
 pub mod commands;
 mod credentials;
+#[cfg(all(test, target_os = "windows"))]
+mod live_acceptance;
 pub mod provider;
 mod streaming;
 #[cfg(test)]

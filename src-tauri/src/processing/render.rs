@@ -1,12 +1,14 @@
 //! History projects immutable generated versions, not the user's external edits.
 use super::{
     quality,
-    units::{Unit, slice},
+    units::{SourceIndex, Unit, slice},
 };
 use crate::contracts::processing::{SourceTurn, UnitRecord};
 pub fn text(turns: &[SourceTurn], records: &[UnitRecord]) -> String {
     let mut rendered = Vec::new();
     for source in turns {
+        let indexed = SourceIndex::new(&source.segments);
+        let source_length = source.text.chars().count();
         let mut text = String::new();
         let mut consumed = 0;
         let mut units = records
@@ -29,7 +31,7 @@ pub fn text(turns: &[SourceTurn], records: &[UnitRecord]) -> String {
             )
         });
         for record in units {
-            if record.source_start < consumed || record.source_end > source.text.chars().count() {
+            if record.source_start < consumed || record.source_end > source_length {
                 continue;
             }
             let Ok(refs) = serde_json::from_str(&record.source_refs) else {
@@ -45,7 +47,7 @@ pub fn text(turns: &[SourceTurn], records: &[UnitRecord]) -> String {
                 final_source: true,
             };
             let candidate = record.candidate_text.as_deref().unwrap();
-            if !unit.matches(source.turn, &source.segments)
+            if !unit.matches_in(source.turn, &indexed)
                 || quality::validate(&record.source_text, candidate).is_err()
             {
                 continue;
@@ -54,7 +56,7 @@ pub fn text(turns: &[SourceTurn], records: &[UnitRecord]) -> String {
             text.push_str(&quality::retain_boundaries(&record.source_text, candidate));
             consumed = record.source_end;
         }
-        text.push_str(&slice(&source.text, consumed..source.text.chars().count()));
+        text.push_str(&slice(&source.text, consumed..source_length));
         if !text.is_empty() {
             rendered.push(text);
         }

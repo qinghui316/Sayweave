@@ -12,9 +12,11 @@ import {fileURLToPath} from 'node:url';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),id=randomUUID();
 const directory=path.join(root,'.local','data-acceptance',id),data=path.join(directory,'data');mkdirSync(data,{recursive:true});
 const exe=path.join(root,'src-tauri','target','release','desktop-acceptance.exe'),port=9241,key='fixture-'+randomUUID();
-const polishOnly=process.argv.includes('--polish');
+const polishCase=process.argv.find(value=>value.startsWith('--polish-case='))?.slice('--polish-case='.length);
+if(polishCase&&polishCase!=='cancel')throw Error('Unknown polish acceptance case');
+const polishOnly=process.argv.includes('--polish')||Boolean(polishCase);
 const report={id,passed:false,checks:[],connections:[],handshakes:[],polishRequests:[]},delay=ms=>new Promise(r=>setTimeout(r,ms));
-let app,browser,server,mode='normal',expectedProtocol='qwen',expectedModel='qwen-audio-3.1-asr-flash-streaming';const sockets=new Set(),polishReleases=new Map();
+let app,browser,server,mode='normal',expectedProtocol='qwen',expectedModel='qwen-audio-3.1-asr-flash-streaming';const sockets=new Set(),polishReleases=new Map(),polishChannels=[];
 async function command(args,extraEnv={}){const child=spawn('cargo',args,{cwd:root,windowsHide:true,env:{...process.env,...extraEnv,SAYWEAVE_DATA_ACCEPTANCE_ID:id},stdio:['ignore','pipe','pipe']});const log=createWriteStream(path.join(directory,'fixture.log'),{flags:'a'});child.stdout.pipe(log);child.stderr.pipe(log);if(await new Promise((r,j)=>{child.on('exit',r);child.on('error',j);})!==0)throw Error('Fixture operation failed');}
 function frame(value,opcode=1){const payload=Buffer.isBuffer(value)?value:Buffer.from(JSON.stringify(value));const header=Buffer.alloc(payload.length<126?2:4);header[0]=0x80|opcode;header[1]=payload.length<126?payload.length:126;if(payload.length>=126)header.writeUInt16BE(payload.length,2);return Buffer.concat([header,payload]);}
 function websocket(req,socket,head){
@@ -29,6 +31,8 @@ function websocket(req,socket,head){
  const send=(event,payload={})=>socket.write(frame({header:{task_id:task,event},payload}));
  const sentence=(sid,text,end)=>send('result-generated',{output:{sentence:{sentence_id:sid,sentence_end:end,text,begin_time:0,end_time:end?connection.bytes/32:null}}});
  const result=(text,end)=>sentence(1,text,end);
+ const raceOrdinal=polishChannels.filter(c=>c.mode===connection.mode).length;
+ if(connection.mode.startsWith('polish-'))polishChannels.push({mode:connection.mode,ordinal:raceOrdinal,sentence,finished:()=>send('task-finished')});
  const binaryPayload=(value,last=false)=>{const bytes=gzipSync(Buffer.from(JSON.stringify(value)));connection.responseSequence=(connection.responseSequence??0)+1;const header=Buffer.alloc(12);header.set([0x11,last?0x93:0x91,0x11,0]);header.writeInt32BE(last?-1:connection.responseSequence,4);header.writeUInt32BE(bytes.length,8);socket.write(frame(Buffer.concat([header,bytes]),2));};
  const binaryResult=(text,end,last=false)=>binaryPayload({code:20000000,result:{text,utterances:text?[{text,definite:end,start_time:0,end_time:Math.round(connection.bytes/32)}]:[]}},last);
  function consume(opcode,payload){
@@ -41,9 +45,9 @@ function websocket(req,socket,head){
   }
 
   if(opcode===8){socket.end(frame(payload,8));return;}if(opcode===9){socket.write(frame(payload,10));return;}
-  if(opcode===2){if(!connection.started)throw Error('Audio arrived before task-started');connection.frames++;connection.bytes+=payload.length;if(connection.mode==='polish'){if(connection.frames===1)sentence(1,'呃，第一段啊。',false);if(connection.frames===8)sentence(1,'呃，第一段啊。',true);if(connection.frames===16)sentence(2,'嗯，第二段啊。',false);if(connection.frames===35)sentence(2,'嗯，第二段啊。',true);if(connection.frames===45)sentence(3,'尾部',false);return;}if(connection.frames===1){if(connection.mode==='failure'){socket.write(frame({header:{task_id:task,event:'task-failed',error_code:'SERVICE_ERROR',error_message:'PRIVATE FIXTURE ERROR'}}));return;}result('正在',false);}if(connection.frames===8)result('正在识别',false);return;}
+  if(opcode===2){if(!connection.started)throw Error('Audio arrived before task-started');connection.frames++;connection.bytes+=payload.length;if(connection.mode.startsWith('polish-')){const text=connection.mode==='polish-edit'?(raceOrdinal===0?'呃，编辑前啊。':'嗯，继续输入🙂。'):connection.mode==='polish-revision'?'嗯，修订前啊。':'呃，等待原文啊。';if(connection.frames===1)sentence(1,text,false);if(connection.frames===8)sentence(1,text,true);return;}if(connection.mode==='polish'){if(connection.frames===1)sentence(1,'呃，第一段啊。',false);if(connection.frames===8)sentence(1,'呃，第一段啊。',true);if(connection.frames===16)sentence(2,'嗯，第二段啊。',false);if(connection.frames===35)sentence(2,'嗯，第二段啊。',true);if(connection.frames===45)sentence(3,'尾部',false);return;}if(connection.frames===1){if(connection.mode==='failure'){socket.write(frame({header:{task_id:task,event:'task-failed',error_code:'SERVICE_ERROR',error_message:'PRIVATE FIXTURE ERROR'}}));return;}result('正在',false);}if(connection.frames===8)result('正在识别',false);return;}
   if(opcode!==1)return;const value=JSON.parse(payload.toString());if(value.header.action==='run-task'){task=value.header.task_id;expect(value.payload.parameters.sample_rate).toBe(16000);expect(value.payload.parameters.format).toBe('pcm');expect(value.payload.model).toBe(expectedModel);connection.model=value.payload.model;connection.started=true;send('task-started');}
-  else if(value.header.action==='finish-task'){connection.finished=true;if(connection.mode==='polish'){sentence(3,'尾部完成🙂',true);send('task-finished');return;}if(connection.mode==='pending')return;if(connection.mode==='empty'){send('task-finished');return;}result('原生受控识别完成。',true);result('重复最终结果不应覆盖。',true);send('task-finished');}
+  else if(value.header.action==='finish-task'){connection.finished=true;if(connection.mode.startsWith('polish-')){if(connection.mode==='polish-edit'&&raceOrdinal===0)sentence(2,'旧轮尾字不应覆盖。',true);send('task-finished');return;}if(connection.mode==='polish'){sentence(3,'尾部完成🙂',true);send('task-finished');return;}if(connection.mode==='pending')return;if(connection.mode==='empty'){send('task-finished');return;}result('原生受控识别完成。',true);result('重复最终结果不应覆盖。',true);send('task-finished');}
  }
  function receive(chunk){buffer=Buffer.concat([buffer,chunk]);try{while(buffer.length>=2){const opcode=buffer[0]&15,fin=(buffer[0]&128)!==0,masked=(buffer[1]&128)!==0;let length=buffer[1]&127,offset=2;if(length===126){if(buffer.length<4)return;length=buffer.readUInt16BE(2);offset=4;}else if(length===127){if(buffer.length<10)return;length=Number(buffer.readBigUInt64BE(2));offset=10;}if(length>1024*1024)throw Error('oversize frame');if(masked)offset+=4;if(buffer.length<offset+length)return;const payload=Buffer.from(buffer.subarray(offset,offset+length));if(masked){const mask=buffer.subarray(offset-4,offset);for(let n=0;n<length;n++)payload[n]^=mask[n%4];}buffer=buffer.subarray(offset+length);if(opcode===0){fragment=Buffer.concat([fragment,payload]);if(fin){consume(fragmentOpcode,fragment);fragment=Buffer.alloc(0);}}else if(!fin&&opcode<8){fragmentOpcode=opcode;fragment=payload;}else consume(opcode,payload);}}catch(e){report.protocolError=String(e);socket.destroy();}}
  socket.on('data',receive);if(head.length)receive(Buffer.alloc(0));
@@ -52,12 +56,13 @@ async function modelFixture(req,res){
  if(req.url!=='/v1/chat/completions'||req.headers.authorization!=='Bearer '+key){res.writeHead(401);res.end('{}');return;}
  let bytes=0;const chunks=[];for await(const chunk of req){bytes+=chunk.length;if(bytes>16*1024){res.writeHead(413);res.end();return;}chunks.push(chunk);}
  const request=JSON.parse(Buffer.concat(chunks).toString('utf8')),data=JSON.parse(request.messages[1].content);expect(request.stream).toBe(true);expect(request.model).toBe('polish-fixture');
- report.polishRequests.push({input:data.input_text,context:data.previous_context,bytes,at:performance.now()});
- const output=data.input_text.includes('第一段')?'第一段。\n':data.input_text.includes('第二段')?'第二段。\n':data.input_text;
- if(data.input_text.includes('第一段')||data.input_text.includes('第二段')){
-  await new Promise(resolve=>{const timer=setTimeout(resolve,15000);const release=()=>{clearTimeout(timer);resolve();};polishReleases.set(data.input_text,release);res.once('close',release);});
-  polishReleases.delete(data.input_text);if(res.destroyed)return;
+ const receipt={input:data.input_text,context:data.previous_context,bytes,at:performance.now(),mode},requestKey=report.polishRequests.length+':'+data.input_text;report.polishRequests.push(receipt);
+ const output=data.input_text.includes('第一段')?'第一段。\n':data.input_text.includes('第二段')?'第二段。\n':data.input_text.includes('继续输入')?'继续输入🙂。':data.input_text.includes('修订后')?'修订后🙂。':data.input_text;
+ if(!data.input_text.includes('尾部完成')){
+  await new Promise(resolve=>{const timer=setTimeout(resolve,30000);const release=()=>{clearTimeout(timer);resolve();};polishReleases.set(requestKey,release);res.once('close',()=>{receipt.closedAt=performance.now();release();});});
+  polishReleases.delete(requestKey);if(res.destroyed){receipt.aborted=true;return;}
  }
+ receipt.respondedAt=performance.now();
  res.writeHead(200,{'Content-Type':'text/event-stream'});
  const chunk=JSON.stringify({choices:[{index:0,delta:{role:'assistant',content:output},finish_reason:null}]});
  const wire=Buffer.from('data: '+chunk+'\r\n\r\ndata: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n');
@@ -69,6 +74,7 @@ async function polishScenario(page,base){
  expect(configured.defaults.find(d=>d.usage==='speech').configId).toBe(overview.defaults.find(d=>d.usage==='speech').configId);
  const editor=await ownedEditor();mode='polish';
  try{
+  if(polishCase==='cancel'){report.polish={};await polishRaces(page,editor,'cancel');return;}
   await editor.command({action:'focus',text:'',start:0,end:0});
   const task=await invoke(page,'dictation_start');expect(task.source).toBe('external');
   const samples=[];let observedTask=task.taskId;report.polish={taskId:task.taskId,samples};
@@ -110,7 +116,57 @@ async function polishScenario(page,base){
   expect(cancelRecord.attempts[0].text).toBe('呃，第一段啊。');expect(cancelRecord.audio?.status==='ready').toBe(false);
   report.polish.cancel={taskId:cancelled.taskId,actual:(await editor.command({action:'read'})).text,units:cancelRecord.processing[0].units.length,requests:report.polishRequests.length-beforeRequests,audio:cancelRecord.audio?.status??null};
   report.checks.push('cancel after submitted prefix removes owned tail/separator, drops pending processing unit and discards recording');
+  await polishRaces(page,editor);
  }finally{await editor.close();mode='normal';}
+}
+// Full production actor with real owned EDIT text. ASR/model timing is gated,
+// not inferred from a native acknowledgement or a physical Codex observation.
+async function polishRaces(page,editor,scope='all'){
+ const actual=async()=>(await editor.command({action:'read'})).text;
+ const pending=async(text)=>{let go;await expect.poll(()=>{go=[...polishReleases].find(([key])=>key.includes(text))?.[1];return Boolean(go);},{timeout:12000}).toBe(true);return go;};
+ const finish=async(task)=>{await invoke(page,'dictation_control',{taskId:task.taskId,action:'finish'});await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).presentation,{timeout:20000}).toBe('idle');};
+ report.polish.races=[];
+
+ if(scope==='all'){
+ mode='polish-revision';await editor.command({action:'focus',text:'',start:0,end:0});
+ const revised=await invoke(page,'dictation_start');const stableRelease=await pending('修订前');
+ const stableRequest=report.polishRequests.at(-1);await expect.poll(actual,{timeout:12000}).toBe('嗯，修订前啊。');
+ const channel=polishChannels.find(c=>c.mode===mode);channel.sentence(1,'嗯，修订后🙂。',true);
+ // Qwen confirmed sentence IDs are immutable: a conflicting duplicate is
+ // deliberately ignored by the adapter, not a fabricated actor revision.
+ await delay(250);expect(await actual()).toBe('嗯，修订前啊。');
+ expect(report.polishRequests.filter(r=>r.mode===mode)).toHaveLength(1);expect(stableRequest.aborted).not.toBe(true);
+ stableRelease();await finish(revised);expect(await actual()).toBe('嗯，修订前啊。');
+ report.polish.races.push({case:'confirmed-provider-duplicate',taskId:revised.taskId,actual:await actual(),generationRequests:1});
+
+ mode='polish-edit';await editor.command({action:'focus',text:'',start:0,end:0});
+ const edited=await invoke(page,'dictation_start');await pending('编辑前');
+ const oldTurnRequest=report.polishRequests.at(-1);await expect.poll(actual,{timeout:12000}).toBe('呃，编辑前啊。');
+ for(const down of [true,false])await editor.command({action:'fixture-key',key:'Backspace',down,process:editor.pid});
+ await expect.poll(actual,{timeout:4000}).toBe('呃，编辑前啊');
+ await expect.poll(()=>polishChannels.filter(c=>c.mode==='polish-edit').length,{timeout:12000}).toBe(2);
+ const nextTurn=await pending('继续输入');await expect.poll(()=>oldTurnRequest.aborted,{timeout:4000}).toBe(true);
+ nextTurn();await expect.poll(actual,{timeout:12000}).toBe('呃，编辑前啊继续输入🙂。');await finish(edited);
+ expect(await actual()).toBe('呃，编辑前啊继续输入🙂。');
+ report.polish.races.push({case:'edit-during-generation',taskId:edited.taskId,actual:await actual(),oldGenerationAborted:true,retiredFinalExcluded:true,injectedKeyboard:true});
+
+ mode='polish-timeout';await editor.command({action:'focus',text:'',start:0,end:0});
+ const timed=await invoke(page,'dictation_start');await pending('等待原文');const timedRequest=report.polishRequests.at(-1);
+ await expect.poll(actual,{timeout:12000}).toBe('呃，等待原文啊。');const began=performance.now();await finish(timed);
+ expect(await actual()).toBe('呃，等待原文啊。');await expect.poll(()=>timedRequest.aborted,{timeout:4000}).toBe(true);
+ const timedSpeech=await invoke(page,'speech_snapshot'),timedDetail=await invoke(page,'history_detail',{id:timedSpeech.recordId});
+ expect(timedDetail.processing[0].units.some(u=>u.errorCode==='timeout'&&u.generationState==='failed')).toBe(true);
+ report.polish.races.push({case:'generation-timeout',taskId:timed.taskId,actual:await actual(),finishMs:Math.round(performance.now()-began),generationAborted:true});
+ }
+
+ mode='polish-abort';await editor.command({action:'focus',text:'甲乙',start:0,end:1});
+ const aborted=await invoke(page,'dictation_start');await pending('等待原文');const abortRequest=report.polishRequests.at(-1);
+ await expect.poll(actual,{timeout:12000}).toBe('呃，等待原文啊。乙');
+ await invoke(page,'dictation_control',{taskId:aborted.taskId,action:'cancel'});
+ await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).presentation,{timeout:12000}).toBe('idle');
+ const restored=await editor.command({action:'read'});expect(restored.text).toBe('甲乙');await expect.poll(()=>abortRequest.aborted,{timeout:4000}).toBe(true);
+ report.polish.races.push({case:'cancel-pending-generation',taskId:aborted.taskId,actual:restored.text,originalTextRestored:true,observedSelection:{start:restored.start,end:restored.end},generationAborted:true});
+ report.checks.push(scope==='cancel'?'targeted production actor cancel pending generation: original text restored, selection observed, generation aborted':'full actor actual-text immutable confirmed-provider duplicate, Backspace handoff/new ASR turn with obsolete generation+retired final,15s generation timeout raw fallback and cancel restores original text');
 }
 async function processMetrics(){
  const taskPid=app.pid;if(!Number.isSafeInteger(taskPid)||taskPid<=0)throw Error('Invalid owned process');
@@ -151,7 +207,7 @@ async function ownedEditor(composition=true){
  const child=spawn(path.join(root,'src-tauri/target/debug/input-fixture.exe'),composition?['composition']:[],{cwd:root,windowsHide:true,env:{...process.env,SAYWEAVE_INPUT_ACCEPTANCE:'1'},stdio:['pipe','pipe','pipe']});
  let buffer='',queue=[],waiting=[];child.stdout.on('data',data=>{buffer+=data.toString('utf8');let at;while((at=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,at);buffer=buffer.slice(at+1);const value=JSON.parse(line);if(waiting.length)waiting.shift()(value);else queue.push(value);}});
  const next=()=>queue.length?Promise.resolve(queue.shift()):Promise.race([new Promise(resolve=>waiting.push(resolve)),delay(3000).then(()=>{throw Error('Owned editor response timeout');})]);
- await next();return {command:async value=>{child.stdin.write(JSON.stringify(value)+'\n');const result=await next();if(['focus','focus-process'].includes(value.action))await delay(80);return result;},close:async()=>{if(child.exitCode===null){child.stdin.write('{"action":"exit"}\n');for(let n=0;n<20&&child.exitCode===null;n++)await delay(50);if(child.exitCode===null)child.kill();}expect(child.exitCode,'Owned fixture cleanup must finish successfully').toBe(0);}};
+ await next();return {pid:child.pid,command:async value=>{child.stdin.write(JSON.stringify(value)+'\n');const result=await next();if(['focus','focus-process'].includes(value.action))await delay(80);return result;},close:async()=>{if(child.exitCode===null){child.stdin.write('{"action":"exit"}\n');for(let n=0;n<20&&child.exitCode===null;n++)await delay(50);if(child.exitCode===null)child.kill();}expect(child.exitCode,'Owned fixture cleanup must finish successfully').toBe(0);}};
 }
 async function nativeOverlayClick(view,editor,name){
  const owned=await editor.command({action:'inspect-overlay',process:app.pid});expect(owned.overlayWindow).toBeGreaterThan(0);
@@ -167,7 +223,7 @@ async function externalRound(page,finish,end,interrupted=false,begin){
  if(!['completed','failed','cancelled'].includes((await invoke(page,'speech_snapshot')).phase)){
   if(end)await end(start);else await invoke(page,'dictation_control',{taskId:start.taskId,action:'finish'});
  }
- if(mode==='delayed-final'){await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).presentation,{timeout:3000}).toBe('recognizing');const view=await overlayPage();await expect(view.getByText('识别中',{exact:true})).toBeVisible();await expect(view.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);}
+ if(mode==='delayed-final'){await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).presentation,{timeout:3000}).toBe('recognizing');const view=await overlayPage();await expect(view.getByRole('group',{name:'识别中',exact:true})).toBeVisible();await expect(view.locator('.voiceControl_feedback')).toHaveCount(0);await expect(view.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);}
  if(interrupted)await expect.poll(async()=>['completed','failed','cancelled'].includes((await invoke(page,'speech_snapshot')).phase),{timeout:15000}).toBe(true);else await waitPhase(page,'completed');
  await expect.poll(async()=>{const result=await invoke(page,'dictation_snapshot');return result.taskId===start.taskId&&result.stage==='result'&&result.delivery!==null&&!['preparing','recording','recognizing','delivering'].includes(result.presentation);},{timeout:5000}).toBe(true);
  return {speech:await invoke(page,'speech_snapshot'),dictation:await invoke(page,'dictation_snapshot')};
