@@ -19,4 +19,18 @@ describe('processing settings',()=>{
   render(<ProcessingSettings port={port} revision={0}/>);await screen.findByText('文字模型：文字服务');await user.click(screen.getByRole('switch'));await user.click(screen.getByRole('button',{name:'保存整理设置'}));
   await waitFor(()=>expect(screen.queryByRole('button',{name:'保存整理设置'})).not.toBeInTheDocument());expect(port.save).toHaveBeenCalledWith({enabled:false,revision:1});expect(screen.getByRole('switch')).not.toBeChecked();
  });
+ it('rejects status reads started before and during a successful save',async()=>{
+  const deferred=()=>{let resolve!:(value:ProcessingStatus)=>void;return {promise:new Promise<ProcessingStatus>(r=>{resolve=r;}),resolve:(value:ProcessingStatus)=>resolve(value)};};
+  const old=deferred(),during=deferred(),saved=deferred();
+  const port:ProcessingPort={status:vi.fn().mockResolvedValueOnce(initial).mockReturnValueOnce(old.promise).mockReturnValueOnce(during.promise),save:vi.fn().mockReturnValueOnce(saved.promise).mockResolvedValueOnce({...initial,settings:{enabled:true,revision:3}})};
+  const user=userEvent.setup(),view=render(<ProcessingSettings port={port} revision={0}/>);await screen.findByText('文字模型：文字服务');
+  view.rerender(<ProcessingSettings port={port} revision={1}/>);await waitFor(()=>expect(port.status).toHaveBeenCalledTimes(2));
+  await user.click(screen.getByRole('switch'));await user.click(screen.getByRole('button',{name:'保存整理设置'}));
+  view.rerender(<ProcessingSettings port={port} revision={2}/>);await waitFor(()=>expect(port.status).toHaveBeenCalledTimes(3));
+  await act(async()=>{saved.resolve({...initial,settings:{enabled:false,revision:2}});});
+  await act(async()=>{during.resolve(initial);old.resolve(initial);});
+  expect(screen.getByRole('switch')).not.toBeChecked();expect(screen.queryByRole('button',{name:'保存整理设置'})).not.toBeInTheDocument();
+  await user.click(screen.getByRole('switch'));await user.click(screen.getByRole('button',{name:'保存整理设置'}));
+  await waitFor(()=>expect(port.save).toHaveBeenLastCalledWith({enabled:true,revision:2}));
+ });
 });
