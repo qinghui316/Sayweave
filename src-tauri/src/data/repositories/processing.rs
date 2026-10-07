@@ -124,7 +124,6 @@ impl Repository {
                 tx.commit().map_err(db_error)?;
                 Ok(DbOutput::Done)
             }
-            DbOperation::Runs(record) => Ok(DbOutput::Runs(read_runs(&self.connection, &record)?)),
             DbOperation::Recover => {
                 let tx = self.connection.transaction().map_err(db_error)?;
                 tx.execute("UPDATE processing_units SET application_state=CASE WHEN application_state='pending' THEN 'uncertain' ELSE application_state END,generation_state=CASE WHEN generation_state='pending' THEN 'interrupted' ELSE generation_state END,error_code=coalesce(error_code,'interrupted'),ended_at=coalesce(ended_at,?1) WHERE run_id IN (SELECT id FROM processing_runs WHERE state='running')",[now()]).map_err(db_error)?;

@@ -22,7 +22,7 @@ use windows::Win32::{
     UI::WindowsAndMessaging::*,
 };
 
-enum Command {
+pub(crate) enum Command {
     Begin(u64, Anchor, oneshot::Sender<Result<(), Error>>),
     Finish(u64, String, Finish, bool, oneshot::Sender<FinishOutcome>),
     Close(oneshot::Sender<Result<(), Error>>),
@@ -101,6 +101,19 @@ impl Connection {
     }
 }
 impl Draft {
+    #[cfg(test)]
+    pub(crate) fn fixture() -> (Arc<Self>, mpsc::Receiver<Command>) {
+        let (sender, receiver) = mpsc::sync_channel(4);
+        (
+            Arc::new(Self {
+                connection: Arc::new(Connection { sender }),
+                turn: 1,
+                closed: AtomicBool::new(false),
+                source_sequence: AtomicU64::new(0),
+            }),
+            receiver,
+        )
+    }
     pub async fn begin(
         task: String,
         turn: u64,

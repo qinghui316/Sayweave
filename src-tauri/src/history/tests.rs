@@ -27,7 +27,7 @@ fn cancelled_partial_attempt_retains_text_without_poisoning_record_state() {
 }
 #[test]
 fn processed_history_reference_search_and_source_versions_remain_independent() {
-    use crate::contracts::processing::{DbOperation as P, DbOutput as O, RunMetadata, UnitRecord};
+    use crate::contracts::processing::{DbOperation as P, RunMetadata, UnitRecord};
     let root = tempfile::tempdir().unwrap();
     let mut repo = Repository::open(root.path()).unwrap();
     let (rid, attempt, _) = prepare(&mut repo, false);
@@ -94,9 +94,7 @@ fn processed_history_reference_search_and_source_versions_remain_independent() {
     assert_eq!(complete.attempts[0].text, "呃，赛维原文。");
     assert_eq!(complete.processing[0].text, "Sayweave 整理结果。");
     assert_eq!(complete.processing[0].units.len(), 2);
-    let O::Runs(runs) = repo.processing_operation(P::Runs(rid)).unwrap() else {
-        panic!("runs expected")
-    };
+    let runs = record(&mut repo, &rid).processing;
     assert_eq!(runs[0].units.len(), 2);
     assert!(
         repo.processing_operation(P::SaveUnit(unit)).is_err(),
@@ -106,7 +104,7 @@ fn processed_history_reference_search_and_source_versions_remain_independent() {
 
 #[test]
 fn cancelled_processing_atomically_drops_pending_tail_and_queues_audio_cleanup() {
-    use crate::contracts::processing::{DbOperation as P, DbOutput as O, RunMetadata, UnitRecord};
+    use crate::contracts::processing::{DbOperation as P, RunMetadata, UnitRecord};
     let root = tempfile::tempdir().unwrap();
     let mut repo = Repository::open(root.path()).unwrap();
     let (rid, attempt, resource) = prepare(&mut repo, true);
@@ -167,9 +165,7 @@ fn cancelled_processing_atomically_drops_pending_tail_and_queues_audio_cleanup()
     assert_eq!(complete.processing[0].units[0].prompt_tokens, Some(12));
     assert_eq!(browse(&mut repo, "未提交", None).total, 0);
     assert!(repo.processing_operation(P::SaveUnit(pending)).is_err());
-    let O::Runs(runs) = repo.processing_operation(P::Runs(rid)).unwrap() else {
-        panic!("runs expected")
-    };
+    let runs = record(&mut repo, &rid).processing;
     assert_eq!(runs[0].units.len(), 1);
     let queued: i64 = repo
         .connection

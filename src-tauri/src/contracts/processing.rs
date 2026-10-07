@@ -58,14 +58,12 @@ pub enum DbOperation {
         raw: String,
         units: Vec<UnitRecord>,
     },
-    Runs(String),
     Recover,
 }
 #[derive(Debug)]
 pub enum DbOutput {
     Settings(Settings),
     Dictionary(Vec<crate::contracts::dictionary::Record>),
-    Runs(Vec<RunRecord>),
     Done,
 }
 #[derive(Clone, Debug, Serialize)]

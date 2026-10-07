@@ -377,6 +377,7 @@ fn worker_authorization_recovery_and_bounded_queue() {
             dispatch: Arc::new(Mutex::new(())),
             root: worker.root.clone(),
             journal_io: worker.journal_io.clone(),
+            deferred_cancellations: worker.deferred_cancellations.clone(),
             lease_active: worker.lease_active.clone(),
         };
         for _ in 0..64 {

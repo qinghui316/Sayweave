@@ -9,13 +9,14 @@ mod tests;
 mod transport;
 use crate::{
     contracts::speech::Phase,
+    data::DataWorker,
     history::{HistoryService, playback::Playback, types::*},
     models::ModelService,
 };
 use serde::Serialize;
 use std::{
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -116,8 +117,16 @@ pub(crate) struct Meter {
 pub(crate) enum NativeEvent {
     Snapshot(Snapshot),
     Meter(Meter),
+    ArchiveSettled(ArchiveSettlement),
 }
 type OutputObserver = Arc<dyn Fn(NativeEvent) + Send + Sync>;
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ArchiveSettlement {
+    pub task_id: String,
+    pub saved: bool,
+    pub save_error: bool,
+}
 struct Task {
     id: String,
     record_id: String,
@@ -128,9 +137,14 @@ struct Task {
     preferences: Preferences,
     replay: Option<Vec<i16>>,
     continuous: Option<continuous::Control>,
+    archive: crate::archive::Archive,
+    record_lease: Mutex<Option<Arc<crate::history::RecordLease>>>,
+    audio_archive: Mutex<Option<(tokio::sync::oneshot::Receiver<bool>, u64)>>,
 }
 pub struct NativeTerminal {
     pub snapshot: Snapshot,
+    pub transcript: NativeTranscript,
+    pub(crate) archived: tokio::sync::oneshot::Receiver<ArchiveSettlement>,
     pub persistent: bool,
 }
 impl std::ops::Deref for NativeTerminal {
@@ -160,6 +174,7 @@ pub struct SpeechService {
     pub history: HistoryService,
     pub playback: Playback,
     snapshot: Mutex<Snapshot>,
+    record_lease: Mutex<Option<(String, Weak<crate::history::RecordLease>)>>,
     states: watch::Sender<Snapshot>,
     transcripts: watch::Sender<NativeTranscript>,
     output: OnceLock<OutputObserver>,
@@ -187,6 +202,7 @@ impl SpeechService {
             history,
             playback: Playback::new(),
             snapshot: Mutex::new(Snapshot::default()),
+            record_lease: Mutex::new(None),
             states,
             transcripts,
             output: OnceLock::new(),
@@ -212,6 +228,15 @@ impl SpeechService {
         self.operations.fetch_add(1, Ordering::AcqRel);
         Ok(FreshOperation(self.operations.clone()))
     }
+    pub(crate) fn task_record(&self, id: &str) -> Option<Arc<crate::history::RecordLease>> {
+        self.record_lease
+            .lock()
+            .ok()?
+            .as_ref()
+            .filter(|(task, _)| task == id)?
+            .1
+            .upgrade()
+    }
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
         self.snapshot
             .lock()
@@ -234,6 +259,13 @@ impl SpeechService {
             observer(event);
         }
     }
+    pub(crate) fn archive_settled(&self, result: ArchiveSettlement) {
+        self.update(&result.task_id, |s| {
+            s.saved = result.saved;
+            s.save_error = result.save_error;
+        });
+        self.publish(NativeEvent::ArchiveSettled(result));
+    }
     pub(crate) fn acknowledge_terminal(&self, id: &str, lifecycle: u64) {
         self.update_if(
             id,
@@ -251,6 +283,9 @@ impl SpeechService {
                 let old = (previous.task_id == task && previous.turn == turn)
                     .then(|| previous.segments.iter().find(|p| p.id == s.id))
                     .flatten();
+                if s.confirmed && old.is_none_or(|p| !p.confirmed || p.text != s.text) {
+                    log::info!(target:"sayweave", "operation=speech_confirmed task_id={} turn={} segment_id={} sequence={} source_chars={}",task,turn,s.id,sequence,s.text.chars().count());
+                }
                 crate::contracts::processing::SourceSegment {
                     id: s.id,
                     text: s.text.clone(),
@@ -492,6 +527,12 @@ impl SpeechService {
             .requests
             .register(&task_id)
             .map_err(|e| Error::new(&e.code))?;
+        let archive = crate::archive::Archive::new(self.history.data.clone(), task_id.clone())?;
+        let record_lease = if persistent {
+            Some(Arc::new(self.history.hold_record(&record_id)?))
+        } else {
+            None
+        };
         if persistent
             && let Err(e) = self
                 .history
@@ -557,7 +598,16 @@ impl SpeechService {
                 .map_err(|_| Error::new("unavailable"))? = None;
         }
         self.update(&task_id, |s| s.phase = Phase::Connecting);
+        *self
+            .record_lease
+            .lock()
+            .map_err(|_| Error::new("unavailable"))? = record_lease
+            .as_ref()
+            .map(|held| (task_id.clone(), Arc::downgrade(held)));
         let task = Task {
+            record_lease: Mutex::new(record_lease),
+            audio_archive: Mutex::new(None),
+            archive,
             id: task_id,
             record_id,
             attempt_id,
@@ -577,21 +627,95 @@ impl SpeechService {
             let result = service
                 .run(&app, &task, &cfg, &mut cancel, &mut admission)
                 .await;
-            drop(_lease);
             if let Err(e) = result {
                 service.update(&id, |s| {
                     s.error = Some(e.code);
                     s.phase = Phase::Failed;
                 });
             }
+            let (archived, archive_done) = tokio::sync::oneshot::channel();
+            let coordinated = terminal.is_some();
             if let Some(terminal) = terminal
                 && let Ok(snapshot) = service.snapshot()
             {
                 let _ = terminal.send(NativeTerminal {
                     snapshot,
+                    transcript: {
+                        let value = service.transcripts.borrow();
+                        if value.task_id == id {
+                            value.clone()
+                        } else {
+                            NativeTranscript {
+                                task_id: id.clone(),
+                                ..NativeTranscript::default()
+                            }
+                        }
+                    },
+                    archived: archive_done,
                     persistent: task.persistent,
                 });
             }
+            task.archive.seal_with(None);
+            let archive = task.archive.clone();
+            let handle = app.clone();
+            let archive_id = id.clone();
+            let archived_snapshot = service
+                .snapshot()
+                .ok()
+                .filter(|s| s.task_id.as_deref() == Some(&id));
+            let retained = task.persistent
+                && archived_snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.record_id.is_some());
+            let prior_save_error = archived_snapshot.as_ref().is_some_and(|s| s.save_error);
+            let record_lease = task.record_lease.lock().ok().and_then(|mut r| r.take());
+            let audio_archive = task.audio_archive.lock().ok().and_then(|mut a| a.take());
+            let audio_id = task
+                .audio
+                .as_ref()
+                .filter(|_| task.persistent)
+                .map(|a| a.id.clone());
+            service.operations.fetch_add(1, Ordering::AcqRel);
+            let operation = FreshOperation(service.operations.clone());
+            tauri::async_runtime::spawn(async move {
+                let _operation = operation;
+                let mut success = archive.finish().await;
+                if let Some((completion, bytes)) = audio_archive {
+                    let audio_saved = completion.await.unwrap_or(false);
+                    success &= audio_saved;
+                    if let Some(audio_id) = audio_id {
+                        success &= handle
+                            .state::<DataWorker>()
+                            .request_archive(crate::data::Operation::History(
+                                DbOperation::AudioState {
+                                    id: audio_id,
+                                    status: if audio_saved { "ready" } else { "corrupt" }.into(),
+                                    bytes,
+                                },
+                            ))
+                            .await
+                            .is_ok();
+                    }
+                }
+                drop(record_lease);
+                drop(_lease);
+                let saved = retained && success && !prior_save_error;
+                handle.state::<SpeechService>().update(&archive_id, |s| {
+                    s.save_error |= !success;
+                    s.saved = saved && !s.save_error;
+                });
+                let result = ArchiveSettlement {
+                    task_id: archive_id,
+                    saved,
+                    save_error: prior_save_error || !success,
+                };
+                if !coordinated {
+                    handle
+                        .state::<SpeechService>()
+                        .archive_settled(result.clone());
+                }
+                let _ = archived.send(result);
+            });
             if let Ok(mut a) = service.active.lock()
                 && a.as_ref().is_some_and(|(current, _)| current == &id)
             {
@@ -627,18 +751,18 @@ impl SpeechService {
                 return Err(Error::new("cancelled"));
             }
             if task.replay.is_none() {
-                capture = Some(
-                    audio::Capture::start(
-                        task.preferences.device_id.clone(),
-                        task.audio
-                            .as_ref()
-                            .map(|a| self.history.files.clone().map(|f| (f, a.file_key.clone())))
-                            .transpose()?,
-                        cancel.clone(),
-                        task.continuous.as_ref().map(|c| c.audio.clone()),
-                    )
-                    .await?,
-                );
+                capture = Some(audio::Capture::prepare(
+                    task.preferences.device_id.clone(),
+                    task.audio
+                        .as_ref()
+                        .map(|a| self.history.files.clone().map(|f| (f, a.file_key.clone())))
+                        .transpose()?,
+                    cancel.clone(),
+                    task.continuous.as_ref().map(|c| c.audio.clone()),
+                )?);
+                // Publish the cleanup owner before readiness can suspend or fail.
+                // The common post-network drain owns file completion on every exit.
+                capture.as_mut().unwrap().wait_ready().await?;
             }
             self.update(&task.id, |s| {
                 s.phase = if task.retry {
@@ -675,10 +799,10 @@ impl SpeechService {
                 ));
             }
             log::info!(target:"sayweave","operation=speech_phase task_id={} phase=ready elapsed_ms={}",task.id,began.elapsed().as_millis());
-            if task.persistent
-                && self
-                    .history
-                    .db(DbOperation::Stage {
+            if task.persistent {
+                task.archive.enqueue(
+                    "stage".into(),
+                    crate::data::Operation::History(DbOperation::Stage {
                         attempt_id: task.attempt_id.clone(),
                         status: if task.retry {
                             "processing"
@@ -686,11 +810,8 @@ impl SpeechService {
                             "recording"
                         }
                         .into(),
-                    })
-                    .await
-                    .is_err()
-            {
-                save_error = true;
+                    }),
+                );
             }
             let mut replay_at = 0;
             let mut sending = true;
@@ -709,13 +830,13 @@ impl SpeechService {
                 }
                 tokio::select! {
                                    biased;
-                                   _=cancel.changed()=>{if *cancel.borrow()==1 {if let Some(c)=&capture{c.stop();}log::info!(target:"sayweave","operation=speech_phase task_id={} phase=capture_stopped elapsed_ms={}",task.id,began.elapsed().as_millis());self.update(&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}},
+                                   _=cancel.changed()=>{if *cancel.borrow()==1 {if let Some(c)=&capture{c.stop();}log::info!(target:"sayweave","operation=speech_phase task_id={} phase=capture_stopped elapsed_ms={}",task.id,began.elapsed().as_millis());self.update(&task.id,|s|s.phase=Phase::Processing);if task.persistent { task.archive.enqueue("stage".into(),crate::data::Operation::History(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()})); }}},
                                    message=session.next_event()=>{match message? {
                                        continuous::StreamEvent::Update(value)=>{
                                            transcript=value.raw;
                                            dirty=true;
                                            if let Some((turn,text))=value.draft {self.publish_transcript(&task.id,turn,text);}
-                                           if !transcript.confirmed_text.is_empty()&&task.persistent&&checkpoint.elapsed()>Duration::from_secs(1){if self.history.db(DbOperation::Checkpoint{attempt_id:task.attempt_id.clone(),text:transcript.text(true)}).await.is_err(){save_error=true;}checkpoint=Instant::now();}
+                                           if !transcript.confirmed_text.is_empty()&&task.persistent&&checkpoint.elapsed()>Duration::from_secs(1){task.archive.enqueue("checkpoint".into(),crate::data::Operation::History(DbOperation::Checkpoint{attempt_id:task.attempt_id.clone(),text:transcript.text(true)}));checkpoint=Instant::now();}
                                        },
                                        continuous::StreamEvent::Finished=>{if sending{return Err(Error::new("protocol"));}
                 if transcript.text(true).trim().is_empty(){return Err(Error::new("emptyText"));}log::info!(target:"sayweave","operation=speech_phase task_id={} phase=final_received elapsed_ms={}",task.id,began.elapsed().as_millis());break;},
@@ -730,7 +851,7 @@ impl SpeechService {
                                                for _ in 0..16 {let Ok(packet)=c.packets.try_recv() else {break};duration=packet.duration_ms;session.send_pcm(packet.turn,&packet.pcm).await?;}
                                                if c.packets.is_closed()&&c.packets.is_empty(){sending=false;}
                                            }
-                                           if !sending {session.finish().await?;final_at=Some(Instant::now());log::info!(target:"sayweave","operation=speech_phase task_id={} phase=audio_drained elapsed_ms={}",task.id,began.elapsed().as_millis());self.update(&task.id,|s|s.phase=Phase::Processing);if task.persistent&&self.history.db(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()}).await.is_err(){save_error=true;}}
+                                           if !sending {session.finish().await?;final_at=Some(Instant::now());log::info!(target:"sayweave","operation=speech_phase task_id={} phase=audio_drained elapsed_ms={}",task.id,began.elapsed().as_millis());self.update(&task.id,|s|s.phase=Phase::Processing);if task.persistent { task.archive.enqueue("stage".into(),crate::data::Operation::History(DbOperation::Stage{attempt_id:task.attempt_id.clone(),status:"processing".into()})); }}
                                        }
                                        if published.elapsed()>=Duration::from_millis(100)&&(dirty||sending){self.update(&task.id,|s|{s.text=transcript.text(false);s.segments=transcript.segments();s.duration_ms=duration;});published=Instant::now();dirty=false;}
                                    }
@@ -758,18 +879,19 @@ impl SpeechService {
                 {
                     outcome = Err(Error::new(&error));
                 }
-                if let Some(a) = task.audio.as_ref().filter(|_| task.persistent)
-                    && self
-                        .history
-                        .db(DbOperation::AudioState {
+                if let Some(completion) = result.archived {
+                    if let Ok(mut archive) = task.audio_archive.lock() {
+                        *archive = Some((completion, result.bytes));
+                    }
+                } else if let Some(a) = task.audio.as_ref().filter(|_| task.persistent) {
+                    task.archive.enqueue(
+                        "audio".into(),
+                        crate::data::Operation::History(DbOperation::AudioState {
                             id: a.id.clone(),
-                            status: if save_error { "corrupt" } else { "ready" }.into(),
+                            status: if save_error { "corrupt" } else { "missing" }.into(),
                             bytes: result.bytes,
-                        })
-                        .await
-                        .is_err()
-                {
-                    save_error = true;
+                        }),
+                    );
                 }
                 if let Ok(mut last) = self.last_audio.lock() {
                     *last = Some((task.record_id.clone(), result.pcm));
@@ -781,17 +903,15 @@ impl SpeechService {
             && !task.retry
             && task.persistent
             && let Some(audio) = &task.audio
-            && self
-                .history
-                .db(DbOperation::AudioState {
+        {
+            task.archive.enqueue(
+                "audio".into(),
+                crate::data::Operation::History(DbOperation::AudioState {
                     id: audio.id.clone(),
                     status: "missing".into(),
                     bytes: 0,
-                })
-                .await
-                .is_err()
-        {
-            save_error = true;
+                }),
+            );
         }
         if *cancel.borrow() >= 2 {
             outcome = Err(Error::new(if *cancel.borrow() == 2 {
@@ -814,6 +934,39 @@ impl SpeechService {
                 .as_ref()
                 .is_some_and(|c| c.preserve_history() || c.has_cancel_archive_owner())
         {
+            let prune = DbOperation::PruneCancelled {
+                attempt_id: task.attempt_id.clone(),
+                text: String::new(),
+            };
+            if task.persistent {
+                save_error |= self
+                    .history
+                    .data
+                    .stage_cancel(&crate::data::Operation::History(prune.clone()))
+                    .await
+                    .is_err();
+                task.archive.seal_with(Some(crate::data::Operation::History(
+                    DbOperation::Finish {
+                        attempt_id: task.attempt_id.clone(),
+                        status: "cancelled".into(),
+                        text: String::new(),
+                        error: Some("cancelled".into()),
+                        duration_ms: duration,
+                        elapsed_ms: began.elapsed().as_millis() as u64,
+                    },
+                )));
+            }
+            save_error |= !task.archive.finish().await;
+            let audio_archive = task.audio_archive.lock().ok().and_then(|mut a| a.take());
+            if let Some((completion, _)) = audio_archive {
+                save_error |= !completion.await.unwrap_or(false);
+            }
+            if task.persistent {
+                save_error |= self.history.db(prune).await.is_err();
+            }
+            if let Ok(mut lease) = task.record_lease.lock() {
+                lease.take();
+            }
             save_error |= self.discard_new(&task.record_id, task.persistent).await;
             self.update(&task.id, |s| {
                 s.text.clear();
@@ -844,28 +997,22 @@ impl SpeechService {
             } else {
                 "failed"
             };
-            if self
-                .history
-                .db(DbOperation::Finish {
+            task.archive
+                .seal_with(Some(crate::data::Operation::History(DbOperation::Finish {
                     attempt_id: task.attempt_id.clone(),
                     status: status.into(),
                     text: text.clone(),
                     error: outcome.as_ref().err().map(|e| e.code.clone()),
                     duration_ms: duration,
                     elapsed_ms: began.elapsed().as_millis() as u64,
-                })
-                .await
-                .is_err()
-            {
-                save_error = true;
-            }
+                })));
         }
         self.update(&task.id, |s| {
             s.text = text;
             s.segments = transcript.segments();
             s.duration_ms = duration;
             s.save_error = save_error;
-            s.saved = task.persistent && !save_error;
+            s.saved = false; // ArchiveSettled updates only this task after persistence.
             s.can_retry = self.last_audio.lock().is_ok_and(|last| {
                 last.as_ref()
                     .is_some_and(|(id, pcm)| id == &task.record_id && !pcm.is_empty())

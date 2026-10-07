@@ -33,6 +33,10 @@ pub fn attach(app: &tauri::AppHandle) -> Result<(), crate::history::types::Error
     let output_app = app.clone();
     app.state::<SpeechService>()
         .set_output(std::sync::Arc::new(move |event| match event {
+            NativeEvent::ArchiveSettled(result) => {
+                let _ = output_app.emit_to("main", "speech:archived", &result);
+                let _ = output_app.emit_to("main", "processing:archived", &result.task_id);
+            }
             NativeEvent::Snapshot(snapshot) => {
                 // Every business transition reaches the renderer, even when the
                 // current-state watch coalesces a Trial terminal with an External start.

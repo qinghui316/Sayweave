@@ -7,6 +7,7 @@ mod tests;
 use model::*;
 use repository::Repository;
 use std::{
+    collections::HashSet,
     fs::{self, File, OpenOptions},
     path::{Path, PathBuf},
     sync::{
@@ -55,6 +56,7 @@ pub struct DataWorker {
     dispatch: Arc<Mutex<()>>,
     root: PathBuf,
     journal_io: Arc<Mutex<()>>,
+    deferred_cancellations: Arc<Mutex<HashSet<String>>>,
     lease_active: Arc<AtomicBool>,
 }
 pub fn profile_root(base: &Path, development: bool) -> PathBuf {
@@ -92,6 +94,8 @@ impl DataWorker {
         let shared = status.clone();
         let journal_io = Arc::new(Mutex::new(()));
         let thread_journal = journal_io.clone();
+        let deferred_cancellations = Arc::new(Mutex::new(HashSet::new()));
+        let thread_deferred = deferred_cancellations.clone();
         let worker_root = root.clone();
         let lease_active = Arc::new(AtomicBool::new(lease.is_some()));
         let thread_lease = lease_active.clone();
@@ -125,6 +129,10 @@ impl DataWorker {
                         Operation::Drain => "drain",
                     };
                     let result = if matches!(request.operation, Operation::Retry) {
+                        if thread_deferred.lock().map(|ids|!ids.is_empty()).unwrap_or(true) {
+                            let _=request.response.send(Err(DataError::new("busy")));
+                            continue;
+                        }
                         if repository.is_err() {
                             if lease.is_none() {
                                 lease = acquire(&root).ok();
@@ -159,7 +167,13 @@ impl DataWorker {
                                 let _journal = thread_journal
                                     .lock()
                                     .map_err(|_| DataError::new("unavailable"))?;
-                                cancellation::replay(repo, &root)?;
+                                let deferred=thread_deferred.lock().map_err(|_|DataError::new("unavailable"))?;
+                                cancellation::replay_except(repo, &root, &deferred)?;
+                                if !deferred.is_empty() && matches!(&request.operation,
+                                    Operation::History(crate::contracts::history::DbOperation::Detail(_) | crate::contracts::history::DbOperation::List(_) | crate::contracts::history::DbOperation::Browse(_) | crate::contracts::history::DbOperation::Usage | crate::contracts::history::DbOperation::Deliveries(_))
+                                    ) { return Err(DataError::new("busy")); }
+                                drop(deferred);
+                                drop(_journal);
                                 match request.operation {
                                     Operation::List(query) => repo.list(query).map(Output::Page),
                                     Operation::Get(kind, id) => {
@@ -230,6 +244,7 @@ impl DataWorker {
             dispatch: Arc::new(Mutex::new(())),
             root: worker_root,
             journal_io,
+            deferred_cancellations,
             lease_active,
         })
     }
@@ -271,6 +286,21 @@ impl DataWorker {
     pub(crate) async fn request_admitted(&self, operation: Operation) -> Result<Output, DataError> {
         self.request_inner(operation, true).await
     }
+    /// Already admitted ordinary archive facts wait for bounded queue capacity
+    /// in the background. Cancellation intents still use request_admitted.
+    pub(crate) async fn request_archive(&self, operation: Operation) -> Result<Output, DataError> {
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), self.sender.reserve())
+            .await
+            .map_err(|_| DataError::new("busy"))?
+            .map_err(|_| DataError::new("unavailable"))?;
+        let (response, receive) = oneshot::channel();
+        permit.send(Request {
+            operation,
+            response,
+            queued: Instant::now(),
+        });
+        receive.await.map_err(|_| DataError::new("unavailable"))?
+    }
     async fn request_inner(
         &self,
         operation: Operation,
@@ -286,15 +316,13 @@ impl DataWorker {
             {
                 return Err(DataError::new("unavailable"));
             }
-            let root = self.root.clone();
-            let journal = self.journal_io.clone();
-            let intent = operation.clone();
-            tokio::task::spawn_blocking(move || {
-                let _guard = journal.lock().map_err(|_| DataError::new("unavailable"))?;
-                cancellation::stage(&root, &intent)
-            })
-            .await
-            .map_err(|_| DataError::new("unavailable"))??;
+            self.stage_cancel(&operation).await?;
+            if let Some(id) = cancellation::identity(&operation) {
+                self.deferred_cancellations
+                    .lock()
+                    .map_err(|_| DataError::new("unavailable"))?
+                    .remove(id);
+            }
         }
         let (response, receive) = oneshot::channel();
         {
@@ -317,6 +345,31 @@ impl DataWorker {
                 })?;
         }
         receive.await.map_err(|_| DataError::new("unavailable"))?
+    }
+    /// Persist the cancellation barrier before waiting for ordinary archives.
+    /// This does not execute SQL; request ordering remains with the archive owner.
+    pub(crate) async fn stage_cancel(&self, operation: &Operation) -> Result<(), DataError> {
+        if !self.lease_active.load(Ordering::Acquire) {
+            return Err(DataError::new("unavailable"));
+        }
+        let root = self.root.clone();
+        let journal = self.journal_io.clone();
+        let intent = operation.clone();
+        let deferred = self.deferred_cancellations.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = journal.lock().map_err(|_| DataError::new("unavailable"))?;
+            let staged = cancellation::stage(&root, &intent)?;
+            if let Some(id) = cancellation::identity(&intent) {
+                deferred
+                    .lock()
+                    .map_err(|_| DataError::new("unavailable"))?
+                    .insert(id.into());
+            }
+            Ok::<_, DataError>(staged)
+        })
+        .await
+        .map_err(|_| DataError::new("unavailable"))??;
+        Ok(())
     }
     pub fn begin_shutdown(&self) {
         if let Ok(_guard) = self.dispatch.lock() {

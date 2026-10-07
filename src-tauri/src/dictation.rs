@@ -557,6 +557,8 @@ impl DictationCoordinator {
             self.release(&app, &id).await;
             return result;
         }
+        #[cfg(windows)]
+        let shared_record = app.state::<SpeechService>().task_record(&id);
         self.update(&app, &id, |s| s.stage = "recognizing".into());
         let source = source.to_string();
         tauri::async_runtime::spawn(async move {
@@ -597,30 +599,22 @@ impl DictationCoordinator {
                     .snapshot()
                     .ok()
                     .filter(|s| s.task_id.as_deref() == Some(&id));
-                let lease = current
-                    .as_ref()
-                    .and_then(|s| s.record_id.as_deref())
-                    .map(|record| app.state::<SpeechService>().history.hold_record(record))
-                    .transpose();
-                match lease {
-                    Ok(lease) => {
-                        if journal_ok
-                            && !gate.cancelled()
-                            && let (Some(context), Some(current)) = (&processing, &current)
-                            && context
-                                .attach(current.record_id.as_deref(), current.attempt_id.as_deref())
-                                .await
-                                .is_err()
-                        {
-                            processing = None;
-                        }
-                        lease
-                    }
-                    Err(_) => {
-                        journal_ok = false;
-                        None
-                    }
+                if current.as_ref().is_some_and(|s| s.record_id.is_some())
+                    && shared_record.is_none()
+                {
+                    journal_ok = false;
                 }
+                if journal_ok
+                    && !gate.cancelled()
+                    && let (Some(context), Some(current)) = (&processing, &current)
+                    && context
+                        .attach(current.record_id.as_deref(), current.attempt_id.as_deref())
+                        .await
+                        .is_err()
+                {
+                    processing = None;
+                }
+                shared_record
             } else {
                 None
             };
@@ -673,7 +667,11 @@ impl DictationCoordinator {
                         .await;
                 });
             }
+            let mut recognition_archive = None;
+            let mut recognized_snapshot = None;
+            let mut delivery_records = Vec::new();
             if let Ok(terminal) = terminal_rx.await {
+                recognized_snapshot = Some(terminal.snapshot.clone());
                 coordinator.update(&app, &id, |s| {
                     s.text = terminal.text.clone();
                     s.stage = "result".into();
@@ -684,24 +682,16 @@ impl DictationCoordinator {
                     #[cfg(windows)]
                     let inline = match &draft {
                         Some(draft) => {
-                            let mode = composition_finish(
-                                terminal.phase,
-                                journal_ok,
-                                !terminal.persistent || terminal.saved,
-                                gate.cancelled(),
-                            );
-                            let latest = app
-                                .state::<SpeechService>()
-                                .subscribe_transcripts()
-                                .borrow()
-                                .clone();
+                            let mode =
+                                composition_finish(terminal.phase, journal_ok, gate.cancelled());
+                            let latest = terminal.transcript.clone();
                             Some(draft.finish(&latest, mode).await)
                         }
                         None => None,
                     };
                     #[cfg(not(windows))]
                     let inline: Option<Delivery> = None;
-                    let mut delivery = inline.unwrap_or_else(|| {
+                    let delivery = inline.unwrap_or_else(|| {
                         Delivery::not_submitted(if gate.cancelled() {
                             "cancelled"
                         } else {
@@ -710,22 +700,17 @@ impl DictationCoordinator {
                     });
                     if terminal.persistent {
                         if session_anchor.is_none() {
-                            let _ = coordinator
-                                .journal(&app, &id, terminal.attempt_id.as_deref(), "pending", None)
-                                .await;
+                            delivery_records.push((
+                                terminal.attempt_id.clone(),
+                                "pending".to_string(),
+                                None,
+                            ));
                         }
-                        let result = coordinator
-                            .journal(
-                                &app,
-                                &id,
-                                terminal.attempt_id.as_deref(),
-                                &delivery.state,
-                                delivery.error.clone(),
-                            )
-                            .await;
-                        if result.is_err() {
-                            delivery.error = Some("saveFailed".into());
-                        }
+                        delivery_records.push((
+                            terminal.attempt_id.clone(),
+                            delivery.state.clone(),
+                            delivery.error.clone(),
+                        ));
                     }
                     coordinator.update(&app, &id, |s| {
                         log::info!(target:"sayweave", "operation=dictation_delivery task_id={} state={} elapsed_ms={} error={}", id, delivery.state, delivery.elapsed_ms, delivery.error.as_deref().unwrap_or("none"));
@@ -748,27 +733,15 @@ impl DictationCoordinator {
                             terminal.error.clone().unwrap_or_else(|| "emptyText".into()),
                         )
                     };
-                    let latest = app
-                        .state::<SpeechService>()
-                        .subscribe_transcripts()
-                        .borrow()
-                        .clone();
+                    let latest = terminal.transcript.clone();
                     let delivery = draft.finish(&latest, mode).await;
-                    let partial = app
-                        .state::<SpeechService>()
-                        .subscribe_transcripts()
-                        .borrow()
-                        .clone();
+                    let partial = terminal.transcript.clone();
                     if terminal.record_id.is_some() {
-                        let _ = coordinator
-                            .journal(
-                                &app,
-                                &id,
-                                terminal.attempt_id.as_deref(),
-                                &delivery.state,
-                                delivery.error.clone(),
-                            )
-                            .await;
+                        delivery_records.push((
+                            terminal.attempt_id.clone(),
+                            delivery.state.clone(),
+                            delivery.error.clone(),
+                        ));
                     }
                     coordinator.update(&app, &id, |s| {
                         if delivery.submission != crate::windows_input::Submission::NotSubmitted
@@ -779,6 +752,7 @@ impl DictationCoordinator {
                         s.delivery = Some(delivery);
                     });
                 }
+                recognition_archive = Some(terminal.archived);
             } else {
                 #[cfg(windows)]
                 let abandoned_delivery = if let Some(draft) = &draft {
@@ -817,91 +791,131 @@ impl DictationCoordinator {
                 });
             }
             #[cfg(windows)]
-            if let Some(draft) = &draft {
-                let final_report = draft.report();
-                let mut processing_archived = false;
-                match draft.archive().await {
-                    Ok(Some((report, persisted))) => {
-                        processing_archived = persisted;
-                        coordinator.update(&app, &id, |s| {
-                            if !report.text.is_empty() || report.cancelled {
-                                s.text = report.text;
-                            }
-                        });
-                        let _ = app.emit_to("main", "processing:archived", &id);
+            if let Some(report) = draft.as_ref().and_then(|d| d.report()) {
+                coordinator.update(&app, &id, |s| {
+                    if !report.text.is_empty() || report.cancelled {
+                        s.text = report.text;
                     }
-                    Err(error) => {
-                        log::info!(target:"sayweave","operation=processing_archive task_id={} result=failed error={}",id,error.code);
-                        coordinator.update(&app, &id, |s| s.error = Some("saveFailed".into()));
-                    }
-                    _ => {}
-                }
-                let current = app
-                    .state::<SpeechService>()
-                    .snapshot()
-                    .ok()
-                    .filter(|s| s.task_id.as_deref() == Some(&id));
-                if final_report.as_ref().is_some_and(|r| r.cancelled) {
-                    app.state::<SpeechService>().invalidate_task_audio(&id);
-                }
-                if let (Some(report), Some(current)) = (&final_report, &current)
-                    && report.cancelled
-                    && let (Some(record), Some(attempt)) = (&current.record_id, &current.attempt_id)
-                {
-                    let service = app.state::<SpeechService>();
-                    if service.history.discard_audio(record).await.is_err() {
-                        log::info!(target:"sayweave","operation=cancel_audio task_id={} result=pending",id);
-                    }
-                    let recovery = report.units.iter().any(|u| u.application == "uncertain")
-                        || coordinator
-                            .snapshot()
-                            .ok()
-                            .and_then(|s| s.delivery)
-                            .is_some_and(|d| {
-                                d.submission != crate::windows_input::Submission::NotSubmitted
-                                    && d.error.as_deref() == Some("compositionRollback")
-                            });
-                    if (!report.raw.is_empty() || recovery) && !processing_archived {
-                        let text = if report.raw.is_empty() {
-                            if !report.recovery_raw.is_empty() {
-                                report.recovery_raw.clone()
-                            } else {
-                                report
-                                    .units
-                                    .iter()
-                                    .filter(|u| u.application == "uncertain")
-                                    .map(|u| u.unit.text.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            }
-                        } else {
-                            report.raw.clone()
-                        };
-                        let pruned = service
-                            .history
-                            .db(DbOperation::PruneCancelled {
-                                attempt_id: attempt.clone(),
-                                text,
-                            })
-                            .await;
-                        if pruned.is_err() {
-                            coordinator.update(&app, &id, |s| s.error = Some("saveFailed".into()));
-                            log::info!(target:"sayweave","operation=cancel_archive task_id={} result=pending",id);
-                        }
-                    }
-                    draft.release_record();
-                    if report.raw.is_empty()
-                        && !recovery
-                        && let Ok(row) = service.history.detail(record).await
-                    {
-                        let _ = service.history.remove(record, row.revision).await;
-                        service.forget_audio(record);
-                    }
-                    let _ = app.emit_to("main", "processing:archived", &id);
-                } else {
-                    draft.release_record();
-                }
+                });
             }
+            // InputSettled: release admission and presentation without awaiting
+            // ordinary persistence. The finalizer retains record/range reports.
+            let input_recovery = coordinator
+                .snapshot()
+                .ok()
+                .filter(|s| s.task_id.as_deref() == Some(&id))
+                .and_then(|s| s.delivery)
+                .is_some_and(|d| {
+                    d.submission != crate::windows_input::Submission::NotSubmitted
+                        && d.error.as_deref() == Some("compositionRollback")
+                });
+            let mut archive_error = false;
+            #[cfg(windows)]
+            let cancel_prune = if let (Some(draft), Some(current)) = (&draft, &recognized_snapshot)
+                && let Some(report) = draft.report()
+                && report.cancelled
+                && let Some(attempt) = &current.attempt_id
+            {
+                // Durable intent first; ordinary SQL below remains ordered after
+                // recognition and processing queues. No external input is replayed.
+                archive_error |= draft.stage_cancel().await.is_err();
+                let text = if report.raw.is_empty() && input_recovery {
+                    report.recovery_raw.clone()
+                } else {
+                    report.raw.clone()
+                };
+                let operation = DbOperation::PruneCancelled {
+                    attempt_id: attempt.clone(),
+                    text,
+                };
+                archive_error |= app
+                    .state::<crate::data::DataWorker>()
+                    .stage_cancel(&crate::data::Operation::History(operation.clone()))
+                    .await
+                    .is_err();
+                Some(operation)
+            } else {
+                None
+            };
+            let archive_app = app.clone();
+            let archive_id = id.clone();
+            crate::archive::spawn(async move {
+                let app = archive_app;
+                let id = archive_id;
+                let coordinator = app.state::<DictationCoordinator>();
+                let mut saved = false;
+                if let Some(archive) = recognition_archive {
+                    match archive.await {
+                        Ok(result) => {
+                            saved = result.saved;
+                            archive_error |= result.save_error;
+                        }
+                        Err(_) => archive_error = true,
+                    }
+                }
+                for (attempt, state, error) in delivery_records {
+                    if coordinator
+                        .journal(&app, &id, attempt.as_deref(), &state, error)
+                        .await
+                        .is_err()
+                    {
+                        archive_error = true;
+                    }
+                }
+                #[cfg(windows)]
+                if let Some(draft) = &draft {
+                    let final_report = draft.report();
+                    match draft.archive().await {
+                        Ok(Some((_report, _persisted))) => {
+                            let _ = app.emit_to("main", "processing:archived", &id);
+                        }
+                        Err(error) => {
+                            log::info!(target:"sayweave","operation=processing_archive task_id={} result=failed error={}",id,error.code);
+                            archive_error = true;
+                        }
+                        _ => {}
+                    }
+                    let current = recognized_snapshot;
+                    if final_report.as_ref().is_some_and(|r| r.cancelled) {
+                        app.state::<SpeechService>().invalidate_task_audio(&id);
+                    }
+                    if let (Some(report), Some(current)) = (&final_report, &current)
+                        && report.cancelled
+                        && let (Some(record), Some(_attempt)) =
+                            (&current.record_id, &current.attempt_id)
+                    {
+                        let service = app.state::<SpeechService>();
+                        if service.history.discard_audio(record).await.is_err() {
+                            archive_error = true;
+                            log::info!(target:"sayweave","operation=cancel_audio task_id={} result=pending",id);
+                        }
+                        let recovery = report.units.iter().any(|u| u.application == "uncertain")
+                            || input_recovery;
+                        if let Some(operation) = cancel_prune {
+                            archive_error |= service.history.db(operation).await.is_err();
+                        }
+                        draft.release_record();
+                        if report.raw.is_empty()
+                            && !recovery
+                            && let Ok(row) = service.history.detail(record).await
+                        {
+                            archive_error |=
+                                service.history.remove(record, row.revision).await.is_err();
+                            saved = false;
+                            service.forget_audio(record);
+                        }
+                        let _ = app.emit_to("main", "processing:archived", &id);
+                    } else {
+                        draft.release_record();
+                    }
+                }
+                app.state::<SpeechService>()
+                    .archive_settled(crate::speech::ArchiveSettlement {
+                        task_id: id,
+                        saved: saved && !archive_error,
+                        save_error: archive_error,
+                    });
+            });
             app.state::<WindowsInputService>().forget(id.clone());
             coordinator.release(&app, &id).await;
         });
@@ -1155,10 +1169,10 @@ impl DictationCoordinator {
     }
 }
 #[cfg(windows)]
-fn composition_finish(phase: Phase, journaled: bool, saved: bool, interrupted: bool) -> Finish {
+fn composition_finish(phase: Phase, journaled: bool, interrupted: bool) -> Finish {
     if phase == Phase::Cancelled {
         Finish::Abort
-    } else if !journaled || !saved {
+    } else if !journaled {
         Finish::Handoff("saveFailed".into())
     } else if phase != Phase::Completed {
         Finish::Handoff("recognitionFailed".into())
@@ -1182,29 +1196,25 @@ mod tests {
     use super::*;
     #[cfg(windows)]
     #[test]
-    fn failed_persistence_and_recognition_cannot_take_the_normal_commit_path() {
+    fn required_journal_and_recognition_guard_commit_independently_of_archive() {
         assert_eq!(
-            composition_finish(Phase::Completed, false, true, false),
+            composition_finish(Phase::Completed, false, false),
             Finish::Handoff("saveFailed".into())
         );
         assert_eq!(
-            composition_finish(Phase::Completed, true, false, false),
-            Finish::Handoff("saveFailed".into())
-        );
-        assert_eq!(
-            composition_finish(Phase::Failed, true, true, false),
+            composition_finish(Phase::Failed, true, false),
             Finish::Handoff("recognitionFailed".into())
         );
         assert_eq!(
-            composition_finish(Phase::Completed, true, true, true),
+            composition_finish(Phase::Completed, true, true),
             Finish::Handoff("interrupted".into())
         );
         assert_eq!(
-            composition_finish(Phase::Cancelled, false, false, true),
+            composition_finish(Phase::Cancelled, false, true),
             Finish::Abort
         );
         assert_eq!(
-            composition_finish(Phase::Completed, true, true, false),
+            composition_finish(Phase::Completed, true, false),
             Finish::Commit
         );
     }

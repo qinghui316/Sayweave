@@ -1,5 +1,6 @@
 #[cfg(feature = "desktop-acceptance")]
 mod acceptance;
+mod archive;
 mod contracts;
 mod coordinator;
 mod data;
@@ -386,6 +387,7 @@ fn tray_action(app: &tauri::AppHandle, id: &str) -> Result<(), RuntimeError> {
                     app.state::<windows_input::WindowsInputService>()
                         .drain()
                         .await;
+                    crate::archive::drain().await;
                     service.finish_shutdown().await;
                 })
                 .await;

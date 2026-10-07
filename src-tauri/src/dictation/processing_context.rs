@@ -26,10 +26,10 @@ pub struct Context {
     pub data: DataWorker,
     run: Arc<OnceLock<Option<RunBinding>>>,
     save_error: Arc<AtomicBool>,
+    archive: crate::archive::Archive,
 }
 struct RunBinding {
     metadata: RunMetadata,
-    record_id: String,
 }
 pub async fn settings(
     data: &DataWorker,
@@ -44,6 +44,32 @@ pub async fn settings(
     }
 }
 impl Context {
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        provider: Arc<crate::models::provider::Provider>,
+        input: crate::models::types::ConfigInput,
+        data: DataWorker,
+    ) -> Self {
+        Self {
+            task_id: "actor-test".into(),
+            provider,
+            configuration: Arc::new(ExecutableConfiguration {
+                id: "fixture".into(),
+                input,
+                key: "fixture-key".into(),
+                revision: 1,
+            }),
+            dictionary: Arc::new(prompt::DictionaryIndex::new(vec![])),
+            settings: Settings {
+                enabled: true,
+                revision: 1,
+            },
+            run: Arc::new(OnceLock::new()),
+            save_error: Arc::new(AtomicBool::new(false)),
+            archive: crate::archive::Archive::new(data.clone(), "actor-test".into()).unwrap(),
+            data,
+        }
+    }
     pub async fn prepare(
         app: &tauri::AppHandle,
         mut cancel: watch::Receiver<u8>,
@@ -77,6 +103,7 @@ impl Context {
                 data: data.inner().clone(),
                 run: Arc::new(OnceLock::new()),
                 save_error: Arc::new(AtomicBool::new(false)),
+                archive: crate::archive::Archive::new(data.inner().clone(), task_id.into())?,
             }))
         };
         if *cancel.borrow() > 0 {
@@ -98,7 +125,7 @@ impl Context {
             .map_err(|e| ModelError::new(e.code))?;
         log::info!(target:"sayweave","operation=processing_request task_id={} unit_id={} turn={} prompt_version={} settings_revision={} source_chars={} prompt_bytes={} context_chars={} dictionary_items={}",self.task_id,unit.id,unit.turn,prompt::VERSION,self.settings.revision,unit.text.chars().count(),prompt.serialized_bytes,prompt.context_chars,prompt.dictionary.terms.len()+prompt.dictionary.corrections.len());
         let mut record = self.unit_record(unit)?;
-        self.persist(&record).await;
+        self.persist(&record);
         let result = self
             .provider
             .generate_unit(
@@ -128,7 +155,7 @@ impl Context {
                 record.error_code = Some(error.code.clone());
             }
         }
-        self.persist(&record).await;
+        self.persist(&record);
         result
     }
     pub fn cancel(&self, unit: &Unit) {
@@ -140,7 +167,7 @@ impl Context {
         attempt: Option<&str>,
     ) -> Result<(), crate::contracts::dictionary::DataError> {
         let value = match (record, attempt) {
-            (Some(record), Some(attempt)) => {
+            (Some(_record), Some(attempt)) => {
                 let metadata = RunMetadata {
                     id: uuid::Uuid::new_v4().to_string(),
                     attempt_id: attempt.into(),
@@ -154,10 +181,7 @@ impl Context {
                     dictionary_version: self.dictionary.version.clone(),
                 };
                 settings(&self.data, DbOperation::Prepare(metadata.clone())).await?;
-                Some(RunBinding {
-                    metadata,
-                    record_id: record.into(),
-                })
+                Some(RunBinding { metadata })
             }
             _ => None,
         };
@@ -191,47 +215,89 @@ impl Context {
             elapsed_ms: 0,
         })
     }
-    async fn persist(&self, record: &UnitRecord) {
-        if record.run_id.is_empty() {
-            return;
-        }
-        if settings(&self.data, DbOperation::SaveUnit(record.clone()))
-            .await
-            .is_err()
+    fn persist(&self, record: &UnitRecord) {
+        if !record.run_id.is_empty()
+            && !self.archive.enqueue(
+                record.id.clone(),
+                Operation::Processing(DbOperation::SaveUnit(record.clone())),
+            )
         {
             self.save_error.store(true, Ordering::Release);
         }
+    }
+    fn final_records(
+        &self,
+        report: &super::drafts::Report,
+    ) -> Result<Vec<UnitRecord>, crate::contracts::dictionary::DataError> {
+        report
+            .units
+            .iter()
+            .filter_map(|result| {
+                let value = (|| {
+                    let mut value = self
+                        .unit_record(&result.unit)
+                        .map_err(|_| crate::contracts::dictionary::DataError::new("invalid"))?;
+                    value.candidate_text = result.candidate.clone();
+                    value.generation_state = result.generation.clone();
+                    value.application_state = result.application.clone();
+                    value.source_committed_end = result.source_committed_end;
+                    value.error_code = result.error.clone();
+                    value.prompt_tokens = result.input_tokens;
+                    value.completion_tokens = result.output_tokens;
+                    value.elapsed_ms = result.elapsed_ms;
+                    if report.cancelled {
+                        crate::processing::retention::cancelled(
+                            value,
+                            result.applied_text.as_deref(),
+                        )
+                        .map_err(|_| crate::contracts::dictionary::DataError::new("invalid"))
+                    } else {
+                        Ok(Some(value))
+                    }
+                })();
+                match value {
+                    Ok(Some(value)) => Some(Ok(value)),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect()
+    }
+    pub async fn stage_cancel(
+        &self,
+        report: &super::drafts::Report,
+    ) -> Result<(), crate::contracts::dictionary::DataError> {
+        if report.cancelled
+            && let Some(Some(run)) = self.run.get()
+        {
+            self.data
+                .stage_cancel(&Operation::Processing(DbOperation::Cancel {
+                    id: run.metadata.id.clone(),
+                    text: report.text.clone(),
+                    raw: report.raw.clone(),
+                    units: self.final_records(report)?,
+                }))
+                .await?;
+        }
+        Ok(())
     }
     pub async fn finish(
         &self,
         report: &super::drafts::Report,
         sources: &[crate::contracts::processing::SourceTurn],
     ) -> Result<bool, crate::contracts::dictionary::DataError> {
+        // Seal before terminal/cancel persistence: late model completions cannot
+        // restore units pruned by cancellation or overwrite application receipts.
+        if !self.archive.finish().await {
+            self.save_error.store(true, Ordering::Release);
+        }
         let Some(Some(run)) = self.run.get() else {
             return Ok(false);
         };
-        let mut retained = Vec::new();
-        for result in &report.units {
-            let mut value = self
-                .unit_record(&result.unit)
-                .map_err(|_| crate::contracts::dictionary::DataError::new("invalid"))?;
-            value.candidate_text = result.candidate.clone();
-            value.generation_state = result.generation.clone();
-            value.application_state = result.application.clone();
-            value.source_committed_end = result.source_committed_end;
-            value.error_code = result.error.clone();
-            value.prompt_tokens = result.input_tokens;
-            value.completion_tokens = result.output_tokens;
-            value.elapsed_ms = result.elapsed_ms;
-            if report.cancelled {
-                if let Some(value) =
-                    crate::processing::retention::cancelled(value, result.applied_text.as_deref())
-                        .map_err(|_| crate::contracts::dictionary::DataError::new("invalid"))?
-                {
-                    retained.push(value);
-                }
-            } else {
-                settings(&self.data, DbOperation::SaveUnit(value)).await?;
+        let retained = self.final_records(report)?;
+        if !report.cancelled {
+            for value in &retained {
+                settings(&self.data, DbOperation::SaveUnit(value.clone())).await?;
             }
         }
         if report.cancelled {
@@ -247,29 +313,15 @@ impl Context {
             .await?;
             return Ok(true);
         }
-        // Read back the same run before terminal settlement. Both source and
-        // generated records remain linked to this attempt; no restart replay.
-        let DbOutput::Runs(runs) =
-            settings(&self.data, DbOperation::Runs(run.record_id.clone())).await?
-        else {
-            return Err(crate::contracts::dictionary::DataError::new("unavailable"));
-        };
-        let saved = runs
-            .iter()
-            .find(|r| r.id == run.metadata.id)
-            .ok_or(crate::contracts::dictionary::DataError::new("notFound"))?;
-        let text = if report.cancelled {
-            report.text.clone()
-        } else {
-            crate::processing::render::text(sources, &saved.units)
-        };
-        let state = if report.cancelled {
-            "cancelled"
-        } else if report.error.is_some() || report.units.iter().any(|u| u.generation == "failed") {
-            "partial"
-        } else {
-            "success"
-        };
+        // These exact immutable receipts have all been saved above. Finishing
+        // this run must not depend on a history read guarded by another cancel.
+        let text = crate::processing::render::text(sources, &retained);
+        let state =
+            if report.error.is_some() || report.units.iter().any(|u| u.generation == "failed") {
+                "partial"
+            } else {
+                "success"
+            };
         settings(
             &self.data,
             DbOperation::Finish {
@@ -284,6 +336,9 @@ impl Context {
             },
         )
         .await?;
+        if self.save_error.load(Ordering::Acquire) {
+            return Err(crate::contracts::dictionary::DataError::new("saveFailed"));
+        }
         Ok(true)
     }
 }

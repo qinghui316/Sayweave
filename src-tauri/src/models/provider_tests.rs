@@ -8,7 +8,7 @@ use std::{
     net::{TcpListener, TcpStream},
     thread,
 };
-struct Reply {
+pub(crate) struct Reply {
     status: u16,
     body: String,
     headers: String,
@@ -17,7 +17,7 @@ struct Reply {
     split_bytes: usize,
 }
 impl Reply {
-    fn json(status: u16, body: &str) -> Self {
+    pub(crate) fn json(status: u16, body: &str) -> Self {
         Self {
             status,
             body: body.into(),
@@ -28,15 +28,15 @@ impl Reply {
         }
     }
 }
-struct Fixture {
+pub(crate) struct Fixture {
     url: String,
-    provider: Arc<Provider>,
+    pub(crate) provider: Arc<Provider>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
-    seen: Arc<Mutex<Vec<String>>>,
+    pub(crate) seen: Arc<Mutex<Vec<String>>>,
 }
 impl Fixture {
-    fn start(replies: Vec<Reply>) -> Self {
+    pub(crate) fn start(replies: Vec<Reply>) -> Self {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let config = rustls::ServerConfig::builder()
@@ -125,7 +125,7 @@ impl Fixture {
             seen,
         }
     }
-    fn input(&self) -> ConfigInput {
+    pub(crate) fn input(&self) -> ConfigInput {
         ConfigInput {
             name: String::new(),
             protocol: "openai-chat".into(),
@@ -212,7 +212,8 @@ async fn https_list_and_text_parameter_fallback() {
     assert_eq!(second["max_completion_tokens"], 128);
     assert!(second.get("max_tokens").is_none());
     assert_eq!(first["messages"][0]["content"], "Reply with OK.");
-    assert_eq!(first.as_object().unwrap().len(), 4);
+    assert_eq!(first["enable_thinking"], false);
+    assert_eq!(first["reasoning_effort"], "none");
 }
 #[tokio::test]
 async fn status_json_size_empty_response_and_redirect() {
@@ -488,5 +489,48 @@ async fn generation_fallback_only_explicit_unsupported_parameter_and_incomplete_
         assert_eq!(error.code, code);
         assert_eq!(fixture.seen.lock().unwrap().len(), 1);
         assert!(!serde_json::to_string(&error).unwrap().contains("secret"));
+    }
+}
+
+#[tokio::test]
+async fn thinking_compatibility_is_shared_and_cache_isolates_credentials_and_endpoint() {
+    let fixture = Fixture::start(vec![
+        Reply::json(
+            400,
+            r#"{"error":{"param":"enable_thinking","code":"unsupported_parameter"}}"#,
+        ),
+        Reply::json(200, r#"{"choices":[{"message":{"content":"OK"}}]}"#),
+        generated_sse("结果。", "stop", true),
+        Reply::json(200, r#"{"choices":[{"message":{"content":"OK"}}]}"#),
+        Reply::json(200, r#"{"choices":[{"message":{"content":"OK"}}]}"#),
+        Reply::json(200, r#"{"choices":[{"message":{"content":"OK"}}]}"#),
+    ]);
+    let input = fixture.input();
+    fixture.provider.text(&input, "first-key").await.unwrap();
+    fixture
+        .provider
+        .generate(&input, "first-key", &messages())
+        .await
+        .unwrap();
+    fixture.provider.text(&input, "second-key").await.unwrap();
+    let mut alternate = input.clone();
+    alternate.base_url.push_str("/other");
+    fixture
+        .provider
+        .text(&alternate, "first-key")
+        .await
+        .unwrap();
+    fixture.provider.invalidate_parameters();
+    fixture.provider.text(&input, "first-key").await.unwrap();
+    let requests = fixture.seen.lock().unwrap();
+    let body = |i: usize| {
+        serde_json::from_str::<Value>(requests[i].split("\r\n\r\n").nth(1).unwrap()).unwrap()
+    };
+    assert_eq!(requests.len(), 6);
+    assert_eq!(body(0)["enable_thinking"], false);
+    assert!(body(1).get("enable_thinking").is_none());
+    assert!(body(2).get("enable_thinking").is_none());
+    for index in 3..6 {
+        assert_eq!(body(index)["enable_thinking"], false);
     }
 }

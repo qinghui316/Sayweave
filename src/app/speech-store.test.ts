@@ -75,3 +75,15 @@ describe('speech renderer synchronization',()=>{
   vi.useFakeTimers();try{const port=new BrowserSpeech();const first=await port.start();await expect(port.start()).rejects.toMatchObject({code:'busy'});await expect(port.control(first.taskId!,'finish')).rejects.toMatchObject({code:'invalid'});await vi.advanceTimersByTimeAsync(250);expect(port.value.phase).toBe('recording');await port.control(first.taskId!,'cancel');}finally{vi.useRealTimers();}
  });
 });
+
+it('applies late archive fields to their retained trial without replacing a new external task',()=>{
+ const store=new SpeechStore(new BrowserSpeech());
+ store.accept({...initialSpeech(),sequence:10,taskId:'trial-a',source:'trial',phase:'completed',text:'保留试说'});
+ store.accept({...initialSpeech(),sequence:11,taskId:'external-b',source:'external',phase:'recording',text:'外部口述'});
+ store.archived({taskId:'trial-a',saved:true,saveError:false});
+ expect(store.getTrialSnapshot().snapshot).toMatchObject({text:'保留试说',saved:true,phase:'completed'});
+ expect(store.getSnapshot().snapshot).toMatchObject({taskId:'external-b',text:'外部口述',saved:false});
+ store.accept({...initialSpeech(),sequence:12,taskId:'trial-c',source:'trial',phase:'recording',text:'新的试说'});
+ store.archived({taskId:'trial-a',saved:false,saveError:true});
+ expect(store.getTrialSnapshot().snapshot).toMatchObject({taskId:'trial-c',text:'新的试说',saveError:false});
+});

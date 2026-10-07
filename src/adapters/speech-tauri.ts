@@ -1,15 +1,16 @@
 import {invoke,isTauri} from '@tauri-apps/api/core';
 import {listen} from '@tauri-apps/api/event';
-import {speechError,parseSpeech,parseMeter,parseDevices,parsePreferences,type SpeechPort,type SpeechSnapshot,type SpeechMeter,type RecordingPreferences} from '../contracts/speech';
+import {speechError,parseSpeechArchive,type SpeechArchive,parseSpeech,parseMeter,parseDevices,parsePreferences,type SpeechPort,type SpeechSnapshot,type SpeechMeter,type RecordingPreferences} from '../contracts/speech';
 import {parseDeliveryReports,parseFeed,parseHistory,parseRecord,parseUsage,parsePlayback,type HistoryPort,type HistoryCursor} from '../contracts/history';
 import {BrowserSpeech,BrowserHistory} from './speech-browser';
 async function call(command:string,args:Record<string,unknown>={}){try{return await invoke<unknown>(command,args);}catch(e){throw speechError(e);}}
 class TauriSpeech implements SpeechPort {
  readonly mode='native' as const;
  async snapshot(){return parseSpeech(await call('speech_snapshot'));}
- async subscribe(s:(v:SpeechSnapshot)=>void,m:(v:SpeechMeter)=>void){
+ async subscribe(s:(v:SpeechSnapshot)=>void,m:(v:SpeechMeter)=>void,archived?:(v:SpeechArchive)=>void){
   const a=await listen<unknown>('speech:snapshot',e=>s(parseSpeech(e.payload)));
-  try{const b=await listen<unknown>('speech:meter',e=>m(parseMeter(e.payload)));return()=>{a();b();};}catch(e){a();throw e;}
+  const releases=[a];
+  try{releases.push(await listen<unknown>('speech:meter',e=>m(parseMeter(e.payload))));releases.push(await listen<unknown>('speech:archived',e=>archived?.(parseSpeechArchive(e.payload))));return()=>releases.forEach(release=>release());}catch(e){releases.forEach(release=>release());throw e;}
  }
  async devices(){return parseDevices(await call('speech_devices'));}
  async preferences(){return parsePreferences(await call('speech_preferences',{preferences:null}));}

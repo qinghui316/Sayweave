@@ -1,4 +1,7 @@
 //! One serial owner. Network/native effects complete back into this loop.
+#[cfg(test)]
+#[path = "drafts_tests.rs"]
+mod tests;
 use super::{Presentation, processing_context::Context};
 use crate::{
     history::types::Error,
@@ -196,13 +199,12 @@ impl Drop for Generating {
 enum UnitSlot {
     Generating(Generating),
     Ready(Unit, Generation),
-    Applying(Unit),
 }
 impl UnitSlot {
     fn source(&self) -> &Unit {
         match self {
             Self::Generating(g) => &g.unit,
-            Self::Ready(u, _) | Self::Applying(u) => u,
+            Self::Ready(u, _) => u,
         }
     }
 }
@@ -300,7 +302,7 @@ pub(crate) struct SessionDraft {
     ends: mpsc::Sender<End>,
     initial: Mutex<Option<(State, mpsc::Receiver<End>)>>,
     view: Mutex<View>,
-    record: Mutex<Option<crate::history::RecordLease>>,
+    record: Mutex<Option<Arc<crate::history::RecordLease>>>,
 }
 impl SessionDraft {
     pub fn new(
@@ -310,7 +312,7 @@ impl SessionDraft {
         control: Control,
         cancel: watch::Sender<u8>,
         context: Option<Context>,
-        record: Option<crate::history::RecordLease>,
+        record: Option<Arc<crate::history::RecordLease>>,
     ) -> Arc<Self> {
         let (latest, _) = watch::channel(NativeTranscript::default());
         let (ends, receiver) = mpsc::channel(1);
@@ -390,6 +392,12 @@ impl SessionDraft {
         }
         Ok(report.map(|report| (report, persisted)))
     }
+    pub async fn stage_cancel(&self) -> Result<(), Error> {
+        if let (Some(context), Some(report)) = (&self.context, self.report()) {
+            context.stage_cancel(&report).await?;
+        }
+        Ok(())
+    }
     pub fn release_record(&self) {
         if let Ok(mut record) = self.record.lock() {
             record.take();
@@ -440,6 +448,7 @@ impl SessionDraft {
             && !record.unit.matches_in(s.turn, &source)
         {
             permit.store(false, Ordering::Release);
+            self.cancel_generation(s); // Lookahead depended on this prefix.
         }
         if value
             .segments
@@ -462,15 +471,7 @@ impl SessionDraft {
         )
     }
     fn cancel_generation(&self, s: &mut State) {
-        if matches!(s.unit, Some(UnitSlot::Applying(_))) {
-            if let Some(NativeJob {
-                kind: NativeKind::Settle { permit, .. },
-                ..
-            }) = &s.native
-            {
-                permit.store(false, Ordering::Release);
-            }
-        } else if let Some(UnitSlot::Generating(g)) = s.unit.take()
+        if let Some(UnitSlot::Generating(g)) = s.unit.take()
             && let Some(c) = &self.context
         {
             c.cancel(&g.unit);
@@ -522,6 +523,13 @@ impl SessionDraft {
         s.handoff = false;
     }
     fn start_generation(&self, s: &mut State) -> Result<(), Error> {
+        if s.stop_error.is_some()
+            || s.ending
+                .as_ref()
+                .is_some_and(|end| end.mode != Finish::Commit)
+        {
+            return Ok(());
+        }
         let pressure = Self::tail(s).encode_utf16().count() >= 14 * 1024;
         if pressure
             && matches!(s.unit, Some(UnitSlot::Generating(_)))
@@ -550,7 +558,38 @@ impl SessionDraft {
         {
             return Ok(());
         }
-        let Some(unit) = units::next(s.turn, &s.latest.segments, s.consumed, final_result)
+        let (source_start, previous) = match &s.native {
+            Some(NativeJob {
+                kind:
+                    NativeKind::Settle {
+                        record,
+                        boundary,
+                        permit,
+                        ..
+                    },
+                ..
+            }) => {
+                if !permit.load(Ordering::Acquire)
+                    || !record.unit.matches(s.turn, &s.latest.segments)
+                {
+                    return Ok(());
+                }
+                (
+                    record.unit.chars.end,
+                    format!(
+                        "{}{}{}",
+                        s.submitted, boundary.committed, boundary.retained_separator
+                    ),
+                )
+            }
+            Some(NativeJob {
+                kind: NativeKind::Replace { .. },
+                ..
+            })
+            | None => (s.consumed, s.submitted.clone()),
+            _ => return Ok(()),
+        };
+        let Some(unit) = units::next(s.turn, &s.latest.segments, source_start, final_result)
             .map_err(|e| Error::new(e.code))?
         else {
             return Ok(());
@@ -573,7 +612,6 @@ impl SessionDraft {
         }
         let context = self.context.as_ref().unwrap().clone();
         let request = unit.clone();
-        let previous = s.submitted.clone();
         let deadline = s
             .ending
             .as_ref()
@@ -581,8 +619,20 @@ impl SessionDraft {
             .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(15));
         let job =
             tokio::spawn(async move { context.generate(&request, &previous, deadline).await });
+        // Already confirmed following text retains its original merge window;
+        // it must not wait for another ASR event or the preceding native ACK.
+        let following_ready = s
+            .latest
+            .segments
+            .iter()
+            .take_while(|segment| segment.confirmed || final_result)
+            .map(|segment| segment.text.chars().count())
+            .sum::<usize>()
+            > unit.chars.end;
+        if !following_ready {
+            s.merge_at = None;
+        }
         s.unit = Some(UnitSlot::Generating(Generating { unit, job }));
-        s.merge_at = None;
         Ok(())
     }
     fn prepare_settle(&self, s: &mut State, unit: Unit, result: Generation) -> Result<(), Error> {
@@ -662,7 +712,6 @@ impl SessionDraft {
         let job = tokio::spawn(async move {
             NativeValue::Settled(draft.settle(sequence, prefix, tail, permission).await)
         });
-        s.unit = Some(UnitSlot::Applying(unit.clone()));
         s.native = Some(NativeJob {
             kind: NativeKind::Settle {
                 record: Box::new(record),
@@ -739,6 +788,11 @@ impl SessionDraft {
                 });
             }
             return Ok(());
+        }
+        if s.latest.text == s.written_raw {
+            // Confirmation/source changes were already consumed by observe and
+            // dispatch; only omit an identical body replacement.
+            s.written_sequence = s.latest.sequence;
         }
         if s.latest.sequence != s.written_sequence
             && s.last_write
@@ -843,10 +897,12 @@ impl SessionDraft {
                 },
                 NativeValue::Settled(outcome),
             ) => {
-                if !matches!(&s.unit,Some(UnitSlot::Applying(unit)) if unit.id==record.unit.id) {
+                if record.unit.chars.start != s.consumed || record.unit.turn != s.turn {
                     s.stop_error = Some("compositionProtocol".into());
                 }
-                s.unit = None;
+                if outcome.prefix != Mutation::Changed || !outcome.tail_owned {
+                    self.cancel_generation(s);
+                }
                 let mut record = record.as_ref().clone();
                 record.error = outcome.error.clone().or(record.error);
                 if outcome.prefix == Mutation::Changed {
@@ -885,7 +941,7 @@ impl SessionDraft {
                     s.written_sequence = *sequence;
                     s.written_raw = raw.clone();
                     s.last_write = Some(Instant::now());
-                    s.merge_at = Some(Instant::now());
+                    s.merge_at.get_or_insert_with(Instant::now);
                 } else if outcome.prefix == Mutation::NotAttempted && s.handoff { /* Real editing owns the next transition. */
                 } else if outcome.prefix == Mutation::NotAttempted
                     && outcome.error.as_deref() == Some("staleSnapshot")
@@ -1028,7 +1084,8 @@ impl SessionDraft {
                 _=edits.changed()=>{self.request_handoff(&mut s);if !s.stopping{publish(Presentation::Editing);}},
                 _=cancel.changed()=>{
                     s.stopping=*cancel.borrow()>0;
-                    if *cancel.borrow()>=2{self.cancel_generation(&mut s);if let Some(e)=&mut s.ending{e.mode=finish_for_signal(e.mode.clone(),*cancel.borrow());}}
+                    if *cancel.borrow()>=2{self.cancel_generation(&mut s);if let Some(NativeJob {kind:NativeKind::Settle{permit,..},..})=&s.native {permit.store(false,Ordering::Release);}
+                    if let Some(e)=&mut s.ending{e.mode=finish_for_signal(e.mode.clone(),*cancel.borrow());}}
                 },
                 _=latest.changed()=>{self.observe(&mut s,latest.borrow_and_update().clone());},
                 value=Self::native_value(&mut s.native),if s.native.is_some()=>{

@@ -305,6 +305,64 @@ pub struct CaptureResult {
     pub save_error: bool,
     pub bytes: u64,
     pub peak: usize,
+    pub archived: Option<oneshot::Receiver<bool>>,
+}
+/// File I/O has a separate bounded owner. A slow disk can fail saving, but
+/// cannot hold the audio/network drain or microphone callback hostage.
+struct FileSink {
+    sender: std::sync::mpsc::SyncSender<Vec<i16>>,
+    failed: Arc<AtomicBool>,
+}
+impl FileSink {
+    fn start(files: AudioFiles, key: String) -> Result<(Self, oneshot::Receiver<bool>), Error> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<i16>>(64);
+        let (complete, archived) = oneshot::channel();
+        let failed = Arc::new(AtomicBool::new(false));
+        let failure = failed.clone();
+        std::thread::Builder::new()
+            .name("sayweave-audio-archive".into())
+            .spawn(move || {
+                let result = (|| -> Result<(), Error> {
+                    let mut writer = files.writer(&key)?;
+                    let mut flushed = Instant::now();
+                    for chunk in receiver {
+                        if failure.load(Ordering::Acquire) {
+                            return Err(Error::new("saveFailed"));
+                        }
+                        for sample in chunk {
+                            writer
+                                .write_sample(sample)
+                                .map_err(|_| Error::new("saveFailed"))?;
+                        }
+                        if flushed.elapsed() >= Duration::from_secs(1) {
+                            writer.flush().map_err(|_| Error::new("saveFailed"))?;
+                            flushed = Instant::now();
+                        }
+                    }
+                    writer.finalize().map_err(|_| Error::new("saveFailed"))?;
+                    if failure.load(Ordering::Acquire) {
+                        return Err(Error::new("saveFailed"));
+                    }
+                    files.complete(&key)?;
+                    Ok(())
+                })();
+                let _ = complete.send(result.is_ok());
+            })
+            .map_err(|_| Error::new("saveFailed"))?;
+        Ok((Self { sender, failed }, archived))
+    }
+    fn push(&self, pcm: &[i16]) {
+        if self.failed.load(Ordering::Acquire) {
+            return;
+        }
+        // Bound bytes as well as slots, including the final resampler drain.
+        for chunk in pcm.chunks(1600) {
+            if self.sender.try_send(chunk.to_vec()).is_err() {
+                self.failed.store(true, Ordering::Release);
+                break;
+            }
+        }
+    }
 }
 pub struct Capture {
     stop: Arc<AtomicBool>,
@@ -312,6 +370,7 @@ pub struct Capture {
     pub packets: mpsc::Receiver<Packet>,
     pub meter: watch::Receiver<LocalMeter>,
     pub done: oneshot::Receiver<CaptureResult>,
+    ready: oneshot::Receiver<Result<(), Error>>,
 }
 impl Drop for Capture {
     fn drop(&mut self) {
@@ -323,7 +382,23 @@ impl Capture {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
     }
+    #[cfg(test)]
     pub async fn start(
+        device_id: Option<String>,
+        file: Option<(AudioFiles, String)>,
+        signal: watch::Receiver<u8>,
+        route: Option<Arc<super::continuous::AudioRoute>>,
+    ) -> Result<Self, Error> {
+        let mut capture = Self::prepare(device_id, file, signal, route)?;
+        capture.wait_ready().await?;
+        Ok(capture)
+    }
+    pub async fn wait_ready(&mut self) -> Result<(), Error> {
+        (&mut self.ready)
+            .await
+            .map_err(|_| Error::new("deviceAccess"))?
+    }
+    pub fn prepare(
         device_id: Option<String>,
         file: Option<(AudioFiles, String)>,
         signal: watch::Receiver<u8>,
@@ -342,11 +417,13 @@ impl Capture {
             packets,
             meter,
             done,
+            ready,
         };
         std::thread::Builder::new()
             .name("sayweave-capture".into())
             .spawn(move || {
                 let mut ready_tx = Some(ready_tx);
+                let mut archived = None;
                 let result = (|| -> Result<CaptureResult, Error> {
                     let host = cpal::default_host();
                     let device = match device_id {
@@ -412,9 +489,9 @@ impl Capture {
                     let mut converter = Converter::new(rate)?;
                     let mut turn_converter = TurnConverter::new(rate);
                     let mut save_error = false;
-                    let mut writer = match &file {
-                        Some((files, key)) => match files.writer(key) {
-                            Ok(w) => Some(w),
+                    let writer = match &file {
+                        Some((files, key)) => match FileSink::start(files.clone(), key.clone()) {
+                            Ok((w, completion)) => { archived = Some(completion); Some(w) },
                             Err(_) => {
                                 save_error = true;
                                 None
@@ -428,7 +505,6 @@ impl Capture {
                         stopper.store(true, Ordering::Release);
                     }
                     let began = Instant::now();
-                    let mut flushed = Instant::now();
                     let mut pcm = Vec::with_capacity(16000 * 10);
                     let mut peak = 0;
                     let mut error = None;
@@ -438,20 +514,7 @@ impl Capture {
                         if chunk.is_empty() {
                             return;
                         }
-                        if let Some(w) = writer.as_mut() {
-                            for &s in &chunk {
-                                if w.write_sample(s).is_err() {
-                                    save_error = true;
-                                    break;
-                                }
-                            }
-                            if flushed.elapsed() >= Duration::from_secs(1) {
-                                if w.flush().is_err() {
-                                    save_error = true;
-                                }
-                                flushed = Instant::now();
-                            }
-                        }
+                        if let Some(w) = &writer { w.push(&chunk); }
                         meter_window.push(&chunk);
                         pcm.extend_from_slice(&chunk);
                         if meter_at.elapsed()>=Duration::from_millis(50) {
@@ -525,38 +588,33 @@ impl Capture {
                         eprintln!("CAPTURE_CALLBACK category=xrun count={xruns} continued=true");
                     }
                     let bytes = pcm.len() as u64 * 2;
-                    if let Some(w) = writer {
-                        if w.finalize().is_err() {
-                            save_error = true;
-                        } else if let Some((files, key)) = &file
-                            && files.complete(key).is_err()
-                        {
-                            save_error = true;
-                        }
-                    }
+                    drop(writer); // Archive worker owns flushing and finalization.
                     Ok(CaptureResult {
                         pcm,
                         error,
                         save_error,
                         bytes,
                         peak,
+                        archived: None,
                     })
                 })();
                 if let (Some(tx), Err(e)) = (ready_tx, result.as_ref()) {
                     let _ = tx.send(Err(e.clone()));
                 }
                 // The exact preparation error is returned without exposing device internals.
-                let result = result.unwrap_or_else(|e| CaptureResult {
+                let mut result = result.unwrap_or_else(|e| CaptureResult {
                     pcm: vec![],
                     error: Some(e.code),
                     save_error: false,
                     bytes: 0,
                     peak: 0,
+                    archived: None,
                 });
+                result.archived = archived;
+                drop(sender); // End of captured audio is independent of file I/O.
                 let _ = done_tx.send(result);
             })
             .map_err(|_| Error::new("deviceAccess"))?;
-        ready.await.map_err(|_| Error::new("deviceAccess"))??;
         Ok(capture)
     }
 }
@@ -566,6 +624,78 @@ mod supported_config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn failed_readiness_keeps_capture_and_file_cleanup_owned() {
+        let root = tempfile::tempdir().unwrap();
+        let files = AudioFiles::new(root.path()).unwrap();
+        let key = uuid::Uuid::new_v4().to_string();
+        let (sink, archived) = FileSink::start(files.clone(), key.clone()).unwrap();
+        let (ready_tx, ready) = oneshot::channel();
+        let (done_tx, done) = oneshot::channel();
+        let (_packets, packets) = mpsc::channel(1);
+        let (_meter, meter) = watch::channel(LocalMeter::default());
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut capture = Capture {
+            stop,
+            stop_watcher: tokio::spawn(std::future::pending()),
+            packets,
+            meter,
+            done,
+            ready,
+        };
+        ready_tx.send(Err(Error::new("deviceAccess"))).unwrap();
+        assert_eq!(capture.wait_ready().await.unwrap_err().code, "deviceAccess");
+        // Readiness failure does not consume the owner. The common drain can
+        // still collect the file worker, even when it finishes after the error.
+        sink.push(&[123; 16]);
+        drop(sink);
+        done_tx
+            .send(CaptureResult {
+                pcm: vec![],
+                error: Some("deviceAccess".into()),
+                save_error: false,
+                bytes: 32,
+                peak: 0,
+                archived: Some(archived),
+            })
+            .ok()
+            .unwrap();
+        capture.stop();
+        let result = (&mut capture.done).await.unwrap();
+        assert!(result.archived.unwrap().await.unwrap());
+        assert!(files.path(&key, false).unwrap().exists());
+    }
+    #[tokio::test]
+    async fn file_sink_saves_pcm_and_finalizes_after_capture_owner_is_released() {
+        let root = tempfile::tempdir().unwrap();
+        let files = AudioFiles::new(root.path()).unwrap();
+        let key = uuid::Uuid::new_v4().to_string();
+        let (sink, done) = FileSink::start(files.clone(), key.clone()).unwrap();
+        let samples = vec![123i16; 3200];
+        sink.push(&samples);
+        drop(sink);
+        assert!(done.await.unwrap());
+        let saved = hound::WavReader::open(files.path(&key, false).unwrap())
+            .unwrap()
+            .into_samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(saved, samples);
+    }
+    #[test]
+    fn stalled_file_writer_has_bounded_memory_and_never_blocks_audio_producer() {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(64);
+        let failed = Arc::new(AtomicBool::new(false));
+        let sink = FileSink {
+            sender,
+            failed: failed.clone(),
+        };
+        sink.push(&vec![0; 1600 * 100]);
+        assert!(failed.load(Ordering::Acquire));
+        let chunks: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(chunks.len(), 64);
+        assert!(chunks.iter().all(|c| c.len() <= 1600));
+    }
     #[test]
     fn callback_xrun_continues_but_cannot_clear_device_failure() {
         let callbacks = CallbackState::default();

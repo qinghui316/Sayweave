@@ -147,6 +147,13 @@ pub(super) fn stage(root: &Path, operation: &Operation) -> Result<bool, DataErro
 /// or partial intent is an explicit recovery error, never permission to expose
 /// pre-cancellation rows or to guess which data should be deleted.
 pub(super) fn replay(repository: &mut Repository, root: &Path) -> Result<(), DataError> {
+    replay_except(repository, root, &std::collections::HashSet::new())
+}
+pub(super) fn replay_except(
+    repository: &mut Repository,
+    root: &Path,
+    deferred: &std::collections::HashSet<String>,
+) -> Result<(), DataError> {
     let path = directory(root)?;
     let mut paths = fs::read_dir(path)
         .map_err(|_| DataError::new("unavailable"))?
@@ -157,6 +164,13 @@ pub(super) fn replay(repository: &mut Repository, root: &Path) -> Result<(), Dat
     let mut entries = Vec::new();
     for path in paths {
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        if path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|id| deferred.contains(id))
+        {
             continue;
         }
         regular(&path, false)?;
@@ -187,12 +201,137 @@ pub(super) fn replay(repository: &mut Repository, root: &Path) -> Result<(), Dat
     }
     Ok(())
 }
+pub(super) fn identity(operation: &Operation) -> Option<&str> {
+    match operation {
+        Operation::Processing(processing::DbOperation::Cancel { id, .. }) => Some(id),
+        Operation::History(history::DbOperation::PruneCancelled { attempt_id, .. }) => {
+            Some(attempt_id)
+        }
+        _ => None,
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::contracts::history::{Attempt, Prepare};
     use crate::data::repository::now;
+    #[tokio::test]
+    async fn failed_intent_write_does_not_leave_a_deferred_barrier() {
+        let root = tempfile::tempdir().unwrap();
+        let worker = crate::data::DataWorker::start(root.path().to_owned()).unwrap();
+        worker.request_admitted(Operation::Retry).await.unwrap();
+        fs::remove_dir(root.path().join("cancel-recovery")).unwrap();
+        fs::write(root.path().join("cancel-recovery"), b"blocked").unwrap();
+        let intent = Operation::History(history::DbOperation::PruneCancelled {
+            attempt_id: uuid::Uuid::new_v4().to_string(),
+            text: String::new(),
+        });
+        assert!(worker.stage_cancel(&intent).await.is_err());
+        assert!(worker.deferred_cancellations.lock().unwrap().is_empty());
+        fs::remove_file(root.path().join("cancel-recovery")).unwrap();
+        assert!(worker.request_admitted(Operation::Retry).await.is_ok());
+    }
+    #[tokio::test]
+    async fn durable_cancel_can_wait_for_ordinary_archive_without_replaying_early() {
+        let root = tempfile::tempdir().unwrap();
+        let mut repo = Repository::open(root.path()).unwrap();
+        let (record, attempt) = prepared(&mut repo);
+        repo.connection
+            .execute(
+                "UPDATE speech_attempts SET status='recording' WHERE id=?1",
+                [&attempt],
+            )
+            .unwrap();
+        drop(repo);
+        let worker = super::super::DataWorker::start(root.path().into()).unwrap();
+        worker.request("main", Operation::Drain).await.unwrap();
+        let cancel = Operation::History(history::DbOperation::PruneCancelled {
+            attempt_id: attempt.clone(),
+            text: "已提交。".into(),
+        });
+        worker.stage_cancel(&cancel).await.unwrap();
+        assert!(
+            root.path()
+                .join("cancel-recovery")
+                .join(format!("{attempt}.json"))
+                .exists()
+        );
+        assert_eq!(
+            worker
+                .request(
+                    "main",
+                    Operation::History(history::DbOperation::Detail(record.clone()))
+                )
+                .await
+                .unwrap_err()
+                .code,
+            "busy"
+        );
+        // Older admitted writes must settle before activation, without making
+        // cancelled content readable or failing due to early journal replay.
+        worker
+            .request_archive(Operation::History(history::DbOperation::Checkpoint {
+                attempt_id: attempt.clone(),
+                text: "已提交。撤销尾部。".into(),
+            }))
+            .await
+            .unwrap();
+        worker
+            .request_archive(Operation::History(history::DbOperation::Finish {
+                attempt_id: attempt.clone(),
+                text: "已提交。撤销尾部。".into(),
+                status: "cancelled".into(),
+                error: Some("cancelled".into()),
+                duration_ms: 1,
+                elapsed_ms: 1,
+            }))
+            .await
+            .unwrap();
+        worker.request_admitted(cancel).await.unwrap();
+        let super::super::Output::History(history::DbOutput::Record(row)) = worker
+            .request(
+                "main",
+                Operation::History(history::DbOperation::Detail(record)),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(row.attempts[0].text, "已提交。");
+        worker.shutdown().await;
+    }
+    #[test]
+    fn cancellation_recovery_does_not_require_normal_recognition_finish() {
+        let root = tempfile::tempdir().unwrap();
+        let mut repo = Repository::open(root.path()).unwrap();
+        let (record, attempt) = prepared(&mut repo);
+        repo.connection
+            .execute(
+                "UPDATE speech_attempts SET status='recording' WHERE id=?1",
+                [&attempt],
+            )
+            .unwrap();
+        stage(
+            root.path(),
+            &Operation::History(history::DbOperation::PruneCancelled {
+                attempt_id: attempt,
+                text: "保留前段。".into(),
+            }),
+        )
+        .unwrap();
+        drop(repo);
+        let mut repo = Repository::open(root.path()).unwrap();
+        let history::DbOutput::Record(row) = repo
+            .history_operation(history::DbOperation::Detail(record))
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(row.attempts[0].text, "保留前段。");
+        assert_eq!(row.attempts[0].status, "cancelled");
+    }
     fn prepared(repo: &mut Repository) -> (String, String) {
         let id = uuid::Uuid::new_v4().to_string();
         let attempt = uuid::Uuid::new_v4().to_string();
@@ -371,6 +510,7 @@ mod tests {
             dispatch: Arc::new(Mutex::new(())),
             root: worker.root.clone(),
             journal_io: worker.journal_io.clone(),
+            deferred_cancellations: worker.deferred_cancellations.clone(),
             lease_active: worker.lease_active.clone(),
         };
         for _ in 0..64 {

@@ -38,13 +38,13 @@ impl Repository {
             DbOperation::PruneCancelled {attempt_id,text}=>{
                 if text.len()>1024*1024 {return Err(Error::new("invalid"));}
                 let tx=self.connection.transaction().map_err(db_error)?;
-                let record:String=tx.query_row("SELECT record_id FROM speech_attempts WHERE id=?1 AND status NOT IN ('preparing','recording','processing')",[&attempt_id],|r|r.get(0)).map_err(db_error)?;
+                let record:String=tx.query_row("SELECT record_id FROM speech_attempts WHERE id=?1",[&attempt_id],|r|r.get(0)).map_err(db_error)?;
                 let precise:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM processing_runs WHERE attempt_id=?1 AND state='cancelled')",[&attempt_id],|r|r.get(0)).map_err(db_error)?;
                 tx.execute("DELETE FROM processing_units WHERE run_id IN (SELECT id FROM processing_runs WHERE attempt_id=?1 AND state<>'cancelled')",[&attempt_id]).map_err(db_error)?;
                 tx.execute("UPDATE processing_runs SET state='cancelled',text=?2,search_key=?3,error_code='saveFailed',ended_at=?4,revision=revision+1 WHERE attempt_id=?1 AND state<>'cancelled'",params![attempt_id,text,crate::contracts::dictionary::key(&text),now()]).map_err(db_error)?;
                 tx.execute("INSERT OR IGNORE INTO discarded_audio(id) SELECT id FROM audio_assets WHERE record_id=?1",[&record]).map_err(db_error)?;
                 tx.execute("UPDATE audio_assets SET status='expire_pending' WHERE record_id=?1",[&record]).map_err(db_error)?;
-                if !precise {tx.execute("UPDATE speech_attempts SET text=?2,search_key=?3 WHERE id=?1",params![attempt_id,text,crate::contracts::dictionary::key(&text)]).map_err(db_error)?;}
+                if !precise {tx.execute("UPDATE speech_attempts SET text=?2,search_key=?3,status='cancelled',error_code='cancelled' WHERE id=?1",params![attempt_id,text,crate::contracts::dictionary::key(&text)]).map_err(db_error)?;}
                 tx.execute("UPDATE speech_records SET status='interrupted',revision=revision+1 WHERE id=?1",[record]).map_err(db_error)?;
                 tx.commit().map_err(db_error)?;Ok(DbOutput::Done)
             },

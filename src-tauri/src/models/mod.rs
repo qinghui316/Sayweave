@@ -1,5 +1,6 @@
 pub mod commands;
 mod credentials;
+mod latency;
 #[cfg(all(test, target_os = "windows"))]
 mod live_acceptance;
 pub mod provider;
@@ -274,6 +275,9 @@ impl ModelService {
                 credential_ref,
             })
             .await;
+        if result.is_ok() {
+            self.provider.invalidate_parameters();
+        }
         // Commit success stays success even if cleanup needs retry.
         if self.recover().await.is_err() {
             self.cleanup_pending.store(true, Ordering::Release);
