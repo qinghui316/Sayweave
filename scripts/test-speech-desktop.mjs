@@ -13,7 +13,7 @@ const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),id=ra
 const directory=path.join(root,'.local','data-acceptance',id),data=path.join(directory,'data');mkdirSync(data,{recursive:true});
 const exe=path.join(root,'src-tauri','target','release','desktop-acceptance.exe'),port=9241,key='fixture-'+randomUUID();
 const polishCase=process.argv.find(value=>value.startsWith('--polish-case='))?.slice('--polish-case='.length);
-if(polishCase&&polishCase!=='cancel')throw Error('Unknown polish acceptance case');
+if(polishCase&&!['cancel','no-history'].includes(polishCase))throw Error('Unknown polish acceptance case');
 const polishOnly=process.argv.includes('--polish')||Boolean(polishCase);
 const report={id,passed:false,checks:[],connections:[],handshakes:[],polishRequests:[]},delay=ms=>new Promise(r=>setTimeout(r,ms));
 let app,browser,server,mode='normal',expectedProtocol='qwen',expectedModel='qwen-audio-3.1-asr-flash-streaming';const sockets=new Set(),polishReleases=new Map(),polishChannels=[];
@@ -75,6 +75,14 @@ async function polishScenario(page,base){
  const editor=await ownedEditor();mode='polish';
  try{
   if(polishCase==='cancel'){report.polish={};await polishRaces(page,editor,'cancel');return;}
+  if(polishCase==='no-history'){
+   const preferences=await invoke(page,'speech_preferences',{preferences:null});
+   await invoke(page,'speech_preferences',{preferences:{...preferences,historyEnabled:false}});
+   report.polish={};await polishRaces(page,editor,'cancel');
+   const snapshot=await invoke(page,'speech_snapshot');expect(snapshot.recordId).toBeNull();
+   expect((await invoke(page,'history_browse',{query:{search:'',cursor:null}})).total).toBe(0);
+   report.checks.push('history-disabled external cancellation leaves no persistent record or blocked history read');return;
+  }
   await editor.command({action:'focus',text:'',start:0,end:0});
   const task=await invoke(page,'dictation_start');expect(task.source).toBe('external');
   const samples=[];let observedTask=task.taskId;report.polish={taskId:task.taskId,samples};
@@ -303,7 +311,7 @@ async function run(){try{
  report.targetGroup=process.env.SAYWEAVE_INPUT_TARGET_GROUP??'all';
  await command(['test','--manifest-path','src-tauri/Cargo.toml','--lib','model_desktop_fixture','--','--ignored']);server=createServer({cert:readFileSync(path.join(data,'fixture-ca.pem')),key:readFileSync(path.join(data,'fixture-key.pem'))});server.on('upgrade',websocket);server.on('request',(req,res)=>void modelFixture(req,res).catch(error=>{report.modelError=String(error);res.destroy();}));await new Promise(r=>server.listen(0,'127.0.0.1',r));const base='https://localhost:'+server.address().port;
  let page=await start(1);await expect(page.getByRole('link',{name:'组件展示'})).toHaveCount(0);await page.getByRole('button',{name:'配置模型',exact:true}).click();const dialog=page.getByRole('dialog');await delay(250);await page.screenshot({path:path.join(directory,'settings-speech-native.png')});await dialog.getByRole('button',{name:'更多设置'}).click();await dialog.getByLabel('名称',{exact:true}).fill('隔离语音验收');await dialog.getByLabel('服务地址（URL）',{exact:true}).fill(base);await dialog.getByLabel('API 密钥',{exact:true}).fill(key);await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(dialog.getByText('已保存。')).toBeVisible();await dialog.getByRole('button',{name:'关闭',exact:true}).click();await expect(dialog).toHaveCount(0);
- if(polishOnly){await polishScenario(page,base);await stop(page);report.passed=true;return;}
+ if(polishOnly){await polishScenario(page,base);await stop(page);if(polishCase==='no-history'){page=await start(2);expect((await invoke(page,'history_browse',{query:{search:'',cursor:null}})).total).toBe(0);await stop(page);report.checks.push('restart after history-disabled cancellation recovers without a stale cancellation intent');}report.passed=true;return;}
 
  const devices=await invoke(page,'speech_devices');report.microphoneCount=devices.length;expect(devices.some(d=>d.isDefault)).toBe(true);
  report.scope=process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE??'all';

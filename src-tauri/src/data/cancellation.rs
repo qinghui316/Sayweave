@@ -211,6 +211,39 @@ pub(super) fn identity(operation: &Operation) -> Option<&str> {
     }
 }
 
+pub(super) fn blocks_read(
+    repository: &Repository,
+    operation: &Operation,
+    deferred: &std::collections::HashSet<String>,
+) -> Result<bool, DataError> {
+    if deferred.is_empty() {
+        return Ok(false);
+    }
+    let record = match operation {
+        Operation::History(
+            history::DbOperation::Detail(id) | history::DbOperation::Deliveries(id),
+        ) => id,
+        Operation::History(
+            history::DbOperation::List(_)
+            | history::DbOperation::Browse(_)
+            | history::DbOperation::Usage,
+        ) => return Ok(true),
+        _ => return Ok(false),
+    };
+    // IDs are native attempt/run identities. Restrict visibility only for the
+    // record being pruned; unrelated archive cleanup must remain independent.
+    for id in deferred {
+        let affected: bool = repository.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM speech_attempts a WHERE a.record_id=?1 AND (a.id=?2 OR EXISTS(SELECT 1 FROM processing_runs p WHERE p.attempt_id=a.id AND p.id=?2)))",
+            rusqlite::params![record,id], |row| row.get(0),
+        ).map_err(super::repository::db_error)?;
+        if affected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +270,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut repo = Repository::open(root.path()).unwrap();
         let (record, attempt) = prepared(&mut repo);
+        let (unrelated, _) = prepared(&mut repo);
         repo.connection
             .execute(
                 "UPDATE speech_attempts SET status='recording' WHERE id=?1",
@@ -251,6 +285,16 @@ mod tests {
             text: "已提交。".into(),
         });
         worker.stage_cancel(&cancel).await.unwrap();
+        assert!(
+            worker
+                .request(
+                    "main",
+                    Operation::History(history::DbOperation::Detail(unrelated))
+                )
+                .await
+                .is_ok(),
+            "another record's cleanup is not blocked by this cancellation"
+        );
         assert!(
             root.path()
                 .join("cancel-recovery")

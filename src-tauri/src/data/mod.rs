@@ -169,9 +169,7 @@ impl DataWorker {
                                     .map_err(|_| DataError::new("unavailable"))?;
                                 let deferred=thread_deferred.lock().map_err(|_|DataError::new("unavailable"))?;
                                 cancellation::replay_except(repo, &root, &deferred)?;
-                                if !deferred.is_empty() && matches!(&request.operation,
-                                    Operation::History(crate::contracts::history::DbOperation::Detail(_) | crate::contracts::history::DbOperation::List(_) | crate::contracts::history::DbOperation::Browse(_) | crate::contracts::history::DbOperation::Usage | crate::contracts::history::DbOperation::Deliveries(_))
-                                    ) { return Err(DataError::new("busy")); }
+                                if cancellation::blocks_read(repo, &request.operation, &deferred)? { return Err(DataError::new("busy")); }
                                 drop(deferred);
                                 drop(_journal);
                                 match request.operation {

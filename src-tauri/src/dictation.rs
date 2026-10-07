@@ -814,6 +814,7 @@ impl DictationCoordinator {
             let cancel_prune = if let (Some(draft), Some(current)) = (&draft, &recognized_snapshot)
                 && let Some(report) = draft.report()
                 && report.cancelled
+                && current.record_id.is_some()
                 && let Some(attempt) = &current.attempt_id
             {
                 // Durable intent first; ordinary SQL below remains ordered after
@@ -895,12 +896,14 @@ impl DictationCoordinator {
                             archive_error |= service.history.db(operation).await.is_err();
                         }
                         draft.release_record();
-                        if report.raw.is_empty()
-                            && !recovery
-                            && let Ok(row) = service.history.detail(record).await
-                        {
-                            archive_error |=
-                                service.history.remove(record, row.revision).await.is_err();
+                        if report.raw.is_empty() && !recovery {
+                            match service.history.detail(record).await {
+                                Ok(row) => {
+                                    archive_error |=
+                                        service.history.remove(record, row.revision).await.is_err()
+                                }
+                                Err(_) => archive_error = true,
+                            }
                             saved = false;
                             service.forget_audio(record);
                         }
