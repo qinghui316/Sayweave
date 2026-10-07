@@ -240,3 +240,34 @@ async fn shutdown_waits_for_admitted_background_cleanup() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+#[ignore = "Explicit real-microphone environment diagnostic; no files/network or raw audio output"]
+async fn microphone_environment_diagnostic() {
+    let (signal, receiver) = tokio::sync::watch::channel(0);
+    let mut capture = audio::Capture::start(None, None, receiver, None)
+        .await
+        .unwrap();
+    let mut packets = 0usize;
+    let stop = tokio::time::sleep(std::time::Duration::from_secs(2));
+    tokio::pin!(stop);
+    loop {
+        tokio::select! {
+            _=&mut stop=>break,
+            value=capture.packets.recv()=>match value {Some(_)=>packets+=1,None=>break},
+        }
+    }
+    signal.send_replace(1);
+    while capture.packets.recv().await.is_some() {
+        packets += 1;
+    }
+    let result = (&mut capture.done).await.unwrap();
+    eprintln!(
+        "MICROPHONE_ENVIRONMENT packets={} duration_ms={} error={:?}",
+        packets,
+        result.pcm.len() / 16,
+        result.error
+    );
+    assert!(result.error.is_none(), "Real microphone stream interrupted");
+    assert!(packets > 1);
+}

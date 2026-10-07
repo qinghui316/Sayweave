@@ -7,11 +7,47 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot, watch};
+#[derive(Default)]
+struct CallbackState {
+    fatal: AtomicU8,
+    xruns: AtomicU32,
+}
+impl CallbackState {
+    fn record(&self, kind: cpal::ErrorKind) {
+        if kind == cpal::ErrorKind::Xrun {
+            let _ = self
+                .xruns
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                    Some(n.saturating_add(1))
+                });
+            return;
+        }
+        let category = match kind {
+            cpal::ErrorKind::DeviceNotAvailable => 1,
+            cpal::ErrorKind::StreamInvalidated => 2,
+            cpal::ErrorKind::BackendError => 4,
+            cpal::ErrorKind::DeviceBusy => 5,
+            cpal::ErrorKind::DeviceChanged => 6,
+            cpal::ErrorKind::HostUnavailable => 7,
+            cpal::ErrorKind::InvalidInput => 8,
+            cpal::ErrorKind::PermissionDenied => 9,
+            cpal::ErrorKind::RealtimeDenied => 10,
+            cpal::ErrorKind::ResourceExhausted => 11,
+            cpal::ErrorKind::UnsupportedConfig => 12,
+            cpal::ErrorKind::UnsupportedOperation => 13,
+            _ => 14,
+        };
+        // Later nonfatal notifications cannot erase the first fatal callback.
+        let _ = self
+            .fatal
+            .compare_exchange(0, category, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
 fn watch_stop(
     stop: Arc<AtomicBool>,
     mut signal: watch::Receiver<u8>,
@@ -333,7 +369,7 @@ impl Capture {
                     }
                     let (mut producer, mut consumer) = rtrb::RingBuffer::<CapturedSample>::new(rate * 2);
                     let overflow = Arc::new(AtomicBool::new(false));
-                    let failure = Arc::new(AtomicBool::new(false));
+                    let failure = Arc::new(CallbackState::default());
                     macro_rules! stream {
                         ($t:ty) => {{
                             let o = overflow.clone();
@@ -353,8 +389,9 @@ impl Capture {
                                             }
                                         }
                                     },
-                                    move |_| {
-                                        f.store(true, Ordering::Release);
+                                    move |error| {
+                                        // Stable category only: no backend/device text is logged.
+                                        f.record(error.kind());
                                     },
                                     Some(Duration::from_secs(5)),
                                 )
@@ -453,7 +490,7 @@ impl Capture {
                         if stopper.load(Ordering::Acquire)
                             || began.elapsed() >= Duration::from_secs(600)
                             || overflow.load(Ordering::Acquire)
-                            || failure.load(Ordering::Acquire)
+                            || failure.fatal.load(Ordering::Acquire) != 0
                         {
                             break;
                         }
@@ -475,8 +512,17 @@ impl Capture {
                     drop(accept);
                     if overflow.load(Ordering::Acquire) {
                         error = Some("bufferOverflow".into());
-                    } else if failure.load(Ordering::Acquire) {
+                    } else if failure.fatal.load(Ordering::Acquire) != 0 {
+                        log::info!(target:"sayweave", "operation=capture_callback result=failed category={}", failure.fatal.load(Ordering::Acquire));
+                        #[cfg(test)]
+                        eprintln!("CAPTURE_CALLBACK category={}", failure.fatal.load(Ordering::Acquire));
                         error = Some("deviceAccess".into());
+                    }
+                    let xruns = failure.xruns.load(Ordering::Acquire);
+                    if xruns > 0 {
+                        log::warn!(target:"sayweave", "operation=capture_callback result=continued category=xrun count={xruns}");
+                        #[cfg(test)]
+                        eprintln!("CAPTURE_CALLBACK category=xrun count={xruns} continued=true");
                     }
                     let bytes = pcm.len() as u64 * 2;
                     if let Some(w) = writer {
@@ -520,6 +566,19 @@ mod supported_config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn callback_xrun_continues_but_cannot_clear_device_failure() {
+        let callbacks = CallbackState::default();
+        callbacks.record(cpal::ErrorKind::Xrun);
+        callbacks.record(cpal::ErrorKind::Xrun);
+        assert_eq!(callbacks.xruns.load(Ordering::Acquire), 2);
+        assert_eq!(callbacks.fatal.load(Ordering::Acquire), 0);
+        callbacks.record(cpal::ErrorKind::DeviceNotAvailable);
+        callbacks.record(cpal::ErrorKind::Xrun);
+        callbacks.record(cpal::ErrorKind::BackendError);
+        assert_eq!(callbacks.fatal.load(Ordering::Acquire), 1);
+        assert_eq!(callbacks.xruns.load(Ordering::Acquire), 3);
+    }
     #[test]
     fn delayed_capture_and_fft_tail_cannot_be_relabelled_as_the_next_turn() {
         use super::super::continuous::{Control, Route};
