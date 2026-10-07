@@ -7,12 +7,11 @@ mod composition_text;
 pub mod deployment;
 #[cfg(windows)]
 mod host_identity;
-#[cfg(any(test, all(windows, feature = "component")))]
-mod prefix;
 #[cfg(windows)]
 pub mod registration;
 #[cfg(all(windows, feature = "component"))]
 mod service;
+pub mod settlement_boundary;
 #[cfg(windows)]
 pub mod transport;
 pub mod wire;

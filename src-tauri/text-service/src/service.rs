@@ -56,10 +56,21 @@ fn module() -> windows::core::Result<HINSTANCE> {
 #[derive(Clone)]
 struct Pending {
     operation: u64,
+    revision: u64,
     task: String,
     turn: u64,
     connection: u64,
     capability: String,
+    settlement: Option<Settlement>,
+}
+const RESUME_PREFIX: u32 = WM_APP + 42;
+struct PrefixContinuation {
+    id: u64,
+    request: Request,
+    context: ITfContext,
+    generation: u64,
+    connection: u64,
+    _lease: Lease,
 }
 #[derive(Default)]
 struct State {
@@ -74,6 +85,7 @@ struct State {
     active: bool,
     generation: u64,
     pending: Option<Pending>,
+    prefix_continuation: Option<PrefixContinuation>,
     epoch: u64,
     own_change: Option<OwnChange>,
     cleanup: bool,
@@ -86,6 +98,7 @@ struct State {
     // dummy character and no live TSF composition until the next actual update.
     empty_range: Option<ITfRange>,
     native_position: Option<NativeEditPosition>,
+    pending_native_position: Option<NativeEditPosition>,
     backup: Option<Rollback>,
     expected: String,
     text: Option<CompositionText>,
@@ -115,6 +128,7 @@ enum Rollback {
 struct NativeEditPosition {
     window: usize,
     offset: u32,
+    end: u32,
 }
 fn native_edit_position(context: &ITfContext) -> windows::core::Result<Option<NativeEditPosition>> {
     unsafe {
@@ -124,10 +138,11 @@ fn native_edit_position(context: &ITfContext) -> windows::core::Result<Option<Na
         if size == 0 || String::from_utf16_lossy(&class[..size as usize]) != "Edit" {
             return Ok(None);
         }
-        let (start, _) = edit_selection(window);
+        let (start, end) = edit_selection(window);
         Ok(Some(NativeEditPosition {
             window: window.0 as usize,
             offset: start,
+            end,
         }))
     }
 }
@@ -260,6 +275,20 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, w: WPARAM, l: LP
         if !data.is_null() {
             if message == WM_TIMER {
                 poll(&*data);
+                let continuation = {
+                    (&*data)
+                        .borrow()
+                        .prefix_continuation
+                        .as_ref()
+                        .map(|job| job.id)
+                };
+                if let Some(id) = continuation {
+                    resume_prefix(&*data, id);
+                }
+                return LRESULT(0);
+            }
+            if message == RESUME_PREFIX {
+                resume_prefix(&*data, w.0 as u64);
                 return LRESULT(0);
             }
             if message == WM_NCDESTROY {
@@ -364,6 +393,7 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
         return;
     }
     let pending = shared.borrow().pending.clone();
+    let inherited_settlement = pending.as_ref().and_then(|p| p.settlement);
     if let Some(p) = pending {
         if r.action != Action::Abort
             || r.task != p.task
@@ -388,21 +418,39 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
             s.pending = None;
         }
         if shared.borrow().composition.is_none() {
-            if shared.borrow().empty_range.is_some() {
-                let epoch = shared.borrow().epoch;
-                release_composition(shared, epoch, None);
-            }
-            shared.borrow_mut().version.applied(&r);
-            reply(
+            // Finalize cancellation before retiring ranges/sinks, which can
+            // reenter and establish a new task. No old version write follows COM.
+            apply_cancel_then_retire(shared, &r, |epoch| {
+                if let Some(epoch) = epoch {
+                    release_composition(shared, epoch, None);
+                }
+            });
+            reply_outcome(
                 shared,
                 &r,
                 connection,
                 true,
-                "cancelledBeforeBegin",
+                if inherited_settlement.is_some() {
+                    "cancelledPrefixContinuation"
+                } else {
+                    "cancelledBeforeBegin"
+                },
                 Mutation::NotAttempted,
+                inherited_settlement,
             );
             return;
         }
+    }
+    if !r.safe_prefix_boundary() {
+        reply(
+            shared,
+            &r,
+            connection,
+            false,
+            "prefixBoundaryUnsupported",
+            Mutation::NotAttempted,
+        );
+        return;
     }
     let already_handed_off = {
         let s = shared.borrow();
@@ -414,13 +462,14 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
             && r.live(unsafe { GetTickCount64() })
     };
     if shared.borrow().key_failure {
-        reply(
+        reply_outcome(
             shared,
             &r,
             connection,
             false,
             "keyboardHandoffFailed",
             Mutation::NotAttempted,
+            inherited_settlement,
         );
         return;
     }
@@ -434,16 +483,25 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
         reply(shared, &r, connection, true, code, Mutation::NotAttempted);
         return;
     }
-    if let Err((stage, e)) = schedule(shared, &r, connection) {
-        reply(
+    if let Err((stage, e)) = schedule(shared, &r, connection, inherited_settlement) {
+        reply_outcome(
             shared,
             &r,
             connection,
             false,
             &format!("{stage}:{:08x}", e.code().0 as u32),
             Mutation::NotAttempted,
+            inherited_settlement,
         );
     }
+}
+fn apply_cancel_then_retire(shared: &Shared, request: &Request, retire: impl FnOnce(Option<u64>)) {
+    let epoch = {
+        let mut state = shared.borrow_mut();
+        state.version.applied(request);
+        state.empty_range.as_ref().map(|_| state.epoch)
+    };
+    retire(epoch);
 }
 fn reply(
     shared: &Shared,
@@ -453,7 +511,7 @@ fn reply(
     code: &str,
     mutation: Mutation,
 ) {
-    reply_outcome(shared, r, connection, applied, code, mutation, None);
+    send_reply(shared, r, connection, applied, code, mutation, None);
 }
 fn reply_outcome(
     shared: &Shared,
@@ -476,6 +534,22 @@ fn reply_outcome(
             && p.capability == r.capability
     }) {
         s.pending = None;
+    }
+    drop(s);
+    send_reply(shared, r, connection, applied, code, mutation, settlement);
+}
+fn send_reply(
+    shared: &Shared,
+    r: &Request,
+    connection: u64,
+    applied: bool,
+    code: &str,
+    mutation: Mutation,
+    settlement: Option<Settlement>,
+) {
+    let s = shared.borrow();
+    if !s.connected || s.connection != connection || s.capability.as_ref() != Some(&r.capability) {
+        return;
     }
     if let Some(pipe) = s.pipe.as_ref() {
         let reply = Reply {
@@ -590,6 +664,7 @@ fn schedule(
     shared: &Shared,
     r: &Request,
     connection: u64,
+    inherited_settlement: Option<Settlement>,
 ) -> Result<(), (&'static str, windows::core::Error)> {
     unsafe {
         let (manager, client, generation) = {
@@ -628,10 +703,12 @@ fn schedule(
         .into();
         shared.borrow_mut().pending = Some(Pending {
             operation: r.operation,
+            revision: r.revision,
             task: r.task.clone(),
             turn: r.turn,
             connection,
             capability: r.capability.clone(),
+            settlement: inherited_settlement,
         });
         let session = context
             .RequestEditSession(client, &edit, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE)
@@ -680,6 +757,7 @@ fn release_composition_with_failure(
         s.own_change = None;
         s.empty_range = None;
         s.native_position = None;
+        s.pending_native_position = None;
         s.key_failure = semantic_failed;
         (
             s.context.take(),
@@ -688,10 +766,51 @@ fn release_composition_with_failure(
             s.backup.take(),
             s.selection.take(),
             s.text.take(),
+            s.prefix_continuation.take(),
+            s.pending
+                .as_ref()
+                .filter(|p| {
+                    p.settlement
+                        .is_some_and(|progress| progress.prefix_operation == p.operation)
+                })
+                .cloned(),
         )
     };
+    // Settle must terminate when editing retires its gap, even if its queued
+    // tail has not started. Send before COM cleanup can admit another task.
+    if let Some(pending) = &old.7 {
+        reply_interrupted_prefix(shared, pending);
+    }
     unwatch(old.0.as_ref(), old.1);
     drop(old);
+}
+fn reply_interrupted_prefix(shared: &Shared, pending: &Pending) {
+    let request = Request {
+        protocol: PROTOCOL,
+        capability: pending.capability.clone(),
+        task: pending.task.clone(),
+        turn: pending.turn,
+        operation: pending.operation,
+        revision: pending.revision,
+        deadline_tick: unsafe { GetTickCount64() },
+        action: Action::Handoff,
+        text: String::new(),
+        prefix: None,
+    };
+    let progress = pending.settlement;
+    reply_outcome(
+        shared,
+        &request,
+        pending.connection,
+        false,
+        "compositionInterrupted",
+        if progress.is_some_and(|s| s.prefix == Mutation::Uncertain) {
+            Mutation::Uncertain
+        } else {
+            Mutation::Changed
+        },
+        progress,
+    );
 }
 /// Retire only the captured range. Semantic conversion has a separate guarded authority;
 /// it never searches a new target or restores a backup over user changes.
@@ -1410,6 +1529,33 @@ impl ITfEditSession_Impl for Edit_Impl {
                     &mut settlement,
                 )
             });
+        if result.is_ok()
+            && self.request.action == Action::Settle
+            && settlement.is_some_and(|s| s.prefix == Mutation::Changed && !s.tail_owned)
+        {
+            if let Err(error) = defer_prefix(
+                &self.state,
+                &self.context,
+                &self.request,
+                self.generation,
+                self.connection,
+            ) {
+                complete(
+                    &self.state,
+                    &self.request,
+                    self.connection,
+                    false,
+                    &format!("settleQueue:{:08x}", error.code().0 as u32),
+                    mutation,
+                    settlement,
+                );
+                if self.state.borrow().generation == self.generation {
+                    end_owned(&self.state);
+                }
+                return Err(error);
+            }
+            return Ok(());
+        }
         match &result {
             Ok(()) => complete(
                 &self.state,
@@ -1439,6 +1585,282 @@ impl ITfEditSession_Impl for Edit_Impl {
         result
     }
 }
+fn defer_prefix(
+    shared: &Shared,
+    context: &ITfContext,
+    request: &Request,
+    generation: u64,
+    connection: u64,
+) -> windows::core::Result<()> {
+    let epoch = shared.borrow().epoch;
+    edit_identity(shared, request, generation, epoch)?;
+    let id = next_generation();
+    let continuation = PrefixContinuation {
+        id,
+        request: request.clone(),
+        context: context.clone(),
+        generation,
+        connection,
+        _lease: Lease::new(),
+    };
+    edit_identity(shared, request, generation, epoch)?;
+    let window = {
+        let mut state = shared.borrow_mut();
+        if state.prefix_continuation.is_some()
+            || state.empty_range.is_none()
+            || !state.pending.as_ref().is_some_and(|p| {
+                p.task == request.task
+                    && p.turn == request.turn
+                    && p.operation == request.operation
+                    && p.connection == connection
+                    && p.capability == request.capability
+            })
+        {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        state.prefix_continuation = Some(continuation);
+        state.window
+    };
+    unsafe {
+        PostMessageW(
+            Some(HWND(window as *mut _)),
+            RESUME_PREFIX,
+            WPARAM(id as usize),
+            LPARAM(0),
+        )?;
+    }
+    Ok(())
+}
+fn resume_prefix(shared: &Shared, id: u64) {
+    let readiness = prefix_insertion_ready(shared, id);
+    if matches!(readiness, Ok(false)) {
+        return;
+    }
+    let continuation = {
+        let mut state = shared.borrow_mut();
+        if state
+            .prefix_continuation
+            .as_ref()
+            .is_none_or(|job| job.id != id)
+        {
+            return;
+        }
+        state.prefix_continuation.take().unwrap()
+    };
+    let result = (|| unsafe {
+        readiness?;
+        lease(
+            shared,
+            &continuation.request,
+            continuation.generation,
+            &continuation.context,
+        )?;
+        let client = shared.borrow().client;
+        let edit: ITfEditSession = PrefixTailEdit {
+            state: shared.clone(),
+            request: continuation.request.clone(),
+            context: continuation.context.clone(),
+            generation: continuation.generation,
+            connection: continuation.connection,
+            _lease: Lease::new(),
+        }
+        .into();
+        // Force a distinct write transaction; ASYNCDONTCARE can run immediately
+        // inside provider reentrancy and batch composition end with tail start.
+        continuation
+            .context
+            .RequestEditSession(client, &edit, TF_ES_ASYNC | TF_ES_READWRITE)?
+            .ok()
+    })();
+    if let Err(error) = result {
+        complete(
+            shared,
+            &continuation.request,
+            continuation.connection,
+            false,
+            &format!("settleTailQueue:{:08x}", error.code().0 as u32),
+            Mutation::Changed,
+            Some(Settlement {
+                prefix_operation: continuation.request.operation,
+                prefix: Mutation::Changed,
+                tail_owned: false,
+            }),
+        );
+        if shared.borrow().generation == continuation.generation {
+            end_owned(shared);
+        }
+    }
+}
+fn prefix_insertion_ready(shared: &Shared, id: u64) -> windows::core::Result<bool> {
+    let (generation, deadline, proof, before) = {
+        let state = shared.borrow();
+        let Some(job) = state
+            .prefix_continuation
+            .as_ref()
+            .filter(|job| job.id == id)
+        else {
+            return Ok(false);
+        };
+        (
+            job.generation,
+            job.request.deadline_tick,
+            state.native_position,
+            state.pending_native_position,
+        )
+    };
+    if deadline < unsafe { GetTickCount64() } {
+        return Err(failure(TF_E_DISCONNECTED));
+    }
+    let ready = if let Some(proof) = proof {
+        let actual = edit_selection(HWND(proof.window as *mut _));
+        #[cfg(feature = "acceptance")]
+        eprintln!(
+            "prefix readiness actual={:?} expected={} before={:?} remaining_ms={}",
+            actual,
+            proof.offset,
+            before.map(|p| p.offset),
+            deadline.saturating_sub(unsafe { GetTickCount64() })
+        );
+        if actual == (proof.offset, proof.offset) {
+            true
+        } else if before.is_some_and(|before| {
+            before.window == proof.window
+                && (actual == (before.offset, before.end)
+                    || actual == (before.offset, before.offset))
+        }) {
+            false
+        } else {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+    } else {
+        true
+    };
+    let state = shared.borrow();
+    if !state.active
+        || !state.version.owned
+        || state.generation != generation
+        || state
+            .prefix_continuation
+            .as_ref()
+            .is_none_or(|job| job.id != id)
+    {
+        return Ok(false);
+    }
+    Ok(ready)
+}
+#[implement(ITfEditSession)]
+struct PrefixTailEdit {
+    state: Shared,
+    request: Request,
+    context: ITfContext,
+    generation: u64,
+    connection: u64,
+    _lease: Lease,
+}
+impl ITfEditSession_Impl for PrefixTailEdit_Impl {
+    fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        let mut mutation = Mutation::NotAttempted;
+        let mut phase = "settleTailLease";
+        let tail = Request {
+            action: Action::Update,
+            prefix: None,
+            ..self.request.clone()
+        };
+        let result =
+            lease(&self.state, &self.request, self.generation, &self.context).and_then(|()| {
+                if self.request.text.is_empty() {
+                    return seal_empty_prefix(
+                        &self.state,
+                        &self.context,
+                        &self.request,
+                        self.generation,
+                        ec,
+                    );
+                }
+                apply(
+                    &self.state,
+                    &self.context,
+                    &tail,
+                    self.generation,
+                    ec,
+                    &mut mutation,
+                    &mut phase,
+                    &mut None,
+                )
+            });
+        complete(
+            &self.state,
+            &self.request,
+            self.connection,
+            result.is_ok(),
+            &result
+                .as_ref()
+                .err()
+                .map(|e| format!("edit:{phase}:{:08x}", e.code().0 as u32))
+                .unwrap_or_else(|| "applied".into()),
+            if mutation == Mutation::Uncertain {
+                Mutation::Uncertain
+            } else {
+                Mutation::Changed
+            },
+            Some(Settlement {
+                prefix_operation: self.request.operation,
+                prefix: Mutation::Changed,
+                tail_owned: result.is_ok(),
+            }),
+        );
+        if result.is_err() && self.state.borrow().generation == self.generation {
+            end_owned(&self.state);
+        }
+        result
+    }
+}
+fn seal_empty_prefix(
+    shared: &Shared,
+    context: &ITfContext,
+    request: &Request,
+    generation: u64,
+    ec: u32,
+) -> windows::core::Result<()> {
+    let (epoch, selected, range, proof) = {
+        let state = shared.borrow();
+        if state.composition.is_some() {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        (
+            state.epoch,
+            state
+                .selection
+                .clone()
+                .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
+            state
+                .empty_range
+                .clone()
+                .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
+            state.native_position,
+        )
+    };
+    edit_identity(shared, request, generation, epoch)?;
+    let current = selection(context, ec)?;
+    if !range_text(&range, ec)?.is_empty()
+        || unsafe {
+            current.CompareStart(ec, &selected, TF_ANCHOR_START)? != 0
+                || current.CompareEnd(ec, &selected, TF_ANCHOR_END)? != 0
+        }
+    {
+        return Err(failure(TF_E_DISCONNECTED));
+    }
+    if let Some(proof) = proof
+        && edit_selection(HWND(proof.window as *mut _)) != (proof.offset, proof.offset)
+    {
+        return Err(failure(TF_E_DISCONNECTED));
+    }
+    edit_identity(shared, request, generation, epoch)?;
+    let mut state = shared.borrow_mut();
+    state.version.applied(request);
+    state.pending_native_position = None;
+    Ok(())
+}
 fn complete(
     shared: &Shared,
     r: &Request,
@@ -1456,6 +1878,8 @@ fn complete(
             && p.capability == r.capability
     });
     if current {
+        let settlement =
+            settlement.or_else(|| shared.borrow().pending.as_ref().and_then(|p| p.settlement));
         reply_outcome(shared, r, connection, applied, code, mutation, settlement);
     }
 }
@@ -1535,7 +1959,7 @@ fn settle_prefix(
     context: &ITfContext,
     composition: &ITfComposition,
     range: &ITfRange,
-    r: &Request,
+    request: &Request,
     generation: u64,
     epoch: u64,
     ec: u32,
@@ -1544,143 +1968,154 @@ fn settle_prefix(
     outcome: &mut Settlement,
 ) -> windows::core::Result<()> {
     unsafe {
-        let prefix = r.prefix.as_ref().ok_or_else(|| failure(E_INVALIDARG))?;
         *phase = "settleIdentity";
+        let prefix = request
+            .prefix
+            .as_ref()
+            .ok_or_else(|| failure(E_INVALIDARG))?;
+        outcome.prefix_operation = request.operation;
         if prefix.range_epoch != epoch
-            || shared.borrow().version.revision != prefix.expected_revision
+            || prefix.expected_revision != shared.borrow().version.revision
         {
             return Err(failure(TF_E_DISCONNECTED));
         }
-        lease(shared, r, generation, context)?;
-        let committed = CompositionText::new(&prefix.text).commit_text();
-        let tail = CompositionText::new(&r.text);
-        let combined = format!("{committed}{}", tail.marked);
-        *phase = "settleText";
-        *mutation = Mutation::Uncertain;
-        range.SetText(
+        lease(shared, request, generation, context)?;
+        // A whole composition boundary materializes paragraphs before continuing
+        // text. Partial anchor movement can leave breaks behind the live tail in
+        // rich document owners. The logical operation remains a single Settle.
+        write_composing(
+            shared,
+            context,
+            range,
+            request,
+            generation,
+            epoch,
             ec,
-            TF_ST_CORRECTION,
-            &combined.encode_utf16().collect::<Vec<_>>(),
+            mutation,
+            phase,
+            &prefix.text,
+            false,
         )?;
-        *mutation = Mutation::Changed;
-        edit_identity(shared, r, generation, epoch)?;
-        preserve_attributes(shared, context, range, r, generation, epoch, ec)?;
-        *phase = "settleReadback";
-        let actual = range_text(range, ec)?;
-        edit_identity(shared, r, generation, epoch)?;
-        let written = range.Clone()?;
-        edit_identity(shared, r, generation, epoch)?;
-        #[cfg(feature = "acceptance")]
-        eprintln!(
-            "prefix readback expected_units={} actual_units={} prefix_units={} matched={}",
-            combined.encode_utf16().count(),
-            actual.encode_utf16().count(),
-            committed.encode_utf16().count(),
-            crate::prefix::boundary(&actual, &committed).is_some()
-        );
-        let (bytes, units) = crate::prefix::boundary(&actual, &committed)
-            .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
-        if !tail.matches_marked(&actual[bytes..]) {
-            *phase = "settleTailReadback";
-            return Err(failure(TF_E_DISCONNECTED));
-        }
-        let boundary = range.Clone()?;
-        edit_identity(shared, r, generation, epoch)?;
-        let mut shifted = 0;
-        boundary.ShiftStart(ec, units, &mut shifted, std::ptr::null())?;
-        edit_identity(shared, r, generation, epoch)?;
-        if shifted != units {
-            return Err(failure(TF_E_DISCONNECTED));
-        }
-        boundary.Collapse(ec, TF_ANCHOR_START)?;
-        edit_identity(shared, r, generation, epoch)?;
-        *phase = "settlePrefix";
-        // From this point prefix submission may be irreversible. Reentrant
-        // Abort must never restore the original selection into the remaining tail.
-        let retired_backup = { shared.borrow_mut().backup.take() };
-        drop(retired_backup);
-        edit_identity(shared, r, generation, epoch)?;
-        outcome.prefix = Mutation::Uncertain;
-        let remaining = if r.text.is_empty() {
-            // An empty composition is terminated by IMM providers. End it
-            // intentionally and retain only a guarded empty insertion lease.
-            let empty = range.Clone()?;
-            empty.Collapse(ec, TF_ANCHOR_END)?;
-            edit_identity(shared, r, generation, epoch)?;
-            composition.EndComposition(ec)?;
-            empty
-        } else {
-            composition.ShiftStart(ec, &boundary)?;
-            composition.GetRange()?
-        };
-        outcome.prefix = Mutation::Changed;
-        #[cfg(feature = "acceptance")]
-        settle_checkpoint(shared, r)?;
-        edit_identity(shared, r, generation, epoch)?;
-        *phase = "settleTail";
-        edit_identity(shared, r, generation, epoch)?;
-        let actual_tail = range_text(&remaining, ec)?;
-        edit_identity(shared, r, generation, epoch)?;
-        if !tail.matches_marked(&actual_tail) {
-            return Err(failure(TF_E_DISCONNECTED));
-        }
-        // The remaining tail is generated text; cancellation erases only this
-        // owned range. Never restore an old selection across committed text.
-        let caret = remaining.Clone()?;
+        *phase = "settleMaterialize";
+        materialize(
+            shared,
+            context,
+            composition,
+            epoch,
+            ec,
+            &|| edit_identity(shared, request, generation, epoch),
+            false,
+            mutation,
+        )?;
+        let written = composition.GetRange()?.Clone()?;
+        edit_identity(shared, request, generation, epoch)?;
+        let receipt_text = range_text(&written, ec)?;
+        edit_identity(shared, request, generation, epoch)?;
+        let caret = written.Clone()?;
         caret.Collapse(ec, TF_ANCHOR_END)?;
-        edit_identity(shared, r, generation, epoch)?;
-        let mut selected = TF_SELECTION {
-            range: ManuallyDrop::new(Some(caret)),
+        edit_identity(shared, request, generation, epoch)?;
+        let retired = { shared.borrow_mut().backup.take() };
+        drop(retired);
+        edit_identity(shared, request, generation, epoch)?;
+        *phase = "settlePrefix";
+        outcome.prefix = Mutation::Uncertain;
+        note_prefix_progress(shared, request, generation, epoch, outcome.prefix)?;
+        composition.EndComposition(ec)?;
+        outcome.prefix = Mutation::Changed;
+        note_prefix_progress(shared, request, generation, epoch, outcome.prefix)?;
+        edit_identity(shared, request, generation, epoch)?;
+        // Ending an IMM composition can restore the control's pre-composition
+        // caret. Reaffirm the captured end range after EndComposition, without
+        // changing foreground or discovering a different insertion position.
+        let mut at_end = TF_SELECTION {
+            range: ManuallyDrop::new(Some(caret.clone())),
             style: TF_SELECTIONSTYLE {
                 ase: TF_AE_NONE,
                 fInterimChar: false.into(),
             },
         };
-        let result = context.SetSelection(ec, std::slice::from_ref(&selected));
-        ManuallyDrop::drop(&mut selected.range);
+        let result = context.SetSelection(ec, std::slice::from_ref(&at_end));
+        ManuallyDrop::drop(&mut at_end.range);
         result?;
-        edit_identity(shared, r, generation, epoch)?;
+        edit_identity(shared, request, generation, epoch)?;
+        // Keep a guarded insertion lease while the owner consumes composition
+        // end. A queued, forced-async edit starts the new tail after this lock.
         let selected = selection(context, ec)?;
-        edit_identity(shared, r, generation, epoch)?;
-        // An IMM-backed provider can rebase ranges after prefix materialization.
-        // Bind the receipt to its post-operation range representation, not to
-        // the earlier combined buffer, and still require the current tail/caret.
-        let receipt_text = range_text(&written, ec)?;
-        edit_identity(shared, r, generation, epoch)?;
+        edit_identity(shared, request, generation, epoch)?;
+        if selected.CompareStart(ec, &caret, TF_ANCHOR_START)? != 0
+            || selected.CompareEnd(ec, &caret, TF_ANCHOR_END)? != 0
+        {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        edit_identity(shared, request, generation, epoch)?;
         let mut state = shared.borrow_mut();
-        state.expected = actual_tail;
-        state.text = (!r.text.is_empty()).then_some(tail);
-        state.backup = Some(Rollback::GeneratedTail);
+        state.empty_range = Some(caret);
+        state.expected.clear();
+        state.text = None;
         state.selection = Some(selected);
-        state.version.applied(r);
+        state.backup = Some(Rollback::GeneratedTail);
+        state.materialize_allowed = false;
+        let retired = state.composition.take();
+        state.pending_native_position = state.native_position;
         if let Some(position) = &mut state.native_position {
             position.offset = position
                 .offset
-                .checked_add(committed.replace('\n', "\r\n").encode_utf16().count() as u32)
+                .checked_add(
+                    prefix
+                        .text
+                        .replace("\r\n", "\n")
+                        .replace('\r', "\n")
+                        .replace('\n', "\r\n")
+                        .encode_utf16()
+                        .count() as u32,
+                )
                 .ok_or_else(|| failure(E_INVALIDARG))?;
+            position.end = position.offset;
         }
-        let retired = if r.text.is_empty() {
-            state.empty_range = Some(remaining);
-
-            state.materialize_allowed = false;
-            state.composition.take()
-        } else {
-            None
-        };
+        // Keep the old write revision until the complete logical operation has
+        // applied its tail. This receipt covers only the prefix transaction.
         state.own_change = Some(OwnChange {
             epoch,
             generation,
-            revision: r.revision,
+            revision: state.version.revision,
             range: written,
             expected: receipt_text,
         });
-        outcome.tail_owned = true;
         drop(state);
         drop(retired);
+        #[cfg(feature = "acceptance")]
+        settle_checkpoint(shared, request)?;
+        edit_identity(shared, request, generation, epoch)?;
         Ok(())
     }
 }
 
+fn note_prefix_progress(
+    shared: &Shared,
+    request: &Request,
+    generation: u64,
+    epoch: u64,
+    mutation: Mutation,
+) -> windows::core::Result<()> {
+    edit_identity(shared, request, generation, epoch)?;
+    let mut state = shared.borrow_mut();
+    let pending = state
+        .pending
+        .as_mut()
+        .filter(|p| {
+            p.operation == request.operation
+                && p.task == request.task
+                && p.turn == request.turn
+                && p.capability == request.capability
+        })
+        .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
+    pending.settlement = Some(Settlement {
+        prefix_operation: request.operation,
+        prefix: mutation,
+        tail_owned: false,
+    });
+    Ok(())
+}
 #[allow(clippy::too_many_arguments)]
 fn preserve_attributes(
     shared: &Shared,
@@ -1905,7 +2340,7 @@ fn apply(
             )
         };
         *phase = "range";
-        let range = match &composition {
+        let mut range = match &composition {
             Some(composition) => composition.GetRange()?,
             None => empty_range.ok_or_else(|| failure(TF_E_DISCONNECTED))?,
         };
@@ -1930,6 +2365,11 @@ fn apply(
             let proof = { shared.borrow().native_position };
             if let Some(proof) = proof {
                 let actual = edit_selection(HWND(proof.window as *mut _));
+                #[cfg(feature = "acceptance")]
+                eprintln!(
+                    "ordered gap selection expected={} actual_start={} actual_end={}",
+                    proof.offset, actual.0, actual.1
+                );
                 edit_identity(shared, r, generation, epoch)?;
                 if actual != (proof.offset, proof.offset) {
                     return Err(failure(TF_E_DISCONNECTED));
@@ -1958,10 +2398,13 @@ fn apply(
                 let mut state = shared.borrow_mut();
                 state.composition = Some(next.clone());
                 state.empty_range = None;
+                state.pending_native_position = None;
 
                 state.materialize_allowed = true;
             }
             composition = Some(next);
+            range = composition.as_ref().unwrap().GetRange()?;
+            edit_identity(shared, r, generation, epoch)?;
         }
         let composition = composition.ok_or_else(|| failure(TF_E_DISCONNECTED))?;
         match r.action {
@@ -2084,6 +2527,11 @@ fn settle_checkpoint(shared: &Shared, request: &Request) -> windows::core::Resul
             Ok(())
         }
         2 => Err(failure(E_FAIL)),
+        3 => {
+            let ended = end_owned_with_flags(shared, TF_ES_SYNC);
+            shared.borrow_mut().key_handoff = ended;
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -2153,6 +2601,223 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancel_version_precedes_reentrant_range_retirement() {
+        let old = uuid::Uuid::new_v4().to_string();
+        let newer = uuid::Uuid::new_v4().to_string();
+        let request = Request {
+            protocol: PROTOCOL,
+            capability: uuid::Uuid::new_v4().to_string(),
+            task: old.clone(),
+            turn: 1,
+            operation: 4,
+            revision: 2,
+            deadline_tick: 1000,
+            action: Action::Abort,
+            text: String::new(),
+            prefix: None,
+        };
+        let shared = Rc::new(RefCell::new(State::default()));
+        apply_cancel_then_retire(&shared, &request, |_| {
+            assert_eq!(shared.borrow().version.task, old);
+            assert_eq!(shared.borrow().version.operation, 4);
+            // UnadviseSink/range Release can reenter and establish a new task.
+            let mut state = shared.borrow_mut();
+            state.epoch = 9;
+            state.version = DraftVersion {
+                task: newer.clone(),
+                turn: 1,
+                operation: 1,
+                revision: 0,
+                owned: true,
+            };
+        });
+        let state = shared.borrow();
+        assert_eq!(state.epoch, 9);
+        assert_eq!(state.version.task, newer);
+        assert_eq!(
+            (
+                state.version.operation,
+                state.version.revision,
+                state.version.owned
+            ),
+            (1, 0, true)
+        );
+    }
+    #[test]
+    fn duplicate_rejections_cannot_retire_an_in_flight_prefix() {
+        let server = Pipe::server().unwrap();
+        let client = Pipe::client(std::process::id(), unsafe {
+            windows::Win32::System::Threading::GetCurrentThreadId()
+        })
+        .unwrap();
+        assert!(server.connect());
+        let request = Request {
+            protocol: PROTOCOL,
+            task: uuid::Uuid::new_v4().to_string(),
+            capability: uuid::Uuid::new_v4().to_string(),
+            turn: 1,
+            operation: 3,
+            revision: 2,
+            deadline_tick: unsafe { GetTickCount64() } + 1000,
+            action: Action::Settle,
+            text: "tail".into(),
+            prefix: Some(crate::wire::Prefix {
+                text: "prefix".into(),
+                expected_revision: 1,
+                range_epoch: 7,
+            }),
+        };
+        let shared = Rc::new(RefCell::new(State {
+            connected: true,
+            connection: 17,
+            pipe: Some(server),
+            capability: Some(request.capability.clone()),
+            version: DraftVersion {
+                task: request.task.clone(),
+                turn: 1,
+                operation: 2,
+                revision: 1,
+                owned: true,
+            },
+            pending: Some(Pending {
+                task: request.task.clone(),
+                turn: 1,
+                operation: 3,
+                revision: 2,
+                connection: 17,
+                capability: request.capability.clone(),
+                settlement: Some(Settlement {
+                    prefix_operation: 3,
+                    prefix: Mutation::Changed,
+                    tail_owned: false,
+                }),
+            }),
+            ..Default::default()
+        }));
+        for action in [Action::Settle, Action::Inspect] {
+            let duplicate = Request {
+                action,
+                prefix: if action == Action::Inspect {
+                    None
+                } else {
+                    request.prefix.clone()
+                },
+                text: if action == Action::Inspect {
+                    String::new()
+                } else {
+                    request.text.clone()
+                },
+                ..request.clone()
+            };
+            assert!(duplicate.valid());
+            dispatch(&shared, duplicate, 17);
+            let frame = client.receive().unwrap().unwrap();
+            let answer: Reply = serde_json::from_slice(&frame).unwrap();
+            assert!(!answer.applied);
+            assert!(
+                shared
+                    .borrow()
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.operation == 3)
+            );
+            assert_eq!(shared.borrow().version.revision, 1);
+        }
+        reply_outcome(
+            &shared,
+            &request,
+            17,
+            true,
+            "applied",
+            Mutation::Changed,
+            Some(Settlement {
+                prefix_operation: 3,
+                prefix: Mutation::Changed,
+                tail_owned: true,
+            }),
+        );
+        let frame = client.receive().unwrap().unwrap();
+        let answer: Reply = serde_json::from_slice(&frame).unwrap();
+        assert!(answer.applied);
+        assert!(shared.borrow().pending.is_none());
+        assert!(client.receive().unwrap().is_none());
+    }
+    #[test]
+    fn abort_rejections_keep_the_exact_in_flight_prefix_progress() {
+        for key_failure in [false, true] {
+            let server = Pipe::server().unwrap();
+            let client = Pipe::client(std::process::id(), unsafe {
+                windows::Win32::System::Threading::GetCurrentThreadId()
+            })
+            .unwrap();
+            assert!(server.connect());
+            let task = uuid::Uuid::new_v4().to_string();
+            let capability = uuid::Uuid::new_v4().to_string();
+            let shared = Rc::new(RefCell::new(State {
+                active: true,
+                connected: true,
+                connection: 17,
+                pipe: Some(server),
+                capability: Some(capability.clone()),
+                key_failure,
+                composition: Some(TestComposition { refuse_end: false }.into()),
+                version: DraftVersion {
+                    task: task.clone(),
+                    turn: 1,
+                    operation: 2,
+                    revision: 1,
+                    owned: true,
+                },
+                pending: Some(Pending {
+                    task: task.clone(),
+                    turn: 1,
+                    operation: 3,
+                    revision: 2,
+                    connection: 17,
+                    capability: capability.clone(),
+                    settlement: Some(Settlement {
+                        prefix_operation: 3,
+                        prefix: Mutation::Changed,
+                        tail_owned: false,
+                    }),
+                }),
+                ..Default::default()
+            }));
+            dispatch(
+                &shared,
+                Request {
+                    protocol: PROTOCOL,
+                    task,
+                    capability,
+                    turn: 1,
+                    operation: 4,
+                    revision: 2,
+                    deadline_tick: unsafe { GetTickCount64() } + 1000,
+                    action: Action::Abort,
+                    text: String::new(),
+                    prefix: None,
+                },
+                17,
+            );
+            let frame = client
+                .receive()
+                .unwrap()
+                .expect("Abort failure must terminate its request");
+            let reply: Reply = serde_json::from_slice(&frame).unwrap();
+            assert!(!reply.applied);
+            assert_eq!(reply.operation, 4);
+            assert_eq!(reply.mutation, Mutation::NotAttempted);
+            assert!(reply.settlement.is_some_and(|s| s.prefix_operation == 3
+                && s.prefix == Mutation::Changed
+                && !s.tail_owned));
+            if key_failure {
+                assert_eq!(reply.code, "keyboardHandoffFailed");
+            } else {
+                assert!(reply.code.starts_with("editManager:"));
+            }
+        }
+    }
     #[test]
     fn old_edit_notice_cannot_own_a_new_write_on_the_same_range() {
         let mut state = State {
@@ -2430,10 +3095,12 @@ mod tests {
             capability: Some(capability.clone()),
             pending: Some(Pending {
                 operation: 1,
+                revision: 0,
                 task: task.clone(),
                 turn: 1,
                 connection: 42,
                 capability,
+                settlement: None,
             }),
             ..Default::default()
         }));

@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_FRAME: usize = 128 * 1024;
 pub const MAX_TEXT_UTF16: usize = 16 * 1024;
-// v5 settles a processed prefix without changing source offsets or ending the
-// logical draft. The remaining tail can be an owned empty insertion lease.
+// v7 requires a non-separator prefix boundary and reports the exact
+// origin operation of a committed prefix, including cancellation/interruption.
 // A registered upgrade is insufficient: the target must be running this version.
-pub const PROTOCOL: u32 = 5;
+pub const PROTOCOL: u32 = 7;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Runtime {
@@ -63,6 +63,8 @@ pub struct Reply {
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 pub struct Settlement {
+    #[serde(default)]
+    pub prefix_operation: u64,
     pub prefix: Mutation,
     /// The tail's logical write lease remains valid, including an empty tail.
     /// This is not independent confirmation of target rendering.
@@ -107,6 +109,13 @@ impl Request {
                 (Action::Settle, None) => false,
                 (_, prefix) => prefix.is_none(),
             }
+    }
+    /// Separate capability rejection from malformed wire data: rejecting this
+    /// boundary keeps the existing draft and authenticated connection intact.
+    pub fn safe_prefix_boundary(&self) -> bool {
+        self.prefix
+            .as_ref()
+            .is_none_or(|prefix| !prefix.text.ends_with(['\r', '\n']))
     }
     pub fn live(&self, now: u64) -> bool {
         self.deadline_tick >= now && self.deadline_tick - now <= 2000
@@ -313,5 +322,20 @@ mod tests {
         assert!(r.live(3000));
         assert!(!r.live(3001));
         assert!(!r.live(999));
+    }
+    #[test]
+    fn prefix_boundaries_reject_trailing_paragraphs_before_input() {
+        let mut value = request(Action::Settle, 2, 1);
+        value.prefix = Some(Prefix {
+            text: "正文\r\n".into(),
+            expected_revision: 0,
+            range_epoch: 1,
+        });
+        assert!(value.valid());
+        assert!(!value.safe_prefix_boundary());
+        value.prefix.as_mut().unwrap().text = "\n正文🙂".into();
+        assert!(value.safe_prefix_boundary());
+        value.prefix.as_mut().unwrap().text = "\n".into();
+        assert!(!value.safe_prefix_boundary());
     }
 }
