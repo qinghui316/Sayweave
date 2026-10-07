@@ -90,8 +90,10 @@ it('protects unsaved retention and preserves a concurrent microphone selection o
  const speech=new BrowserSpeech();let guard:DepartureGuard|null=null;render(<SaveSettings speech={speech} onGuardChange={v=>{guard=v;}}/>);
  const select=await screen.findByRole('combobox',{name:'录音保留时间'});fireEvent.change(select,{target:{value:'7'}});
  const leave=vi.fn();act(()=>guard!(leave));expect(leave).not.toHaveBeenCalled();fireEvent.click(screen.getByRole('button',{name:'继续填写'}));expect(select).toHaveValue('7');
- speech.settings={...speech.settings,deviceId:'new-device',revision:2};fireEvent.click(screen.getByRole('button',{name:'保存设置'}));
+ const dirtyGuard=guard;speech.settings={...speech.settings,deviceId:'new-device',revision:2};fireEvent.click(screen.getByRole('button',{name:'保存设置'}));
  await screen.findByText('已保存，下一次录音生效。');expect(speech.settings).toMatchObject({deviceId:'new-device',retentionDays:7,revision:3});
+ // onGuardChange is an effect contract; observe its rebind before invoking it.
+ await waitFor(()=>{expect(guard).not.toBeNull();expect(guard).not.toBe(dirtyGuard);});
  act(()=>guard!(leave));expect(leave).toHaveBeenCalledOnce();
 });
 it('can retry unavailable save settings without leaving the history page',async()=>{

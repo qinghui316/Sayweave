@@ -14,3 +14,15 @@ window.fixtureEditor={
  read(){return view.state.doc.textBetween(0,view.state.doc.content.size,'\n');},
  inspect(){const selection=getSelection();return {html:view.dom.innerHTML,selection:{from:view.state.selection.from,to:view.state.selection.to},domSelection:selection?{anchor:{parent:selection.anchorNode?.parentElement?.tagName,offset:selection.anchorOffset,text:selection.anchorNode?.textContent},focus:{parent:selection.focusNode?.parentElement?.tagName,offset:selection.focusOffset,text:selection.focusNode?.textContent}}:null,document:view.state.doc.toJSON()};},
 };
+
+// A second real view permits inline hard breaks, as full rich editors commonly
+// do. Read semantic leaf breaks explicitly rather than losing them in textBetween.
+const inlineSchema=new Schema({nodes:{doc:{content:'paragraph+'},paragraph:{content:'inline*',group:'block',parseDOM:[{tag:'p'}],toDOM:()=>['p',0]},text:{group:'inline'},hard_break:{inline:true,group:'inline',selectable:false,parseDOM:[{tag:'br'}],toDOM:()=>['br']}}});
+const inlineHost=document.createElement('div');inlineHost.id='prosemirror-inline';document.body.append(inlineHost);
+const inlineView=new EditorView(inlineHost,{state:EditorState.create({schema:inlineSchema})});
+declare global {interface Window {fixtureInlineEditor:Window['fixtureEditor']}}
+window.fixtureInlineEditor={
+ set(text,start,end){const doc=inlineSchema.node('doc',null,[inlineSchema.node('paragraph',null,text?inlineSchema.text(text):undefined)]);inlineView.updateState(EditorState.create({schema:inlineSchema,doc,selection:TextSelection.create(doc,start+1,end+1)}));inlineView.focus();},
+ read(){return inlineView.state.doc.textBetween(0,inlineView.state.doc.content.size,'\n',node=>node.type.name==='hard_break'?'\n':'');},
+ inspect(){const selection=getSelection();return {html:inlineView.dom.innerHTML,selection:{from:inlineView.state.selection.from,to:inlineView.state.selection.to},domSelection:selection?{anchor:{parent:selection.anchorNode?.parentElement?.tagName,offset:selection.anchorOffset,text:selection.anchorNode?.textContent},focus:{parent:selection.focusNode?.parentElement?.tagName,offset:selection.focusOffset,text:selection.focusNode?.textContent}}:null,document:inlineView.state.doc.toJSON()};},
+};

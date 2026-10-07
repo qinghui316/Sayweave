@@ -63,15 +63,6 @@ struct Pending {
     capability: String,
     settlement: Option<Settlement>,
 }
-const RESUME_PREFIX: u32 = WM_APP + 42;
-struct PrefixContinuation {
-    id: u64,
-    request: Request,
-    context: ITfContext,
-    generation: u64,
-    connection: u64,
-    _lease: Lease,
-}
 #[derive(Default)]
 struct State {
     manager: Option<ITfThreadMgr>,
@@ -85,7 +76,6 @@ struct State {
     active: bool,
     generation: u64,
     pending: Option<Pending>,
-    prefix_continuation: Option<PrefixContinuation>,
     epoch: u64,
     own_change: Option<OwnChange>,
     cleanup: bool,
@@ -98,7 +88,6 @@ struct State {
     // dummy character and no live TSF composition until the next actual update.
     empty_range: Option<ITfRange>,
     native_position: Option<NativeEditPosition>,
-    pending_native_position: Option<NativeEditPosition>,
     backup: Option<Rollback>,
     expected: String,
     text: Option<CompositionText>,
@@ -275,20 +264,6 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, w: WPARAM, l: LP
         if !data.is_null() {
             if message == WM_TIMER {
                 poll(&*data);
-                let continuation = {
-                    (&*data)
-                        .borrow()
-                        .prefix_continuation
-                        .as_ref()
-                        .map(|job| job.id)
-                };
-                if let Some(id) = continuation {
-                    resume_prefix(&*data, id);
-                }
-                return LRESULT(0);
-            }
-            if message == RESUME_PREFIX {
-                resume_prefix(&*data, w.0 as u64);
                 return LRESULT(0);
             }
             if message == WM_NCDESTROY {
@@ -757,7 +732,6 @@ fn release_composition_with_failure(
         s.own_change = None;
         s.empty_range = None;
         s.native_position = None;
-        s.pending_native_position = None;
         s.key_failure = semantic_failed;
         (
             s.context.take(),
@@ -766,7 +740,6 @@ fn release_composition_with_failure(
             s.backup.take(),
             s.selection.take(),
             s.text.take(),
-            s.prefix_continuation.take(),
             s.pending
                 .as_ref()
                 .filter(|p| {
@@ -778,7 +751,7 @@ fn release_composition_with_failure(
     };
     // Settle must terminate when editing retires its gap, even if its queued
     // tail has not started. Send before COM cleanup can admit another task.
-    if let Some(pending) = &old.7 {
+    if let Some(pending) = &old.6 {
         reply_interrupted_prefix(shared, pending);
     }
     unwatch(old.0.as_ref(), old.1);
@@ -1529,33 +1502,6 @@ impl ITfEditSession_Impl for Edit_Impl {
                     &mut settlement,
                 )
             });
-        if result.is_ok()
-            && self.request.action == Action::Settle
-            && settlement.is_some_and(|s| s.prefix == Mutation::Changed && !s.tail_owned)
-        {
-            if let Err(error) = defer_prefix(
-                &self.state,
-                &self.context,
-                &self.request,
-                self.generation,
-                self.connection,
-            ) {
-                complete(
-                    &self.state,
-                    &self.request,
-                    self.connection,
-                    false,
-                    &format!("settleQueue:{:08x}", error.code().0 as u32),
-                    mutation,
-                    settlement,
-                );
-                if self.state.borrow().generation == self.generation {
-                    end_owned(&self.state);
-                }
-                return Err(error);
-            }
-            return Ok(());
-        }
         match &result {
             Ok(()) => complete(
                 &self.state,
@@ -1567,6 +1513,9 @@ impl ITfEditSession_Impl for Edit_Impl {
                 settlement,
             ),
             Err(e) => {
+                if let Some(progress) = &mut settlement {
+                    progress.tail_owned = false;
+                }
                 complete(
                     &self.state,
                     &self.request,
@@ -1584,282 +1533,6 @@ impl ITfEditSession_Impl for Edit_Impl {
         };
         result
     }
-}
-fn defer_prefix(
-    shared: &Shared,
-    context: &ITfContext,
-    request: &Request,
-    generation: u64,
-    connection: u64,
-) -> windows::core::Result<()> {
-    let epoch = shared.borrow().epoch;
-    edit_identity(shared, request, generation, epoch)?;
-    let id = next_generation();
-    let continuation = PrefixContinuation {
-        id,
-        request: request.clone(),
-        context: context.clone(),
-        generation,
-        connection,
-        _lease: Lease::new(),
-    };
-    edit_identity(shared, request, generation, epoch)?;
-    let window = {
-        let mut state = shared.borrow_mut();
-        if state.prefix_continuation.is_some()
-            || state.empty_range.is_none()
-            || !state.pending.as_ref().is_some_and(|p| {
-                p.task == request.task
-                    && p.turn == request.turn
-                    && p.operation == request.operation
-                    && p.connection == connection
-                    && p.capability == request.capability
-            })
-        {
-            return Err(failure(TF_E_DISCONNECTED));
-        }
-        state.prefix_continuation = Some(continuation);
-        state.window
-    };
-    unsafe {
-        PostMessageW(
-            Some(HWND(window as *mut _)),
-            RESUME_PREFIX,
-            WPARAM(id as usize),
-            LPARAM(0),
-        )?;
-    }
-    Ok(())
-}
-fn resume_prefix(shared: &Shared, id: u64) {
-    let readiness = prefix_insertion_ready(shared, id);
-    if matches!(readiness, Ok(false)) {
-        return;
-    }
-    let continuation = {
-        let mut state = shared.borrow_mut();
-        if state
-            .prefix_continuation
-            .as_ref()
-            .is_none_or(|job| job.id != id)
-        {
-            return;
-        }
-        state.prefix_continuation.take().unwrap()
-    };
-    let result = (|| unsafe {
-        readiness?;
-        lease(
-            shared,
-            &continuation.request,
-            continuation.generation,
-            &continuation.context,
-        )?;
-        let client = shared.borrow().client;
-        let edit: ITfEditSession = PrefixTailEdit {
-            state: shared.clone(),
-            request: continuation.request.clone(),
-            context: continuation.context.clone(),
-            generation: continuation.generation,
-            connection: continuation.connection,
-            _lease: Lease::new(),
-        }
-        .into();
-        // Force a distinct write transaction; ASYNCDONTCARE can run immediately
-        // inside provider reentrancy and batch composition end with tail start.
-        continuation
-            .context
-            .RequestEditSession(client, &edit, TF_ES_ASYNC | TF_ES_READWRITE)?
-            .ok()
-    })();
-    if let Err(error) = result {
-        complete(
-            shared,
-            &continuation.request,
-            continuation.connection,
-            false,
-            &format!("settleTailQueue:{:08x}", error.code().0 as u32),
-            Mutation::Changed,
-            Some(Settlement {
-                prefix_operation: continuation.request.operation,
-                prefix: Mutation::Changed,
-                tail_owned: false,
-            }),
-        );
-        if shared.borrow().generation == continuation.generation {
-            end_owned(shared);
-        }
-    }
-}
-fn prefix_insertion_ready(shared: &Shared, id: u64) -> windows::core::Result<bool> {
-    let (generation, deadline, proof, before) = {
-        let state = shared.borrow();
-        let Some(job) = state
-            .prefix_continuation
-            .as_ref()
-            .filter(|job| job.id == id)
-        else {
-            return Ok(false);
-        };
-        (
-            job.generation,
-            job.request.deadline_tick,
-            state.native_position,
-            state.pending_native_position,
-        )
-    };
-    if deadline < unsafe { GetTickCount64() } {
-        return Err(failure(TF_E_DISCONNECTED));
-    }
-    let ready = if let Some(proof) = proof {
-        let actual = edit_selection(HWND(proof.window as *mut _));
-        #[cfg(feature = "acceptance")]
-        eprintln!(
-            "prefix readiness actual={:?} expected={} before={:?} remaining_ms={}",
-            actual,
-            proof.offset,
-            before.map(|p| p.offset),
-            deadline.saturating_sub(unsafe { GetTickCount64() })
-        );
-        if actual == (proof.offset, proof.offset) {
-            true
-        } else if before.is_some_and(|before| {
-            before.window == proof.window
-                && (actual == (before.offset, before.end)
-                    || actual == (before.offset, before.offset))
-        }) {
-            false
-        } else {
-            return Err(failure(TF_E_DISCONNECTED));
-        }
-    } else {
-        true
-    };
-    let state = shared.borrow();
-    if !state.active
-        || !state.version.owned
-        || state.generation != generation
-        || state
-            .prefix_continuation
-            .as_ref()
-            .is_none_or(|job| job.id != id)
-    {
-        return Ok(false);
-    }
-    Ok(ready)
-}
-#[implement(ITfEditSession)]
-struct PrefixTailEdit {
-    state: Shared,
-    request: Request,
-    context: ITfContext,
-    generation: u64,
-    connection: u64,
-    _lease: Lease,
-}
-impl ITfEditSession_Impl for PrefixTailEdit_Impl {
-    fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
-        let mut mutation = Mutation::NotAttempted;
-        let mut phase = "settleTailLease";
-        let tail = Request {
-            action: Action::Update,
-            prefix: None,
-            ..self.request.clone()
-        };
-        let result =
-            lease(&self.state, &self.request, self.generation, &self.context).and_then(|()| {
-                if self.request.text.is_empty() {
-                    return seal_empty_prefix(
-                        &self.state,
-                        &self.context,
-                        &self.request,
-                        self.generation,
-                        ec,
-                    );
-                }
-                apply(
-                    &self.state,
-                    &self.context,
-                    &tail,
-                    self.generation,
-                    ec,
-                    &mut mutation,
-                    &mut phase,
-                    &mut None,
-                )
-            });
-        complete(
-            &self.state,
-            &self.request,
-            self.connection,
-            result.is_ok(),
-            &result
-                .as_ref()
-                .err()
-                .map(|e| format!("edit:{phase}:{:08x}", e.code().0 as u32))
-                .unwrap_or_else(|| "applied".into()),
-            if mutation == Mutation::Uncertain {
-                Mutation::Uncertain
-            } else {
-                Mutation::Changed
-            },
-            Some(Settlement {
-                prefix_operation: self.request.operation,
-                prefix: Mutation::Changed,
-                tail_owned: result.is_ok(),
-            }),
-        );
-        if result.is_err() && self.state.borrow().generation == self.generation {
-            end_owned(&self.state);
-        }
-        result
-    }
-}
-fn seal_empty_prefix(
-    shared: &Shared,
-    context: &ITfContext,
-    request: &Request,
-    generation: u64,
-    ec: u32,
-) -> windows::core::Result<()> {
-    let (epoch, selected, range, proof) = {
-        let state = shared.borrow();
-        if state.composition.is_some() {
-            return Err(failure(TF_E_DISCONNECTED));
-        }
-        (
-            state.epoch,
-            state
-                .selection
-                .clone()
-                .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
-            state
-                .empty_range
-                .clone()
-                .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
-            state.native_position,
-        )
-    };
-    edit_identity(shared, request, generation, epoch)?;
-    let current = selection(context, ec)?;
-    if !range_text(&range, ec)?.is_empty()
-        || unsafe {
-            current.CompareStart(ec, &selected, TF_ANCHOR_START)? != 0
-                || current.CompareEnd(ec, &selected, TF_ANCHOR_END)? != 0
-        }
-    {
-        return Err(failure(TF_E_DISCONNECTED));
-    }
-    if let Some(proof) = proof
-        && edit_selection(HWND(proof.window as *mut _)) != (proof.offset, proof.offset)
-    {
-        return Err(failure(TF_E_DISCONNECTED));
-    }
-    edit_identity(shared, request, generation, epoch)?;
-    let mut state = shared.borrow_mut();
-    state.version.applied(request);
-    state.pending_native_position = None;
-    Ok(())
 }
 fn complete(
     shared: &Shared,
@@ -1959,7 +1632,7 @@ fn settle_prefix(
     context: &ITfContext,
     composition: &ITfComposition,
     range: &ITfRange,
-    request: &Request,
+    r: &Request,
     generation: u64,
     epoch: u64,
     ec: u32,
@@ -1968,112 +1641,160 @@ fn settle_prefix(
     outcome: &mut Settlement,
 ) -> windows::core::Result<()> {
     unsafe {
+        let prefix = r.prefix.as_ref().ok_or_else(|| failure(E_INVALIDARG))?;
         *phase = "settleIdentity";
-        let prefix = request
-            .prefix
-            .as_ref()
-            .ok_or_else(|| failure(E_INVALIDARG))?;
-        outcome.prefix_operation = request.operation;
         if prefix.range_epoch != epoch
-            || prefix.expected_revision != shared.borrow().version.revision
+            || shared.borrow().version.revision != prefix.expected_revision
         {
             return Err(failure(TF_E_DISCONNECTED));
         }
-        lease(shared, request, generation, context)?;
-        // A whole composition boundary materializes paragraphs before continuing
-        // text. Partial anchor movement can leave breaks behind the live tail in
-        // rich document owners. The logical operation remains a single Settle.
-        write_composing(
-            shared,
-            context,
-            range,
-            request,
-            generation,
-            epoch,
+        lease(shared, r, generation, context)?;
+        let committed = CompositionText::new(&prefix.text).commit_text();
+        let tail = CompositionText::new(&r.text);
+        let combined = format!("{committed}{}", tail.marked);
+        *phase = "settleText";
+        *mutation = Mutation::Uncertain;
+        range.SetText(
             ec,
-            mutation,
-            phase,
-            &prefix.text,
-            false,
+            TF_ST_CORRECTION,
+            &combined.encode_utf16().collect::<Vec<_>>(),
         )?;
-        *phase = "settleMaterialize";
-        materialize(
-            shared,
-            context,
-            composition,
-            epoch,
-            ec,
-            &|| edit_identity(shared, request, generation, epoch),
-            false,
-            mutation,
-        )?;
-        let written = composition.GetRange()?.Clone()?;
-        edit_identity(shared, request, generation, epoch)?;
-        let receipt_text = range_text(&written, ec)?;
-        edit_identity(shared, request, generation, epoch)?;
-        let caret = written.Clone()?;
-        caret.Collapse(ec, TF_ANCHOR_END)?;
-        edit_identity(shared, request, generation, epoch)?;
-        let retired = { shared.borrow_mut().backup.take() };
-        drop(retired);
-        edit_identity(shared, request, generation, epoch)?;
+        *mutation = Mutation::Changed;
+        edit_identity(shared, r, generation, epoch)?;
+        preserve_attributes(shared, context, range, r, generation, epoch, ec)?;
+        *phase = "settleReadback";
+        let actual = range_text(range, ec)?;
+        edit_identity(shared, r, generation, epoch)?;
+        let written = range.Clone()?;
+        edit_identity(shared, r, generation, epoch)?;
+        #[cfg(feature = "acceptance")]
+        eprintln!(
+            "prefix readback expected_units={} actual_units={} prefix_units={} matched={}",
+            combined.encode_utf16().count(),
+            actual.encode_utf16().count(),
+            committed.encode_utf16().count(),
+            crate::prefix::boundary(&actual, &committed).is_some()
+        );
+        let (bytes, units) = crate::prefix::boundary(&actual, &committed)
+            .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
+        if !tail.matches_marked(&actual[bytes..]) {
+            *phase = "settleTailReadback";
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        let boundary = range.Clone()?;
+        edit_identity(shared, r, generation, epoch)?;
+        let mut shifted = 0;
+        boundary.ShiftStart(ec, units, &mut shifted, std::ptr::null())?;
+        edit_identity(shared, r, generation, epoch)?;
+        if shifted != units {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        boundary.Collapse(ec, TF_ANCHOR_START)?;
+        edit_identity(shared, r, generation, epoch)?;
         *phase = "settlePrefix";
+        // From this point prefix submission may be irreversible. Reentrant
+        // Abort must never restore the original selection into the remaining tail.
+        let retired_backup = { shared.borrow_mut().backup.take() };
+        drop(retired_backup);
+        edit_identity(shared, r, generation, epoch)?;
+        outcome.prefix_operation = r.operation;
         outcome.prefix = Mutation::Uncertain;
-        note_prefix_progress(shared, request, generation, epoch, outcome.prefix)?;
-        composition.EndComposition(ec)?;
+        note_prefix_progress(shared, r, generation, epoch, outcome.prefix)?;
+        let remaining = if r.text.is_empty() {
+            // An empty composition is terminated by IMM providers. End it
+            // intentionally and retain only a guarded empty insertion lease.
+            let empty = range.Clone()?;
+            empty.Collapse(ec, TF_ANCHOR_END)?;
+            edit_identity(shared, r, generation, epoch)?;
+            composition.EndComposition(ec)?;
+            empty
+        } else {
+            composition.ShiftStart(ec, &boundary)?;
+            composition.GetRange()?
+        };
         outcome.prefix = Mutation::Changed;
-        note_prefix_progress(shared, request, generation, epoch, outcome.prefix)?;
-        edit_identity(shared, request, generation, epoch)?;
-        // Ending an IMM composition can restore the control's pre-composition
-        // caret. Reaffirm the captured end range after EndComposition, without
-        // changing foreground or discovering a different insertion position.
-        let mut at_end = TF_SELECTION {
-            range: ManuallyDrop::new(Some(caret.clone())),
+        note_prefix_progress(shared, r, generation, epoch, outcome.prefix)?;
+        edit_identity(shared, r, generation, epoch)?;
+        *phase = "settleTail";
+        edit_identity(shared, r, generation, epoch)?;
+        let actual_tail = range_text(&remaining, ec)?;
+        edit_identity(shared, r, generation, epoch)?;
+        if !tail.matches_marked(&actual_tail) {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        // Install verified range truth before more COM calls can fail/reenter.
+        // Cleanup must never compare this shrunken range to the old ASR buffer.
+        let retired = {
+            let mut state = shared.borrow_mut();
+            state.expected = actual_tail;
+            state.text = (!r.text.is_empty()).then_some(tail);
+            state.backup = Some(Rollback::GeneratedTail);
+            state.selection = None;
+            if let Some(position) = &mut state.native_position {
+                position.offset = position
+                    .offset
+                    .checked_add(committed.replace('\n', "\r\n").encode_utf16().count() as u32)
+                    .ok_or_else(|| failure(E_INVALIDARG))?;
+            }
+            if r.text.is_empty() {
+                state.empty_range = Some(remaining.clone());
+                state.materialize_allowed = false;
+                state.composition.take()
+            } else {
+                None
+            }
+        };
+        drop(retired);
+        edit_identity(shared, r, generation, epoch)?;
+        #[cfg(feature = "acceptance")]
+        match SETTLE_FAULT.load(Ordering::Acquire) {
+            4 => {
+                SETTLE_FAULT.store(0, Ordering::Release);
+                return Err(failure(E_FAIL));
+            }
+            5 => {
+                SETTLE_FAULT.store(0, Ordering::Release);
+                let connection = shared.borrow().connection;
+                dispatch(
+                    shared,
+                    Request {
+                        action: Action::Abort,
+                        operation: r.operation + 1,
+                        text: String::new(),
+                        prefix: None,
+                        ..r.clone()
+                    },
+                    connection,
+                );
+                edit_identity(shared, r, generation, epoch)?;
+            }
+            _ => (),
+        }
+        // The remaining tail is generated text; cancellation erases only this
+        // owned range. Never restore an old selection across committed text.
+        let caret = remaining.Clone()?;
+        caret.Collapse(ec, TF_ANCHOR_END)?;
+        edit_identity(shared, r, generation, epoch)?;
+        let mut selected = TF_SELECTION {
+            range: ManuallyDrop::new(Some(caret)),
             style: TF_SELECTIONSTYLE {
                 ase: TF_AE_NONE,
                 fInterimChar: false.into(),
             },
         };
-        let result = context.SetSelection(ec, std::slice::from_ref(&at_end));
-        ManuallyDrop::drop(&mut at_end.range);
+        let result = context.SetSelection(ec, std::slice::from_ref(&selected));
+        ManuallyDrop::drop(&mut selected.range);
         result?;
-        edit_identity(shared, request, generation, epoch)?;
-        // Keep a guarded insertion lease while the owner consumes composition
-        // end. A queued, forced-async edit starts the new tail after this lock.
+        edit_identity(shared, r, generation, epoch)?;
         let selected = selection(context, ec)?;
-        edit_identity(shared, request, generation, epoch)?;
-        if selected.CompareStart(ec, &caret, TF_ANCHOR_START)? != 0
-            || selected.CompareEnd(ec, &caret, TF_ANCHOR_END)? != 0
-        {
-            return Err(failure(TF_E_DISCONNECTED));
-        }
-        edit_identity(shared, request, generation, epoch)?;
+        edit_identity(shared, r, generation, epoch)?;
+        // An IMM-backed provider can rebase ranges after prefix materialization.
+        // Bind the receipt to its post-operation range representation, not to
+        // the earlier combined buffer, and still require the current tail/caret.
+        let receipt_text = range_text(&written, ec)?;
+        edit_identity(shared, r, generation, epoch)?;
         let mut state = shared.borrow_mut();
-        state.empty_range = Some(caret);
-        state.expected.clear();
-        state.text = None;
         state.selection = Some(selected);
-        state.backup = Some(Rollback::GeneratedTail);
-        state.materialize_allowed = false;
-        let retired = state.composition.take();
-        state.pending_native_position = state.native_position;
-        if let Some(position) = &mut state.native_position {
-            position.offset = position
-                .offset
-                .checked_add(
-                    prefix
-                        .text
-                        .replace("\r\n", "\n")
-                        .replace('\r', "\n")
-                        .replace('\n', "\r\n")
-                        .encode_utf16()
-                        .count() as u32,
-                )
-                .ok_or_else(|| failure(E_INVALIDARG))?;
-            position.end = position.offset;
-        }
-        // Keep the old write revision until the complete logical operation has
-        // applied its tail. This receipt covers only the prefix transaction.
         state.own_change = Some(OwnChange {
             epoch,
             generation,
@@ -2081,11 +1802,27 @@ fn settle_prefix(
             range: written,
             expected: receipt_text,
         });
+        outcome.tail_owned = true;
         drop(state);
-        drop(retired);
         #[cfg(feature = "acceptance")]
-        settle_checkpoint(shared, request)?;
-        edit_identity(shared, request, generation, epoch)?;
+        settle_checkpoint(
+            shared,
+            r,
+            context,
+            composition,
+            epoch,
+            ec,
+            generation,
+            mutation,
+        )?;
+        edit_identity(shared, r, generation, epoch)?;
+        {
+            let mut state = shared.borrow_mut();
+            state.version.applied(r);
+            if let Some(receipt) = &mut state.own_change {
+                receipt.revision = r.revision;
+            }
+        }
         Ok(())
     }
 }
@@ -2327,16 +2064,15 @@ fn apply(
             return Ok(());
         }
         *phase = "ownership";
-        let (mut composition, expected, old_selection, epoch, empty_range) = {
+        let (mut composition, expected, old_selection, epoch, empty_range, cancel_generated_tail) = {
             let s = shared.borrow();
             (
                 s.composition.clone(),
                 s.expected.clone(),
-                s.selection
-                    .clone()
-                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
+                s.selection.clone(),
                 s.epoch,
                 s.empty_range.clone(),
+                r.action == Action::Abort && matches!(s.backup, Some(Rollback::GeneratedTail)),
             )
         };
         *phase = "range";
@@ -2344,15 +2080,22 @@ fn apply(
             Some(composition) => composition.GetRange()?,
             None => empty_range.ok_or_else(|| failure(TF_E_DISCONNECTED))?,
         };
-        *phase = "selection";
-        let current_selection = selection(context, ec)?;
         *phase = "position";
-        if password(context, &range, ec)?
-            || range_text(&range, ec)? != expected
-            || current_selection.CompareStart(ec, &old_selection, TF_ANCHOR_START)? != 0
-            || current_selection.CompareEnd(ec, &old_selection, TF_ANCHOR_END)? != 0
-        {
+        if password(context, &range, ec)? || range_text(&range, ec)? != expected {
             return Err(failure(TF_E_DISCONNECTED));
+        }
+        // Cancel erases only a still-owned, unchanged generated range. It does
+        // not restore a selection or discover a new insertion position. Writes
+        // and restoration of OriginalSelection retain the exact caret guard.
+        if !cancel_generated_tail {
+            *phase = "selection";
+            let old_selection = old_selection.ok_or_else(|| failure(TF_E_DISCONNECTED))?;
+            let current_selection = selection(context, ec)?;
+            if current_selection.CompareStart(ec, &old_selection, TF_ANCHOR_START)? != 0
+                || current_selection.CompareEnd(ec, &old_selection, TF_ANCHOR_END)? != 0
+            {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
         }
         // Reopen the same logical draft only at the still-owned empty caret.
         // User edits revoke this lease through the existing key/text sinks.
@@ -2398,7 +2141,6 @@ fn apply(
                 let mut state = shared.borrow_mut();
                 state.composition = Some(next.clone());
                 state.empty_range = None;
-                state.pending_native_position = None;
 
                 state.materialize_allowed = true;
             }
@@ -2512,7 +2254,17 @@ pub extern "system" fn SayweaveSettleFixtureFault(mode: usize) {
     SETTLE_FAULT.store(mode, Ordering::Release);
 }
 #[cfg(feature = "acceptance")]
-fn settle_checkpoint(shared: &Shared, request: &Request) -> windows::core::Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn settle_checkpoint(
+    shared: &Shared,
+    request: &Request,
+    context: &ITfContext,
+    composition: &ITfComposition,
+    epoch: u64,
+    ec: u32,
+    generation: u64,
+    mutation: &mut Mutation,
+) -> windows::core::Result<()> {
     match SETTLE_FAULT.swap(0, Ordering::AcqRel) {
         1 => {
             let connection = shared.borrow().connection;
@@ -2528,8 +2280,23 @@ fn settle_checkpoint(shared: &Shared, request: &Request) -> windows::core::Resul
         }
         2 => Err(failure(E_FAIL)),
         3 => {
-            let ended = end_owned_with_flags(shared, TF_ES_SYNC);
-            shared.borrow_mut().key_handoff = ended;
+            // Provider termination is allowed to reenter inside a write lock.
+            // Preserve the already-visible raw tail before relinquishing it.
+            materialize(
+                shared,
+                context,
+                composition,
+                epoch,
+                ec,
+                &|| edit_identity(shared, request, generation, epoch),
+                true,
+                mutation,
+            )?;
+            unsafe {
+                composition.EndComposition(ec)?;
+            }
+            release_composition(shared, epoch, Some(composition));
+            shared.borrow_mut().key_handoff = true;
             Ok(())
         }
         _ => Ok(()),

@@ -105,7 +105,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|s| s.parse::<u64>())
                     .transpose()?
                     .unwrap_or(5);
-                if !(5..=30).contains(&focus_seconds) {
+                let owned_immediate = focus_seconds == 0
+                    && std::env::var("SAYWEAVE_INPUT_ACCEPTANCE").as_deref() == Ok("1")
+                    && args
+                        .get(2)
+                        .and_then(|pid| pid.parse::<u32>().ok())
+                        .is_some();
+                if !owned_immediate && !(5..=30).contains(&focus_seconds) {
                     return Err("operator focus countdown must be between5and30seconds".into());
                 }
                 println!(
@@ -147,7 +153,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|s| s.parse::<u64>())
                     .transpose()?
                     .unwrap_or(700);
-                if interval > 1000 {
+                // Operator observation delay only; native request deadlines and
+                // production recording/processing latency are unchanged.
+                if interval > 3000 {
                     return Err("probe interval exceeds limit".into());
                 }
                 let first_boundary =
@@ -412,6 +420,15 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         }
         let _ = SetForegroundWindow(top);
         let _ = SetFocus(Some(editor));
+        // Test-only operator/controller lease. Allows the desktop adapter to
+        // focus this exact newly-created window; no production capture delay.
+        if std::env::var_os("SAYWEAVE_TSF_FIXTURE_SUPERVISED").is_some() {
+            println!("owned fixture awaiting controller foreground=true");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while GetForegroundWindow() != top && Instant::now() < deadline {
+                pump(Duration::from_millis(25));
+            }
+        }
         pump(Duration::from_millis(200));
         println!(
             "owned fixture stage=focus foreground_matches={}",
@@ -1246,6 +1263,8 @@ fn prefix_fixture(
             );
             SendMessageW(editor, 0x00B1, Some(WPARAM(1)), Some(LPARAM(4)));
         }
+        // Drain the fixture's own external reset before claiming a new range.
+        pump(Duration::from_millis(50));
         let task = uuid::Uuid::new_v4().to_string();
         let begin = exchange(pipe, capability, &task, 1, 1, 0, Action::Begin, "", false)?;
         if !begin.applied {
@@ -1532,7 +1551,7 @@ fn prefix_fault_fixture(
         let entry = GetProcAddress(component, s!("SayweaveSettleFixtureFault"))
             .ok_or("missing owned acceptance-only checkpoint")?;
         let inject: unsafe extern "system" fn(usize) = std::mem::transmute(entry);
-        for mode in [1, 2, 3] {
+        for mode in [1, 2, 3, 4, 5] {
             SendMessageW(
                 editor,
                 WM_SETTEXT,
@@ -1562,6 +1581,11 @@ fn prefix_fault_fixture(
                 return Err("prefix fault fixture setup failed".into());
             }
             inject(mode);
+            let raw_tail = if matches!(mode, 4 | 5) {
+                "原文\n尾🙂"
+            } else {
+                "原文尾🙂"
+            };
             let request = Request {
                 protocol: PROTOCOL,
                 capability: capability.into(),
@@ -1571,7 +1595,7 @@ fn prefix_fault_fixture(
                 revision: 2,
                 deadline_tick: windows::Win32::System::SystemInformation::GetTickCount64() + 2000,
                 action: Action::Settle,
-                text: "原文尾🙂".into(),
+                text: raw_tail.into(),
                 prefix: Some(Prefix {
                     text: "提交前段🙂".into(),
                     expected_revision: 1,
@@ -1589,11 +1613,12 @@ fn prefix_fault_fixture(
                     return Err("prefix fault reply missing".into());
                 }
             };
-            if (mode == 1 && (!reply.applied || reply.code != "cancelledPrefixContinuation"))
-                || (mode != 1 && reply.applied)
-                || reply.operation != if mode == 1 { 4 } else { 3 }
+            let cancelled = matches!(mode, 1 | 5);
+            if (cancelled && (!reply.applied || reply.code != "applied"))
+                || (!cancelled && reply.applied)
+                || reply.operation != if cancelled { 4 } else { 3 }
             {
-                return Err("prefix fault was falsely reported as fully applied".into());
+                return Err(format!("prefix fault mode={mode} reply applied={} operation={} code={} settlement={:?}",reply.applied,reply.operation,reply.code,reply.settlement).into());
             }
             if !reply.settlement.is_some_and(|s| {
                 s.prefix_operation == 3 && s.prefix == Mutation::Changed && !s.tail_owned
@@ -1604,7 +1629,12 @@ fn prefix_fault_fixture(
             let actual = editor_text(editor)?
                 .replace("\r\n", "\n")
                 .replace('\r', "\n");
-            if actual != "左提交前段🙂右" {
+            let expected_actual = if cancelled {
+                "左提交前段🙂右".to_string()
+            } else {
+                format!("左提交前段🙂{raw_tail}右")
+            };
+            if actual != expected_actual {
                 return Err(
                     "post-prefix cancellation/failure erased prefix or restored original selection"
                         .into(),
@@ -1659,7 +1689,7 @@ fn prefix_fault_fixture(
                 if editor_text(editor)?
                     .replace("\r\n", "\n")
                     .replace('\r', "\n")
-                    != "左提交前段🙂新轮次右"
+                    != "左提交前段🙂原文尾🙂新轮次右"
                 {
                     return Err("interrupted prefix old tail wrote over the new turn".into());
                 }

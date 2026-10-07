@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_FRAME: usize = 128 * 1024;
 pub const MAX_TEXT_UTF16: usize = 16 * 1024;
-// v7 requires a non-separator prefix boundary and reports the exact
+// v8 settles inside one composition owner at a verified native split and reports the exact
 // origin operation of a committed prefix, including cancellation/interruption.
 // A registered upgrade is insufficient: the target must be running this version.
-pub const PROTOCOL: u32 = 7;
+pub const PROTOCOL: u32 = 8;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Runtime {
