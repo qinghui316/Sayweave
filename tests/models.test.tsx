@@ -14,10 +14,11 @@ async function panel(port:ModelConfigPort=new BrowserModels(),onGuardChange?:((g
  return port;
 }
 function textTab(){fireEvent.mouseDown(screen.getByRole('tab',{name:'文字处理'}),{button:0,ctrlKey:false});}
+function manualModel(){const button=screen.queryByRole('button',{name:'手动填写'});if(button)fireEvent.click(button);}
 function fillText(){
  textTab();
  fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'dummy-personal-key'}});
- fireEvent.change(screen.getByLabelText('模型'),{target:{value:'test-model'}});
+ manualModel();fireEvent.change(screen.getByLabelText('模型'),{target:{value:'test-model'}});
  fireEvent.click(screen.getByRole('button',{name:'更多设置'}));
  fireEvent.change(screen.getByLabelText('名称'),{target:{value:'个人配置'}});
  fireEvent.change(screen.getByLabelText('服务地址（URL）'),{target:{value:'https://example.invalid/v1'}});
@@ -80,7 +81,7 @@ describe('task-based model settings',()=>{
   const p=new BrowserModels();let resolve!:(result:ModelTestResult)=>void;
   vi.spyOn(p,'testTextModel').mockImplementation(()=>new Promise(r=>{resolve=r;}));const cancel=vi.spyOn(p,'cancelRequest');
   const {unmount}=render(<ModelPanel port={p}/>);await screen.findByLabelText('API 密钥');fillText();
-  fireEvent.click(screen.getByRole('button',{name:'测试连接'}));fireEvent.change(screen.getByLabelText('模型'),{target:{value:'new-model'}});
+  fireEvent.click(screen.getByRole('button',{name:'测试连接'}));manualModel();fireEvent.change(screen.getByLabelText('模型'),{target:{value:'new-model'}});
   await act(async()=>resolve({testedAt:1,elapsedMs:1}));expect(screen.queryByText('模拟连接成功')).not.toBeInTheDocument();expect(cancel).toHaveBeenCalledOnce();
   fireEvent.click(screen.getByRole('button',{name:'测试连接'}));unmount();expect(cancel).toHaveBeenCalledTimes(2);
  });
@@ -99,29 +100,29 @@ describe('task-based model settings',()=>{
   const p=new BrowserModels();await panel(p);fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'speech-key'}});
   textTab();expect(screen.getByRole('alertdialog')).toBeInTheDocument();fireEvent.click(screen.getByRole('button',{name:'继续填写'}));expect(screen.getByRole('tab',{name:'语音识别'})).toHaveAttribute('aria-selected','true');
   fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
-  textTab();fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'text-key'}});fireEvent.change(screen.getByLabelText('模型'),{target:{value:'text-model'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
+  textTab();fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'text-key'}});manualModel();fireEvent.change(screen.getByLabelText('模型'),{target:{value:'text-model'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
   const view=await p.overview();expect(view.configs).toHaveLength(2);expect(view.defaults[0]!.configId).not.toBe(view.defaults[1]!.configId);
  });
  it('preserves legacy multi-use record usages and custom names during edits',async()=>{
   const p=new BrowserModels();await p.save({id:null,revision:null,expectation:null,key:{action:'replace',value:'fixture-key'},input:{name:'原有名称',protocol:'openai-chat',baseUrl:'https://example.invalid/v1',modelId:'legacy-model',usages:['speech','text']}});
   await panel(p);textTab();fireEvent.click(screen.getByRole('button',{name:'编辑'}));
-  fireEvent.change(screen.getByLabelText('模型'),{target:{value:'changed-model'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
+  manualModel();fireEvent.change(screen.getByLabelText('模型'),{target:{value:'changed-model'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
   expect((await p.overview()).configs[0]).toMatchObject({name:'原有名称',usages:['speech','text'],modelId:'changed-model'});
  });
  it('keeps a legacy speech-only Chat record accessible without promoting its capabilities',async()=>{
   const p=new BrowserModels();await p.save({id:null,revision:null,expectation:null,key:{action:'replace',value:'fixture-key'},input:{name:'此前语音配置',protocol:'openai-chat',baseUrl:'https://example.invalid/v1',modelId:'legacy-model',usages:['speech']}});
   await panel(p);textTab();expect(screen.getByText('此前语音配置')).toBeInTheDocument();expect(screen.queryByRole('button',{name:'使用此模型'})).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button',{name:'编辑'}));fireEvent.change(screen.getByLabelText('模型'),{target:{value:'changed-model'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
+  fireEvent.click(screen.getByRole('button',{name:'编辑'}));manualModel();fireEvent.change(screen.getByLabelText('模型'),{target:{value:'changed-model'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
   expect((await p.overview()).configs[0]).toMatchObject({name:'此前语音配置',usages:['speech'],modelId:'changed-model'});
  });
  it('shows only the three required text fields and derives the saved name from the model',async()=>{
   const p=new BrowserModels();await panel(p);textTab();
   expect(screen.getByLabelText('服务地址（URL）')).toHaveValue('https://api.openai.com/v1');
-  expect(screen.getByLabelText('API 密钥')).toHaveValue('');expect(screen.getByLabelText('模型')).toHaveValue('');
+  expect(screen.getByLabelText('API 密钥')).toHaveValue('');expect(screen.getByLabelText('模型')).toHaveTextContent('选择文字模型');
   expect(screen.getByLabelText('模型')).not.toHaveAttribute('list');
   expect(screen.queryByRole('combobox')).not.toBeInTheDocument();expect(screen.queryByLabelText('名称')).not.toBeInTheDocument();
   fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'fixture-key'}});
-  fireEvent.change(screen.getByLabelText('模型'),{target:{value:'gpt-personal'}});
+  manualModel();fireEvent.change(screen.getByLabelText('模型'),{target:{value:'gpt-personal'}});
   fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
   expect((await p.overview()).configs[0]).toMatchObject({name:'gpt-personal',modelId:'gpt-personal',baseUrl:'https://api.openai.com/v1',usages:['text']});
  });
@@ -147,4 +148,22 @@ describe('task-based model settings',()=>{
   expect(screen.queryByLabelText('名称')).not.toBeInTheDocument();
  });
 
+});
+
+it('synchronizes without a model id, searches and selects without a paid test',async()=>{
+ const p=new BrowserModels();const fetch=vi.spyOn(p,'fetchModels').mockResolvedValue(['alpha','fast-text','beta']);const test=vi.spyOn(p,'testTextModel');
+ await panel(p);textTab();fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'fixture-key'}});fireEvent.blur(screen.getByLabelText('API 密钥'));
+ await waitFor(()=>expect(fetch).toHaveBeenCalledOnce());expect(fetch.mock.calls[0]![0].input.modelId).toBe('');
+ fireEvent.click(screen.getByLabelText('模型'));await screen.findByRole('option',{name:'fast-text'});
+ fireEvent.change(screen.getByLabelText('搜索模型'),{target:{value:'fast'}});expect(screen.queryByRole('option',{name:'alpha'})).not.toBeInTheDocument();
+ fireEvent.click(screen.getByRole('option',{name:'fast-text'}));expect(screen.getByLabelText('模型')).toHaveTextContent('fast-text');expect(test).not.toHaveBeenCalled();expect(fetch).toHaveBeenCalledOnce();
+});
+it('cancels obsolete list requests and preserves the selection on refresh failure',async()=>{
+ const p=new BrowserModels();let oldResolve!:(ids:string[])=>void;
+ const fetch=vi.spyOn(p,'fetchModels').mockImplementationOnce(()=>new Promise(r=>{oldResolve=r;})).mockResolvedValueOnce(['new-model']).mockRejectedValueOnce(new ModelError('network'));
+ const cancel=vi.spyOn(p,'cancelRequest');await panel(p);textTab();fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'fixture-key'}});fireEvent.blur(screen.getByLabelText('API 密钥'));await waitFor(()=>expect(fetch).toHaveBeenCalledTimes(1));
+ fireEvent.change(screen.getByLabelText('服务地址（URL）'),{target:{value:'https://new.example/v1'}});fireEvent.blur(screen.getByLabelText('服务地址（URL）'));await waitFor(()=>expect(fetch).toHaveBeenCalledTimes(2));
+ await act(async()=>oldResolve(['old-model']));expect(cancel).toHaveBeenCalled();
+ fireEvent.click(screen.getByLabelText('模型'));await screen.findByRole('option',{name:'new-model'});expect(screen.queryByRole('option',{name:'old-model'})).not.toBeInTheDocument();fireEvent.click(screen.getByRole('option',{name:'new-model'}));
+ fireEvent.click(screen.getByLabelText('模型'));await waitFor(()=>expect(screen.getByRole('button',{name:'刷新'})).toBeEnabled());fireEvent.click(screen.getByRole('button',{name:'刷新'}));await screen.findByText('无法连接服务，请检查网络和地址。');expect(screen.getByRole('option',{name:/new-model/})).toHaveAttribute('aria-selected','true');
 });

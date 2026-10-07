@@ -1,5 +1,6 @@
 import {test,expect,type Locator,type Page} from '@playwright/test';
 async function open(page:Page){await page.goto('/');await page.getByRole('button',{name:'配置模型',exact:true}).click();const dialog=page.getByRole('dialog');await expect(dialog.getByLabel('API 密钥')).toBeVisible();return dialog;}
+async function manualModel(dialog:Locator){const button=dialog.getByRole('button',{name:'手动填写',exact:true});if(await button.count())await button.click();}
 async function hitVisible(locator:Locator){
  await expect.poll(()=>locator.evaluate(el=>{const r=el.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;const top=document.elementFromPoint(x,y);return r.width>0&&r.height>0&&x>=0&&y>=0&&x<innerWidth&&y<innerHeight&&!!top&&(el===top||el.contains(top));})).toBe(true);
 }
@@ -8,14 +9,14 @@ test('task-based model settings save, select, edit and discard with focus restor
  await dialog.getByRole('tab',{name:'文字处理'}).click();
  await dialog.getByLabel('服务地址（URL）',{exact:true}).fill('https://example.invalid/v1');
  await dialog.getByLabel('API 密钥',{exact:true}).fill('fixture-key');
- await dialog.getByLabel('模型',{exact:true}).fill('demo-text-model');
+ await manualModel(dialog);await dialog.getByLabel('模型',{exact:true}).fill('demo-text-model');
  await dialog.getByRole('button',{name:'测试连接'}).click();await expect(dialog.getByText('模拟连接成功',{exact:true})).toBeVisible();
  await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(dialog.getByText('已保存。')).toBeVisible();
  await expect(dialog.getByText('当前使用',{exact:true})).toBeVisible();
  await page.keyboard.press('Escape');await expect(dialog).toHaveCount(0);await expect(page.getByRole('button',{name:'配置模型',exact:true})).toBeFocused();
  await page.getByRole('button',{name:'配置模型',exact:true}).click();await dialog.getByRole('tab',{name:'文字处理'}).click();
  await dialog.getByRole('button',{name:'编辑',exact:true}).click();await expect(dialog.getByLabel('API 密钥',{exact:true})).toHaveValue('');
- await dialog.getByLabel('模型',{exact:true}).fill('updated-model');
+ await manualModel(dialog);await dialog.getByLabel('模型',{exact:true}).fill('updated-model');
  await dialog.getByRole('button',{name:'关闭',exact:true}).click();
  const confirm=page.getByRole('alertdialog');await expect(confirm).toBeVisible();await hitVisible(confirm.getByRole('button',{name:'继续填写'}));
  await confirm.getByRole('button',{name:'继续填写'}).click();await expect(dialog.getByLabel('模型',{exact:true})).toHaveValue('updated-model');
@@ -58,7 +59,7 @@ test('long model summaries, menus and delete confirmation stay within a small wi
  const option=page.getByRole('option',{name:'Qwen Audio 3.0 · 实时识别',exact:true});await hitVisible(option);await page.screenshot({path:'tests/visual/settings-model-menu-960.png'});await page.keyboard.press('Escape');
  await dialog.getByRole('tab',{name:'文字处理'}).click();
  await dialog.getByLabel('服务地址（URL）',{exact:true}).fill('https://example.invalid/v1');await dialog.getByLabel('API 密钥',{exact:true}).fill('fixture-key');
- await dialog.getByLabel('模型',{exact:true}).fill('model-'+ 'abcdefghij'.repeat(23));await dialog.getByRole('button',{name:'更多设置'}).click();
+ await manualModel(dialog);await dialog.getByLabel('模型',{exact:true}).fill('model-'+ 'abcdefghij'.repeat(23));await dialog.getByRole('button',{name:'更多设置'}).click();
  const name='这是一份需要完整保留名称的个人模型'.repeat(3);await dialog.getByLabel('名称',{exact:true}).fill(name);
  await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(dialog.getByText('当前使用',{exact:true})).toBeVisible();
  expect(await dialog.evaluate(el=>el.scrollWidth<=el.clientWidth)).toBe(true);await hitVisible(dialog.getByRole('button',{name:'关闭',exact:true}));
@@ -73,7 +74,7 @@ test('model category tabs are lightweight, fixed and keyboard accessible',async(
  await speech.focus();await page.keyboard.press('ArrowRight');await expect(text).toBeFocused();await expect(speech).toHaveAttribute('aria-selected','true');await page.keyboard.press('Enter');await expect(text).toHaveAttribute('aria-selected','true');
  expect(await speech.boundingBox()).toEqual(before.speech);expect(await text.boundingBox()).toEqual(before.text);
  expect(await text.evaluate(el=>getComputedStyle(el).backgroundColor)).toBe('rgba(0, 0, 0, 0)');
- await hitVisible(dialog.getByLabel('服务地址（URL）'));await expect(dialog.getByLabel('模型',{exact:true})).toHaveValue('');
+ await hitVisible(dialog.getByLabel('服务地址（URL）'));await expect(dialog.getByLabel('模型',{exact:true})).toHaveText('选择文字模型⌄');
  await page.keyboard.press('Escape');await expect(dialog).toHaveCount(0);
 });
 
@@ -92,7 +93,7 @@ test('compact actions, selected surface and reduced motion remain clear',async({
 test('processing controls follow saved text models and protect unsaved changes',async({page})=>{
  const dialog=await open(page);await dialog.getByRole('tab',{name:'文字处理'}).click();
  await expect(dialog.getByRole('switch',{name:'整理口述'})).toHaveCount(0);
- await dialog.getByLabel('API 密钥').fill('fixture-key');await dialog.getByLabel('模型',{exact:true}).fill('fixture-text');
+ await dialog.getByLabel('API 密钥').fill('fixture-key');await manualModel(dialog);await dialog.getByLabel('模型',{exact:true}).fill('fixture-text');
  await dialog.getByRole('button',{name:'保存',exact:true}).click();
  const toggle=dialog.getByRole('switch',{name:'整理口述'});await expect(toggle).toBeChecked();await toggle.click();
  await dialog.getByRole('button',{name:'关闭',exact:true}).click();
@@ -100,4 +101,22 @@ test('processing controls follow saved text models and protect unsaved changes',
  await dialog.getByRole('button',{name:'保存整理设置'}).click();await expect(dialog.getByRole('button',{name:'保存整理设置'})).toHaveCount(0);
  await dialog.getByRole('button',{name:'关闭',exact:true}).click();
  await page.getByRole('button',{name:'配置模型',exact:true}).click();const reopened=page.getByRole('dialog');await reopened.getByRole('tab',{name:'文字处理'}).click();await expect(reopened.getByRole('switch',{name:'整理口述'})).not.toBeChecked();
+});
+
+test('synchronized text model picker stays visible, searches and restores focus',async({page})=>{
+ for(const size of [{width:1120,height:760},{width:960,height:640}]){
+  await page.setViewportSize(size);const settings=await open(page);
+  await settings.getByRole('tab',{name:'文字处理'}).click();
+  await settings.getByLabel('API 密钥').fill('fixture-key');
+  const model=settings.getByLabel('模型',{exact:true});await model.click();
+  const picker=page.getByRole('dialog',{name:'选择文字模型',exact:true});
+  await expect(picker.getByRole('option',{name:'demo-text-model'})).toBeVisible();
+  await hitVisible(picker.getByLabel('搜索模型'));await hitVisible(picker.getByRole('button',{name:'刷新'}));
+  await hitVisible(picker.getByRole('button',{name:'关闭',exact:true}));
+  await picker.getByLabel('搜索模型').fill('second');
+  const option=picker.getByRole('option',{name:'demo-second-model'});await hitVisible(option);
+  await option.focus();await page.keyboard.press('Enter');
+  await expect(picker).toHaveCount(0);await expect(model).toBeFocused();await expect(model).toContainText('demo-second-model');
+  await model.click();await page.keyboard.press('Escape');await expect(picker).toHaveCount(0);await expect(model).toBeFocused();
+ }
 });

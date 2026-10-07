@@ -296,8 +296,8 @@ async function homeTrialIsolation(page){
 async function run(){try{
  // This entry is also invoked directly. Never reuse a stale acceptance executable.
  await buildFixture({logLevel:'error'});
- await command(['build','--manifest-path','src-tauri/text-service/Cargo.toml','--release']);
- const payload=path.join(root,'src-tauri/text-service/target/release/sayweave_text_service.dll');report.componentSha256=createHash('sha256').update(readFileSync(payload)).digest('hex');
+ if(!process.env.SAYWEAVE_TSF_PAYLOAD)await command(['build','--manifest-path','src-tauri/text-service/Cargo.toml','--release']);
+ const payload=process.env.SAYWEAVE_TSF_PAYLOAD??path.join(root,'src-tauri/text-service/target/release/sayweave_text_service.dll');report.componentSha256=createHash('sha256').update(readFileSync(payload)).digest('hex');
  await command(['build','--manifest-path','src-tauri/Cargo.toml','--release','--features','desktop-acceptance,tauri/custom-protocol','--bin','desktop-acceptance'],{SAYWEAVE_TSF_PAYLOAD:payload});
  await command(['build','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance','--bin','input-fixture']);
  report.targetGroup=process.env.SAYWEAVE_INPUT_TARGET_GROUP??'all';

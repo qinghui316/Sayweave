@@ -22,3 +22,11 @@
 .name { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-12); }.name strong { font-size: var(--text-section); line-height: var(--line-section); font-weight: 500; overflow-wrap: anywhere; }
 .current { font-size: var(--text-meta); color: var(--text-secondary); background: var(--surface-canvas); padding: var(--space-2) var(--space-8); border-radius: var(--radius-control); }
 .replacement { overflow-wrap: anywhere; font-size: var(--text-small); line-height: var(--line-small); }
+
+.modelChoice,.modelSearch { display:flex; gap:var(--space-8); align-items:center; min-width:0; }
+.modelChoice>input,.modelTrigger,.modelSearch>input { flex:1; min-width:0; }
+.modelTrigger { justify-content:space-between; overflow:hidden; text-overflow:ellipsis; }
+.modelOptions { display:flex; flex-direction:column; gap:var(--space-4); max-height:280px; overflow:auto; margin-top:var(--space-12); }
+.modelOptions>button { justify-content:space-between; text-align:left; overflow-wrap:anywhere; flex-shrink:0; }
+
+.modelDialog { width:min(520px,calc(100vw - 48px)); height:auto; max-height:calc(100vh - 48px); padding:56px 24px 24px; z-index:61; }

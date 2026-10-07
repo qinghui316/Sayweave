@@ -3,6 +3,8 @@ import {Button, Dialog, Field, TextInput, PasswordInput, Select, InlineMessage, 
 import {modelError, modelExecutable, modelExpectation, modelSameOrigin, type ModelConfigPort, type ModelOverview, type ModelInput, type ModelRecord, type ModelDraft, type ModelExpectation, type ModelTestResult, type ModelErrorCode, type ModelUsage} from '../../contracts/models';
 import {initialModel, modelName, speechPresets} from './presets';
 import s from './models.module.css';
+import {useModelDiscovery} from './discovery';
+import {ModelPicker} from './ModelPicker';
 
 const errors: Record<ModelErrorCode, string> = {
  invalid:'请检查填写内容。', notFound:'这个模型已被删除，请重新加载。', conflict:'模型或当前选择已变化，请重新加载后确认。',
@@ -41,6 +43,8 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
  const generation = useRef(0), loadVersion = useRef(0), request = useRef<string|null>(null), alive = useRef(false);
  const form = useRef<HTMLFormElement|null>(null);
  const formId = useId();
+ const discovery=useModelDiscovery(port,editor&&usage==='text'?{input:editor.input,key:editor.key.trim()?{action:'replace',value:editor.key}:{action:'keep'},id:editor.record?.id??null,revision:editor.record?.revision??null}:null);
+ const cancelDiscovery=discovery.cancel;
  const changed = !!editor && (editor.key !== '' || JSON.stringify(editor.input) !== JSON.stringify(editor.initial));
  const report = useCallback((e:unknown, category?:ModelUsage) => {
   const value = modelError(e);
@@ -48,11 +52,11 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
   setError({text:errors[value.code], field:value.field ?? (value.code === 'credentialMissing' || value.code === 'originChanged' ? 'key' : undefined), conflict:value.code === 'conflict' || value.code === 'notFound'});
  }, []);
  const cancel = useCallback(() => {
-  generation.current++;
+  generation.current++; cancelDiscovery();
   const id = request.current; request.current = null;
   if(id) void port.cancelRequest(id).catch(() => {});
   setNetwork(null);
- }, [port]);
+ }, [port,cancelDiscovery]);
  const load = useCallback(async(retry = false) => {
   const version = ++loadVersion.current;
   setLoading(true); setError(null);
@@ -162,7 +166,7 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
  const selected = view?.defaults.find(d => d.usage === usage)?.configId;
  const current = view?.configs.find(c => c.id === selected && modelExecutable(c, usage));
  const records = view ? recordsFor(view, usage) : [];
- const addressField = editor && <Field label="服务地址（URL）" error={fieldError('baseUrl')}>{props => <TextInput {...props} value={editor.input.baseUrl} autoComplete="off" spellCheck={false} onChange={e => modify({baseUrl:e.target.value})}/>}</Field>;
+ const addressField = editor && <Field label="服务地址（URL）" error={fieldError('baseUrl')}>{props => <TextInput {...props} value={editor.input.baseUrl} autoComplete="off" spellCheck={false} onBlur={()=>{if(usage==='text')void discovery.sync();}} onChange={e => modify({baseUrl:e.target.value})}/>}</Field>;
  const speechOptions = speechPresets.map(p => ({value:p.modelId as string, label:p.label as string}));
  if(editor && !speechOptions.some(p => p.value === editor.input.modelId)) speechOptions.unshift({value:editor.input.modelId, label:'当前自定义模型 · '+editor.input.modelId});
  return <Tabs variant="navigation" activationMode="manual" className={s.panel} contentClassName={s.tabContent} value={usage} onValueChange={switchUsage} disabled={saving || loading} label="模型类别" options={[{value:'speech', label:'语音识别'}, {value:'text', label:'文字处理'}]}>
@@ -185,10 +189,10 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
     <fieldset disabled={saving} className={s.fields}>
      {usage === 'speech' ? <Field label="模型" error={fieldError('modelId')}>{props => <Select {...props} disabled={saving} label="模型" value={editor.input.modelId} onValueChange={selectSpeechPreset} options={speechOptions}/>}</Field> : addressField}
      <div className={s.keyGroup}>
-      <Field label="API 密钥" error={fieldError('key')} description={originChanged ? '请填写这个服务的密钥。' : editor.record?.credentialStatus === 'present' ? '已保存；留空即可继续使用。' : undefined}>{props => <PasswordInput {...props} value={editor.key} placeholder={!originChanged && editor.record?.credentialStatus === 'present' ? '密钥已保存' : '粘贴 API 密钥'} autoComplete="off" onChange={e => modify({},e.target.value)}/>}</Field>
+      <Field label="API 密钥" error={fieldError('key')} description={originChanged ? '请填写这个服务的密钥。' : editor.record?.credentialStatus === 'present' ? '已保存；留空即可继续使用。' : undefined}>{props => <PasswordInput {...props} value={editor.key} placeholder={!originChanged && editor.record?.credentialStatus === 'present' ? '密钥已保存' : '粘贴 API 密钥'} autoComplete="off" onBlur={()=>{if(usage==='text')void discovery.sync();}} onChange={e => modify({},e.target.value)}/>}</Field>
       {usage === 'speech' && <Button variant="quiet" disabled={saving} onClick={() => {if(onHelp) void onHelp(editor.input.protocol==='doubao-asr-streaming'?'doubao-api-key':'qwen-api-key').catch(() => setNotice('无法打开帮助，请稍后重试。'));}}>获取 API 密钥</Button>}
      </div>
-     {usage === 'text' && <Field label="模型" error={fieldError('modelId')}>{props => <TextInput {...props} value={editor.input.modelId} placeholder="填写模型名称" autoComplete="off" spellCheck={false} onChange={e => modify({modelId:e.target.value})}/>}</Field>}
+     {usage === 'text' && <Field label="模型" error={fieldError('modelId')}>{props => <ModelPicker {...props} value={editor.input.modelId} ids={discovery.ids} loading={discovery.loading} error={discovery.error?errors[modelError(discovery.error).code]:null} onOpen={()=>void discovery.sync()} onRefresh={()=>void discovery.sync(true)} onChange={modelId=>modify({modelId})}/>}</Field>}
      <Button variant="quiet" className={s.more} aria-expanded={advanced} aria-controls={formId+'-advanced'} onClick={() => setAdvanced(value => !value)}>{advanced ? '收起设置' : '更多设置'}</Button>
      {advanced && <div id={formId+'-advanced'} className={s.advanced}>
       <Field label="名称" error={fieldError('name')}>{props => <TextInput {...props} value={editor.input.name} autoComplete="off" onChange={e => modify({name:e.target.value})}/>}</Field>
