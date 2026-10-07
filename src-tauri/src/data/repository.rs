@@ -29,6 +29,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "windows_dictation_v1",
         include_str!("migrations/006_dictation.sql"),
     ),
+    (
+        "streaming_processing_v1",
+        include_str!("migrations/007_streaming_processing.sql"),
+    ),
 ];
 pub fn now() -> i64 {
     SystemTime::now()
@@ -208,9 +212,11 @@ impl Repository {
             .map_err(db_error)?;
         migrate(&mut connection, root, MIGRATIONS)?;
         configure(&connection)?;
-        Ok(Self { connection })
+        let mut repository = Self { connection };
+        super::cancellation::replay(&mut repository, root)?;
+        Ok(repository)
     }
-    fn row(kind: Kind, row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
+    pub(super) fn row(kind: Kind, row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
         Ok(Record {
             id: row.get(0)?,
             kind,

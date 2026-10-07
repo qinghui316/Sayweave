@@ -16,6 +16,8 @@ use tokio::sync::{oneshot, watch};
 pub(crate) mod drafts;
 mod presentation;
 #[cfg(windows)]
+pub(crate) mod processing_context;
+#[cfg(windows)]
 use crate::windows_input::composition::{Draft, Finish};
 pub use presentation::Presentation;
 use presentation::{final_presentation, speech_presentation};
@@ -432,6 +434,24 @@ impl DictationCoordinator {
         self.update(&app, &id, |_| {});
         let input = app.state::<WindowsInputService>();
         let mut anchor = anchor;
+        #[cfg(windows)]
+        let processing = if source == "external" {
+            match processing_context::Context::prepare(&app, tx.subscribe(), &id).await {
+                Ok(value) => value,
+                Err(error) if error.code == "cancelled" => {
+                    let error = Error::new("cancelled");
+                    self.reject_preparation(&app, &id, speech_source, &error, &gate)
+                        .await;
+                    return Err(error);
+                }
+                Err(error) => {
+                    log::info!(target:"sayweave","operation=processing_prepare task_id={} result=original error={}",id,error.code);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         self.update(&app, &id, |s| {
             s.input_route = if source != "external" {
                 InputRoute::None
@@ -477,6 +497,7 @@ impl DictationCoordinator {
             let flow =
                 crate::speech::continuous::Control::new(crate::input_state::activity_evidence());
             flow.resume(1, anchor.as_ref().unwrap().activity);
+            flow.defer_cancel_archive();
             flow
         });
         if let Ok(mut active) = self.active.lock()
@@ -568,32 +589,77 @@ impl DictationCoordinator {
                 };
             }
             #[cfg(windows)]
-            let draft = raw_draft.map(|draft| {
+            let mut processing = processing;
+            #[cfg(windows)]
+            let record = if raw_draft.is_some() {
+                let current = app
+                    .state::<SpeechService>()
+                    .snapshot()
+                    .ok()
+                    .filter(|s| s.task_id.as_deref() == Some(&id));
+                let lease = current
+                    .as_ref()
+                    .and_then(|s| s.record_id.as_deref())
+                    .map(|record| app.state::<SpeechService>().history.hold_record(record))
+                    .transpose();
+                match lease {
+                    Ok(lease) => {
+                        if journal_ok
+                            && !gate.cancelled()
+                            && let (Some(context), Some(current)) = (&processing, &current)
+                            && context
+                                .attach(current.record_id.as_deref(), current.attempt_id.as_deref())
+                                .await
+                                .is_err()
+                        {
+                            processing = None;
+                        }
+                        lease
+                    }
+                    Err(_) => {
+                        journal_ok = false;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            #[cfg(windows)]
+            let draft = raw_draft.map(|native| {
                 drafts::SessionDraft::new(
                     id.clone(),
                     session_anchor.clone().unwrap(),
-                    draft,
+                    native,
                     continuous.clone().unwrap(),
                     session_cancel.clone(),
+                    processing,
+                    record,
                 )
             });
             #[cfg(windows)]
-            if let Some(draft) = &draft
-                && journal_ok
-                && !gate.cancelled()
-            {
-                draft.activate();
-                if let Ok(mut active) = coordinator.active.lock()
-                    && let Some(session) = active.as_mut().filter(|s| s.id == id)
-                {
-                    session.draft = Some(draft.clone());
+            if let Some(draft) = &draft {
+                if journal_ok && !gate.cancelled() {
+                    draft.activate();
+                    if let Ok(mut active) = coordinator.active.lock()
+                        && let Some(session) = active.as_mut().filter(|s| s.id == id)
+                    {
+                        session.draft = Some(draft.clone());
+                    }
+                    let latest = app
+                        .state::<SpeechService>()
+                        .subscribe_transcripts()
+                        .borrow()
+                        .clone();
+                    coordinator.observe_transcript(&latest);
+                } else if !journal_ok && !gate.cancelled() {
+                    coordinator.update(&app, &id, |s| s.error = Some("saveFailed".into()));
+                    let _ = crate::task_stop::request(
+                        &session_cancel,
+                        crate::contracts::speech::StopReason::Interrupted,
+                    );
                 }
-                let latest = app
-                    .state::<SpeechService>()
-                    .subscribe_transcripts()
-                    .borrow()
-                    .clone();
-                coordinator.observe_transcript(&latest);
+                // Every admitted range has a cleanup owner, including the
+                // cancelled/failed-journal path which may never write text.
                 let manager = draft.clone();
                 let handle = app.clone();
                 let task_id = id.clone();
@@ -606,10 +672,6 @@ impl DictationCoordinator {
                         })
                         .await;
                 });
-            } else if continuous.is_some() && !journal_ok && !gate.cancelled() {
-                // A failed journal may never turn a live task into a different input path.
-                coordinator.update(&app, &id, |s| s.error = Some("saveFailed".into()));
-                session_cancel.send_replace(3);
             }
             if let Ok(terminal) = terminal_rx.await {
                 coordinator.update(&app, &id, |s| {
@@ -753,6 +815,92 @@ impl DictationCoordinator {
                     }
                     s.presentation = Presentation::Recognizing;
                 });
+            }
+            #[cfg(windows)]
+            if let Some(draft) = &draft {
+                let final_report = draft.report();
+                let mut processing_archived = false;
+                match draft.archive().await {
+                    Ok(Some((report, persisted))) => {
+                        processing_archived = persisted;
+                        coordinator.update(&app, &id, |s| {
+                            if !report.text.is_empty() || report.cancelled {
+                                s.text = report.text;
+                            }
+                        });
+                        let _ = app.emit_to("main", "processing:archived", &id);
+                    }
+                    Err(error) => {
+                        log::info!(target:"sayweave","operation=processing_archive task_id={} result=failed error={}",id,error.code);
+                        coordinator.update(&app, &id, |s| s.error = Some("saveFailed".into()));
+                    }
+                    _ => {}
+                }
+                let current = app
+                    .state::<SpeechService>()
+                    .snapshot()
+                    .ok()
+                    .filter(|s| s.task_id.as_deref() == Some(&id));
+                if final_report.as_ref().is_some_and(|r| r.cancelled) {
+                    app.state::<SpeechService>().invalidate_task_audio(&id);
+                }
+                if let (Some(report), Some(current)) = (&final_report, &current)
+                    && report.cancelled
+                    && let (Some(record), Some(attempt)) = (&current.record_id, &current.attempt_id)
+                {
+                    let service = app.state::<SpeechService>();
+                    if service.history.discard_audio(record).await.is_err() {
+                        log::info!(target:"sayweave","operation=cancel_audio task_id={} result=pending",id);
+                    }
+                    let recovery = report.units.iter().any(|u| u.application == "uncertain")
+                        || coordinator
+                            .snapshot()
+                            .ok()
+                            .and_then(|s| s.delivery)
+                            .is_some_and(|d| {
+                                d.submission != crate::windows_input::Submission::NotSubmitted
+                                    && d.error.as_deref() == Some("compositionRollback")
+                            });
+                    if (!report.raw.is_empty() || recovery) && !processing_archived {
+                        let text = if report.raw.is_empty() {
+                            if !report.recovery_raw.is_empty() {
+                                report.recovery_raw.clone()
+                            } else {
+                                report
+                                    .units
+                                    .iter()
+                                    .filter(|u| u.application == "uncertain")
+                                    .map(|u| u.unit.text.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            }
+                        } else {
+                            report.raw.clone()
+                        };
+                        let pruned = service
+                            .history
+                            .db(DbOperation::PruneCancelled {
+                                attempt_id: attempt.clone(),
+                                text,
+                            })
+                            .await;
+                        if pruned.is_err() {
+                            coordinator.update(&app, &id, |s| s.error = Some("saveFailed".into()));
+                            log::info!(target:"sayweave","operation=cancel_archive task_id={} result=pending",id);
+                        }
+                    }
+                    draft.release_record();
+                    if report.raw.is_empty()
+                        && !recovery
+                        && let Ok(row) = service.history.detail(record).await
+                    {
+                        let _ = service.history.remove(record, row.revision).await;
+                        service.forget_audio(record);
+                    }
+                    let _ = app.emit_to("main", "processing:archived", &id);
+                } else {
+                    draft.release_record();
+                }
             }
             app.state::<WindowsInputService>().forget(id.clone());
             coordinator.release(&app, &id).await;
@@ -944,7 +1092,8 @@ impl DictationCoordinator {
             if let Some(flow) = &a.continuous {
                 flow.request_finish();
             }
-            a.cancel.send(1).map_err(|_| Error::new("staleSession"))?;
+            crate::task_stop::request(&a.cancel, crate::contracts::speech::StopReason::Finish)
+                .map_err(|_| Error::new("staleSession"))?;
             let elapsed = a.began.elapsed().as_millis();
             drop(active);
             self.update(app, id, |s| s.presentation = Presentation::Recognizing);
@@ -966,7 +1115,7 @@ impl DictationCoordinator {
         if let Some(flow) = &a.continuous {
             flow.request_finish();
         }
-        a.cancel.send_replace(2);
+        let _ = crate::task_stop::request(&a.cancel, crate::contracts::speech::StopReason::Cancel);
         Ok(())
     }
     pub fn interrupt_bound(&self, id: Option<&str>) {
@@ -977,7 +1126,10 @@ impl DictationCoordinator {
             if let Some(flow) = &a.continuous {
                 flow.request_finish();
             }
-            a.cancel.send_replace(3);
+            let _ = crate::task_stop::request(
+                &a.cancel,
+                crate::contracts::speech::StopReason::Interrupted,
+            );
         }
     }
     pub fn shutdown(&self) {
@@ -990,7 +1142,10 @@ impl DictationCoordinator {
             if let Some(flow) = &a.continuous {
                 flow.request_finish();
             }
-            a.cancel.send_replace(3);
+            let _ = crate::task_stop::request(
+                &a.cancel,
+                crate::contracts::speech::StopReason::Interrupted,
+            );
         }
     }
     pub async fn drain(&self) {

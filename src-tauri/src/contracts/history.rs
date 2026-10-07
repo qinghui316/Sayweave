@@ -52,6 +52,7 @@ pub struct Summary {
     pub status: String,
     pub revision: i64,
     pub display_attempt: Option<String>,
+    pub display_reference: Option<TextReference>,
     pub preview: String,
     pub truncated: bool,
     pub matched_old_version: bool,
@@ -108,6 +109,15 @@ pub struct Record {
     pub revision: i64,
     pub attempts: Vec<Attempt>,
     pub audio: Option<Audio>,
+    #[serde(default)]
+    pub processing: Vec<crate::contracts::processing::RunRecord>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextReference {
+    pub kind: String,
+    pub id: String,
+    pub attempt_id: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -132,6 +142,13 @@ pub struct Prepare {
 }
 #[derive(Clone, Debug)]
 pub enum DbOperation {
+    PruneCancelled {
+        attempt_id: String,
+        text: String,
+    },
+    DiscardAudio(String),
+    DiscardedAudio,
+    DeleteDiscardedAudio(String),
     RecoverDelivery,
     Deliveries(String),
     Delivery {

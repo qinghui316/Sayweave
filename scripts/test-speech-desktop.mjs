@@ -12,8 +12,9 @@ import {fileURLToPath} from 'node:url';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),id=randomUUID();
 const directory=path.join(root,'.local','data-acceptance',id),data=path.join(directory,'data');mkdirSync(data,{recursive:true});
 const exe=path.join(root,'src-tauri','target','release','desktop-acceptance.exe'),port=9241,key='fixture-'+randomUUID();
-const report={id,passed:false,checks:[],connections:[],handshakes:[]},delay=ms=>new Promise(r=>setTimeout(r,ms));
-let app,browser,server,mode='normal',expectedProtocol='qwen',expectedModel='qwen-audio-3.1-asr-flash-streaming';const sockets=new Set();
+const polishOnly=process.argv.includes('--polish');
+const report={id,passed:false,checks:[],connections:[],handshakes:[],polishRequests:[]},delay=ms=>new Promise(r=>setTimeout(r,ms));
+let app,browser,server,mode='normal',expectedProtocol='qwen',expectedModel='qwen-audio-3.1-asr-flash-streaming';const sockets=new Set(),polishReleases=new Map();
 async function command(args,extraEnv={}){const child=spawn('cargo',args,{cwd:root,windowsHide:true,env:{...process.env,...extraEnv,SAYWEAVE_DATA_ACCEPTANCE_ID:id},stdio:['ignore','pipe','pipe']});const log=createWriteStream(path.join(directory,'fixture.log'),{flags:'a'});child.stdout.pipe(log);child.stderr.pipe(log);if(await new Promise((r,j)=>{child.on('exit',r);child.on('error',j);})!==0)throw Error('Fixture operation failed');}
 function frame(value,opcode=1){const payload=Buffer.isBuffer(value)?value:Buffer.from(JSON.stringify(value));const header=Buffer.alloc(payload.length<126?2:4);header[0]=0x80|opcode;header[1]=payload.length<126?payload.length:126;if(payload.length>=126)header.writeUInt16BE(payload.length,2);return Buffer.concat([header,payload]);}
 function websocket(req,socket,head){
@@ -26,7 +27,8 @@ function websocket(req,socket,head){
  const accept=createHash('sha1').update(req.headers['sec-websocket-key']+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '+accept+'\r\n\r\n');sockets.add(socket);socket.on('close',()=>sockets.delete(socket));socket.on('error',()=>{});
  const connection={protocol:expectedProtocol,mode,model:null,frames:0,bytes:0,started:false,finished:false};report.connections.push(connection);let task,buffer=head,fragment=Buffer.alloc(0),fragmentOpcode=0;
  const send=(event,payload={})=>socket.write(frame({header:{task_id:task,event},payload}));
- const result=(text,end)=>send('result-generated',{output:{sentence:{sentence_id:1,sentence_end:end,text,begin_time:0,end_time:end?connection.bytes/32:null}}});
+ const sentence=(sid,text,end)=>send('result-generated',{output:{sentence:{sentence_id:sid,sentence_end:end,text,begin_time:0,end_time:end?connection.bytes/32:null}}});
+ const result=(text,end)=>sentence(1,text,end);
  const binaryPayload=(value,last=false)=>{const bytes=gzipSync(Buffer.from(JSON.stringify(value)));connection.responseSequence=(connection.responseSequence??0)+1;const header=Buffer.alloc(12);header.set([0x11,last?0x93:0x91,0x11,0]);header.writeInt32BE(last?-1:connection.responseSequence,4);header.writeUInt32BE(bytes.length,8);socket.write(frame(Buffer.concat([header,bytes]),2));};
  const binaryResult=(text,end,last=false)=>binaryPayload({code:20000000,result:{text,utterances:text?[{text,definite:end,start_time:0,end_time:Math.round(connection.bytes/32)}]:[]}},last);
  function consume(opcode,payload){
@@ -39,12 +41,76 @@ function websocket(req,socket,head){
   }
 
   if(opcode===8){socket.end(frame(payload,8));return;}if(opcode===9){socket.write(frame(payload,10));return;}
-  if(opcode===2){if(!connection.started)throw Error('Audio arrived before task-started');connection.frames++;connection.bytes+=payload.length;if(connection.frames===1){if(connection.mode==='failure'){socket.write(frame({header:{task_id:task,event:'task-failed',error_code:'SERVICE_ERROR',error_message:'PRIVATE FIXTURE ERROR'}}));return;}result('正在',false);}if(connection.frames===8)result('正在识别',false);return;}
+  if(opcode===2){if(!connection.started)throw Error('Audio arrived before task-started');connection.frames++;connection.bytes+=payload.length;if(connection.mode==='polish'){if(connection.frames===1)sentence(1,'呃，第一段啊。',false);if(connection.frames===8)sentence(1,'呃，第一段啊。',true);if(connection.frames===16)sentence(2,'嗯，第二段啊。',false);if(connection.frames===35)sentence(2,'嗯，第二段啊。',true);if(connection.frames===45)sentence(3,'尾部',false);return;}if(connection.frames===1){if(connection.mode==='failure'){socket.write(frame({header:{task_id:task,event:'task-failed',error_code:'SERVICE_ERROR',error_message:'PRIVATE FIXTURE ERROR'}}));return;}result('正在',false);}if(connection.frames===8)result('正在识别',false);return;}
   if(opcode!==1)return;const value=JSON.parse(payload.toString());if(value.header.action==='run-task'){task=value.header.task_id;expect(value.payload.parameters.sample_rate).toBe(16000);expect(value.payload.parameters.format).toBe('pcm');expect(value.payload.model).toBe(expectedModel);connection.model=value.payload.model;connection.started=true;send('task-started');}
-  else if(value.header.action==='finish-task'){connection.finished=true;if(connection.mode==='pending')return;if(connection.mode==='empty'){send('task-finished');return;}result('原生受控识别完成。',true);result('重复最终结果不应覆盖。',true);send('task-finished');}
+  else if(value.header.action==='finish-task'){connection.finished=true;if(connection.mode==='polish'){sentence(3,'尾部完成🙂',true);send('task-finished');return;}if(connection.mode==='pending')return;if(connection.mode==='empty'){send('task-finished');return;}result('原生受控识别完成。',true);result('重复最终结果不应覆盖。',true);send('task-finished');}
  }
  function receive(chunk){buffer=Buffer.concat([buffer,chunk]);try{while(buffer.length>=2){const opcode=buffer[0]&15,fin=(buffer[0]&128)!==0,masked=(buffer[1]&128)!==0;let length=buffer[1]&127,offset=2;if(length===126){if(buffer.length<4)return;length=buffer.readUInt16BE(2);offset=4;}else if(length===127){if(buffer.length<10)return;length=Number(buffer.readBigUInt64BE(2));offset=10;}if(length>1024*1024)throw Error('oversize frame');if(masked)offset+=4;if(buffer.length<offset+length)return;const payload=Buffer.from(buffer.subarray(offset,offset+length));if(masked){const mask=buffer.subarray(offset-4,offset);for(let n=0;n<length;n++)payload[n]^=mask[n%4];}buffer=buffer.subarray(offset+length);if(opcode===0){fragment=Buffer.concat([fragment,payload]);if(fin){consume(fragmentOpcode,fragment);fragment=Buffer.alloc(0);}}else if(!fin&&opcode<8){fragmentOpcode=opcode;fragment=payload;}else consume(opcode,payload);}}catch(e){report.protocolError=String(e);socket.destroy();}}
  socket.on('data',receive);if(head.length)receive(Buffer.alloc(0));
+}
+async function modelFixture(req,res){
+ if(req.url!=='/v1/chat/completions'||req.headers.authorization!=='Bearer '+key){res.writeHead(401);res.end('{}');return;}
+ let bytes=0;const chunks=[];for await(const chunk of req){bytes+=chunk.length;if(bytes>16*1024){res.writeHead(413);res.end();return;}chunks.push(chunk);}
+ const request=JSON.parse(Buffer.concat(chunks).toString('utf8')),data=JSON.parse(request.messages[1].content);expect(request.stream).toBe(true);expect(request.model).toBe('polish-fixture');
+ report.polishRequests.push({input:data.input_text,context:data.previous_context,bytes,at:performance.now()});
+ const output=data.input_text.includes('第一段')?'第一段。\n':data.input_text.includes('第二段')?'第二段。\n':data.input_text;
+ if(data.input_text.includes('第一段')||data.input_text.includes('第二段')){
+  await new Promise(resolve=>{const timer=setTimeout(resolve,15000);const release=()=>{clearTimeout(timer);resolve();};polishReleases.set(data.input_text,release);res.once('close',release);});
+  polishReleases.delete(data.input_text);if(res.destroyed)return;
+ }
+ res.writeHead(200,{'Content-Type':'text/event-stream'});
+ const chunk=JSON.stringify({choices:[{index:0,delta:{role:'assistant',content:output},finish_reason:null}]});
+ const wire=Buffer.from('data: '+chunk+'\r\n\r\ndata: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n');
+ for(let n=0;n<wire.length;n+=7){res.write(wire.subarray(n,n+7));}res.end();
+}
+async function polishScenario(page,base){
+ const overview=await readModels(page);
+ const configured=await invoke(page,'model_save',{request:{id:null,revision:null,expectation:null,input:{name:'隔离整理验收',protocol:'openai-chat',baseUrl:base+'/v1',modelId:'polish-fixture',usages:['text']},key:{action:'replace',value:key}}});
+ expect(configured.defaults.find(d=>d.usage==='speech').configId).toBe(overview.defaults.find(d=>d.usage==='speech').configId);
+ const editor=await ownedEditor();mode='polish';
+ try{
+  await editor.command({action:'focus',text:'',start:0,end:0});
+  const task=await invoke(page,'dictation_start');expect(task.source).toBe('external');
+  const samples=[];let observedTask=task.taskId;report.polish={taskId:task.taskId,samples};
+  const observe=async()=>{const value=(await editor.command({action:'read'})).text;samples.push({taskId:observedTask,at:performance.now(),text:value});return value;};
+  const release=async(text)=>{await expect.poll(()=>[...polishReleases.keys()].some(k=>k.includes(text)),{timeout:12000}).toBe(true);for(const [input,go]of polishReleases){if(input.includes(text))go();}};
+  await expect.poll(observe,{timeout:12000,intervals:[50,100]}).toContain('呃，第一段啊。');
+  await release('第一段');
+  await expect.poll(observe,{timeout:12000,intervals:[50,100]}).toContain('第一段。');
+  await expect.poll(observe,{timeout:12000,intervals:[50,100]}).toContain('嗯，第二段啊。');
+  await release('第二段');
+  await expect.poll(observe,{timeout:12000,intervals:[50,100]}).toContain('第二段。');
+  await expect.poll(async()=>report.polishRequests.filter(r=>r.input.includes('第二段')).length,{timeout:5000}).toBe(1);
+  await expect.poll(async()=>{const value=(await editor.command({action:'read'})).text;samples.push({taskId:observedTask,at:performance.now(),text:value});return value;},{timeout:5000}).toContain('尾部');
+  expect(report.polishRequests.filter(r=>r.input.includes('第一段'))).toHaveLength(1);
+  await invoke(page,'dictation_control',{taskId:task.taskId,action:'finish'});
+  await expect.poll(async()=>(await editor.command({action:'read'})).text,{timeout:12000}).toBe('第一段。\r\n第二段。\r\n尾部完成🙂');
+  await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).presentation,{timeout:5000}).toBe('idle');
+  const completed=await invoke(page,'speech_snapshot');const detail=await invoke(page,'history_detail',{id:completed.recordId});
+  expect(detail.attempts.find(a=>a.id===completed.attemptId).text).toBe('呃，第一段啊。嗯，第二段啊。尾部完成🙂');
+  expect(detail.processing[0].text).toBe('第一段。\n第二段。\n尾部完成🙂');
+  const summary=await invoke(page,'history_browse',{query:{search:'',cursor:null}});expect(summary.records[0].displayReference.kind).toBe('processed');
+  report.polish={taskId:task.taskId,samples,actualFinal:(await editor.command({action:'read'})).text,raw:detail.attempts[0].text,processed:detail.processing[0].text,units:detail.processing[0].units.map(u=>({generation:u.generationState,application:u.applicationState,sourceStart:u.sourceStart,sourceEnd:u.sourceEnd,committedEnd:u.sourceCommittedEnd})),supplierRequests:false};
+  report.checks.push('controlled ASR partial then2stable LLM prefixes with live tail, exact native final multiline/emoji, raw/processed independent and summary reference bound');
+  // Start a second real session; keep the next model response pending while
+  // cancelling so persistence cannot retain unsubmitted generation payloads.
+  const beforeRequests=report.polishRequests.length;
+  await editor.command({action:'focus',text:'',start:0,end:0});
+  const cancelled=await invoke(page,'dictation_start');observedTask=cancelled.taskId;
+  await expect.poll(observe,{timeout:12000,intervals:[50,100]}).toContain('呃，第一段啊。');
+  await release('第一段');
+  await expect.poll(observe,{timeout:12000,intervals:[50,100]}).toContain('第一段。');
+  await expect.poll(()=>[...polishReleases.keys()].some(k=>k.includes('第二段')),{timeout:12000}).toBe(true);
+  await invoke(page,'dictation_control',{taskId:cancelled.taskId,action:'cancel'});
+  await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).presentation,{timeout:12000}).toBe('idle');
+  expect((await editor.command({action:'read'})).text).toBe('第一段。');
+  const cancelSpeech=await invoke(page,'speech_snapshot'),cancelRecord=await invoke(page,'history_detail',{id:cancelSpeech.recordId});
+  expect(cancelRecord.processing[0].state).toBe('cancelled');expect(cancelRecord.processing[0].text).toBe('第一段。');
+  expect(cancelRecord.processing[0].units).toHaveLength(1);expect(cancelRecord.processing[0].units[0].candidateText).toBe('第一段。');
+  expect(cancelRecord.attempts[0].text).toBe('呃，第一段啊。');expect(cancelRecord.audio?.status==='ready').toBe(false);
+  report.polish.cancel={taskId:cancelled.taskId,actual:(await editor.command({action:'read'})).text,units:cancelRecord.processing[0].units.length,requests:report.polishRequests.length-beforeRequests,audio:cancelRecord.audio?.status??null};
+  report.checks.push('cancel after submitted prefix removes owned tail/separator, drops pending processing unit and discards recording');
+ }finally{await editor.close();mode='normal';}
 }
 async function processMetrics(){
  const taskPid=app.pid;if(!Number.isSafeInteger(taskPid)||taskPid<=0)throw Error('Invalid owned process');
@@ -179,8 +245,10 @@ async function run(){try{
  await command(['build','--manifest-path','src-tauri/Cargo.toml','--release','--features','desktop-acceptance,tauri/custom-protocol','--bin','desktop-acceptance'],{SAYWEAVE_TSF_PAYLOAD:payload});
  await command(['build','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance','--bin','input-fixture']);
  report.targetGroup=process.env.SAYWEAVE_INPUT_TARGET_GROUP??'all';
- await command(['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_fixture','--','--ignored']);server=createServer({cert:readFileSync(path.join(data,'fixture-ca.pem')),key:readFileSync(path.join(data,'fixture-key.pem'))});server.on('upgrade',websocket);await new Promise(r=>server.listen(0,'127.0.0.1',r));const base='https://localhost:'+server.address().port;
+ await command(['test','--manifest-path','src-tauri/Cargo.toml','--lib','model_desktop_fixture','--','--ignored']);server=createServer({cert:readFileSync(path.join(data,'fixture-ca.pem')),key:readFileSync(path.join(data,'fixture-key.pem'))});server.on('upgrade',websocket);server.on('request',(req,res)=>void modelFixture(req,res).catch(error=>{report.modelError=String(error);res.destroy();}));await new Promise(r=>server.listen(0,'127.0.0.1',r));const base='https://localhost:'+server.address().port;
  let page=await start(1);await expect(page.getByRole('link',{name:'组件展示'})).toHaveCount(0);await page.getByRole('button',{name:'配置模型',exact:true}).click();const dialog=page.getByRole('dialog');await delay(250);await page.screenshot({path:path.join(directory,'settings-speech-native.png')});await dialog.getByRole('button',{name:'更多设置'}).click();await dialog.getByLabel('名称',{exact:true}).fill('隔离语音验收');await dialog.getByLabel('服务地址（URL）',{exact:true}).fill(base);await dialog.getByLabel('API 密钥',{exact:true}).fill(key);await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(dialog.getByText('已保存。')).toBeVisible();await dialog.getByRole('button',{name:'关闭',exact:true}).click();await expect(dialog).toHaveCount(0);
+ if(polishOnly){await polishScenario(page,base);await stop(page);report.passed=true;return;}
+
  const devices=await invoke(page,'speech_devices');report.microphoneCount=devices.length;expect(devices.some(d=>d.isDefault)).toBe(true);
  report.scope=process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE??'all';
  if(report.scope==='home-trial'){await homeTrialIsolation(page);report.passed=true;return;}
@@ -438,9 +506,9 @@ for(const r of (await invoke(page,'history_list',{query:{search:'',page:1}})).re
  await invoke(page,'acceptance_main_size',{minimum:false});
  report.checks.push('10k native summaries through IPC;1000 rows continuously loaded; cached reading restored by real routes');
  await stop(page);expect(readFileSync(path.join(data,'dictionary.sqlite')).includes(Buffer.from(key))).toBe(false);for(let round=1;round<=5;round++)for(const suffix of ['.log','-errors.log'])expect(readFileSync(path.join(directory,'round-'+round+suffix),'utf8')).not.toContain(key);if(report.compatibilityFailures?.length)throw Error('Actual input compatibility failures remain; see compatibilityFailures.');report.passed=true;
-}catch(e){report.error=String(e).replaceAll(key,'[redacted]');report.errorStack=e.stack?.replaceAll(key,'[redacted]');if(browser){const main=browser.contexts().flatMap(c=>c.pages()).find(p=>!p.url().includes('surface=overlay'));if(main){await main.screenshot({path:path.join(directory,'failure.png')}).catch(()=>{});report.failureDialogs=await main.getByRole('dialog').count().catch(()=>null);const speech=await invoke(main,'speech_snapshot').catch(()=>null);report.failureSpeechPhase=speech?.phase??null;report.failureSpeechError=speech?.error??null;}}process.exitCode=1;}finally{
+}catch(e){report.error=String(e).replaceAll(key,'[redacted]');report.errorStack=e.stack?.replaceAll(key,'[redacted]');if(browser){const main=browser.contexts().flatMap(c=>c.pages()).find(p=>!p.url().includes('surface=overlay'));if(main){await main.screenshot({path:path.join(directory,'failure.png')}).catch(()=>{});report.failureDialogs=await main.getByRole('dialog').count().catch(()=>null);const speech=await invoke(main,'speech_snapshot').catch(()=>null);report.failureSpeechPhase=speech?.phase??null;report.failureSpeechError=speech?.error??null;}}writeFileSync(path.join(directory,'pending-report.json'),JSON.stringify(report,null,2));process.exitCode=1;}finally{
  if(browser){const page=browser.contexts().flatMap(c=>c.pages()).find(p=>!p.url().includes('surface=overlay'));await stop(page).catch(()=>stop(null,false));}else await stop(null,false);for(const socket of sockets)socket.destroy();if(server)await new Promise(r=>server.close(r));
- try{await command(['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_cleanup','--','--ignored']);report.credentialCleanup=true;}catch{report.credentialCleanup=false;report.passed=false;process.exitCode=1;}
+ try{await command(['test','--manifest-path','src-tauri/Cargo.toml','--lib','model_desktop_cleanup','--','--ignored']);report.credentialCleanup=true;}catch{report.credentialCleanup=false;report.passed=false;process.exitCode=1;}
  for(const name of ['fixture-ca.der','fixture-ca.pem','fixture-key.pem'])if(existsSync(path.join(data,name)))unlinkSync(path.join(data,name));writeFileSync(path.join(directory,'report.json'),JSON.stringify(report,null,2));writeFileSync(path.join(root,'.local','speech-desktop-report.json'),JSON.stringify(report,null,2));
 }
 }

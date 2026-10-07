@@ -1,0 +1,22 @@
+import {act,render,screen,waitFor} from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import {describe,it,expect,vi} from 'vitest';
+import {ProcessingSettings} from '../src/features/settings';
+import type {ProcessingPort,ProcessingStatus} from '../src/contracts/processing';
+const initial:ProcessingStatus={settings:{enabled:true,revision:1},available:true,model:'文字服务',error:null};
+describe('processing settings',()=>{
+ it('preserves input on save failure and model metadata refresh, then protects leaving',async()=>{
+  let guard:((next:()=>void)=>void)|null=null;const bind=(value:typeof guard)=>{guard=value;};
+  const port:ProcessingPort={status:vi.fn().mockResolvedValue(initial),save:vi.fn().mockRejectedValue({code:'unavailable'})};const user=userEvent.setup();
+  const view=render(<ProcessingSettings port={port} revision={0} onGuardChange={bind}/>);await screen.findByText('文字模型：文字服务');
+  await user.click(screen.getByRole('switch',{name:'整理口述'}));await user.click(screen.getByRole('button',{name:'保存整理设置'}));await screen.findByText('保存失败，修改仍保留。');expect(screen.getByRole('switch')).not.toBeChecked();
+  vi.mocked(port.status).mockResolvedValue({...initial,model:'新文字服务'});view.rerender(<ProcessingSettings port={port} revision={1} onGuardChange={bind}/>);await screen.findByText('文字模型：新文字服务');expect(screen.getByRole('switch')).not.toBeChecked();
+  const leave=vi.fn();await waitFor(()=>expect(guard).not.toBeNull());act(()=>guard!(leave));await screen.findByRole('alertdialog');await user.click(screen.getByRole('button',{name:'继续填写'}));expect(leave).not.toHaveBeenCalled();
+  act(()=>guard!(leave));await user.click(screen.getByRole('button',{name:'放弃修改'}));expect(leave).toHaveBeenCalledOnce();
+ });
+ it('saves only the explicit preference using its revision',async()=>{
+  const port:ProcessingPort={status:vi.fn().mockResolvedValue(initial),save:vi.fn().mockResolvedValue({...initial,settings:{enabled:false,revision:2}})};const user=userEvent.setup();
+  render(<ProcessingSettings port={port} revision={0}/>);await screen.findByText('文字模型：文字服务');await user.click(screen.getByRole('switch'));await user.click(screen.getByRole('button',{name:'保存整理设置'}));
+  await waitFor(()=>expect(screen.queryByRole('button',{name:'保存整理设置'})).not.toBeInTheDocument());expect(port.save).toHaveBeenCalledWith({enabled:false,revision:1});expect(screen.getByRole('switch')).not.toBeChecked();
+ });
+});

@@ -4250,6 +4250,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "unicode-normalization",
+ "unicode-segmentation",
  "uuid",
  "windows",
  "windows-core",

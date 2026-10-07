@@ -112,9 +112,9 @@ it('offers stopping delivery after recognition without a discard label',async()=
 
 it('shows only recognition feedback while final text is pending and clears completed captions',()=>{
  const view=render(<VoiceSurface presentation="recognizing" phase="processing" text="尾字尚在返回" start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
- expect(screen.getByText('识别中')).toBeVisible();expect(screen.queryByLabelText('实时字幕')).not.toBeInTheDocument();
+ expect(screen.getByRole('group',{name:'识别中'})).toBeVisible();expect(screen.queryByText('识别中')).not.toBeInTheDocument();expect(screen.queryByLabelText('实时字幕')).not.toBeInTheDocument();
  view.rerender(<VoiceSurface presentation="completed" phase="completed" text="完整结果" start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
- expect(screen.getByText('口述完成')).toBeVisible();expect(screen.queryByText('完整结果')).not.toBeInTheDocument();
+ expect(screen.getByRole('group',{name:'口述完成'})).toBeVisible();expect(screen.queryByText('口述完成')).not.toBeInTheDocument();expect(screen.queryByText('完整结果')).not.toBeInTheDocument();
  expect(screen.queryByRole('button',{name:'复制'})).not.toBeInTheDocument();
 });
 it('submitted input offers a closeable notice without a copy card',async()=>{
@@ -139,7 +139,7 @@ it.each(['editing','resuming'] as const)('keeps finish available while the conti
  const state=parseDictation({...initialDictation(),source:'external',taskId:'live',presentationId:'view',stage:'recognizing',presentation});
  const phase=dictationPhase(state,'recording',{taskId:'live',text:'原始识别'});
  render(<VoiceSurface presentation={presentation} phase={phase} text="原始识别" start={()=>{}} finish={finish} cancel={()=>{}}/>);
- expect(screen.getByText(presentation==='editing'?'编辑中，口述已暂停':'准备继续口述')).toBeVisible();
+ expect(screen.getByRole('group',{name:presentation==='editing'?'编辑中，口述已暂停':'准备继续口述'})).toBeVisible();expect(screen.queryByText(presentation==='editing'?'编辑中，口述已暂停':'准备继续口述')).not.toBeInTheDocument();
  expect(screen.queryByRole('region',{name:'口述结果'})).not.toBeInTheDocument();
  await user.click(screen.getByRole('button',{name:'结束录音'}));expect(finish).toHaveBeenCalledOnce();
 });
@@ -185,4 +185,10 @@ it('reports rejected live admission without a copy card and exposes settings',as
  await user.click(screen.getByRole('button',{name:'设置'}));expect(settings).toHaveBeenCalledOnce();
  expect(()=>parseDictation({...state,inputRoute:'paste'})).toThrow();
  expect(()=>parseDictation({...state,admission:'unknown'})).toThrow();
+});
+it('shows an archive failure separately from normal stage animation',()=>{
+ render(<VoiceSurface presentation="notice" phase="completed" noticeText="保存未完成，结果已保留。" start={()=>{}} finish={()=>{}} cancel={()=>{}} dismiss={()=>{}}/>);
+ expect(screen.getByRole('status')).toHaveTextContent('保存未完成，结果已保留。');
+ expect(screen.queryByRole('region',{name:'口述结果'})).not.toBeInTheDocument();
+ expect(screen.getByRole('button',{name:'关闭'})).toBeVisible();
 });

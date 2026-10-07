@@ -8,9 +8,12 @@ mod history;
 mod input_state;
 mod models;
 mod network;
+mod processing;
+mod processing_commands;
 mod shortcuts;
 mod speech;
 mod speech_projection;
+mod task_stop;
 mod text_service;
 mod voice_window;
 pub use text_service::helper_entry as text_service_helper_entry;
@@ -550,6 +553,8 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            processing_commands::processing_status,
+            processing_commands::processing_save,
             shortcut_status,
             shortcut_save,
             shortcut_capture,

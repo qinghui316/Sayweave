@@ -14,6 +14,7 @@ struct Reply {
     headers: String,
     delay: Duration,
     chunked: bool,
+    split_bytes: usize,
 }
 impl Reply {
     fn json(status: u16, body: &str) -> Self {
@@ -23,6 +24,7 @@ impl Reply {
             headers: String::new(),
             delay: Duration::ZERO,
             chunked: false,
+            split_bytes: 0,
         }
     }
 }
@@ -97,12 +99,17 @@ impl Fixture {
                 };
                 let _ = stream.write_all(header.as_bytes());
                 if item.chunked {
-                    let _ = write!(
-                        stream,
-                        "{:x}\r\n{}\r\n0\r\n\r\n",
-                        item.body.len(),
-                        item.body
-                    );
+                    for chunk in item.body.as_bytes().chunks(if item.split_bytes == 0 {
+                        item.body.len().max(1)
+                    } else {
+                        item.split_bytes
+                    }) {
+                        let _ = write!(stream, "{:x}\r\n", chunk.len());
+                        let _ = stream.write_all(chunk);
+                        let _ = stream.write_all(b"\r\n");
+                        let _ = stream.flush();
+                    }
+                    let _ = stream.write_all(b"0\r\n\r\n");
                 } else {
                     let _ = stream.write_all(item.body.as_bytes());
                 }
@@ -160,7 +167,7 @@ fn read_request(
                 .and_then(|v| v.trim().parse::<usize>().ok())
         })
         .unwrap_or(0);
-    if len > 8192 {
+    if len > 16 * 1024 {
         return Err(());
     }
     data.resize(end + len, 0);
@@ -379,4 +386,107 @@ async fn normal_tls_verification_rejects_untrusted_fixture() {
             .code,
         "network"
     );
+}
+
+fn generated_sse(text: &str, finish: &str, done: bool) -> Reply {
+    let mut body = format!(
+        "data: {}\r\n\r\ndata: {}\n\n",
+        json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]}),
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":finish}]})
+    );
+    if done {
+        body.push_str("data: [DONE]\n\n");
+    }
+    let mut reply = Reply::json(200, &body);
+    reply.headers = "Content-Type: text/event-stream\r\n".into();
+    reply.chunked = true;
+    reply.split_bytes = 1;
+    reply
+}
+fn messages() -> Vec<Message> {
+    vec![
+        Message {
+            role: "system",
+            content: "Return only cleaned dictated text.".into(),
+        },
+        Message {
+            role: "user",
+            content: r#"{"input_text":"呃，中文🙂。"}"#.into(),
+        },
+    ]
+}
+#[tokio::test]
+async fn generated_sse_and_json_complete_actual_tls_without_publishing_partial() {
+    let fixture = Fixture::start(vec![
+        generated_sse("中文🙂。", "stop", true),
+        Reply::json(
+            200,
+            r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"中文🙂。"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+        ),
+    ]);
+    let output = fixture
+        .provider
+        .generate(&fixture.input(), "fixture-key", &messages())
+        .await
+        .unwrap();
+    assert_eq!(output.text, "中文🙂。");
+    assert!(output.first_output_ms.is_some());
+    let output = fixture
+        .provider
+        .generate(&fixture.input(), "fixture-key", &messages())
+        .await
+        .unwrap();
+    assert_eq!(output.text, "中文🙂。");
+    assert_eq!(output.usage.total, Some(15));
+    let requests = fixture.seen.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let request: Value =
+        serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(request["stream"], true);
+    assert_eq!(request["model"], "test-model");
+    assert_eq!(request["messages"][1]["content"], messages()[1].content);
+}
+#[tokio::test]
+async fn generation_fallback_only_explicit_unsupported_parameter_and_incomplete_never_retries() {
+    let fixture = Fixture::start(vec![
+        Reply::json(
+            400,
+            r#"{"error":{"param":"max_tokens","code":"unsupported_parameter"}}"#,
+        ),
+        generated_sse("结果。", "stop", true),
+    ]);
+    assert_eq!(
+        fixture
+            .provider
+            .generate(&fixture.input(), "fixture-key", &messages())
+            .await
+            .unwrap()
+            .text,
+        "结果。"
+    );
+    let requests = fixture.seen.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let retry: Value = serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(retry["max_completion_tokens"], 2048);
+    drop(requests);
+    for (reply, code) in [
+        (generated_sse("partial", "stop", false), "incompleteText"),
+        (generated_sse("partial", "length", true), "truncatedText"),
+        (Reply::json(401, "secret provider text"), "auth"),
+        (
+            Reply::json(400, r#"{"error":{"message":"max_tokens unsupported"}}"#),
+            "protocol",
+        ),
+    ] {
+        let fixture = Fixture::start(vec![reply]);
+        let error = fixture
+            .provider
+            .generate(&fixture.input(), "fixture-key", &messages())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, code);
+        assert_eq!(fixture.seen.lock().unwrap().len(), 1);
+        assert!(!serde_json::to_string(&error).unwrap().contains("secret"));
+    }
 }

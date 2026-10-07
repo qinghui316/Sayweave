@@ -40,6 +40,7 @@ for (const file of checked) {
   const forbidden = file.startsWith('contracts/') ? [...refs].filter(name => name !== 'contracts')
     : file.startsWith('data/') ? [...refs].filter(name => name !== 'contracts' && name !== 'data')
     : file === 'network.rs' ? [...refs]
+    : file.startsWith('processing/') ? [...refs].filter(name => name !== 'contracts' && name !== 'processing')
     : [];
   for (const name of forbidden) violations.push(`${file} -> crate::${name}`);
   if (/^(?:models|history|shortcuts)\//.test(file) && /\bimpl\s+Repository\b/.test(source)) {

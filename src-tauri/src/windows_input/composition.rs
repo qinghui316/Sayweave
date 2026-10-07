@@ -5,10 +5,14 @@ use sayweave_text_service::{
     client::ProfileLease,
     registration,
     transport::Pipe,
-    wire::{Action, Mutation, Reply, Request},
+    wire::{Action, Mutation, Prefix, Reply, Request},
 };
 use std::{
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::oneshot;
@@ -18,25 +22,38 @@ use windows::Win32::{
     UI::WindowsAndMessaging::*,
 };
 
-#[derive(Default)]
-struct Desired {
-    revision: u64,
-    text: String,
-    closed: bool,
-    notified: bool,
-    frozen: bool,
-    failure: Option<String>,
-}
 enum Command {
-    Wake,
-    Begin(
-        u64,
-        Anchor,
-        Arc<Mutex<Desired>>,
-        oneshot::Sender<Result<(), Error>>,
-    ),
-    Finish(u64, String, Finish, bool, oneshot::Sender<Delivery>),
+    Begin(u64, Anchor, oneshot::Sender<Result<(), Error>>),
+    Finish(u64, String, Finish, bool, oneshot::Sender<FinishOutcome>),
     Close(oneshot::Sender<Result<(), Error>>),
+    Replace(u64, String, oneshot::Sender<Result<(), Error>>),
+    Settle(
+        u64,
+        String,
+        String,
+        Arc<AtomicBool>,
+        oneshot::Sender<PrefixOutcome>,
+    ),
+}
+pub(crate) struct PrefixOutcome {
+    pub prefix: Mutation,
+    pub tail_owned: bool,
+    pub error: Option<String>,
+}
+pub(crate) struct FinishOutcome {
+    pub delivery: Delivery,
+    /// Acknowledgement of this Commit; prior visible text is independent.
+    pub committed: bool,
+    pub handed_off: bool,
+}
+impl FinishOutcome {
+    fn rejected(code: &str) -> Self {
+        Self {
+            delivery: Delivery::not_submitted(code),
+            committed: false,
+            handed_off: false,
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Finish {
@@ -47,7 +64,8 @@ pub enum Finish {
 pub struct Draft {
     connection: Arc<Connection>,
     turn: u64,
-    desired: Arc<Mutex<Desired>>,
+    closed: AtomicBool,
+    source_sequence: AtomicU64,
 }
 /// One apartment, activation lease and authenticated pipe for the entire session.
 /// Editing retires only the range; it does not toggle the process-wide TSF service.
@@ -60,10 +78,9 @@ impl Connection {
         turn: u64,
         anchor: Anchor,
     ) -> Result<Arc<Draft>, Error> {
-        let desired = Arc::new(Mutex::new(Desired::default()));
         let (reply, result) = oneshot::channel();
         self.sender
-            .try_send(Command::Begin(turn, anchor, desired.clone(), reply))
+            .try_send(Command::Begin(turn, anchor, reply))
             .map_err(|_| Error::new("compositionWorker"))?;
         result
             .await
@@ -71,7 +88,8 @@ impl Connection {
         Ok(Arc::new(Draft {
             connection: self.clone(),
             turn,
-            desired,
+            closed: AtomicBool::new(false),
+            source_sequence: AtomicU64::new(0),
         }))
     }
     pub async fn close(&self) -> Result<(), Error> {
@@ -90,9 +108,7 @@ impl Draft {
         gate: Arc<DeliveryGate>,
     ) -> Result<Arc<Self>, Error> {
         let (sender, commands) = mpsc::sync_channel(4);
-        let desired = Arc::new(Mutex::new(Desired::default()));
         let (ready, result) = oneshot::channel();
-        let mut shared = desired.clone();
         std::thread::Builder::new()
             .name("sayweave-composition-sta".into())
             .spawn(move || {
@@ -110,66 +126,30 @@ impl Draft {
                 if ready.send(Ok(())).is_err() {
                     return;
                 }
-                let mut applied = 0;
-                let mut last_update: Option<Instant> = None;
                 loop {
                     pump();
                     match commands.recv_timeout(Duration::from_millis(5)) {
-                        Ok(Command::Begin(turn, anchor, desired, reply)) => {
-                            let result = host.begin_turn(turn, anchor);
-                            if result.is_ok() {
-                                shared = desired;
-                                applied = 0;
-                                last_update = None;
-                            }
-                            let _ = reply.send(result);
-                        }
-                        Ok(Command::Close(reply)) => {
-                            let result = host.close();
-                            drop(host);
-                            let _ = reply.send(result);
-                            return;
-                        }
-                        Ok(Command::Finish(turn, text, mode, keep, reply)) => {
-                            if turn != host.turn {
-                                let _ = reply.send(Delivery::not_submitted("staleSession"));
-                                continue;
-                            }
-                            let mut delivery = host.finish(&text, mode);
-                            if keep {
-                                let _ = reply.send(delivery);
-                                continue;
-                            }
-                            if host.close().is_err() {
-                                delivery.error = Some("compositionCleanup".into());
-                            }
-                            drop(host);
-                            let _ = reply.send(delivery);
-                            return;
-                        }
-                        Ok(Command::Wake) => {
-                            if let Ok(mut desired) = shared.lock() {
-                                desired.notified = false;
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                    let latest = shared.lock().ok().and_then(|d| {
-                        (!d.closed && !d.frozen && d.revision > applied)
-                            .then(|| (d.revision, d.text.clone()))
-                    });
-                    if let Some((revision, text)) = latest
-                        && last_update.is_none_or(|at| at.elapsed() >= Duration::from_millis(50))
-                    {
-                        if host.failure.is_none() {
-                            let _ = host.update(&text);
-                        }
-                        if let Ok(mut desired) = shared.lock() {
-                            desired.failure = host.failure.clone();
-                        }
-                        applied = revision;
-                        last_update = Some(Instant::now());
+                        Ok(Command::Replace(turn,text,reply))=>{
+                            let result=if turn==host.turn {host.update(&text)}else{Err(Error::new("staleSession"))};
+                            let _=reply.send(result);
+                        },
+                        Ok(Command::Settle(turn,prefix,tail,permit,reply))=>{
+                            let outcome=if turn!=host.turn {PrefixOutcome {prefix:Mutation::NotAttempted,tail_owned:false,error:Some("staleSession".into())}}
+                            else if !permit.load(Ordering::Acquire) {PrefixOutcome {prefix:Mutation::NotAttempted,tail_owned:false,error:Some("staleSnapshot".into())}}
+                            else {host.settle(&prefix,&tail,&permit)};
+                            let _=reply.send(outcome);
+                        },
+                        Ok(Command::Begin(turn,anchor,reply))=>{let _=reply.send(host.begin_turn(turn,anchor));},
+                        Ok(Command::Close(reply))=>{let result=host.close();drop(host);let _=reply.send(result);return;},
+                        Ok(Command::Finish(turn,text,mode,keep,reply))=>{
+                            if turn!=host.turn {let _=reply.send(FinishOutcome::rejected("staleSession"));continue;}
+                            let mut delivery=host.finish(&text,mode);
+                            if keep {let _=reply.send(delivery);continue;}
+                            if host.close().is_err(){delivery.delivery.error=Some("compositionCleanup".into());}
+                            drop(host);let _=reply.send(delivery);return;
+                        },
+                        Err(mpsc::RecvTimeoutError::Disconnected)=>return,
+                        Err(mpsc::RecvTimeoutError::Timeout)=>{},
                     }
                 }
             })
@@ -180,50 +160,74 @@ impl Draft {
         Ok(Arc::new(Self {
             connection: Arc::new(Connection { sender }),
             turn,
-            desired,
+            closed: AtomicBool::new(false),
+            source_sequence: AtomicU64::new(0),
         }))
     }
     pub(crate) fn connection(&self) -> Arc<Connection> {
         self.connection.clone()
     }
-    /// One replaceable snapshot; a blocked target cannot create an unbounded edit queue.
-    pub fn update(&self, turn: u64, sequence: u64, text: &str) {
-        let Ok(mut desired) = self.desired.lock() else {
-            return;
+    pub async fn replace(&self, sequence: u64, text: String) -> Result<(), Error> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::new("staleSession"));
+        }
+        if sequence == 0 || sequence <= self.source_sequence.fetch_max(sequence, Ordering::AcqRel) {
+            return Err(Error::new("staleSnapshot"));
+        }
+        let (reply, result) = oneshot::channel();
+        self.connection
+            .sender
+            .try_send(Command::Replace(self.turn, text, reply))
+            .map_err(|_| Error::new("compositionWorker"))?;
+        result.await.map_err(|_| Error::new("compositionWorker"))?
+    }
+    pub async fn settle(
+        &self,
+        sequence: u64,
+        prefix: String,
+        tail: String,
+        permit: Arc<AtomicBool>,
+    ) -> PrefixOutcome {
+        let fail = |code: &str| PrefixOutcome {
+            prefix: Mutation::NotAttempted,
+            tail_owned: false,
+            error: Some(code.into()),
         };
-        if turn != self.turn || desired.closed || desired.frozen || sequence <= desired.revision {
-            return;
+        if self.closed.load(Ordering::Acquire) {
+            return fail("staleSession");
         }
-        desired.revision = sequence;
-        desired.text = text.into();
-        if !desired.notified {
-            desired.notified = true;
-            if self.connection.sender.try_send(Command::Wake).is_err() {
-                desired.notified = false;
-            }
+        if sequence == 0 || sequence < self.source_sequence.fetch_max(sequence, Ordering::AcqRel) {
+            return fail("staleSnapshot");
         }
-    }
-    pub fn freeze(&self) {
-        if let Ok(mut desired) = self.desired.lock() {
-            desired.frozen = true;
+        let (reply, result) = oneshot::channel();
+        if self
+            .connection
+            .sender
+            .try_send(Command::Settle(self.turn, prefix, tail, permit, reply))
+            .is_err()
+        {
+            return fail("compositionWorker");
         }
-    }
-    pub fn failure(&self) -> Option<String> {
-        self.desired.lock().ok().and_then(|d| d.failure.clone())
+        result.await.unwrap_or_else(|_| PrefixOutcome {
+            prefix: Mutation::Uncertain,
+            tail_owned: false,
+            error: Some("compositionWorker".into()),
+        })
     }
     pub async fn finish(&self, text: String, mode: Finish) -> Delivery {
+        self.finish_range(text, mode, false).await.delivery
+    }
+    pub async fn finish_receipt(&self, text: String, mode: Finish) -> FinishOutcome {
         self.finish_range(text, mode, false).await
     }
-    pub async fn handoff(&self) -> Delivery {
+
+    pub async fn handoff_receipt(&self) -> FinishOutcome {
         self.finish_range(String::new(), Finish::Handoff("editing".into()), true)
             .await
     }
-    async fn finish_range(&self, text: String, mode: Finish, keep: bool) -> Delivery {
-        if let Ok(mut desired) = self.desired.lock() {
-            if desired.closed {
-                return Delivery::not_submitted("staleSession");
-            }
-            desired.closed = true;
+    async fn finish_range(&self, text: String, mode: Finish, keep: bool) -> FinishOutcome {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return FinishOutcome::rejected("staleSession");
         }
         let (reply, result) = oneshot::channel();
         if self
@@ -235,13 +239,21 @@ impl Draft {
             let mut outcome = Delivery::not_submitted("compositionWorker");
             outcome.submission = Submission::Uncertain;
             outcome.state = "unconfirmed".into();
-            return outcome;
+            return FinishOutcome {
+                delivery: outcome,
+                committed: false,
+                handed_off: false,
+            };
         }
         result.await.unwrap_or_else(|_| {
             let mut outcome = Delivery::not_submitted("compositionWorker");
             outcome.submission = Submission::Uncertain;
             outcome.state = "unconfirmed".into();
-            outcome
+            FinishOutcome {
+                delivery: outcome,
+                committed: false,
+                handed_off: false,
+            }
         })
     }
 }
@@ -262,6 +274,8 @@ struct Host {
     capability: String,
     operation: u64,
     revision: u64,
+    range_epoch: u64,
+    transport_attempted: bool,
     text: String,
     attempted: bool,
     visible: bool,
@@ -322,6 +336,8 @@ impl Host {
             capability,
             operation: 0,
             revision: 0,
+            range_epoch: 0,
+            transport_attempted: false,
             text: String::new(),
             attempted: false,
             visible: false,
@@ -378,6 +394,22 @@ impl Host {
         Ok(())
     }
     fn exchange(&mut self, action: Action, text: &str, cleanup: bool) -> Result<(), Error> {
+        let reply = self.exchange_reply(action, text, None, cleanup, None)?;
+        if reply.applied {
+            Ok(())
+        } else {
+            Err(Error::new(reply_error(&reply.code)))
+        }
+    }
+    fn exchange_reply(
+        &mut self,
+        action: Action,
+        text: &str,
+        prefix: Option<Prefix>,
+        cleanup: bool,
+        permission: Option<&AtomicBool>,
+    ) -> Result<Reply, Error> {
+        self.transport_attempted = false;
         if !cleanup {
             target_ready(&self.task, &self.anchor, &self.gate)?;
         }
@@ -385,7 +417,7 @@ impl Host {
             super::native::composition_begin_target(&self.task, &self.anchor)?;
         }
         self.operation += 1;
-        if action == Action::Update {
+        if matches!(action, Action::Update | Action::Settle) {
             self.revision += 1;
         }
         let request = Request {
@@ -398,14 +430,18 @@ impl Host {
             deadline_tick: unsafe { GetTickCount64() } + 2000,
             action,
             text: text.into(),
-            prefix: None,
+            prefix,
         };
         if !request.valid() {
             return Err(Error::new("compositionTextLimit"));
         }
-        if action == Action::Update {
+        if matches!(action, Action::Update | Action::Settle) {
             self.attempted = true;
         }
+        if permission.is_some_and(|p| !p.load(Ordering::Acquire)) {
+            return Err(Error::new("staleSnapshot"));
+        }
+        self.transport_attempted = true;
         self.pipe
             .send(&serde_json::to_vec(&request).map_err(|_| Error::new("compositionProtocol"))?)
             .map_err(|error| {
@@ -439,18 +475,74 @@ impl Host {
                 if reply.mutation == Mutation::Changed {
                     self.visible = true;
                 }
+                if reply.applied {self.range_epoch=reply.range_epoch;}
                 log::info!(target:"sayweave", "operation=composition_edit task_id={} turn={} revision={} action={:?} applied={} code={} mutation={:?} elapsed_ms={}", self.task, self.turn, request.revision, action, reply.applied, reply.code, reply.mutation, at.elapsed().as_millis());
-                return if reply.applied {
-                    Ok(())
-                } else {
-                    Err(Error::new(reply_error(&reply.code)))
-                };
+                return Ok(reply);
             }
             if at.elapsed() >= Duration::from_secs(2) {
                 return Err(Error::new("compositionTimeout"));
             }
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+    fn settle(&mut self, prefix: &str, tail: &str, permit: &AtomicBool) -> PrefixOutcome {
+        // Only this existing host's range/revision may settle a prefix. Never
+        // choose a new target or replay a request after a possibly changed range.
+        let expected = Prefix {
+            text: prefix.into(),
+            expected_revision: self.revision,
+            range_epoch: self.range_epoch,
+        };
+        if !permit.load(Ordering::Acquire) {
+            return PrefixOutcome {
+                prefix: Mutation::NotAttempted,
+                tail_owned: false,
+                error: Some("staleSnapshot".into()),
+            };
+        }
+        let result = self.exchange_reply(Action::Settle, tail, Some(expected), false, Some(permit));
+        let outcome = match result {
+            Ok(reply) => {
+                let settlement = reply.settlement.unwrap_or_default();
+                if settlement.prefix != Mutation::NotAttempted
+                    && settlement.prefix_operation != reply.operation
+                {
+                    PrefixOutcome {
+                        prefix: Mutation::Uncertain,
+                        tail_owned: false,
+                        error: Some("compositionProtocol".into()),
+                    }
+                } else {
+                    PrefixOutcome {
+                        prefix: settlement.prefix,
+                        tail_owned: reply.applied && settlement.tail_owned,
+                        error: (!reply.applied).then(|| reply_error(&reply.code).into()),
+                    }
+                }
+            }
+            Err(error) => PrefixOutcome {
+                prefix: if self.transport_attempted {
+                    Mutation::Uncertain
+                } else {
+                    Mutation::NotAttempted
+                },
+                tail_owned: false,
+                error: Some(error.code),
+            },
+        };
+        if outcome.tail_owned {
+            self.text = tail.into();
+        }
+        if outcome.prefix == Mutation::Changed {
+            self.visible = true;
+        }
+        if outcome.error.is_some()
+            && !(outcome.prefix == Mutation::NotAttempted
+                && outcome.error.as_deref() == Some("staleSnapshot"))
+        {
+            self.failure = outcome.error.clone();
+        }
+        outcome
     }
     fn update(&mut self, text: &str) -> Result<(), Error> {
         if text == self.text {
@@ -464,14 +556,16 @@ impl Host {
         }
         result
     }
-    fn finish(&mut self, text: &str, mode: Finish) -> Delivery {
+    fn finish(&mut self, text: &str, mode: Finish) -> FinishOutcome {
         let began = Instant::now();
         let aborted = mode == Finish::Abort;
+        let mut handed_off = false;
         let result = if aborted {
             self.exchange(Action::Abort, "", true)
         } else if let Finish::Handoff(reason) = &mode {
             let result = self.exchange(Action::Handoff, "", true);
             if result.is_ok() {
+                handed_off = true;
                 self.range_open = false;
             } else {
                 self.failure = result.as_ref().err().map(|e| e.code.clone());
@@ -520,7 +614,11 @@ impl Host {
             };
             delivery.verification = Verification::Unavailable;
         }
-        delivery
+        FinishOutcome {
+            delivery,
+            committed,
+            handed_off,
+        }
     }
     fn close(&mut self) -> Result<(), Error> {
         self.profile

@@ -62,6 +62,7 @@ pub struct Control {
     draft_activity: Arc<AtomicU64>,
     draft_armed: Arc<AtomicBool>,
     handed_off: Arc<AtomicBool>,
+    cancel_archive_owner: Arc<AtomicBool>,
     raw: Arc<Mutex<RawTurns>>,
     task: Arc<OnceLock<String>>,
 }
@@ -78,6 +79,7 @@ impl Control {
             draft_activity: Arc::new(AtomicU64::new(0)),
             draft_armed: Arc::new(AtomicBool::new(false)),
             handed_off: Arc::new(AtomicBool::new(false)),
+            cancel_archive_owner: Arc::new(AtomicBool::new(false)),
             raw: Arc::new(Mutex::new(RawTurns::default())),
             task: Arc::new(OnceLock::new()),
         }
@@ -115,6 +117,12 @@ impl Control {
     pub fn handoff_started(&self) {
         self.handed_off.store(true, Ordering::Release);
     }
+    pub fn defer_cancel_archive(&self) {
+        self.cancel_archive_owner.store(true, Ordering::Release);
+    }
+    pub fn has_cancel_archive_owner(&self) -> bool {
+        self.cancel_archive_owner.load(Ordering::Acquire)
+    }
     /// Physical editing can hand the TSF range back before the async draft actor observes it.
     pub fn preserve_history(&self) -> bool {
         self.handed_off.load(Ordering::Acquire)
@@ -143,6 +151,29 @@ impl Control {
             .filter(|r| !r.0.is_empty())
             .map(|r| r.combined())
     }
+    pub fn source_turns(&self) -> Vec<crate::contracts::processing::SourceTurn> {
+        self.raw
+            .lock()
+            .map(|r| {
+                r.0.iter()
+                    .map(|(turn, t)| crate::contracts::processing::SourceTurn {
+                        turn: *turn,
+                        text: t.text.clone(),
+                        segments: t
+                            .segments
+                            .iter()
+                            .map(|s| crate::contracts::processing::SourceSegment {
+                                id: s.id,
+                                revision: s.sequence,
+                                text: s.text.clone(),
+                                confirmed: s.confirmed,
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     pub fn readiness(&self) -> watch::Receiver<u64> {
         self.ready.subscribe()
     }
@@ -164,7 +195,7 @@ impl Control {
 }
 pub struct Update {
     pub raw: Transcript,
-    pub draft: Option<(u64, String)>,
+    pub draft: Option<(u64, Transcript)>,
 }
 pub enum StreamEvent {
     Update(Update),
@@ -208,7 +239,7 @@ impl Stream {
         match self {
             Self::Single(s) => Ok(match s.next_event().await? {
                 Event::Update(raw) => StreamEvent::Update(Update {
-                    draft: Some((1, raw.text(false))),
+                    draft: Some((1, raw.clone())),
                     raw,
                 }),
                 Event::Finished => StreamEvent::Finished,
@@ -420,9 +451,9 @@ impl Continuous {
                                 Event::Update(value)=> {
                                     let text = value.text(false);
                                     if first_text != turn && !text.is_empty() { first_text = turn; control.trace(turn,"first_transcript"); }
-                                    control.record(turn,value)?;
+                                    control.record(turn,value.clone())?;
                                     // Editing evidence immediately closes the write gate, even before Pause arrives.
-                                    let draft = (control.audio.current() == turn).then_some((turn,text));
+                                    let draft = (control.audio.current() == turn).then_some((turn,value));
                                     send.send(Ok(StreamEvent::Update(Update {raw:control.latest_raw().unwrap_or_default(),draft}))).await.map_err(|_|Error::new("cancelled"))?;
                                 },
                                 Event::Finished=>return Err(Error::new("protocol")),
@@ -435,7 +466,7 @@ impl Continuous {
                         value=retiring.join_next(), if !retiring.is_empty()=>match value {
                             Some(Ok(Retired {turn,transcript,error}))=> {
                                 let draft = (error.is_none() && ended && final_route.turn == turn && final_route.activity == control.audio.evidence.load(Ordering::Acquire))
-                                    .then(|| (turn, transcript.text(false)));
+                                    .then(|| (turn, transcript.clone()));
                                 control.record(turn,transcript)?;
                                 send.send(Ok(StreamEvent::Update(Update { raw:control.latest_raw().unwrap_or_default(),draft }))).await.map_err(|_|Error::new("cancelled"))?;
                                 if error.is_some() { failure=error; }
@@ -785,7 +816,7 @@ mod tests {
             assert_eq!(old.audio().await, [1, 2]);
             old.events.send(Ok(Event::Update(Transcript {text:"旧草稿".into(), ..Transcript::default()}))).await.unwrap();
             let value = stream.events.recv().await.unwrap().unwrap();
-            assert!(matches!(value,StreamEvent::Update(Update { draft: Some((1,ref text)), .. }) if text=="旧草稿"));
+            assert!(matches!(value,StreamEvent::Update(Update { draft: Some((1,ref text)), .. }) if text.text=="旧草稿"));
             evidence.fetch_add(1, Ordering::AcqRel);
             control.pause();
             stream.send_pcm(1, &[99]).await.unwrap();
@@ -809,8 +840,8 @@ mod tests {
                         raw = value.raw.text;
                         if let Some((turn,text)) = value.draft {
                             assert_eq!(turn,2);
-                            assert!(!text.contains("旧"));
-                            saw_tail |= text=="新尾字🙂";
+                            assert!(!text.text.contains("旧"));
+                            saw_tail |= text.text=="新尾字🙂";
                         }
                     },
                     StreamEvent::Finished=>break, StreamEvent::Heartbeat=>{}

@@ -42,6 +42,20 @@ pub fn final_presentation(
     delivery: Option<&Delivery>,
     error: Option<&str>,
 ) -> Presentation {
+    let cancelled = error == Some("cancelled")
+        || delivery.is_some_and(|d| d.error.as_deref() == Some("cancelled"));
+    if cancelled
+        && error != Some("saveFailed")
+        && delivery.is_none_or(|d| {
+            !d.restore_error
+                && d.submission != Submission::Uncertain
+                && d.error.as_deref().is_none_or(|e| e == "cancelled")
+        })
+    {
+        // A previously submitted prefix does not turn successful tail removal
+        // into an input failure. Cancellation uses the existing close animation.
+        return Presentation::Idle;
+    }
     // A completed TSF commit ends the gesture even without an independent
     // renderer confirmation fence. Keep that distinction in Delivery/history;
     // do not turn every normal streaming task into a persistent warning.
@@ -165,6 +179,15 @@ mod tests {
         assert_eq!(
             final_presentation(false, "", Some(&delivery), Some("cancelled")),
             Presentation::Idle
+        );
+        delivery.submission = Submission::Submitted;
+        assert_eq!(
+            final_presentation(false, "已提交前段", Some(&delivery), Some("cancelled")),
+            Presentation::Idle
+        );
+        assert_eq!(
+            final_presentation(false, "已提交前段", Some(&delivery), Some("saveFailed")),
+            Presentation::Notice
         );
     }
     #[test]

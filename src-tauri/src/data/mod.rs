@@ -1,3 +1,4 @@
+mod cancellation;
 pub mod model;
 mod repositories;
 pub mod repository;
@@ -27,6 +28,7 @@ pub enum Operation {
     Models(crate::contracts::models::DbOperation),
     History(crate::contracts::history::DbOperation),
     Shortcuts(crate::contracts::shortcuts::DbOperation),
+    Processing(crate::contracts::processing::DbOperation),
     Drain,
 }
 #[derive(Debug)]
@@ -38,6 +40,7 @@ pub enum Output {
     Models(Result<crate::contracts::models::DbOutput, crate::contracts::models::ModelError>),
     History(crate::contracts::history::DbOutput),
     Shortcuts(crate::contracts::shortcuts::DbOutput),
+    Processing(crate::contracts::processing::DbOutput),
 }
 struct Request {
     operation: Operation,
@@ -50,6 +53,9 @@ pub struct DataWorker {
     status: Arc<Mutex<Status>>,
     stopping: Arc<AtomicBool>,
     dispatch: Arc<Mutex<()>>,
+    root: PathBuf,
+    journal_io: Arc<Mutex<()>>,
+    lease_active: Arc<AtomicBool>,
 }
 pub fn profile_root(base: &Path, development: bool) -> PathBuf {
     base.join(if development { "data-dev" } else { "data" })
@@ -84,12 +90,20 @@ impl DataWorker {
             normalization_version: 1,
         }));
         let shared = status.clone();
+        let journal_io = Arc::new(Mutex::new(()));
+        let thread_journal = journal_io.clone();
+        let worker_root = root.clone();
+        let lease_active = Arc::new(AtomicBool::new(lease.is_some()));
+        let thread_lease = lease_active.clone();
         std::thread::Builder::new()
             .name("sayweave-data".into())
             .spawn(move || {
                 let mut lease = lease;
                 let mut repository = if lease.is_some() {
-                    Repository::open(&root)
+                    match thread_journal.lock() {
+                        Ok(_guard) => Repository::open(&root),
+                        Err(_) => Err(DataError::new("unavailable")),
+                    }
                 } else {
                     Err(DataError::new("unavailable"))
                 };
@@ -107,19 +121,32 @@ impl DataWorker {
                         Operation::Models(_) => "models",
                         Operation::History(_) => "history",
                         Operation::Shortcuts(_) => "shortcuts",
+                        Operation::Processing(_) => "processing",
                         Operation::Drain => "drain",
                     };
                     let result = if matches!(request.operation, Operation::Retry) {
                         if repository.is_err() {
                             if lease.is_none() {
                                 lease = acquire(&root).ok();
+                                thread_lease.store(lease.is_some(), Ordering::Release);
                             }
                             repository = if lease.is_some() {
-                                Repository::open(&root)
+                                match thread_journal.lock() {
+                                    Ok(_guard) => Repository::open(&root),
+                                    Err(_) => Err(DataError::new("unavailable")),
+                                }
                             } else {
                                 Err(DataError::new("unavailable"))
                             };
                         }
+                        let recovery = match repository.as_mut() {
+                            Ok(repo) => match thread_journal.lock() {
+                                Ok(_guard) => cancellation::replay(repo, &root),
+                                Err(_) => Err(DataError::new("unavailable")),
+                            },
+                            Err(error) => Err(error.clone()),
+                        };
+                        if let Err(error) = recovery { repository = Err(error); }
                         Self::set_status(&shared, &repository);
                         shared
                             .lock()
@@ -128,33 +155,55 @@ impl DataWorker {
                     } else {
                         match repository.as_mut() {
                             Err(error) => Err(error.clone()),
-                            Ok(repo) => match request.operation {
-                                Operation::List(query) => repo.list(query).map(Output::Page),
-                                Operation::Get(kind, id) => repo.get(kind, &id).map(Output::Record),
-                                Operation::Create(input) => {
-                                    repo.save(input, None).map(Output::Record)
-                                }
-                                Operation::Update(input, id, revision) => {
-                                    repo.save(input, Some((id, revision))).map(Output::Record)
-                                }
-                                Operation::Delete(kind, id, revision) => {
-                                    repo.delete(kind, &id, revision).map(|_| Output::Deleted)
-                                }
-                                Operation::Retry => unreachable!(),
-                                Operation::History(op) => {
-                                    repo.history_operation(op).map(Output::History)
-                                }
-                                Operation::Shortcuts(op) => {
-                                    repo.shortcut_operation(op).map(Output::Shortcuts)
-                                }
-                                Operation::Models(op) => match repo.model_operation(op) {
-                                    Err(e) if e.code == "unavailable" => {
-                                        Err(DataError::new("unavailable"))
+                            Ok(repo) => (|| {
+                                let _journal = thread_journal
+                                    .lock()
+                                    .map_err(|_| DataError::new("unavailable"))?;
+                                cancellation::replay(repo, &root)?;
+                                match request.operation {
+                                    Operation::List(query) => repo.list(query).map(Output::Page),
+                                    Operation::Get(kind, id) => {
+                                        repo.get(kind, &id).map(Output::Record)
                                     }
-                                    result => Ok(Output::Models(result)),
-                                },
-                                Operation::Drain => Ok(Output::Deleted),
-                            },
+                                    Operation::Create(input) => {
+                                        repo.save(input, None).map(Output::Record)
+                                    }
+                                    Operation::Update(input, id, revision) => {
+                                        repo.save(input, Some((id, revision))).map(Output::Record)
+                                    }
+                                    Operation::Delete(kind, id, revision) => {
+                                        repo.delete(kind, &id, revision).map(|_| Output::Deleted)
+                                    }
+                                    Operation::Retry => unreachable!(),
+                                    Operation::History(op) => {
+                                    if matches!(op,crate::contracts::history::DbOperation::PruneCancelled{..}) {
+                                        Ok(Output::History(crate::contracts::history::DbOutput::Done))
+                                    } else { repo.history_operation(op).map(Output::History) }
+                                    }
+                                    Operation::Shortcuts(op) => {
+                                        repo.shortcut_operation(op).map(Output::Shortcuts)
+                                    }
+                                    Operation::Processing(op) => {
+                                        if matches!(
+                                            op,
+                                            crate::contracts::processing::DbOperation::Cancel { .. }
+                                        ) {
+                                            Ok(Output::Processing(
+                                                crate::contracts::processing::DbOutput::Done,
+                                            ))
+                                        } else {
+                                            repo.processing_operation(op).map(Output::Processing)
+                                        }
+                                    }
+                                    Operation::Models(op) => match repo.model_operation(op) {
+                                        Err(e) if e.code == "unavailable" => {
+                                            Err(DataError::new("unavailable"))
+                                        }
+                                        result => Ok(Output::Models(result)),
+                                    },
+                                    Operation::Drain => Ok(Output::Deleted),
+                                }
+                            })(),
                         }
                     };
                     if let Err(error) = &result
@@ -171,6 +220,7 @@ impl DataWorker {
                     );
                     let _ = request.response.send(result);
                 }
+                thread_lease.store(false, Ordering::Release);
             })
             .map_err(|_| DataError::new("unavailable"))?;
         Ok(Self {
@@ -178,6 +228,9 @@ impl DataWorker {
             status,
             stopping: Arc::new(AtomicBool::new(false)),
             dispatch: Arc::new(Mutex::new(())),
+            root: worker_root,
+            journal_io,
+            lease_active,
         })
     }
     fn set_status(shared: &Mutex<Status>, repository: &Result<Repository, DataError>) {
@@ -223,6 +276,26 @@ impl DataWorker {
         operation: Operation,
         admitted: bool,
     ) -> Result<Output, DataError> {
+        if matches!(
+            &operation,
+            Operation::Processing(crate::contracts::processing::DbOperation::Cancel { .. })
+                | Operation::History(crate::contracts::history::DbOperation::PruneCancelled { .. })
+        ) {
+            if !self.lease_active.load(Ordering::Acquire)
+                || (self.stopping.load(Ordering::Acquire) && !admitted)
+            {
+                return Err(DataError::new("unavailable"));
+            }
+            let root = self.root.clone();
+            let journal = self.journal_io.clone();
+            let intent = operation.clone();
+            tokio::task::spawn_blocking(move || {
+                let _guard = journal.lock().map_err(|_| DataError::new("unavailable"))?;
+                cancellation::stage(&root, &intent)
+            })
+            .await
+            .map_err(|_| DataError::new("unavailable"))??;
+        }
         let (response, receive) = oneshot::channel();
         {
             let _dispatch = self

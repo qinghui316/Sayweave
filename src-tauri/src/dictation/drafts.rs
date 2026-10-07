@@ -1,30 +1,293 @@
-//! Session-owned draft turns. Speech still owns the microphone and supplier connections.
-use super::Presentation;
+//! One serial owner. Network/native effects complete back into this loop.
+use super::{Presentation, processing_context::Context};
 use crate::{
     history::types::Error,
     input_state,
+    processing::{
+        quality,
+        units::{self, Unit},
+    },
     speech::{NativeTranscript, continuous::Control},
     windows_input::{
         self, Anchor, Delivery,
-        composition::{Connection, Draft, Finish},
+        composition::{Connection, Draft, Finish, FinishOutcome, PrefixOutcome},
     },
 };
+use sayweave_text_service::{settlement_boundary::SettlementBoundary, wire::Mutation};
 use std::{
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
-use tokio::sync::{Mutex as AsyncMutex, watch};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::Instant;
+type Generation =
+    Result<crate::contracts::processing::GeneratedText, crate::models::types::ModelError>;
+fn finish_for_signal(mode: Finish, signal: u8) -> Finish {
+    if mode == Finish::Abort {
+        return mode;
+    }
+    match signal {
+        2 => Finish::Abort,
+        3 => Finish::Handoff("interrupted".into()),
+        _ => mode,
+    }
+}
 
+#[cfg(test)]
+#[test]
+fn interruption_and_cancel_have_order_independent_finish_semantics() {
+    assert_eq!(
+        finish_for_signal(Finish::Commit, 3),
+        Finish::Handoff("interrupted".into())
+    );
+    assert_eq!(
+        finish_for_signal(Finish::Handoff("interrupted".into()), 3),
+        Finish::Handoff("interrupted".into())
+    );
+    assert_eq!(finish_for_signal(Finish::Commit, 2), Finish::Abort);
+    assert_eq!(finish_for_signal(Finish::Abort, 2), Finish::Abort);
+    assert_eq!(finish_for_signal(Finish::Abort, 3), Finish::Abort);
+    assert_eq!(finish_for_signal(Finish::Commit, 1), Finish::Commit);
+}
+fn closed_delivery(
+    handoff: Option<FinishOutcome>,
+    cancelled: bool,
+    failed: bool,
+    intact: bool,
+) -> Delivery {
+    let (mut delivery, handed_off) = handoff
+        .map(|o| (o.delivery, o.handed_off))
+        .unwrap_or_else(|| (Delivery::not_submitted("editing"), false));
+    if failed {
+        delivery.error = Some("compositionCleanup".into());
+    } else if handed_off && intact {
+        if cancelled {
+            delivery.error = Some("cancelled".into());
+        } else if delivery.submission == crate::windows_input::Submission::Submitted {
+            delivery.error = Some("inputUnconfirmed".into());
+        }
+    }
+    delivery
+}
+#[cfg(test)]
+#[test]
+fn ending_after_user_handoff_never_promotes_an_unknown_input_or_adds_normal_notice() {
+    let receipt = |handed_off| {
+        let mut delivery = Delivery::not_submitted("editing");
+        delivery.stage = "composition".into();
+        delivery.state = "unconfirmed".into();
+        delivery.submission = crate::windows_input::Submission::Submitted;
+        FinishOutcome {
+            delivery,
+            committed: false,
+            handed_off,
+        }
+    };
+    let done = closed_delivery(Some(receipt(true)), false, false, true);
+    assert_eq!(
+        super::presentation::final_presentation(false, "text", Some(&done), None),
+        Presentation::Completed
+    );
+    let cancelled = closed_delivery(Some(receipt(true)), true, false, true);
+    assert_eq!(
+        super::presentation::final_presentation(false, "text", Some(&cancelled), Some("cancelled")),
+        Presentation::Idle
+    );
+    let uncertain = closed_delivery(Some(receipt(false)), false, false, true);
+    assert_eq!(uncertain.error.as_deref(), Some("editing"));
+    let failed = closed_delivery(Some(receipt(true)), true, true, true);
+    assert_eq!(failed.error.as_deref(), Some("compositionCleanup"));
+    let empty = closed_delivery(None, false, false, true);
+    assert_eq!(
+        empty.submission,
+        crate::windows_input::Submission::NotSubmitted
+    );
+}
+#[derive(Clone)]
+pub(crate) struct UnitResult {
+    pub unit: Unit,
+    pub candidate: Option<String>,
+    pub generation: String,
+    pub application: String,
+    pub error: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub elapsed_ms: u64,
+    pub source_committed_end: Option<usize>,
+    pub applied_text: Option<String>,
+    pub retained_separator: String,
+}
+fn settle_separators(units: &mut [UnitResult], turn: u64) {
+    for unit in units
+        .iter_mut()
+        .filter(|u| u.unit.turn == turn && !u.retained_separator.is_empty())
+    {
+        unit.applied_text
+            .get_or_insert_with(String::new)
+            .push_str(&unit.retained_separator);
+        unit.retained_separator.clear();
+        unit.application = "applied".into();
+        unit.source_committed_end = Some(unit.unit.chars.end);
+    }
+}
+#[cfg(test)]
+#[test]
+fn separator_only_unit_keeps_its_source_when_a_later_prefix_is_submitted() {
+    let record =
+        |id: u64, start: usize, text: &str, application: &str, applied: Option<&str>| UnitResult {
+            unit: Unit {
+                id: id.to_string(),
+                turn: 1,
+                chars: start..start + text.chars().count(),
+                source: vec![crate::processing::units::SourceSpan {
+                    segment: id,
+                    revision: 1,
+                    chars: 0..text.chars().count(),
+                }],
+                text: text.into(),
+                preserve_raw: false,
+                final_source: false,
+            },
+            candidate: None,
+            generation: "skipped".into(),
+            application: application.into(),
+            error: None,
+            input_tokens: None,
+            output_tokens: None,
+            elapsed_ms: 0,
+            source_committed_end: None,
+            applied_text: applied.map(str::to_owned),
+            retained_separator: "\n".into(),
+        };
+    let mut records = vec![
+        record(1u64, 0, "正文\n", "applied", Some("正文")),
+        record(2, 3, "\n", "pending", None),
+    ];
+    settle_separators(&mut records, 1);
+    assert_eq!(records[0].applied_text.as_deref(), Some("正文\n"));
+    assert_eq!(records[0].source_committed_end, Some(3));
+    assert_eq!(records[1].applied_text.as_deref(), Some("\n"));
+    assert_eq!(records[1].source_committed_end, Some(4));
+    assert_eq!(records[1].application, "applied");
+    settle_separators(&mut records, 1);
+    assert_eq!(records[0].applied_text.as_deref(), Some("正文\n"));
+}
+#[derive(Clone, Default)]
+pub(crate) struct Report {
+    pub text: String,
+    pub raw: String,
+    pub recovery_raw: String,
+    pub units: Vec<UnitResult>,
+    pub error: Option<String>,
+    pub cancelled: bool,
+}
+struct Generating {
+    unit: Unit,
+    job: tokio::task::JoinHandle<Generation>,
+}
+impl Drop for Generating {
+    fn drop(&mut self) {
+        self.job.abort();
+    }
+}
+enum UnitSlot {
+    Generating(Generating),
+    Ready(Unit, Generation),
+    Applying(Unit),
+}
+impl UnitSlot {
+    fn source(&self) -> &Unit {
+        match self {
+            Self::Generating(g) => &g.unit,
+            Self::Ready(u, _) | Self::Applying(u) => u,
+        }
+    }
+}
+enum NativeKind {
+    Replace {
+        sequence: u64,
+        raw: String,
+    },
+    Settle {
+        record: Box<UnitResult>,
+        boundary: SettlementBoundary,
+        sequence: u64,
+        raw: String,
+        source_end: usize,
+        permit: Arc<AtomicBool>,
+    },
+    Begin {
+        turn: u64,
+        activity: u64,
+    },
+    Handoff,
+    Final {
+        mode: Finish,
+        raw: String,
+        text: String,
+    },
+    Close,
+}
+enum NativeValue {
+    Replaced(Result<(), Error>),
+    Settled(PrefixOutcome),
+    Begun(Result<Arc<Draft>, Error>),
+    HandedOff(FinishOutcome),
+    Finalized(FinishOutcome),
+    Closed(Result<(), Error>),
+}
+struct NativeJob {
+    kind: NativeKind,
+    job: tokio::task::JoinHandle<NativeValue>,
+}
+impl Drop for NativeJob {
+    fn drop(&mut self) {
+        self.job.abort();
+    }
+}
+struct End {
+    latest: NativeTranscript,
+    mode: Finish,
+    reply: oneshot::Sender<Delivery>,
+}
+struct Ending {
+    mode: Finish,
+    reply: oneshot::Sender<Delivery>,
+    deadline: tokio::time::Instant,
+    expired: bool,
+}
 struct State {
     draft: Option<Arc<Draft>>,
     turn: u64,
     activity: u64,
-    sequence: u64,
-    text: String,
-    closing: bool,
+    latest: NativeTranscript,
+    written_sequence: u64,
+    written_raw: String,
+    consumed: usize,
+    committed_source: usize,
+    submitted: String,
+    separator: String,
     paused_at: Option<Instant>,
-    last_delivery: Option<Delivery>,
+    merge_at: Option<Instant>,
+    last_write: Option<Instant>,
+    stopping: bool,
+    handoff: bool,
+    last_handoff: Option<FinishOutcome>,
     stop_error: Option<String>,
+    model_disabled: bool,
+    unit: Option<UnitSlot>,
+    native: Option<NativeJob>,
+    ending: Option<Ending>,
+    report: Report,
+}
+#[derive(Default)]
+struct View {
+    turn: u64,
+    paused: bool,
+    report: Option<Report>,
 }
 pub(crate) struct SessionDraft {
     connection: Arc<Connection>,
@@ -32,17 +295,75 @@ pub(crate) struct SessionDraft {
     anchor: Anchor,
     control: Control,
     cancel: watch::Sender<u8>,
-    state: Mutex<State>,
-    operation: AsyncMutex<()>,
+    context: Option<Context>,
+    latest: watch::Sender<NativeTranscript>,
+    ends: mpsc::Sender<End>,
+    initial: Mutex<Option<(State, mpsc::Receiver<End>)>>,
+    view: Mutex<View>,
+    record: Mutex<Option<crate::history::RecordLease>>,
 }
 impl SessionDraft {
+    pub fn new(
+        task: String,
+        anchor: Anchor,
+        draft: Arc<Draft>,
+        control: Control,
+        cancel: watch::Sender<u8>,
+        context: Option<Context>,
+        record: Option<crate::history::RecordLease>,
+    ) -> Arc<Self> {
+        let (latest, _) = watch::channel(NativeTranscript::default());
+        let (ends, receiver) = mpsc::channel(1);
+        Arc::new(Self {
+            connection: draft.connection(),
+            task,
+            anchor: anchor.clone(),
+            control,
+            cancel,
+            context,
+            latest,
+            ends,
+            initial: Mutex::new(Some((
+                State {
+                    draft: Some(draft),
+                    turn: 1,
+                    activity: anchor.activity,
+                    latest: NativeTranscript::default(),
+                    written_sequence: 0,
+                    written_raw: String::new(),
+                    consumed: 0,
+                    committed_source: 0,
+                    submitted: String::new(),
+                    separator: String::new(),
+                    paused_at: None,
+                    merge_at: None,
+                    last_write: None,
+                    stopping: false,
+                    handoff: false,
+                    last_handoff: None,
+                    stop_error: None,
+                    model_disabled: false,
+                    unit: None,
+                    native: None,
+                    ending: None,
+                    report: Report::default(),
+                },
+                receiver,
+            ))),
+            view: Mutex::new(View {
+                turn: 1,
+                ..View::default()
+            }),
+            record: Mutex::new(record),
+        })
+    }
     pub fn presentation(&self) -> Presentation {
-        self.state
+        self.view
             .lock()
-            .map(|state| {
-                if state.paused_at.is_some() {
+            .map(|v| {
+                if v.paused {
                     Presentation::Editing
-                } else if *self.control.readiness().borrow() != state.turn {
+                } else if *self.control.readiness().borrow() != v.turn {
                     Presentation::Resuming
                 } else {
                     Presentation::Recording
@@ -50,261 +371,739 @@ impl SessionDraft {
             })
             .unwrap_or(Presentation::Editing)
     }
-    pub fn new(
-        task: String,
-        anchor: Anchor,
-        draft: Arc<Draft>,
-        control: Control,
-        cancel: watch::Sender<u8>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            connection: draft.connection(),
-            task,
-            anchor: anchor.clone(),
-            control,
-            cancel,
-            state: Mutex::new(State {
-                draft: Some(draft),
-                turn: 1,
-                activity: anchor.activity,
-                sequence: 0,
-                text: String::new(),
-                closing: false,
-                paused_at: None,
-                last_delivery: None,
-                stop_error: None,
-            }),
-            operation: AsyncMutex::new(()),
-        })
-    }
     pub fn activate(&self) {
         self.control.draft_started(self.anchor.activity);
     }
     pub fn update(&self, value: &NativeTranscript) {
-        if let Ok(mut state) = self.state.lock()
-            && !state.closing
-            && state.turn == value.turn
-            && state.activity == input_state::activity()
-            && value.task_id == self.task
-            && value.sequence > state.sequence
+        if value.task_id == self.task {
+            self.latest.send_replace(value.clone());
+        }
+    }
+    pub fn report(&self) -> Option<Report> {
+        self.view.lock().ok().and_then(|v| v.report.clone())
+    }
+    pub async fn archive(&self) -> Result<Option<(Report, bool)>, Error> {
+        let report = self.report();
+        let mut persisted = false;
+        if let (Some(context), Some(report)) = (&self.context, &report) {
+            persisted = context.finish(report, &self.control.source_turns()).await?;
+        }
+        Ok(report.map(|report| (report, persisted)))
+    }
+    pub fn release_record(&self) {
+        if let Ok(mut record) = self.record.lock() {
+            record.take();
+        }
+    }
+    fn project(&self, s: &State) {
+        if let Ok(mut v) = self.view.lock() {
+            v.turn = s.turn;
+            v.paused = s.paused_at.is_some() || s.handoff;
+        }
+    }
+    fn observe(&self, s: &mut State, value: NativeTranscript) {
+        if value.task_id != self.task
+            || value.turn != s.turn
+            || value.sequence <= s.latest.sequence
+            || s.activity != input_state::activity()
+            || s.handoff
+            || s.draft.is_none()
         {
-            state.sequence = value.sequence;
-            state.text.clone_from(&value.text);
-            if let Some(draft) = &state.draft {
-                draft.update(value.turn, value.sequence, &value.text);
+            return;
+        }
+        if value.text.chars().count() < s.consumed {
+            s.stop_error = Some("sourceChanged".into());
+            return;
+        }
+        // Keep the frozen source identity of every irreversible prefix, not
+        // merely its length. Never reinterpret an old commit as revised ASR.
+        if s.report
+            .units
+            .iter()
+            .filter(|u| u.application == "applied" && u.unit.turn == s.turn)
+            .any(|u| !u.unit.matches(s.turn, &value.segments))
+        {
+            s.stop_error = Some("sourceChanged".into());
+            return;
+        }
+        if s.unit
+            .as_ref()
+            .is_some_and(|u| !u.source().matches(s.turn, &value.segments))
+        {
+            self.cancel_generation(s);
+        }
+        if let Some(NativeJob {
+            kind: NativeKind::Settle { record, permit, .. },
+            ..
+        }) = &s.native
+            && !record.unit.matches(s.turn, &value.segments)
+        {
+            permit.store(false, Ordering::Release);
+        }
+        if value
+            .segments
+            .iter()
+            .take_while(|seg| seg.confirmed)
+            .map(|seg| seg.text.chars().count())
+            .sum::<usize>()
+            > s.consumed
+            && s.merge_at.is_none()
+        {
+            s.merge_at = Some(Instant::now());
+        }
+        s.latest = value;
+    }
+    fn tail(s: &State) -> String {
+        format!(
+            "{}{}",
+            s.separator,
+            units::slice(&s.latest.text, s.consumed..s.latest.text.chars().count())
+        )
+    }
+    fn cancel_generation(&self, s: &mut State) {
+        if matches!(s.unit, Some(UnitSlot::Applying(_))) {
+            if let Some(NativeJob {
+                kind: NativeKind::Settle { permit, .. },
+                ..
+            }) = &s.native
+            {
+                permit.store(false, Ordering::Release);
             }
+        } else if let Some(UnitSlot::Generating(g)) = s.unit.take()
+            && let Some(c) = &self.context
+        {
+            c.cancel(&g.unit);
         }
     }
-    fn feedback(&self, publish: &impl Fn(Presentation), presentation: Presentation) {
-        if *self.cancel.borrow() == 0 {
-            publish(presentation);
-        }
-    }
-    async fn handoff(&self, activity: u64) {
-        if self.state.lock().is_ok_and(|s| s.activity == activity) {
-            return; // The tick may already have consumed this watch notification.
+    fn request_handoff(&self, s: &mut State) {
+        if s.activity == input_state::activity() {
+            return;
         }
         self.control.handoff_started();
         self.control.pause();
-        let _operation = self.operation.lock().await;
-        let draft = {
-            let Ok(mut state) = self.state.lock() else {
-                return;
-            };
-            if state.closing {
-                return;
-            }
-            let draft = state.draft.take();
-            if let Some(draft) = &draft {
-                draft.freeze();
-            }
-            state.activity = activity;
-            state.sequence = 0;
-            state.text.clear();
-            state.paused_at = Some(Instant::now());
-            if draft.is_some() {
-                state.turn += 1;
-            }
-            draft
-        };
-        if let Some(draft) = draft {
-            let delivery = draft.handoff().await;
-            if let Ok(mut state) = self.state.lock() {
-                state.last_delivery = Some(delivery);
-            }
+        self.cancel_generation(s);
+        s.handoff = true;
+        s.paused_at = Some(Instant::now());
+        if let Some(NativeJob {
+            kind: NativeKind::Settle { permit, .. },
+            ..
+        }) = &s.native
+        {
+            permit.store(false, Ordering::Release);
         }
     }
-    async fn resume(&self, publish: &impl Fn(Presentation)) -> Result<(), Error> {
-        let _operation = self.operation.lock().await;
-        if *self.cancel.borrow() > 0 || self.control.stopping() {
-            return Ok(());
+    fn archive_turn(&self, s: &mut State, raw: &str, text: &str) {
+        if raw.is_empty() && text.is_empty() {
+            return;
         }
-        let (turn, activity) = {
-            let state = self.state.lock().map_err(|_| Error::new("unavailable"))?;
-            if state.closing
-                || state.draft.is_some()
-                || state
-                    .paused_at
-                    .is_none_or(|at| at.elapsed() < Duration::from_millis(300))
-            {
-                return Ok(());
-            }
-            (state.turn, state.activity)
-        };
-        if activity != input_state::activity() || input_state::editing_key_held() {
-            return Ok(());
+        if !s.report.raw.is_empty() {
+            s.report.raw.push('\n');
         }
-        let anchor = windows_input::reanchor_turn(&self.task, &self.anchor)?;
-        self.feedback(publish, Presentation::Resuming);
-        let draft = match self.connection.begin_turn(turn, anchor.clone()).await {
-            Ok(draft) => draft,
-            // Begin does not write text. Wait for the foreign IME composition to actually
-            // end; the300ms debounce alone is not permission to acquire its range.
-            Err(error) if error.code == "inputComposition" => {
-                if let Ok(mut state) = self.state.lock() {
-                    state.paused_at = Some(Instant::now());
-                }
-                return Ok(());
-            }
-            Err(error) if error.code == "editing" => {
-                // Editing may resume while the asynchronous, no-text Begin is pending.
-                // The connection has retired that range before reporting this result.
-                if let Ok(mut state) = self.state.lock() {
-                    state.turn += 1;
-                    state.activity = input_state::activity();
-                    state.paused_at = Some(Instant::now());
-                }
-                self.feedback(publish, Presentation::Editing);
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        if *self.cancel.borrow() > 0
-            || self.control.stopping()
-            || input_state::activity() != activity
+        if !s.report.text.is_empty() {
+            s.report.text.push('\n');
+        }
+        s.report.raw.push_str(raw);
+        s.report.text.push_str(text);
+    }
+    fn reset_turn(&self, s: &mut State) {
+        s.draft = None;
+        s.turn += 1;
+        s.activity = input_state::activity();
+        s.latest = NativeTranscript::default();
+        s.written_sequence = 0;
+        s.written_raw.clear();
+        s.consumed = 0;
+        s.committed_source = 0;
+        s.submitted.clear();
+        s.separator.clear();
+        s.merge_at = None;
+        s.last_write = None;
+        s.handoff = false;
+    }
+    fn start_generation(&self, s: &mut State) -> Result<(), Error> {
+        let pressure = Self::tail(s).encode_utf16().count() >= 14 * 1024;
+        if pressure
+            && matches!(s.unit, Some(UnitSlot::Generating(_)))
+            && let Some(UnitSlot::Generating(g)) = s.unit.take()
         {
-            self.retire_unpublished(&draft, turn).await;
+            if let Some(c) = &self.context {
+                c.cancel(&g.unit);
+            }
+            s.unit = Some(UnitSlot::Ready(
+                g.unit.clone(),
+                Err(crate::models::types::ModelError::new("capacity")),
+            ));
+        }
+        if (self.context.is_none() && !pressure)
+            || s.unit.is_some()
+            || s.draft.is_none()
+            || s.handoff
+        {
             return Ok(());
         }
-        let accepted = if let Ok(mut state) = self.state.lock() {
-            if !state.closing && state.turn == turn && state.activity == activity {
-                state.draft = Some(draft.clone());
-                state.paused_at = None;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
+        let final_result = s.ending.is_some();
+        if !final_result
+            && !pressure
+            && s.merge_at
+                .is_none_or(|at| at.elapsed() < Duration::from_millis(150))
+        {
+            return Ok(());
+        }
+        let Some(unit) = units::next(s.turn, &s.latest.segments, s.consumed, final_result)
+            .map_err(|e| Error::new(e.code))?
+        else {
+            return Ok(());
         };
-        if accepted {
-            self.control.resume(turn, activity);
-            log::info!(target:"sayweave", "operation=dictation_turn task_id={} turn={turn} state=resuming", self.task);
-        } else {
-            self.retire_unpublished(&draft, turn).await;
+        let expired = s.ending.as_ref().is_some_and(|e| e.expired);
+        if pressure || expired || s.model_disabled || unit.preserve_raw {
+            s.unit = Some(UnitSlot::Ready(
+                unit,
+                Err(crate::models::types::ModelError::new(if pressure {
+                    "capacity"
+                } else if expired {
+                    "timeout"
+                } else if s.model_disabled {
+                    "auth"
+                } else {
+                    "preserveRaw"
+                })),
+            ));
+            return Ok(());
+        }
+        let context = self.context.as_ref().unwrap().clone();
+        let request = unit.clone();
+        let previous = s.submitted.clone();
+        let deadline = s
+            .ending
+            .as_ref()
+            .map(|e| e.deadline)
+            .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(15));
+        let job =
+            tokio::spawn(async move { context.generate(&request, &previous, deadline).await });
+        s.unit = Some(UnitSlot::Generating(Generating { unit, job }));
+        s.merge_at = None;
+        Ok(())
+    }
+    fn prepare_settle(&self, s: &mut State, unit: Unit, result: Generation) -> Result<(), Error> {
+        if s.activity != input_state::activity()
+            || s.handoff
+            || s.draft.is_none()
+            || unit.chars.start != s.consumed
+            || !unit.matches(s.turn, &s.latest.segments)
+        {
+            return Ok(());
+        }
+        let mut record = UnitResult {
+            unit: unit.clone(),
+            candidate: None,
+            generation: "failed".into(),
+            application: "pending".into(),
+            error: None,
+            input_tokens: None,
+            output_tokens: None,
+            elapsed_ms: 0,
+            source_committed_end: None,
+            applied_text: None,
+            retained_separator: String::new(),
+        };
+        let output = match result {
+            Ok(value) => {
+                record.candidate = Some(value.text.clone());
+                record.input_tokens = value.usage.input;
+                record.output_tokens = value.usage.output;
+                record.elapsed_ms = value.elapsed_ms;
+                log::info!(target:"sayweave","operation=processing_result task_id={} unit_id={} first_output_ms={} elapsed_ms={} result=complete",self.task,unit.id,value.first_output_ms.map(|n|n.to_string()).unwrap_or_else(||"unavailable".into()),value.elapsed_ms);
+                match quality::validate(&unit.text, &value.text) {
+                    Ok(()) => {
+                        record.generation = "success".into();
+                        record.candidate = Some(value.text.clone());
+                        value.text
+                    }
+                    Err(error) => {
+                        record.error = Some(error.code.into());
+                        unit.text.clone()
+                    }
+                }
+            }
+            Err(error) => {
+                if error.code == "auth" {
+                    s.model_disabled = true;
+                }
+                record.generation = if ["preserveRaw", "capacity"].contains(&error.code.as_str()) {
+                    "skipped"
+                } else {
+                    "failed"
+                }
+                .into();
+                record.error = Some(error.code);
+                unit.text.clone()
+            }
+        };
+        let source_body = unit.text.trim_end_matches(['\r', '\n']);
+        let suffix = &unit.text[source_body.len()..];
+        let output = quality::retain_boundaries(&unit.text, &output);
+        let Some(boundary) = SettlementBoundary::prepare(&s.separator, &output) else {
+            record.retained_separator = output.clone();
+            s.separator.push_str(&output);
+            s.consumed = unit.chars.end;
+            s.report.units.push(record);
+            return Ok(());
+        };
+        let tail = boundary.tail(&units::slice(
+            &s.latest.text,
+            unit.chars.end..s.latest.text.chars().count(),
+        ));
+        let permit = Arc::new(AtomicBool::new(true));
+        let permission = permit.clone();
+        let draft = s.draft.as_ref().unwrap().clone();
+        let sequence = s.latest.sequence;
+        let prefix = boundary.committed.clone();
+        let job = tokio::spawn(async move {
+            NativeValue::Settled(draft.settle(sequence, prefix, tail, permission).await)
+        });
+        s.unit = Some(UnitSlot::Applying(unit.clone()));
+        s.native = Some(NativeJob {
+            kind: NativeKind::Settle {
+                record: Box::new(record),
+                boundary,
+                sequence,
+                raw: s.latest.text.clone(),
+                source_end: unit.chars.end - suffix.chars().count(),
+                permit,
+            },
+            job,
+        });
+        Ok(())
+    }
+    fn schedule(&self, s: &mut State) -> Result<(), Error> {
+        if s.native.is_some() {
+            return Ok(());
+        }
+        if s.handoff {
+            if let Some(draft) = s.draft.take() {
+                let job =
+                    tokio::spawn(
+                        async move { NativeValue::HandedOff(draft.handoff_receipt().await) },
+                    );
+                s.native = Some(NativeJob {
+                    kind: NativeKind::Handoff,
+                    job,
+                });
+            } else {
+                s.activity = input_state::activity();
+                s.handoff = false;
+            }
+            return Ok(());
+        }
+        if s.ending.as_ref().is_some_and(|e| e.mode != Finish::Commit)
+            || s.stop_error.is_some() && s.ending.is_some()
+        {
+            return self.schedule_final(s);
+        }
+        if matches!(s.unit, Some(UnitSlot::Ready(..)))
+            && let Some(UnitSlot::Ready(unit, result)) = s.unit.take()
+        {
+            return self.prepare_settle(s, unit, result);
+        }
+        if s.ending.is_some() {
+            self.start_generation(s)?;
+            if matches!(s.unit, Some(UnitSlot::Ready(..)))
+                && let Some(UnitSlot::Ready(unit, result)) = s.unit.take()
+            {
+                return self.prepare_settle(s, unit, result);
+            }
+            if s.unit.is_none() {
+                return self.schedule_final(s);
+            }
+            return Ok(());
+        }
+        if s.stopping {
+            return Ok(());
+        }
+        if s.draft.is_none() {
+            if s.paused_at
+                .is_some_and(|at| at.elapsed() >= Duration::from_millis(300))
+                && !input_state::editing_key_held()
+            {
+                let anchor = windows_input::reanchor_turn(&self.task, &self.anchor)?;
+                let connection = self.connection.clone();
+                let turn = s.turn;
+                let activity = s.activity;
+                let job = tokio::spawn(async move {
+                    NativeValue::Begun(connection.begin_turn(turn, anchor).await)
+                });
+                s.native = Some(NativeJob {
+                    kind: NativeKind::Begin { turn, activity },
+                    job,
+                });
+            }
+            return Ok(());
+        }
+        if s.latest.sequence != s.written_sequence
+            && s.last_write
+                .is_none_or(|at| at.elapsed() >= Duration::from_millis(50))
+        {
+            let tail = Self::tail(s);
+            let draft = s.draft.as_ref().unwrap().clone();
+            let sequence = s.latest.sequence;
+            let job =
+                tokio::spawn(
+                    async move { NativeValue::Replaced(draft.replace(sequence, tail).await) },
+                );
+            s.native = Some(NativeJob {
+                kind: NativeKind::Replace {
+                    sequence,
+                    raw: s.latest.text.clone(),
+                },
+                job,
+            });
         }
         Ok(())
     }
-    async fn retire_unpublished(&self, draft: &Draft, turn: u64) {
-        let delivery = draft.handoff().await;
-        if let Ok(mut state) = self.state.lock() {
-            if state.turn == turn {
-                state.turn += 1;
+    fn schedule_final(&self, s: &mut State) -> Result<(), Error> {
+        self.cancel_generation(s);
+        let Some(ending) = &s.ending else {
+            return Ok(());
+        };
+        let mut mode = ending.mode.clone();
+        if let Some(error) = &s.stop_error
+            && mode == Finish::Commit
+        {
+            mode = Finish::Handoff(error.clone());
+        }
+        if let Some(draft) = s.draft.take() {
+            let tail = if matches!(mode, Finish::Handoff(_)) {
+                format!(
+                    "{}{}",
+                    s.separator,
+                    units::slice(
+                        &s.written_raw,
+                        s.consumed..s.written_raw.chars().count().max(s.consumed)
+                    )
+                )
+            } else {
+                Self::tail(s)
+            };
+            let raw = if mode == Finish::Abort {
+                units::slice(&s.written_raw, 0..s.committed_source)
+            } else if matches!(mode, Finish::Handoff(_)) {
+                s.written_raw.clone()
+            } else {
+                s.latest.text.clone()
+            };
+            let text = if mode == Finish::Abort {
+                s.submitted.clone()
+            } else {
+                format!("{}{tail}", s.submitted)
+            };
+            let action = mode.clone();
+            let job = tokio::spawn(async move {
+                NativeValue::Finalized(draft.finish_receipt(tail, action).await)
+            });
+            s.native = Some(NativeJob {
+                kind: NativeKind::Final { mode, raw, text },
+                job,
+            });
+        } else {
+            let connection = self.connection.clone();
+            let job = tokio::spawn(async move { NativeValue::Closed(connection.close().await) });
+            s.native = Some(NativeJob {
+                kind: NativeKind::Close,
+                job,
+            });
+        }
+        Ok(())
+    }
+    fn native_done(
+        &self,
+        s: &mut State,
+        kind: &NativeKind,
+        value: NativeValue,
+    ) -> Option<Delivery> {
+        match (kind, value) {
+            (NativeKind::Replace { sequence, raw }, NativeValue::Replaced(result)) => {
+                match result {
+                    Ok(()) => {
+                        s.written_sequence = *sequence;
+                        s.written_raw = raw.clone();
+                        s.last_write = Some(Instant::now());
+                    }
+                    Err(e) => s.stop_error = Some(e.code),
+                }
             }
-            state.last_delivery = Some(delivery);
+            (
+                NativeKind::Settle {
+                    record,
+                    boundary,
+                    sequence,
+                    raw,
+                    source_end,
+                    ..
+                },
+                NativeValue::Settled(outcome),
+            ) => {
+                if !matches!(&s.unit,Some(UnitSlot::Applying(unit)) if unit.id==record.unit.id) {
+                    s.stop_error = Some("compositionProtocol".into());
+                }
+                s.unit = None;
+                let mut record = record.as_ref().clone();
+                record.error = outcome.error.clone().or(record.error);
+                if outcome.prefix == Mutation::Changed {
+                    record.application = "applied".into();
+                    record.applied_text = Some(boundary.committed[s.separator.len()..].into());
+                    settle_separators(&mut s.report.units, s.turn);
+                    record.retained_separator = boundary.retained_separator.clone();
+                    s.submitted.push_str(&boundary.committed);
+                    s.consumed = record.unit.chars.end;
+                    s.committed_source = *source_end;
+                    record.source_committed_end = Some(*source_end);
+                    for previous in &mut s.report.units {
+                        if previous.unit.turn == s.turn && previous.application == "applied" {
+                            previous.source_committed_end = Some(previous.unit.chars.end);
+                        }
+                    }
+                    s.separator = boundary.retained_separator.clone();
+                    s.written_raw = raw.clone();
+                    if !record.unit.matches(s.turn, &s.latest.segments) {
+                        s.stop_error = Some("sourceChanged".into());
+                    }
+                    self.control.handoff_started();
+                } else {
+                    record.application = if outcome.prefix == Mutation::Uncertain {
+                        s.report.recovery_raw = raw.clone();
+                        "uncertain"
+                    } else {
+                        "notApplied"
+                    }
+                    .into();
+                }
+                log::info!(target:"sayweave","operation=processing_apply task_id={} unit_id={} turn={} prefix={:?} tail_owned={} error={}",self.task,record.unit.id,s.turn,outcome.prefix,outcome.tail_owned,outcome.error.as_deref().unwrap_or("none"));
+                s.report.units.push(record);
+                if outcome.tail_owned && outcome.prefix == Mutation::Changed {
+                    s.separator = boundary.retained_separator.clone();
+                    s.written_sequence = *sequence;
+                    s.written_raw = raw.clone();
+                    s.last_write = Some(Instant::now());
+                    s.merge_at = Some(Instant::now());
+                } else if outcome.prefix == Mutation::NotAttempted && s.handoff { /* Real editing owns the next transition. */
+                } else if outcome.prefix == Mutation::NotAttempted
+                    && outcome.error.as_deref() == Some("staleSnapshot")
+                {
+                    // This source operation was revoked before IPC; refreeze it.
+                    s.merge_at = Some(Instant::now());
+                } else {
+                    s.stop_error =
+                        Some(outcome.error.unwrap_or_else(|| "compositionPartial".into()));
+                }
+            }
+            (NativeKind::Begin { turn, activity }, NativeValue::Begun(result)) => match result {
+                Ok(draft) => {
+                    s.draft = Some(draft);
+                    if *activity != input_state::activity() || s.stopping || self.control.stopping()
+                    {
+                        s.handoff = true;
+                    } else {
+                        s.paused_at = None;
+                        self.control.resume(*turn, *activity);
+                    }
+                }
+                Err(e) if e.code == "inputComposition" => s.paused_at = Some(Instant::now()),
+                Err(e) if e.code == "editing" => {
+                    s.turn += 1;
+                    s.activity = input_state::activity();
+                    s.paused_at = Some(Instant::now());
+                }
+                Err(e) => s.stop_error = Some(e.code),
+            },
+            (NativeKind::Handoff, NativeValue::HandedOff(outcome)) => {
+                if outcome.handed_off {
+                    settle_separators(&mut s.report.units, s.turn);
+                }
+                for unit in &mut s.report.units {
+                    if unit.unit.turn == s.turn && unit.application == "pending" {
+                        unit.application = if outcome.handed_off {
+                            "handedOff"
+                        } else {
+                            "uncertain"
+                        }
+                        .into();
+                        if outcome.handed_off {
+                            unit.source_committed_end = Some(unit.unit.chars.end);
+                        }
+                    }
+                }
+                if !outcome.handed_off {
+                    s.stop_error = Some("compositionHandoffFailed".into());
+                }
+                let raw = s.written_raw.clone();
+                let text = format!(
+                    "{}{}{}",
+                    s.submitted,
+                    s.separator,
+                    units::slice(&raw, s.consumed..raw.chars().count().max(s.consumed))
+                );
+                self.archive_turn(s, &raw, &text);
+                s.last_handoff = Some(outcome);
+                self.reset_turn(s);
+            }
+            (NativeKind::Final { mode, raw, text }, NativeValue::Finalized(outcome)) => {
+                let delivery = outcome.delivery;
+                let cancelled =
+                    *mode == Finish::Abort || delivery.error.as_deref() == Some("cancelled");
+                if cancelled {
+                    if delivery.error.as_deref() == Some("compositionRollback") {
+                        s.report.recovery_raw = s.written_raw.clone();
+                    }
+                    self.archive_turn(
+                        s,
+                        &units::slice(&s.written_raw, 0..s.committed_source),
+                        &s.submitted.clone(),
+                    );
+                    s.report.cancelled = true;
+                } else {
+                    self.archive_turn(s, raw, text);
+                }
+                if outcome.committed {
+                    settle_separators(&mut s.report.units, s.turn);
+                    for unit in s.report.units.iter_mut().filter(|u| u.unit.turn == s.turn) {
+                        if unit.application == "pending" {
+                            unit.application = "applied".into();
+                        }
+                        if unit.unit.turn == s.turn && unit.application == "applied" {
+                            unit.source_committed_end = Some(unit.unit.chars.end);
+                        }
+                    }
+                }
+                return Some(delivery);
+            }
+            (NativeKind::Close, NativeValue::Closed(result)) => {
+                s.report.cancelled = s.ending.as_ref().is_some_and(|e| e.mode == Finish::Abort);
+                let delivery = closed_delivery(
+                    s.last_handoff.take(),
+                    s.report.cancelled,
+                    result.is_err(),
+                    s.stop_error.is_none(),
+                );
+                return Some(delivery);
+            }
+            _ => s.stop_error = Some("compositionProtocol".into()),
+        }
+        None
+    }
+    async fn native_value(native: &mut Option<NativeJob>) -> Option<NativeValue> {
+        match native {
+            Some(value) => (&mut value.job).await.ok(),
+            None => std::future::pending().await,
+        }
+    }
+    async fn generation_value(unit: &mut Option<UnitSlot>) -> Generation {
+        match unit {
+            Some(UnitSlot::Generating(value)) => (&mut value.job)
+                .await
+                .unwrap_or_else(|_| Err(crate::models::types::ModelError::new("interrupted"))),
+            _ => std::future::pending().await,
         }
     }
     pub async fn maintain(self: Arc<Self>, publish: impl Fn(Presentation) + Send + Sync + 'static) {
+        let Some((mut s, mut ends)) = self.initial.lock().ok().and_then(|mut v| v.take()) else {
+            return;
+        };
+        let mut latest = self.latest.subscribe();
         let mut edits = input_state::subscribe_edits();
         let mut cancel = self.cancel.subscribe();
         let mut readiness = self.control.readiness();
-        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        self.observe(&mut s, latest.borrow().clone());
+        s.stopping = *cancel.borrow() > 0;
+        let mut tick = tokio::time::interval(Duration::from_millis(50));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            if *cancel.borrow() > 0 || self.state.lock().is_ok_and(|s| s.closing) {
-                break;
-            }
             tokio::select! {
                 biased;
-                _=cancel.changed()=>{},
-                _=edits.changed()=>{
-                    let activity = input_state::activity();
-                    self.feedback(&publish, Presentation::Editing);
-                    self.handoff(activity).await;
+                Some(end)=ends.recv()=>{
+                    self.observe(&mut s,end.latest);s.stopping=true;
+                    if s.ending.is_some(){let _=end.reply.send(Delivery::not_submitted("staleSession"));}
+                    else{s.ending=Some(Ending {mode:finish_for_signal(end.mode,*cancel.borrow()),reply:end.reply,deadline:tokio::time::Instant::now()+Duration::from_secs(15),expired:false});}
                 },
-                _=readiness.changed()=>{
-                    let turn = *readiness.borrow_and_update();
-                    if turn > 0 && self.state.lock().is_ok_and(|s|s.turn==turn && s.draft.is_some()) {
-                        self.feedback(&publish, Presentation::Recording);
-                    }
+                _=edits.changed()=>{self.request_handoff(&mut s);if !s.stopping{publish(Presentation::Editing);}},
+                _=cancel.changed()=>{
+                    s.stopping=*cancel.borrow()>0;
+                    if *cancel.borrow()>=2{self.cancel_generation(&mut s);if let Some(e)=&mut s.ending{e.mode=finish_for_signal(e.mode.clone(),*cancel.borrow());}}
                 },
+                _=latest.changed()=>{self.observe(&mut s,latest.borrow_and_update().clone());},
+                value=Self::native_value(&mut s.native),if s.native.is_some()=>{
+                    let native=s.native.take().unwrap();
+                    if let Some(value)=value{
+                        if let Some(mut delivery)=self.native_done(&mut s,&native.kind,value){
+                            if let Some(error)=&s.stop_error{delivery.error=Some(error.clone());s.report.error=Some(error.clone());}
+                            if let Ok(mut view)=self.view.lock(){view.report=Some(s.report.clone());}
+                            if let Some(ending)=s.ending.take(){let _=ending.reply.send(delivery);}return;
+                        }
+                    }else{s.stop_error=Some("compositionWorker".into());}
+                },
+                result=Self::generation_value(&mut s.unit),if matches!(s.unit,Some(UnitSlot::Generating(_)))=>{
+                    if let Some(UnitSlot::Generating(generating))=s.unit.take(){s.unit=Some(UnitSlot::Ready(generating.unit.clone(),result));}
+                },
+                _=readiness.changed()=>{let _=readiness.borrow_and_update();if !s.stopping{publish(self.presentation());}},
                 _=tick.tick()=>{
-                    if windows_input::composition_target(&self.task,&self.anchor).is_err() {
-                        self.control.request_finish(); self.control.pause(); self.cancel.send_replace(1); break;
+                    self.request_handoff(&mut s);
+                    if !s.stopping&&let Err(error)=windows_input::composition_target(&self.task,&self.anchor){s.stop_error=Some(error.code);}
+                },
+            }
+            if s.ending
+                .as_ref()
+                .is_some_and(|e| !e.expired && tokio::time::Instant::now() >= e.deadline)
+            {
+                if matches!(s.unit, Some(UnitSlot::Generating(_)))
+                    && let Some(UnitSlot::Generating(g)) = s.unit.take()
+                {
+                    if let Some(c) = &self.context {
+                        c.cancel(&g.unit);
                     }
-                    if self.state.lock().is_ok_and(|s|s.activity!=input_state::activity()) {
-                        self.feedback(&publish, Presentation::Editing);
-                        self.handoff(input_state::activity()).await;
-                    }
-                    let failure = self.state.lock().ok().and_then(|s|s.draft.as_ref().and_then(|d|d.failure()));
-                    if let Some(error) = failure {
-                        if let Ok(mut state) = self.state.lock() { state.stop_error = Some(error.clone()); }
-                        log::info!(target:"sayweave", "operation=dictation_turn task_id={} state=stopped error={error}", self.task);
-                        self.control.request_finish(); self.control.pause(); self.cancel.send_replace(1); break;
-                    }
-                    if let Err(error) = self.resume(&publish).await {
-                        if let Ok(mut state) = self.state.lock() { state.stop_error = Some(error.code.clone()); }
-                        log::info!(target:"sayweave", "operation=dictation_turn task_id={} state=stopped error={}", self.task,error.code);
-                        self.control.request_finish(); self.control.pause(); self.cancel.send_replace(1); break;
-                    }
+                    s.unit = Some(UnitSlot::Ready(
+                        g.unit.clone(),
+                        Err(crate::models::types::ModelError::new("timeout")),
+                    ));
+                }
+                if let Some(e) = &mut s.ending {
+                    e.expired = true;
                 }
             }
+            if !s.stopping || s.ending.is_some() {
+                if let Err(error) = self.start_generation(&mut s) {
+                    s.stop_error = Some(error.code);
+                }
+                if let Err(error) = self.schedule(&mut s) {
+                    s.stop_error = Some(error.code);
+                }
+            }
+            if s.stop_error.is_some() && !s.stopping {
+                s.stopping = true;
+                self.control.request_finish();
+                self.control.pause();
+                let _ = crate::task_stop::request(
+                    &self.cancel,
+                    crate::contracts::speech::StopReason::Finish,
+                );
+            }
+            self.project(&s);
         }
     }
-    /// Only the current turn's cumulative text can finalize its range. Aggregate raw
-    /// history text contains earlier turns and must never be pasted into this draft.
     pub async fn finish(&self, latest: &NativeTranscript, mode: Finish) -> Delivery {
-        let _operation = self.operation.lock().await;
-        let (draft, text, old, edited, stop_error) = {
-            let Ok(mut state) = self.state.lock() else {
-                return Delivery::not_submitted("unavailable");
-            };
-            state.closing = true;
-            let text = if latest.task_id == self.task
-                && latest.turn == state.turn
-                && state.activity == input_state::activity()
-            {
-                latest.text.clone()
-            } else {
-                state.text.clone()
-            };
-            (
-                state.draft.take(),
-                text,
-                state.last_delivery.take(),
-                state.activity != input_state::activity(),
-                state.stop_error.take(),
-            )
-        };
-        let mut delivery = if let Some(draft) = draft {
-            let mode = if mode == Finish::Abort && edited {
-                self.control.handoff_started();
-                Finish::Handoff("editing".into())
-            } else {
-                mode
-            };
-            draft.finish(text, mode).await
-        } else {
-            let mut delivery = old.unwrap_or_else(|| Delivery::not_submitted("editing"));
-            if let Err(error) = self.connection.close().await {
-                log::info!(target:"sayweave", "operation=dictation_cleanup task_id={} error={}", self.task, error.code);
-                delivery.error = Some("compositionCleanup".into());
-            }
-            delivery
-        };
-        if let Some(error) = stop_error {
-            delivery.error = Some(error);
+        let (reply, result) = oneshot::channel();
+        if self
+            .ends
+            .send(End {
+                latest: latest.clone(),
+                mode,
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return Delivery::not_submitted("compositionWorker");
         }
-        delivery
+        result
+            .await
+            .unwrap_or_else(|_| Delivery::not_submitted("compositionWorker"))
     }
 }

@@ -9,6 +9,7 @@ import type {ShortcutConfigPort} from '../../contracts/dictation';
 import type {TextServicePort} from '../../contracts/text-service';
 import {TextServiceSettings} from './TextServiceSettings';
 export type SettingsTab = keyof typeof zh.settings.tabs;
+export {ProcessingSettings} from './ProcessingSettings';
 export function SettingsShell({ open, tab, onTabChange, onOpenChange, modelContent,speechPort,shortcutPort,textServicePort,onShortcutGuardChange }: { open: boolean; tab: SettingsTab; onTabChange: (tab: SettingsTab) => void; onOpenChange: (open: boolean) => void; modelContent?:ReactNode;speechPort?:SpeechPort;shortcutPort?:ShortcutConfigPort;textServicePort?:TextServicePort;onShortcutGuardChange?:(guard:((action:()=>void)=>void)|null)=>void }) {
   const t = zh.settings;
   const headings = { device: t.deviceHeading, models: t.modelsHeading, language: t.languageHeading, appearance: t.appearanceHeading, about: t.aboutHeading };

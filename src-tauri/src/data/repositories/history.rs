@@ -22,9 +22,10 @@ fn assets(c: &Connection, filter: &str, at: i64) -> Result<Vec<Audio>, Error> {
     .map_err(db_error)
 }
 fn detail(c: &Connection, id: &str) -> Result<Record, Error> {
-    let mut record=c.query_row("SELECT id,created_at,ended_at,duration_ms,status,current_attempt,revision FROM speech_records WHERE id=?1",[id],|r|Ok(Record{id:r.get(0)?,created_at:r.get(1)?,ended_at:r.get(2)?,duration_ms:r.get::<_,i64>(3)? as u64,status:r.get(4)?,current_attempt:r.get(5)?,revision:r.get(6)?,attempts:vec![],audio:None})).optional().map_err(db_error)?.ok_or(Error::new("notFound"))?;
+    let mut record=c.query_row("SELECT id,created_at,ended_at,duration_ms,status,current_attempt,revision FROM speech_records WHERE id=?1",[id],|r|Ok(Record{id:r.get(0)?,created_at:r.get(1)?,ended_at:r.get(2)?,duration_ms:r.get::<_,i64>(3)? as u64,status:r.get(4)?,current_attempt:r.get(5)?,revision:r.get(6)?,attempts:vec![],audio:None,processing:vec![]})).optional().map_err(db_error)?.ok_or(Error::new("notFound"))?;
     record.attempts=c.prepare("SELECT id,record_id,kind,config_id,config_name,model_id,service_host,created_at,ended_at,status,text,error_code,elapsed_ms,config_revision FROM speech_attempts WHERE record_id=?1 ORDER BY created_at DESC,id ASC").map_err(db_error)?.query_map([id],|r|Ok(Attempt{id:r.get(0)?,record_id:r.get(1)?,kind:r.get(2)?,config_id:r.get(3)?,config_name:r.get(4)?,model_id:r.get(5)?,service_host:r.get(6)?,created_at:r.get(7)?,ended_at:r.get(8)?,status:r.get(9)?,text:r.get(10)?,error_code:r.get(11)?,elapsed_ms:r.get::<_,i64>(12)? as u64,config_revision:r.get(13)?})).map_err(db_error)?.collect::<Result<Vec<_>,_>>().map_err(db_error)?;
     record.audio=c.query_row("SELECT id,record_id,file_key,status,bytes,expires_at FROM audio_assets WHERE record_id=?1",[id],audio).optional().map_err(db_error)?;
+    record.processing = super::processing::read_runs(c, id)?;
     Ok(record)
 }
 fn insert_attempt(c: &Connection, a: &Attempt) -> Result<(), Error> {
@@ -34,6 +35,30 @@ fn insert_attempt(c: &Connection, a: &Attempt) -> Result<(), Error> {
 impl Repository {
     pub fn history_operation(&mut self, op: DbOperation) -> Result<DbOutput, Error> {
         match op {
+            DbOperation::PruneCancelled {attempt_id,text}=>{
+                if text.len()>1024*1024 {return Err(Error::new("invalid"));}
+                let tx=self.connection.transaction().map_err(db_error)?;
+                let record:String=tx.query_row("SELECT record_id FROM speech_attempts WHERE id=?1 AND status NOT IN ('preparing','recording','processing')",[&attempt_id],|r|r.get(0)).map_err(db_error)?;
+                let precise:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM processing_runs WHERE attempt_id=?1 AND state='cancelled')",[&attempt_id],|r|r.get(0)).map_err(db_error)?;
+                tx.execute("DELETE FROM processing_units WHERE run_id IN (SELECT id FROM processing_runs WHERE attempt_id=?1 AND state<>'cancelled')",[&attempt_id]).map_err(db_error)?;
+                tx.execute("UPDATE processing_runs SET state='cancelled',text=?2,search_key=?3,error_code='saveFailed',ended_at=?4,revision=revision+1 WHERE attempt_id=?1 AND state<>'cancelled'",params![attempt_id,text,crate::contracts::dictionary::key(&text),now()]).map_err(db_error)?;
+                tx.execute("INSERT OR IGNORE INTO discarded_audio(id) SELECT id FROM audio_assets WHERE record_id=?1",[&record]).map_err(db_error)?;
+                tx.execute("UPDATE audio_assets SET status='expire_pending' WHERE record_id=?1",[&record]).map_err(db_error)?;
+                if !precise {tx.execute("UPDATE speech_attempts SET text=?2,search_key=?3 WHERE id=?1",params![attempt_id,text,crate::contracts::dictionary::key(&text)]).map_err(db_error)?;}
+                tx.execute("UPDATE speech_records SET status='interrupted',revision=revision+1 WHERE id=?1",[record]).map_err(db_error)?;
+                tx.commit().map_err(db_error)?;Ok(DbOutput::Done)
+            },
+            DbOperation::DiscardAudio(record)=>{
+                let tx=self.connection.transaction().map_err(db_error)?;
+                tx.execute("INSERT OR IGNORE INTO discarded_audio(id) SELECT id FROM audio_assets WHERE record_id=?1",[&record]).map_err(db_error)?;
+                tx.execute("UPDATE audio_assets SET status='expire_pending' WHERE record_id=?1",[&record]).map_err(db_error)?;
+                tx.execute("UPDATE speech_records SET revision=revision+1 WHERE id=?1",[record]).map_err(db_error)?;
+                tx.commit().map_err(db_error)?;Ok(DbOutput::Done)
+            },
+            DbOperation::DiscardedAudio=>Ok(DbOutput::Assets(assets(&self.connection,"id IN (SELECT id FROM discarded_audio) AND ?1>=0",0)?)),
+            DbOperation::DeleteDiscardedAudio(id)=>{
+                self.connection.execute("DELETE FROM audio_assets WHERE id=?1 AND id IN (SELECT id FROM discarded_audio)",[id]).map_err(db_error)?;Ok(DbOutput::Done)
+            },
             DbOperation::RecoverDelivery => {
                 self.connection.execute("UPDATE delivery_attempts SET state='unconfirmed',error_code='interrupted',updated_at=?1 WHERE state IN ('pending','delivering','submitted')",[now()]).map_err(db_error)?;
                 Ok(DbOutput::Done)
@@ -73,7 +98,7 @@ impl Repository {
                 }
                 let tx = self.connection.transaction().map_err(db_error)?;
                 let search = crate::data::model::key(&q.search);
-                let filter = "(?1='' OR EXISTS(SELECT 1 FROM speech_attempts a WHERE a.record_id=r.id AND instr(a.search_key,?1)>0))";
+                let filter = "(?1='' OR EXISTS(SELECT 1 FROM speech_attempts a WHERE a.record_id=r.id AND (instr(a.search_key,?1)>0 OR EXISTS(SELECT 1 FROM processing_runs p WHERE p.attempt_id=a.id AND p.state!='running' AND instr(p.search_key,?1)>0))))";
                 let total = tx.query_row(&format!("SELECT count(*) FROM speech_records r WHERE {filter}"), [&search], |r| r.get(0)).map_err(db_error)?;
                 let at = q.cursor.as_ref().map(|c| c.created_at);
                 let anchor = q.cursor.as_ref().map(|c| c.id.as_str()).unwrap_or("");
@@ -90,15 +115,16 @@ impl Repository {
                 ))).map_err(db_error)?.collect::<Result<Vec<_>,_>>().map_err(db_error)?;
                 let more = rows.len() > 50;
                 let mut records = Vec::with_capacity(rows.len().min(50));
-                for (id,created_at,duration_ms,status,revision,current,display_attempt) in rows.into_iter().take(50) {
-                    let preview = if let Some(a) = &display_attempt {
-                        tx.query_row("SELECT substr(text,1,240),length(text)>240 FROM speech_attempts WHERE id=?1", [a], |r| Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?))).map_err(db_error)?
-                    } else { (String::new(),false) };
+                for (id,created_at,duration_ms,status,revision,current,_raw_attempt) in rows.into_iter().take(50) {
+                    let displayed=tx.query_row("SELECT kind,version,attempt,preview,truncated FROM (SELECT 'processed' AS kind,p.id AS version,a.id AS attempt,substr(p.text,1,240) AS preview,length(p.text)>240 AS truncated,(a.id=coalesce(?3,'')) AS current_rank,a.created_at AS at,0 AS type_rank FROM speech_attempts a JOIN processing_runs p ON p.attempt_id=a.id WHERE a.record_id=?1 AND p.state!='running' AND p.text!='' AND (?2='' OR instr(p.search_key,?2)>0) UNION ALL SELECT 'raw',a.id,a.id,substr(a.text,1,240),length(a.text)>240,(a.id=coalesce(?3,'')),a.created_at,1 FROM speech_attempts a WHERE a.record_id=?1 AND (?2='' OR instr(a.search_key,?2)>0)) ORDER BY current_rank DESC,at DESC,attempt ASC,type_rank ASC LIMIT 1",params![id,search,current],|r|Ok((TextReference {kind:r.get(0)?,id:r.get(1)?,attempt_id:r.get(2)?},r.get::<_,String>(3)?,r.get::<_,bool>(4)?))).optional().map_err(db_error)?;
+                    let display_attempt=displayed.as_ref().map(|d|d.0.attempt_id.clone());
+                    let display_reference=displayed.as_ref().map(|d|d.0.clone());
+                    let preview=displayed.map(|d|(d.1,d.2)).unwrap_or_default();
                     let latest = tx.query_row("SELECT id,status,error_code FROM speech_attempts WHERE record_id=?1 ORDER BY created_at DESC,id ASC LIMIT 1", [&id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?))).optional().map_err(db_error)?;
                     let audio = tx.query_row("SELECT id,record_id,file_key,status,bytes,expires_at FROM audio_assets WHERE record_id=?1", [&id], audio).optional().map_err(db_error)?;
                     records.push(Summary {id,created_at,duration_ms:duration_ms as u64,status,revision,
                         matched_old_version:!search.is_empty() && display_attempt != current,
-                        display_attempt,preview:preview.0,truncated:preview.1,
+                        display_attempt,display_reference,preview:preview.0,truncated:preview.1,
                         latest_attempt:latest.as_ref().map(|a|a.0.clone()),latest_status:latest.as_ref().map(|a|a.1.clone()),
                         latest_error:latest.and_then(|a|a.2),audio});
                 }
@@ -120,7 +146,7 @@ impl Repository {
                 if q.search.chars().count()>256 || q.search.chars().any(char::is_control){return Err(Error::new("invalid"));}
                 let tx=self.connection.transaction().map_err(db_error)?;
                 let search=crate::data::model::key(&q.search);
-                let filter="(?1='' OR EXISTS(SELECT 1 FROM speech_attempts a WHERE a.record_id=r.id AND instr(a.search_key,?1)>0))";
+                let filter="(?1='' OR EXISTS(SELECT 1 FROM speech_attempts a WHERE a.record_id=r.id AND (instr(a.search_key,?1)>0 OR EXISTS(SELECT 1 FROM processing_runs p WHERE p.attempt_id=a.id AND p.state!='running' AND instr(p.search_key,?1)>0))))";
                 let total:u32=tx.query_row(&format!("SELECT count(*) FROM speech_records r WHERE {filter}"),[&search],|r|r.get(0)).map_err(db_error)?;
                 let page=q.page.max(1).min(total.div_ceil(50).max(1));
                 let ids=tx.prepare(&format!("SELECT r.id FROM speech_records r WHERE {filter} ORDER BY r.created_at DESC,r.id ASC LIMIT 50 OFFSET ?2")).map_err(db_error)?.query_map(params![search,(page-1)*50],|r|r.get::<_,String>(0)).map_err(db_error)?.collect::<Result<Vec<_>,_>>().map_err(db_error)?;
@@ -148,7 +174,8 @@ impl Repository {
                 let (record_id,kind):(String,String)=tx.query_row("SELECT record_id,kind FROM speech_attempts WHERE id=?1",[&attempt_id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(db_error)?;
                 let n=tx.execute("UPDATE speech_attempts SET status=?2,text=?3,error_code=?4,elapsed_ms=?5,ended_at=?6,search_key=?7 WHERE id=?1 AND status IN ('preparing','recording','processing')",params![attempt_id,status,text,error,elapsed_ms as i64,now(),crate::data::model::key(&text)]).map_err(db_error)?;
                 if n!=1{return Err(Error::new("conflict"));}
-                if kind=="live" {tx.execute("UPDATE speech_records SET status=?2,ended_at=?3,duration_ms=?4,current_attempt=?5,revision=revision+1 WHERE id=?1",params![record_id,status,now(),duration_ms as i64,attempt_id]).map_err(db_error)?;}
+                // Frozen record lifecycle and recognition attempt outcome are distinct.
+                if kind=="live" {let record_status=if status=="cancelled"{"interrupted"}else{status.as_str()};tx.execute("UPDATE speech_records SET status=?2,ended_at=?3,duration_ms=?4,current_attempt=?5,revision=revision+1 WHERE id=?1",params![record_id,record_status,now(),duration_ms as i64,attempt_id]).map_err(db_error)?;}
                 else if status=="success"{tx.execute("UPDATE speech_records SET current_attempt=?2,status='success',revision=revision+1 WHERE id=?1",params![record_id,attempt_id]).map_err(db_error)?;}
                 tx.commit().map_err(db_error)?;Ok(DbOutput::Done)
             },

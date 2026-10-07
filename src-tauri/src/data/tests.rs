@@ -375,6 +375,9 @@ fn worker_authorization_recovery_and_bounded_queue() {
             status: worker.status.clone(),
             stopping: Arc::new(AtomicBool::new(false)),
             dispatch: Arc::new(Mutex::new(())),
+            root: worker.root.clone(),
+            journal_io: worker.journal_io.clone(),
+            lease_active: worker.lease_active.clone(),
         };
         for _ in 0..64 {
             let (response, _) = oneshot::channel();

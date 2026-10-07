@@ -206,6 +206,26 @@ async fn cancellation_clears_temporary_audio_even_if_database_is_unavailable() {
     assert!(service.discard_new("cancelled-record", true).await);
     assert!(service.last_audio.lock().unwrap().is_none());
 }
+#[test]
+fn cancel_without_history_clears_memory_audio_and_retry_but_preserves_newer_task() {
+    let root = tempfile::tempdir().unwrap();
+    let worker = crate::data::DataWorker::start(root.path().to_path_buf()).unwrap();
+    let service = SpeechService::new(crate::history::HistoryService::new(worker, root.path()));
+    {
+        let mut s = service.snapshot.lock().unwrap();
+        s.task_id = Some("external".into());
+        s.source_record_id = Some("memory-only".into());
+        s.record_id = None;
+        s.can_retry = true;
+    }
+    *service.last_audio.lock().unwrap() = Some(("memory-only".into(), vec![1, 2, 3]));
+    service.invalidate_task_audio("old-task");
+    assert!(service.last_audio.lock().unwrap().is_some());
+    service.invalidate_task_audio("external");
+    assert!(service.last_audio.lock().unwrap().is_none());
+    assert!(!service.snapshot().unwrap().can_retry);
+    assert!(service.snapshot().unwrap().source_record_id.is_none());
+}
 
 #[tokio::test]
 async fn shutdown_waits_for_admitted_background_cleanup() {

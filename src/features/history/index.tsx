@@ -1,7 +1,7 @@
 import {memo,useCallback,useEffect,useLayoutEffect,useRef,useState,useSyncExternalStore} from 'react';
 import {useNavigate} from 'react-router-dom';
 import {ActionIcon,Button,EmptyState,IconButton,InlineMessage,TextInput} from '../../ui';
-import type {HistoryPort} from '../../contracts/history';
+import {historyVersion,type HistoryPort} from '../../contracts/history';
 import type {SpeechPort,SpeechSnapshot} from '../../contracts/speech';
 import {initialSpeech,speechError,SpeechError} from '../../contracts/speech';
 import type {ModelConfigPort} from '../../contracts/models';
@@ -15,19 +15,19 @@ export {HistoryFeedStore} from './feed';
 const quietSpeech=initialSpeech();
 const day=(at:number)=>new Date(at).toLocaleDateString('zh-CN');
 function dateLabel(at:number){const date=day(at),today=new Date(),yesterday=new Date(today);yesterday.setDate(today.getDate()-1);return date===day(today.getTime())?'今天':date===day(yesterday.getTime())?'昨天':date;}
-export const History=memo(function History({deliveryRevision='',port,speech,models,snapshot,reading,visible=true,onChanged,onGuardChange}:{deliveryRevision?:string;port:HistoryPort;speech:SpeechPort;models:ModelConfigPort;snapshot:SpeechSnapshot;reading?:HistoryFeedStore;visible?:boolean;onChanged?:()=>void;onGuardChange?:(guard:DepartureGuard|null)=>void}){
+export const History=memo(function History({deliveryRevision='',contentRevision=0,port,speech,models,snapshot,reading,visible=true,onChanged,onGuardChange}:{deliveryRevision?:string;contentRevision?:number;port:HistoryPort;speech:SpeechPort;models:ModelConfigPort;snapshot:SpeechSnapshot;reading?:HistoryFeedStore;visible?:boolean;onChanged?:()=>void;onGuardChange?:(guard:DepartureGuard|null)=>void}){
  const navigate=useNavigate();
  const [own]=useState(()=>new HistoryFeedStore(port));const feed=reading??own;const state=useSyncExternalStore(feed.subscribe,feed.getSnapshot);
  const [mode,setMode]=useState<ExpandMode>('text'),[activation,setActivation]=useState(0),[settings,setSettings]=useState(false),[documentVisible,setDocumentVisible]=useState(()=>!document.hidden);
  const scroller=useRef<HTMLDivElement>(null),sentinel=useRef<HTMLDivElement>(null),guard=useRef<DepartureGuard|null>(null),opening=useRef(0),anchor=useRef<{id:string;offset:number}|null>(null);
  const alive=useRef(false),copyGeneration=useRef(0);
  useEffect(()=>{alive.current=true;return()=>{alive.current=false;};},[]);
- const copyFull=useCallback(async(id:string,attemptId:string|null,current:()=>boolean)=>{const token=++copyGeneration.current;const search=feed.getSnapshot().search;const full=await port.detail(id);if(!alive.current||token!==copyGeneration.current||search!==feed.getSnapshot().search||!current())return false;const attempt=full.attempts.find(a=>a.id===attemptId);if(!attempt?.text)throw new SpeechError('notFound');await speech.copy(attempt.text);return true;},[feed,port,speech]);
+ const copyFull=useCallback(async(id:string,attemptId:string|null,current:()=>boolean)=>{const token=++copyGeneration.current;const search=feed.getSnapshot().search;const full=await port.detail(id);if(!alive.current||token!==copyGeneration.current||search!==feed.getSnapshot().search||!current())return false;const selected=historyVersion(full,attemptId);if(!selected.text)throw new SpeechError('notFound');await speech.copy(selected.text);return true;},[feed,port,speech]);
  const playback=useHistoryPlayback(port,visible&&documentVisible);const play=playback.control;const [emptyPlayer]=useState({resourceId:null,playing:false,positionMs:0,durationMs:0});
  const bindGuard=useCallback((value:DepartureGuard|null)=>{guard.current=value;onGuardChange?.(value);},[onGuardChange]);
  const recordAgain=useCallback(()=>{const action=()=>navigate('/');if(guard.current)guard.current(action);else action();},[navigate]);
  useEffect(()=>{const update=()=>setDocumentVisible(!document.hidden);document.addEventListener('visibilitychange',update);return()=>document.removeEventListener('visibilitychange',update);},[]);
- useEffect(()=>{if(visible&&documentVisible)void feed.refresh();},[feed,visible,documentVisible]);
+ useEffect(()=>{if(visible&&documentVisible)void feed.refresh();},[feed,visible,documentVisible,contentRevision]);
  useLayoutEffect(()=>{if(scroller.current)scroller.current.scrollTop=feed.getScroll();},[feed]);
  const remember=useCallback(()=>{const node=scroller.current;if(!node)return;feed.setScroll(node.scrollTop);const items=node.querySelectorAll<HTMLElement>('[data-record-id]');const first=[...items].find(item=>item.offsetTop+item.offsetHeight>=node.scrollTop);anchor.current=first?{id:first.dataset.recordId!,offset:first.offsetTop-node.scrollTop}:null;},[feed]);
  useLayoutEffect(()=>{const node=scroller.current;if(!node||!anchor.current)return;const item=[...node.querySelectorAll<HTMLElement>('[data-record-id]')].find(r=>r.dataset.recordId===anchor.current?.id);if(item)node.scrollTop=item.offsetTop-anchor.current.offset;},[state.records]);

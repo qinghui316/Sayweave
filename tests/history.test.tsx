@@ -5,12 +5,29 @@ import {MemoryRouter} from 'react-router-dom';
 import {History,HistoryFeedStore} from '../src/features/history';
 import {BrowserHistory,BrowserSpeech} from '../src/adapters/speech-browser';
 import {BrowserModels} from '../src/adapters/models-browser';
-import {parseFeed,summarizeHistory,type HistoryRecord} from '../src/contracts/history';
+import {parseFeed,parseRecord,summarizeHistory,type HistoryRecord} from '../src/contracts/history';
 import {initialSpeech} from '../src/contracts/speech';
 import {SaveSettings,type DepartureGuard} from '../src/features/history/SaveSettings';
 function record(n=1,text='完整的识别文字'):HistoryRecord {const id=`record-${n}`,a=`attempt-${n}`;return {id,createdAt:1000+n,endedAt:2000+n,durationMs:1000,status:'success',currentAttempt:a,revision:1,audio:null,attempts:[{id:a,recordId:id,kind:'live',configId:'fixture',configName:'模型',configRevision:1,modelId:'fixture',serviceHost:'example.invalid',createdAt:1000+n,endedAt:2000+n,status:'success',text,errorCode:null,elapsedMs:1}]};}
 function fixture(records:HistoryRecord[]){const speech=new BrowserSpeech();speech.records.push(...records);return {speech,port:new BrowserHistory(speech),models:new BrowserModels()};}
 function deferred<T>(){let resolve!:(value:T)=>void;const promise=new Promise<T>(r=>resolve=r);return {promise,resolve};}
+it('copies and searches the full processed version independently of raw text',async()=>{
+ const r=record(1,'识别原文'),full='整理后的完整正文🙂'.repeat(50);
+ r.processing=[{id:'processed-1',attemptId:r.currentAttempt!,configName:'文字模型',modelId:'fixture',state:'success',text:full,revision:1,errorCode:null,units:[]}];
+ expect(parseRecord(r).processing?.[0]?.text).toBe(full);
+ const f=fixture([r]),copy=vi.spyOn(f.speech,'copy').mockResolvedValue();
+ render(<MemoryRouter><History {...f} snapshot={initialSpeech()}/></MemoryRouter>);
+ const row=await screen.findByRole('listitem');fireEvent.click(within(row).getByRole('button',{name:'复制'}));
+ await waitFor(()=>expect(copy).toHaveBeenCalledWith(full));
+ fireEvent.change(screen.getByRole('textbox',{name:'搜索识别文字'}),{target:{value:'识别原文'}});
+ await screen.findByText('识别原文');fireEvent.click(within(screen.getByRole('listitem')).getByRole('button',{name:'复制'}));
+ await waitFor(()=>expect(copy).toHaveBeenLastCalledWith('识别原文'));
+});
+it('rejects processing records with unrelated source identity or invalid receipts',()=>{
+ const r=record();r.processing=[{id:'p',attemptId:r.currentAttempt!,configName:'m',modelId:'m',state:'success',text:'整理',revision:1,errorCode:null,units:[]}];
+ expect(()=>parseRecord({...r,processing:[{...r.processing![0],attemptId:'another'}]})).toThrow();
+ expect(()=>parseRecord({...r,processing:[{...r.processing![0],units:[{id:'u',runId:'other'}]}]})).toThrow();
+});
 it('refreshes late delivery confirmation without changing the recognition record',async()=>{
  const r=record(),f=fixture([r]);let state='delivering';
  const port=Object.assign(Object.create(f.port) as import('../src/contracts/history').HistoryPort,{delivery:vi.fn(async()=>[{attemptId:r.currentAttempt!,state,error:null,updatedAt:1}])});

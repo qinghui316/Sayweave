@@ -1,6 +1,7 @@
 pub mod commands;
 mod credentials;
 pub mod provider;
+mod streaming;
 #[cfg(test)]
 mod tests;
 pub mod types;
@@ -370,6 +371,12 @@ impl ModelService {
     }
     // Internal task snapshot. Never Serialize/Debug or expose to a renderer.
     pub async fn speech_config(&self) -> Result<SpeechConfiguration, ModelError> {
+        self.default_config(Usage::Speech).await
+    }
+    pub async fn text_config(&self) -> Result<ExecutableConfiguration, ModelError> {
+        self.default_config(Usage::Text).await
+    }
+    async fn default_config(&self, usage: Usage) -> Result<ExecutableConfiguration, ModelError> {
         self.status("main", false).await?;
         self.check("main")?;
         let _guard = self.gate.try_lock().map_err(|_| ModelError::new("busy"))?;
@@ -377,7 +384,7 @@ impl ModelService {
         let id = view
             .defaults
             .iter()
-            .find(|d| d.usage == Usage::Speech)
+            .find(|d| d.usage == usage)
             .and_then(|d| d.config_id.as_deref())
             .ok_or(ModelError::new("notConfigured"))?;
         let config = view
@@ -385,11 +392,11 @@ impl ModelService {
             .iter()
             .find(|c| c.id == id)
             .ok_or(ModelError::new("notConfigured"))?;
-        if !executable(&config.input, &Usage::Speech) {
+        if !executable(&config.input, &usage) {
             return Err(ModelError::new("unsupported"));
         }
         let key = self.vault.get(config.credential_ref.clone()).await?;
-        Ok(SpeechConfiguration {
+        Ok(ExecutableConfiguration {
             id: config.id.clone(),
             input: config.input.clone(),
             revision: config.revision,
@@ -401,9 +408,10 @@ impl ModelService {
         self.data.shutdown().await;
     }
 }
-pub struct SpeechConfiguration {
+pub struct ExecutableConfiguration {
     pub id: String,
     pub input: ConfigInput,
     pub revision: i64,
     pub key: String,
 }
+pub type SpeechConfiguration = ExecutableConfiguration;

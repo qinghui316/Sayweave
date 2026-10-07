@@ -15,10 +15,22 @@ pub struct HistoryService {
     pub data: DataWorker,
     pub files: Result<files::AudioFiles, Error>,
     active: Arc<Mutex<HashSet<String>>>,
+    records: Arc<Mutex<HashSet<String>>>,
 }
 pub struct AudioLease {
     pub audio: Audio,
     _reservation: AudioReservation,
+}
+pub(crate) struct RecordLease {
+    id: String,
+    records: Arc<Mutex<HashSet<String>>>,
+}
+impl Drop for RecordLease {
+    fn drop(&mut self) {
+        if let Ok(mut records) = self.records.lock() {
+            records.remove(&self.id);
+        }
+    }
 }
 struct AudioReservation {
     id: String,
@@ -32,11 +44,22 @@ impl Drop for AudioReservation {
     }
 }
 impl HistoryService {
+    pub(crate) fn hold_record(&self, id: &str) -> Result<RecordLease, Error> {
+        let mut records = self.records.lock().map_err(|_| Error::new("unavailable"))?;
+        if !records.insert(id.into()) {
+            return Err(Error::new("busy"));
+        }
+        Ok(RecordLease {
+            id: id.into(),
+            records: self.records.clone(),
+        })
+    }
     pub fn new(data: DataWorker, root: &Path) -> Self {
         Self {
             data,
             files: files::AudioFiles::new(root),
             active: Arc::new(Mutex::new(HashSet::new())),
+            records: Arc::new(Mutex::new(HashSet::new())),
         }
     }
     pub async fn db(&self, op: DbOperation) -> Result<DbOutput, Error> {
@@ -84,6 +107,7 @@ impl HistoryService {
         })
     }
     pub async fn remove(&self, id: &str, revision: i64) -> Result<(), Error> {
+        let _record = self.hold_record(id)?;
         let record = self.detail(id).await?;
         let audio = record.audio;
         let _lease = if let Some(a) = &audio {
@@ -106,6 +130,12 @@ impl HistoryService {
         Ok(())
     }
     pub async fn recover(&self) -> Result<(), Error> {
+        self.clean_discarded_audio().await?;
+        self.data
+            .request_admitted(Operation::Processing(
+                crate::contracts::processing::DbOperation::Recover,
+            ))
+            .await?;
         self.db(DbOperation::RecoverDelivery).await?;
         let assets = match self.db(DbOperation::Pending).await? {
             DbOutput::Assets(v) => v,
@@ -145,6 +175,25 @@ impl HistoryService {
         // Also finish tombstones for text-only records.
         self.db(DbOperation::Interrupted).await?;
         self.cleanup().await
+    }
+    pub(crate) async fn discard_audio(&self, record: &str) -> Result<(), Error> {
+        self.db(DbOperation::DiscardAudio(record.into())).await?;
+        self.clean_discarded_audio().await
+    }
+    async fn clean_discarded_audio(&self) -> Result<(), Error> {
+        let DbOutput::Assets(assets) = self.db(DbOperation::DiscardedAudio).await? else {
+            return Err(Error::new("unavailable"));
+        };
+        for asset in assets {
+            let _lease = self.reserve(&asset.id)?;
+            let files = self.files.clone()?;
+            let key = asset.file_key;
+            tokio::task::spawn_blocking(move || files.remove(&key))
+                .await
+                .map_err(|_| Error::new("deleteFailed"))??;
+            self.db(DbOperation::DeleteDiscardedAudio(asset.id)).await?;
+        }
+        Ok(())
     }
     pub async fn cleanup(&self) -> Result<(), Error> {
         let assets = match self

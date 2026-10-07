@@ -46,11 +46,11 @@ test('no-target results retain full text and close after failed copy without cli
 test('normal finish shows recognition feedback and hides terminal captions',async({page})=>{
  await page.setViewportSize({width:384,height:220});
  await page.goto('/tests/fixtures/voice-recovery.html?presentation=recognizing');
- await expect(page.getByText('识别中',{exact:true})).toBeVisible();
+ await expect(page.getByRole('group',{name:'识别中',exact:true})).toBeVisible();await expect(page.getByText('识别中',{exact:true})).toHaveCount(0);
  await expect(page.getByLabel('实时字幕')).toHaveCount(0);await expect(page.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);
  await page.setViewportSize({width:120,height:112});await page.goto('/tests/fixtures/voice-recovery.html?presentation=completed');
- await expect(page.getByText('口述完成',{exact:true})).toBeVisible();
- const rect=await page.getByText('口述完成',{exact:true}).boundingBox();expect(rect!.y+rect!.height).toBeLessThanOrEqual(112);
+ await expect(page.getByRole('group',{name:'口述完成',exact:true})).toBeVisible();await expect(page.getByText('口述完成',{exact:true})).toHaveCount(0);
+ const rect=await page.getByRole('group',{name:'口述完成',exact:true}).boundingBox();expect(rect!.y+rect!.height).toBeLessThanOrEqual(112);
 });
 
 test('device and shortcut controls fit both window sizes with shared styles and keyboard operation',async({page})=>{

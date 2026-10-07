@@ -168,7 +168,9 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
                 Arc::new(DeliveryGate::default()),
             ))
             .map_err(|e| e.code)?;
-        draft.update(1, 1, prefix);
+        runtime
+            .block_on(draft.replace(1, prefix.into()))
+            .map_err(|e| e.code)?;
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
             let value = fixture.command(serde_json::json!({"action":"read"}))?;
@@ -180,8 +182,16 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        draft.update(1, 2, text);
-        draft.update(1, 1, "STALE");
+        runtime
+            .block_on(draft.replace(2, text.into()))
+            .map_err(|e| e.code)?;
+        if runtime
+            .block_on(draft.replace(1, "STALE".into()))
+            .err()
+            .is_none_or(|e| e.code != "staleSnapshot")
+        {
+            return Err("old source snapshot accepted".into());
+        }
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
             let value = fixture.command(serde_json::json!({"action":"read"}))?;
@@ -237,7 +247,9 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
                 Arc::new(DeliveryGate::default()),
             ))
             .map_err(|e| e.code)?;
-        draft.update(1, 1, "正在识别");
+        runtime
+            .block_on(draft.replace(1, "正在识别".into()))
+            .map_err(|e| e.code)?;
         let until = Instant::now() + Duration::from_secs(3);
         while fixture.command(serde_json::json!({"action":"read"}))?["text"] != "protected正在识别"
         {
@@ -254,7 +266,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         if moved["start"] != 0 || moved["end"] != 0 {
             return Err("fixture caret did not move".into());
         }
-        draft.update(1, 2, "不应覆盖");
+        let _ = runtime.block_on(draft.replace(2, "不应覆盖".into()));
         let delivery = runtime.block_on(draft.finish("不应覆盖".into(), Finish::Commit));
         let after = fixture.command(serde_json::json!({"action":"read"}))?;
         if delivery.state == "confirmed" || after["text"] != "protected正在识别" {
@@ -287,7 +299,15 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         let flow = Control::new(crate::input_state::activity_evidence());
         flow.resume(1, anchor.activity);
         let (cancel, _) = tokio::sync::watch::channel(0);
-        let manager = SessionDraft::new(id.clone(), anchor, draft, flow.clone(), cancel.clone());
+        let manager = SessionDraft::new(
+            id.clone(),
+            anchor,
+            draft,
+            flow.clone(),
+            cancel.clone(),
+            None,
+            None,
+        );
         manager.activate();
         let ongoing = manager.clone();
         let actor = runtime.spawn(async move {
@@ -298,6 +318,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             turn: 1,
             sequence: 1,
             text: "你好".into(),
+            ..NativeTranscript::default()
         });
         let until = std::time::Instant::now() + Duration::from_secs(3);
         while fixture.command(serde_json::json!({"action":"read"}))?["text"] != "a你好bc" {
@@ -321,12 +342,14 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             turn: 1,
             sequence: 2,
             text: "旧轮禁止覆盖".into(),
+            ..NativeTranscript::default()
         });
         let latest = NativeTranscript {
             task_id: id.clone(),
             turn: 2,
             sequence: 3,
             text: "新🙂".into(),
+            ..NativeTranscript::default()
         };
         manager.update(&latest);
         flow.request_finish();
@@ -364,7 +387,9 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             Arc::new(DeliveryGate::default()),
         ))
         .map_err(|e| e.code)?;
-    draft.update(1, 1, "已有草稿");
+    runtime
+        .block_on(draft.replace(1, "已有草稿".into()))
+        .map_err(|e| e.code)?;
     let until = std::time::Instant::now() + Duration::from_secs(3);
     while fixture.command(serde_json::json!({"action":"read"}))?["text"] != "已有草稿" {
         if std::time::Instant::now() >= until {

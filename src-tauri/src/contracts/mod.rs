@@ -2,5 +2,6 @@
 pub mod dictionary;
 pub mod history;
 pub mod models;
+pub mod processing;
 pub mod shortcuts;
 pub mod speech;

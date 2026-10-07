@@ -154,6 +154,7 @@ pub struct NativeTranscript {
     pub turn: u64,
     pub sequence: u64,
     pub text: String,
+    pub segments: Vec<crate::contracts::processing::SourceSegment>,
 }
 pub struct SpeechService {
     pub history: HistoryService,
@@ -240,13 +241,32 @@ impl SpeechService {
             |s| s.phase = Phase::Idle,
         );
     }
-    fn publish_transcript(&self, task: &str, turn: u64, text: String) {
-        let sequence = self.transcripts.borrow().sequence + 1;
+    fn publish_transcript(&self, task: &str, turn: u64, transcript: recognition::Transcript) {
+        let previous = self.transcripts.borrow().clone();
+        let sequence = previous.sequence + 1;
+        let segments = transcript
+            .segments
+            .iter()
+            .map(|s| {
+                let old = (previous.task_id == task && previous.turn == turn)
+                    .then(|| previous.segments.iter().find(|p| p.id == s.id))
+                    .flatten();
+                crate::contracts::processing::SourceSegment {
+                    id: s.id,
+                    text: s.text.clone(),
+                    confirmed: s.confirmed,
+                    revision: old
+                        .map(|p| p.revision + u64::from(p.text != s.text))
+                        .unwrap_or(1),
+                }
+            })
+            .collect();
         self.transcripts.send_replace(NativeTranscript {
             task_id: task.into(),
             turn,
             sequence,
-            text,
+            text: transcript.text,
+            segments,
         });
     }
     pub fn is_active(&self) -> bool {
@@ -792,7 +812,7 @@ impl SpeechService {
             && !task
                 .continuous
                 .as_ref()
-                .is_some_and(|c| c.preserve_history())
+                .is_some_and(|c| c.preserve_history() || c.has_cancel_archive_owner())
         {
             save_error |= self.discard_new(&task.record_id, task.persistent).await;
             self.update(&task.id, |s| {
@@ -893,6 +913,25 @@ impl SpeechService {
             });
         }
     }
+    pub(crate) fn invalidate_task_audio(&self, task_id: &str) {
+        let Ok(snapshot) = self.snapshot() else {
+            return;
+        };
+        if snapshot.task_id.as_deref() != Some(task_id) {
+            return;
+        }
+        if let Ok(mut last) = self.last_audio.lock()
+            && last
+                .as_ref()
+                .is_some_and(|(id, _)| snapshot.source_record_id.as_ref() == Some(id))
+        {
+            *last = None;
+        }
+        self.update(task_id, |s| {
+            s.can_retry = false;
+            s.source_record_id = None;
+        });
+    }
     pub fn start_error(&self, id: &str, source: Source, error: &Error) {
         let Ok(_gate) = self.gate.try_lock() else {
             return;
@@ -924,7 +963,8 @@ impl SpeechService {
         if let Ok(a) = self.active.lock()
             && let Some((_, tx)) = a.as_ref()
         {
-            let _ = tx.send(3);
+            let _ =
+                crate::task_stop::request(tx, crate::contracts::speech::StopReason::Interrupted);
         }
     }
     pub async fn drain(&self) {

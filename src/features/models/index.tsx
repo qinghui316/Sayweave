@@ -1,4 +1,4 @@
-import {useCallback, useEffect, useId, useRef, useState} from 'react';
+import {useCallback, useEffect, useId, useRef, useState,type ReactNode} from 'react';
 import {Button, Dialog, Field, TextInput, PasswordInput, Select, InlineMessage, AsyncStatusFeedback, Tabs} from '../../ui';
 import {modelError, modelExecutable, modelExpectation, modelSameOrigin, type ModelConfigPort, type ModelOverview, type ModelInput, type ModelRecord, type ModelDraft, type ModelExpectation, type ModelTestResult, type ModelErrorCode, type ModelUsage} from '../../contracts/models';
 import {initialModel, modelName, speechPresets} from './presets';
@@ -23,8 +23,8 @@ function fromRecord(c:ModelRecord):Editor {
  const input = {name:c.name, protocol:c.protocol, baseUrl:c.baseUrl, modelId:c.modelId, usages:[...c.usages]};
  return {input, initial:structuredClone(input), key:'', record:c, automaticName:false};
 }
-export interface ModelPanelProps {port:ModelConfigPort; onSpeech?:()=>void; onChanged?:()=>void; onHelp?:(help:import('../../contracts/models').ModelHelp)=>Promise<void>; onGuardChange?:(guard:((action:()=>void)=>void)|null)=>void}
-export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged}: ModelPanelProps) {
+export interface ModelPanelProps {port:ModelConfigPort; onSpeech?:()=>void; onChanged?:()=>void; onHelp?:(help:import('../../contracts/models').ModelHelp)=>Promise<void>; onGuardChange?:(guard:((action:()=>void)=>void)|null)=>void;extraContent?:ReactNode;extraGuard?:(action:()=>void)=>void}
+export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,extraContent,extraGuard}: ModelPanelProps) {
  const [usage, setUsage] = useState<ModelUsage>('speech');
  const [view, setView] = useState<ModelOverview|null>(null);
  const [editor, setEditor] = useState<Editor|null>(null);
@@ -80,13 +80,14 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged}: M
   const counter = generation;
   return () => {stopped = true; alive.current = false; counter.current++; const id = request.current; if(id) void port.cancelRequest(id).catch(() => {}); request.current = null;};
  }, [port, load]);
- const guard = useCallback((action:()=>void) => {
+ const localGuard = useCallback((action:()=>void) => {
   if(saving) {setNotice('正在保存，请稍候。'); return;}
   cancel();
   if(changed) {setConfirmation(null); nextAction.current = action; setLeaving(true);}
   else {setEditor(null); action();}
  }, [saving, cancel, changed]);
- useEffect(() => {onGuardChange?.(guard); return () => onGuardChange?.(null);}, [guard, onGuardChange]);
+ const guard=useCallback((action:()=>void)=>localGuard(()=>{if(extraGuard)extraGuard(action);else action();}),[localGuard,extraGuard]);
+ useEffect(() => {onGuardChange?.(localGuard); return () => onGuardChange?.(null);}, [localGuard, onGuardChange]);
  useEffect(() => {if(error?.field) form.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();}, [error, advanced]);
  function resetFeedback() {setError(null); setNotice(''); setTested(null); setNetworkError(null); setConfirmation(null); setAdvanced(false);}
  function switchUsage(value:string) {
@@ -166,6 +167,7 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged}: M
  if(editor && !speechOptions.some(p => p.value === editor.input.modelId)) speechOptions.unshift({value:editor.input.modelId, label:'当前自定义模型 · '+editor.input.modelId});
  return <Tabs variant="navigation" activationMode="manual" className={s.panel} contentClassName={s.tabContent} value={usage} onValueChange={switchUsage} disabled={saving || loading} label="模型类别" options={[{value:'speech', label:'语音识别'}, {value:'text', label:'文字处理'}]}>
   <div className={s.scroll} data-testid="model-scroll">
+   {usage==='text'&&!editor&&extraContent}
    {loading && <p role="status">正在读取模型…</p>}
    {!view && !loading && <Button onClick={() => void load(true)}>重新读取</Button>}
    {view?.cleanupPending && <InlineMessage>密钥清理尚未完成。<Button disabled={saving} onClick={() => guard(() => void load(true))}>重试清理</Button></InlineMessage>}

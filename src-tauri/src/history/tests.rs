@@ -5,6 +5,182 @@ use rusqlite::{Connection, params};
 fn id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+#[test]
+fn cancelled_partial_attempt_retains_text_without_poisoning_record_state() {
+    let root = tempfile::tempdir().unwrap();
+    let mut repo = Repository::open(root.path()).unwrap();
+    let (record_id, attempt, _) = prepare(&mut repo, false);
+    repo.history_operation(DbOperation::Finish {
+        attempt_id: attempt.id.clone(),
+        status: "cancelled".into(),
+        text: "已提交前段".into(),
+        error: Some("cancelled".into()),
+        duration_ms: 0,
+        elapsed_ms: 20,
+    })
+    .unwrap();
+    let current = record(&mut repo, &record_id);
+    assert_eq!(current.current_attempt, Some(attempt.id));
+    assert_eq!(current.status, "interrupted");
+    assert_eq!(current.attempts[0].status, "cancelled");
+    assert_eq!(current.attempts[0].text, "已提交前段");
+}
+#[test]
+fn processed_history_reference_search_and_source_versions_remain_independent() {
+    use crate::contracts::processing::{DbOperation as P, DbOutput as O, RunMetadata, UnitRecord};
+    let root = tempfile::tempdir().unwrap();
+    let mut repo = Repository::open(root.path()).unwrap();
+    let (rid, attempt, _) = prepare(&mut repo, false);
+    finish(&mut repo, &attempt, "success", "呃，赛维原文。");
+    let run = RunMetadata {
+        id: id(),
+        attempt_id: attempt.id.clone(),
+        task_id: id(),
+        config_id: id(),
+        config_name: "文字服务".into(),
+        model_id: "fixture".into(),
+        config_revision: 1,
+        prompt_version: "faithful-v1".into(),
+        settings_revision: 1,
+        dictionary_version: "snapshot".into(),
+    };
+    repo.processing_operation(P::Prepare(run.clone())).unwrap();
+    let unit = UnitRecord {
+        id: id(),
+        run_id: run.id.clone(),
+        turn: 1,
+        source_start: 0,
+        source_end: 8,
+        source_refs: "[]".into(),
+        source_text: "呃，赛维原文。".into(),
+        candidate_text: Some("Sayweave 整理结果。".into()),
+        generation_state: "success".into(),
+        application_state: "applied".into(),
+        source_committed_end: Some(8),
+        error_code: None,
+        prompt_tokens: Some(10),
+        completion_tokens: Some(5),
+        elapsed_ms: 20,
+    };
+    repo.processing_operation(P::SaveUnit(unit.clone()))
+        .unwrap();
+    // A new content revision at the same source start has a new request identity;
+    // provenance is retained instead of an unconditional source-start uniqueness.
+    let mut revised = unit.clone();
+    revised.id = id();
+    revised.source_text = "修订来源".into();
+    revised.source_refs = "[{\"revision\":2}]".into();
+    revised.application_state = "notApplied".into();
+    repo.processing_operation(P::SaveUnit(revised)).unwrap();
+    repo.processing_operation(P::Finish {
+        id: run.id.clone(),
+        text: "Sayweave 整理结果。".into(),
+        state: "success".into(),
+        error: None,
+    })
+    .unwrap();
+    let summary = browse(&mut repo, "", None).records.remove(0);
+    assert_eq!(summary.preview, "Sayweave 整理结果。");
+    assert_eq!(
+        summary.display_reference.as_ref().unwrap().kind,
+        "processed"
+    );
+    assert_eq!(summary.display_reference.as_ref().unwrap().id, run.id);
+    let raw = browse(&mut repo, "赛维", None).records.remove(0);
+    assert_eq!(raw.display_reference.as_ref().unwrap().kind, "raw");
+    assert_eq!(raw.preview, "呃，赛维原文。");
+    assert_eq!(browse(&mut repo, "整理结果", None).total, 1);
+    let complete = record(&mut repo, &rid);
+    assert_eq!(complete.attempts[0].text, "呃，赛维原文。");
+    assert_eq!(complete.processing[0].text, "Sayweave 整理结果。");
+    assert_eq!(complete.processing[0].units.len(), 2);
+    let O::Runs(runs) = repo.processing_operation(P::Runs(rid)).unwrap() else {
+        panic!("runs expected")
+    };
+    assert_eq!(runs[0].units.len(), 2);
+    assert!(
+        repo.processing_operation(P::SaveUnit(unit)).is_err(),
+        "late write must not mutate settled run"
+    );
+}
+
+#[test]
+fn cancelled_processing_atomically_drops_pending_tail_and_queues_audio_cleanup() {
+    use crate::contracts::processing::{DbOperation as P, DbOutput as O, RunMetadata, UnitRecord};
+    let root = tempfile::tempdir().unwrap();
+    let mut repo = Repository::open(root.path()).unwrap();
+    let (rid, attempt, resource) = prepare(&mut repo, true);
+    finish(&mut repo, &attempt, "success", "前段。未提交尾部。");
+    let run = RunMetadata {
+        id: id(),
+        attempt_id: attempt.id.clone(),
+        task_id: id(),
+        config_id: id(),
+        config_name: "fixture".into(),
+        model_id: "fixture".into(),
+        config_revision: 1,
+        prompt_version: "faithful-v1".into(),
+        settings_revision: 1,
+        dictionary_version: "snapshot".into(),
+    };
+    repo.processing_operation(P::Prepare(run.clone())).unwrap();
+    let kept = UnitRecord {
+        id: id(),
+        run_id: run.id.clone(),
+        turn: 1,
+        source_start: 0,
+        source_end: 3,
+        source_refs: "[]".into(),
+        source_text: "前段。".into(),
+        candidate_text: Some("前段。".into()),
+        generation_state: "success".into(),
+        application_state: "applied".into(),
+        source_committed_end: Some(3),
+        error_code: None,
+        prompt_tokens: Some(12),
+        completion_tokens: Some(3),
+        elapsed_ms: 5,
+    };
+    repo.processing_operation(P::SaveUnit(kept.clone()))
+        .unwrap();
+    let mut pending = kept.clone();
+    pending.id = id();
+    pending.source_start = 3;
+    pending.source_end = 9;
+    pending.source_text = "未提交尾部。".into();
+    pending.candidate_text = Some("未提交候选。".into());
+    pending.application_state = "pending".into();
+    pending.source_committed_end = None;
+    repo.processing_operation(P::SaveUnit(pending.clone()))
+        .unwrap();
+    repo.processing_operation(P::Cancel {
+        id: run.id.clone(),
+        text: "前段。".into(),
+        raw: "前段。".into(),
+        units: vec![kept],
+    })
+    .unwrap();
+    let complete = record(&mut repo, &rid);
+    assert_eq!(complete.attempts[0].text, "前段。");
+    assert_eq!(complete.processing[0].state, "cancelled");
+    assert_eq!(complete.processing[0].units.len(), 1);
+    assert_eq!(complete.processing[0].units[0].prompt_tokens, Some(12));
+    assert_eq!(browse(&mut repo, "未提交", None).total, 0);
+    assert!(repo.processing_operation(P::SaveUnit(pending)).is_err());
+    let O::Runs(runs) = repo.processing_operation(P::Runs(rid)).unwrap() else {
+        panic!("runs expected")
+    };
+    assert_eq!(runs[0].units.len(), 1);
+    let queued: i64 = repo
+        .connection
+        .query_row(
+            "SELECT count(*) FROM discarded_audio WHERE id=?1",
+            [resource.unwrap().id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(queued, 1);
+}
 
 fn browse(repo: &mut Repository, search: &str, cursor: Option<Cursor>) -> Feed {
     match repo
