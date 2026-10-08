@@ -818,11 +818,7 @@ impl DictationCoordinator {
                 // Durable intent first; ordinary SQL below remains ordered after
                 // recognition and processing queues. No external input is replayed.
                 archive_error |= draft.stage_cancel().await.is_err();
-                let text = if report.raw.is_empty() && input_recovery {
-                    report.recovery_raw.clone()
-                } else {
-                    report.raw.clone()
-                };
+                let text = report.cancellation_raw().to_owned();
                 let operation = DbOperation::PruneCancelled {
                     attempt_id: attempt.clone(),
                     text,

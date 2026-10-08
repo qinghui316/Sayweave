@@ -364,4 +364,5 @@ fn rollback_and_cleanup_failure_preserve_uncommitted_recovery_text() {
     assert!(state.report.raw.is_empty());
     assert!(state.report.text.is_empty());
     assert_eq!(state.report.recovery_raw, "仍可能存在的尾部");
+    assert_eq!(state.report.cancellation_raw(), "仍可能存在的尾部");
 }

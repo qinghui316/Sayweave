@@ -56,6 +56,7 @@ pub enum DbOperation {
         id: String,
         text: String,
         raw: String,
+        rollback_failed: bool,
         units: Vec<UnitRecord>,
     },
     Recover,

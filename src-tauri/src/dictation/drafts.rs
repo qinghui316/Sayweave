@@ -190,6 +190,15 @@ pub(crate) struct Report {
     pub cancelled: bool,
     pub rollback_failed: bool,
 }
+impl Report {
+    pub(crate) fn cancellation_raw(&self) -> &str {
+        if self.rollback_failed {
+            &self.recovery_raw
+        } else {
+            &self.raw
+        }
+    }
+}
 struct Generating {
     unit: Unit,
     job: tokio::task::JoinHandle<Generation>,
@@ -1013,7 +1022,11 @@ impl SessionDraft {
                 if cancelled {
                     if outcome.rollback_failed {
                         s.report.rollback_failed = true;
-                        s.report.recovery_raw = s.written_raw.clone();
+                        s.report.recovery_raw = if s.report.raw.is_empty() {
+                            s.written_raw.clone()
+                        } else {
+                            format!("{}\n{}", s.report.raw, s.written_raw)
+                        };
                     }
                     self.archive_turn(
                         s,

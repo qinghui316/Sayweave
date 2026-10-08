@@ -17,6 +17,8 @@ enum Entry {
         id: String,
         text: String,
         raw: String,
+        #[serde(default)]
+        rollback_failed: bool,
         units: Vec<processing::UnitRecord>,
     },
     History {
@@ -37,11 +39,13 @@ impl Entry {
                 id,
                 text,
                 raw,
+                rollback_failed,
                 units,
             }) => Some(Self::Processing {
                 id: id.clone(),
                 text: text.clone(),
                 raw: raw.clone(),
+                rollback_failed: *rollback_failed,
                 units: units.clone(),
             }),
             Operation::History(history::DbOperation::PruneCancelled { attempt_id, text }) => {
@@ -59,14 +63,16 @@ impl Entry {
                 id,
                 text,
                 raw,
+                rollback_failed,
                 units,
             } => {
-                let settled = repository.connection.query_row("SELECT p.state='cancelled' AND p.text=?2 AND a.text=?3 FROM processing_runs p JOIN speech_attempts a ON a.id=p.attempt_id WHERE p.id=?1",rusqlite::params![id,text,raw],|r|r.get::<_,bool>(0)).optional().map_err(super::repository::db_error)?.unwrap_or(false);
+                let settled = repository.connection.query_row("SELECT p.state='cancelled' AND p.text=?2 AND a.text=?3 AND p.error_code=?4 FROM processing_runs p JOIN speech_attempts a ON a.id=p.attempt_id WHERE p.id=?1",rusqlite::params![id,text,raw,if rollback_failed {"compositionRollback"} else {"cancelled"}],|r|r.get::<_,bool>(0)).optional().map_err(super::repository::db_error)?.unwrap_or(false);
                 if !settled {
                     repository.processing_operation(processing::DbOperation::Cancel {
                         id,
                         text,
                         raw,
+                        rollback_failed,
                         units,
                     })?;
                 }
@@ -463,6 +469,87 @@ mod tests {
         assert!(Repository::open(root.path()).is_err());
     }
     #[test]
+    fn rollback_recovery_survives_cancel_journal_and_database_reopen() {
+        for applied_before_restart in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut repo = Repository::open(root.path()).unwrap();
+            let (record, attempt) = prepared(&mut repo);
+            repo.connection.execute(
+                "INSERT INTO audio_assets(id,record_id,file_key,status) VALUES(?1,?2,?3,'ready')",
+                rusqlite::params![uuid::Uuid::new_v4().to_string(), record, "fixture.wav"],
+            ).unwrap();
+            let run = processing::RunMetadata {
+                id: uuid::Uuid::new_v4().to_string(),
+                attempt_id: attempt.clone(),
+                task_id: uuid::Uuid::new_v4().to_string(),
+                config_id: uuid::Uuid::new_v4().to_string(),
+                config_name: "fixture".into(),
+                model_id: "fixture".into(),
+                config_revision: 1,
+                prompt_version: "faithful-v1".into(),
+                settings_revision: 1,
+                dictionary_version: "snapshot".into(),
+            };
+            repo.processing_operation(processing::DbOperation::Prepare(run.clone()))
+                .unwrap();
+            let cancel = processing::DbOperation::Cancel {
+                id: run.id,
+                text: String::new(),
+                raw: "仍可能存在的尾部🙂".into(),
+                rollback_failed: true,
+                units: vec![],
+            };
+            stage(
+                root.path(),
+                &Operation::History(history::DbOperation::PruneCancelled {
+                    attempt_id: attempt,
+                    text: "更宽泛的旧原文".into(),
+                }),
+            )
+            .unwrap();
+            stage(root.path(), &Operation::Processing(cancel.clone())).unwrap();
+            if applied_before_restart {
+                repo.processing_operation(cancel).unwrap();
+            }
+            drop(repo);
+            let mut reopened = Repository::open(root.path()).unwrap();
+            let history::DbOutput::Record(row) = reopened
+                .history_operation(history::DbOperation::Detail(record))
+                .unwrap()
+            else {
+                panic!("record expected")
+            };
+            assert_eq!(row.attempts[0].text, "仍可能存在的尾部🙂");
+            assert_eq!(row.processing[0].state, "cancelled");
+            assert_eq!(
+                row.processing[0].error_code.as_deref(),
+                Some("compositionRollback")
+            );
+            assert!(row.processing[0].text.is_empty());
+            assert!(row.processing[0].units.is_empty());
+            let audio_pending: bool = reopened
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM audio_assets WHERE status='expire_pending')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(audio_pending);
+        }
+        let old: Entry =
+            serde_json::from_str(r#"{"Processing":{"id":"old","text":"","raw":"","units":[]}}"#)
+                .unwrap();
+        assert!(matches!(
+            old,
+            Entry::Processing {
+                rollback_failed: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn precise_cancel_receipt_wins_over_broader_raw_fallback_on_restart() {
         let root = tempfile::tempdir().unwrap();
         let mut repo = Repository::open(root.path()).unwrap();
@@ -516,6 +603,7 @@ mod tests {
                 id: run.id,
                 text: String::new(),
                 raw: String::new(),
+                rollback_failed: false,
                 units: vec![unit],
             }),
         )

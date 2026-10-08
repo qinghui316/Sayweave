@@ -155,6 +155,7 @@ fn cancelled_processing_atomically_drops_pending_tail_and_queues_audio_cleanup()
         id: run.id.clone(),
         text: "前段。".into(),
         raw: "前段。".into(),
+        rollback_failed: false,
         units: vec![kept],
     })
     .unwrap();

@@ -55,6 +55,7 @@ impl Repository {
                 id,
                 text,
                 raw,
+                rollback_failed,
                 units,
             } => {
                 if text.len() > 2 * 1024 * 1024 || raw.len() > 1024 * 1024 {
@@ -99,7 +100,7 @@ impl Repository {
                 )
                 .map_err(db_error)?;
                 tx.execute("UPDATE speech_records SET status='interrupted',revision=revision+1 WHERE id=?1",[record]).map_err(db_error)?;
-                tx.execute("UPDATE processing_runs SET state='cancelled',text=?2,search_key=?3,ended_at=?4,error_code='cancelled',revision=revision+1 WHERE id=?1",params![id,text,crate::contracts::dictionary::key(&text),now()]).map_err(db_error)?;
+                tx.execute("UPDATE processing_runs SET state='cancelled',text=?2,search_key=?3,ended_at=?4,error_code=?5,revision=revision+1 WHERE id=?1",params![id,text,crate::contracts::dictionary::key(&text),now(),if rollback_failed {"compositionRollback"} else {"cancelled"}]).map_err(db_error)?;
                 tx.commit().map_err(db_error)?;
                 Ok(DbOutput::Done)
             }

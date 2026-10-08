@@ -274,7 +274,8 @@ impl Context {
                 .stage_cancel(&Operation::Processing(DbOperation::Cancel {
                     id: run.metadata.id.clone(),
                     text: report.text.clone(),
-                    raw: report.raw.clone(),
+                    raw: report.cancellation_raw().to_owned(),
+                    rollback_failed: report.rollback_failed,
                     units: self.final_records(report)?,
                 }))
                 .await?;
@@ -306,7 +307,8 @@ impl Context {
                 DbOperation::Cancel {
                     id: run.metadata.id.clone(),
                     text: report.text.clone(),
-                    raw: report.raw.clone(),
+                    raw: report.cancellation_raw().to_owned(),
+                    rollback_failed: report.rollback_failed,
                     units: retained,
                 },
             )
