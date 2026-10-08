@@ -169,7 +169,7 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
  const addressField = editor && <Field label="服务地址（URL）" error={fieldError('baseUrl')}>{props => <TextInput {...props} value={editor.input.baseUrl} autoComplete="off" spellCheck={false} onBlur={()=>{if(usage==='text')void discovery.sync();}} onChange={e => modify({baseUrl:e.target.value})}/>}</Field>;
  const speechOptions = speechPresets.map(p => ({value:p.modelId as string, label:p.label as string}));
  if(editor && !speechOptions.some(p => p.value === editor.input.modelId)) speechOptions.unshift({value:editor.input.modelId, label:'当前自定义模型 · '+editor.input.modelId});
- return <Tabs variant="navigation" activationMode="manual" className={s.panel} contentClassName={s.tabContent} value={usage} onValueChange={switchUsage} disabled={saving || loading} label="模型类别" options={[{value:'speech', label:'语音识别'}, {value:'text', label:'文字处理'}]}>
+ return <Tabs activationMode="manual" className={s.panel} contentClassName={s.tabContent} value={usage} onValueChange={switchUsage} disabled={saving || loading} label="模型类别" options={[{value:'speech', label:'语音识别'}, {value:'text', label:'文字处理'}]}>
   <div className={s.scroll} data-testid="model-scroll">
    {usage==='text'&&!editor&&extraContent}
    {loading && <p role="status">正在读取模型…</p>}

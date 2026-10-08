@@ -7,19 +7,19 @@ describe('speech renderer synchronization',()=>{
  it('retains only trial state while global external/history events and meters continue',async()=>{
   const port=new BrowserSpeech(),store=new SpeechStore(port),changed=vi.fn();store.subscribeTrial(changed);
   store.accept({...initialSpeech(),sequence:2,taskId:'external-first',source:'external',phase:'recording',text:'outside'});
-  store.meter({taskId:'external-first',sequence:1,captureSequence:1,energies:Array(15).fill(.8),level:.8,durationMs:400});
+  store.meter({taskId:'external-first',sequence:1,captureSequence:1,energies:Array(15).fill(.8),bars:Array(15).fill(.8),level:.8,durationMs:400});
   expect(store.getTrialSnapshot().snapshot).toEqual(initialSpeech());expect(changed).not.toHaveBeenCalled();
   store.accept({...initialSpeech(),sequence:3,taskId:'trial',source:'trial',phase:'recording',text:'practice'});
-  store.meter({taskId:'trial',sequence:1,captureSequence:1,energies:Array(15).fill(.4),level:.4,durationMs:300});
+  store.meter({taskId:'trial',sequence:1,captureSequence:1,energies:Array(15).fill(.4),bars:Array(15).fill(.4),level:.4,durationMs:300});
   expect(store.getTrialSnapshot().level).toBe(.4);
   store.accept({...store.getSnapshot().snapshot,sequence:4,phase:'completed',saved:true,canRetry:true});
   const retained=store.getTrialSnapshot();changed.mockClear();
   for(const [sequence,source] of [[5,'external'],[6,'history']] as const){
    store.accept({...initialSpeech(),sequence,taskId:source,source,phase:'processing',text:source,error:'service'});
-   store.meter({taskId:source,sequence:1,captureSequence:1,energies:Array(15).fill(.9),level:.9,durationMs:9999});
+   store.meter({taskId:source,sequence:1,captureSequence:1,energies:Array(15).fill(.9),bars:Array(15).fill(.9),level:.9,durationMs:9999});
    expect(store.getSnapshot().snapshot.text).toBe(source);expect(store.getTrialSnapshot()).toBe(retained);
   }
-  store.meter({taskId:'trial',sequence:99,captureSequence:99,energies:Array(15).fill(1),level:1,durationMs:9999});
+  store.meter({taskId:'trial',sequence:99,captureSequence:99,energies:Array(15).fill(1),bars:Array(15).fill(1),level:1,durationMs:9999});
   port.value={...store.getSnapshot().snapshot,sequence:7,phase:'failed'};await store.resync();
   expect(store.getTrialSnapshot()).toBe(retained);expect(changed).not.toHaveBeenCalled();
   store.accept({...initialSpeech(),sequence:8,taskId:'trial-next',source:'trial',phase:'connecting'});
@@ -44,14 +44,14 @@ describe('speech renderer synchronization',()=>{
  it('ignores stale task meters and does not use content updates as lifecycle changes',()=>{
   const store=new SpeechStore(new BrowserSpeech());
   store.accept({...initialSpeech(),sequence:2,lifecycle:2,taskId:'one',source:'trial',phase:'recording'});
-  store.meter({taskId:'one',sequence:10,captureSequence:10,energies:Array(15).fill(.5),level:.5,durationMs:900});
+  store.meter({taskId:'one',sequence:10,captureSequence:10,energies:Array(15).fill(.5),bars:Array(15).fill(.5),level:.5,durationMs:900});
   expect(store.getSnapshot().snapshot.lifecycle).toBe(2);
   store.accept({...initialSpeech(),sequence:3,lifecycle:3,taskId:'two',source:'trial',phase:'recording'});
-  store.meter({taskId:'one',sequence:11,captureSequence:11,energies:Array(15).fill(1),level:1,durationMs:9999});
+  store.meter({taskId:'one',sequence:11,captureSequence:11,energies:Array(15).fill(1),bars:Array(15).fill(1),level:1,durationMs:9999});
   expect(store.getSnapshot().snapshot.durationMs).toBe(0);expect(store.getSnapshot().level).toBe(0);
-  store.meter({taskId:'two',sequence:1,captureSequence:1,energies:Array(15).fill(.25),level:.25,durationMs:100});
+  store.meter({taskId:'two',sequence:1,captureSequence:1,energies:Array(15).fill(.25),bars:Array(15).fill(.25),level:.25,durationMs:100});
   store.accept({...initialSpeech(),sequence:4,lifecycle:4,taskId:'two',source:'trial',phase:'cancelled'});
-  store.meter({taskId:'two',sequence:2,captureSequence:2,energies:Array(15).fill(1),level:1,durationMs:100});expect(store.getSnapshot().level).toBe(0);
+  store.meter({taskId:'two',sequence:2,captureSequence:2,energies:Array(15).fill(1),bars:Array(15).fill(1),level:1,durationMs:100});expect(store.getSnapshot().level).toBe(0);
   store.accept({...initialSpeech(),sequence:3,lifecycle:3,taskId:'two',source:'trial',phase:'recording'});expect(store.getSnapshot().snapshot.phase).toBe('cancelled');
  });
  it('StrictMode overlapping connections keep the newer subscription',async()=>{
@@ -91,9 +91,9 @@ it('applies late archive fields to their retained trial without replacing a new 
 it('meter frames notify only the waveform, publishing page time once per second',()=>{
  const store=new SpeechStore(new BrowserSpeech());store.accept({...initialSpeech(),sequence:2,taskId:'trial',source:'trial',phase:'recording'});
  const page=vi.fn(),trial=vi.fn(),wave=vi.fn();store.subscribe(page);store.subscribeTrial(trial);store.trialMeter.subscribe(wave);
- for(let i=1;i<=20;i++)store.meter({taskId:'trial',sequence:i,captureSequence:i,energies:Array(15).fill(.1),level:.1,durationMs:i*50});
+ for(let i=1;i<=20;i++)store.meter({taskId:'trial',sequence:i,captureSequence:i,energies:Array(15).fill(.1),bars:Array(15).fill(.1),level:.1,durationMs:i*50});
  expect(wave).toHaveBeenCalledTimes(20);expect(page).toHaveBeenCalledTimes(1);expect(trial).toHaveBeenCalledTimes(1);
- const current=store.trialMeter.getSnapshot();store.meter({taskId:'trial',sequence:21,captureSequence:20,energies:Array(15).fill(1),level:1,durationMs:1050});
+ const current=store.trialMeter.getSnapshot();store.meter({taskId:'trial',sequence:21,captureSequence:20,energies:Array(15).fill(1),bars:Array(15).fill(1),level:1,durationMs:1050});
  expect(store.trialMeter.getSnapshot()).toBe(current);expect(wave).toHaveBeenCalledTimes(20);
- expect(()=>parseMeter({...current,energies:[0]})).toThrow();expect(()=>parseMeter({...current,energies:Array(15).fill(NaN)})).toThrow();
+ expect(()=>parseMeter({...current,bars:[0]})).toThrow();expect(()=>parseMeter({...current,bars:Array(15).fill(Infinity)})).toThrow();expect(()=>parseMeter({...current,energies:[0]})).toThrow();expect(()=>parseMeter({...current,energies:Array(15).fill(NaN),bars:Array(15).fill(NaN)})).toThrow();
 });

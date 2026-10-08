@@ -114,6 +114,7 @@ pub(crate) struct Meter {
     sequence: u64,
     level: f32,
     energies: [f32; 15],
+    bars: [f32; 15],
     capture_sequence: u64,
     duration_ms: u64,
 }
@@ -789,6 +790,7 @@ impl SpeechService {
                             sequence,
                             level: sample.level,
                             energies: sample.energies,
+                            bars: sample.bars,
                             capture_sequence: sample.capture_sequence,
                             duration_ms: sample.duration_ms,
                         };

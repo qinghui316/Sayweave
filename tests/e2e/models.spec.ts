@@ -68,23 +68,26 @@ test('long model summaries, menus and delete confirmation stay within a small wi
 });
 
 
-test('model category tabs are lightweight, fixed and keyboard accessible',async({page})=>{
+test('model category tabs use shared jelly motion with stable group and keyboard semantics',async({page})=>{
  const dialog=await open(page), speech=dialog.getByRole('tab',{name:'语音识别'}), text=dialog.getByRole('tab',{name:'文字处理'});
- const before={speech:await speech.boundingBox(),text:await text.boundingBox()};
+ const group=dialog.getByRole('tablist',{name:'模型类别'}),before=await group.boundingBox();
  await speech.focus();await page.keyboard.press('ArrowRight');await expect(text).toBeFocused();await expect(speech).toHaveAttribute('aria-selected','true');await page.keyboard.press('Enter');await expect(text).toHaveAttribute('aria-selected','true');
- expect(await speech.boundingBox()).toEqual(before.speech);expect(await text.boundingBox()).toEqual(before.text);
+ expect(await group.boundingBox()).toEqual(before);
+ await expect.poll(()=>text.evaluate(el=>new DOMMatrix(getComputedStyle(el).transform).a)).toBeGreaterThan(1.15);
+ await expect(text.locator('[data-choice-face]')).toHaveCSS('background-color','rgb(0, 0, 0)');
+ await expect(text).toHaveCSS('color','rgb(246, 246, 246)');
  expect(await text.evaluate(el=>getComputedStyle(el).backgroundColor)).toBe('rgba(0, 0, 0, 0)');
- await hitVisible(dialog.getByLabel('服务地址（URL）'));await expect(dialog.getByLabel('模型',{exact:true})).toHaveText('选择文字模型⌄');
+ await hitVisible(dialog.getByLabel('服务地址（URL）'));await expect(dialog.getByLabel('模型',{exact:true})).toHaveText('选择文字模型');
  await page.keyboard.press('Escape');await expect(dialog).toHaveCount(0);
 });
 
 test('compact actions, selected surface and reduced motion remain clear',async({page})=>{
  await page.setViewportSize({width:960,height:640});await page.emulateMedia({reducedMotion:'reduce'});
  const dialog=await open(page),tabs=dialog.getByRole('tablist',{name:'模型类别'});
- expect(await tabs.evaluate(el=>getComputedStyle(el,'::before').transitionDuration)).toBe('0s');
- expect(await tabs.evaluate(el=>getComputedStyle(el,'::before').backgroundColor)).toBe('rgb(255, 255, 255)');
+ await expect(tabs.getByRole('tab').first()).toHaveCSS('transition-duration','0s');
+ await expect(tabs.locator('[data-choice-face][data-current="true"]')).toHaveCSS('background-color','rgb(0, 0, 0)');
  await dialog.getByRole('tab',{name:'文字处理'}).click();
- expect(await dialog.getByRole('tab',{name:'文字处理'}).evaluate(el=>getComputedStyle(el,'::before').opacity)).toBe('1');
+ await expect(dialog.getByRole('tab',{name:'文字处理'})).toHaveCSS('transform','matrix(1, 0, 0, 1, 0, 0)');
  const more=(await dialog.getByRole('button',{name:'更多设置'}).boundingBox())!,save=(await dialog.getByRole('button',{name:'保存',exact:true}).boundingBox())!;
  expect(save.y-(more.y+more.height)).toBeLessThan(80);await hitVisible(dialog.getByLabel('模型',{exact:true}));
  await page.screenshot({path:'tests/visual/settings-compact-960.png'});

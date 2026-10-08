@@ -24,7 +24,7 @@ export function MeterWave({source, enabled=true, compact=false, level}: {source?
       if(bars)Array.from(bars).forEach((bar,i)=>{
         const node=bar as HTMLElement;
         node.style.transform=`scaleY(${values[i]})`;
-        node.style.opacity=String(.7+(values[i]??0)*.3);
+        node.style.opacity=String(.4+(values[i]??0)*.6);
       });
       frame=requestAnimationFrame(draw);
     };

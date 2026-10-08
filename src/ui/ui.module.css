@@ -40,32 +40,25 @@
 .confirmationDescription { color: var(--text-secondary); font-size: var(--text-body); line-height: var(--line-body); }
 .srOnly { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
 
-.navigationTabs { position: relative; align-self: flex-start; display: inline-flex; gap: 0; padding: 4px; background: var(--surface-sidebar); border-radius: var(--radius-control); }
-.navigationTabs::before { content: ''; position: absolute; inset: 4px auto 4px 4px; width: 128px; background: var(--surface-content); border-radius: 8px; box-shadow: 0 1px 4px rgb(0 0 0 / 6%); transform: translateX(calc(var(--selected-tab, 0) * 100%)); transition: transform 200ms ease; pointer-events: none; }
-.navigationTabs .tab { position: relative; z-index: 1; flex: none; width: 128px; height: 36px; padding: 0 12px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; color: var(--text-secondary); font-weight: 500; background: transparent; }
-.navigationTabs .tab::before { content: ''; width: 6px; height: 6px; flex: none; border-radius: 50%; background: var(--signal); opacity: 0; transition: opacity 120ms ease; }
-.navigationTabs .tab[data-state="active"] { color: var(--text-primary); background: transparent; }
-.navigationTabs .tab[data-state="active"]::before { opacity: 1; }
-.navigationContent { animation: tab-enter 120ms ease; }
-@keyframes tab-enter { from { opacity: 0; } to { opacity: 1; } }
-@media (prefers-reduced-motion: reduce) { .navigationTabs::before,.navigationTabs .tab::before { transition: none !important; } .navigationContent { animation: none !important; } }
-
-/* Shared selection motion: geometry stays fixed; only internal surfaces move. */
-.selectionHighlight { position:absolute; left:0; top:0; pointer-events:none; border-radius:8px; background:var(--surface-sidebar); opacity:0; transition-property:transform,opacity; transition-timing-function:cubic-bezier(.2,.8,.2,1); z-index:0; }
+/* Shared selection motion: group geometry stays fixed; visible items and hit areas move together. */
+.selectionHighlight { position:absolute; left:0; top:0; pointer-events:none; border-radius:8px; background:var(--surface-key); opacity:0; transition-property:transform,opacity; transition-timing-function:cubic-bezier(.2,.8,.2,1); z-index:0; }
 .selectContent { position:relative; transform-origin:var(--radix-select-content-transform-origin); isolation:isolate; }
 .selectContent[data-motion="active"][data-state="open"] { animation:select-enter var(--duration-select-enter) cubic-bezier(.2,.8,.2,1); }
 .selectContent[data-motion="active"][data-state="closed"] { animation:select-exit var(--duration-select-exit) ease-in; }
 .selectItem { position:relative; z-index:1; min-height:36px; align-items:center; gap:12px; font-size:var(--text-small); }
 .selectItem[data-highlighted] { background:transparent; }
 .selectionMark { flex:none; width:16px; color:var(--text-primary); }
+.select:hover:not(:disabled) { background:var(--surface-key); }
 .selectChevron { display:flex; transition:transform 180ms ease; }
 .select[data-state="open"] .selectChevron { transform:rotate(180deg); }
 .switchHit { min-height:36px; display:inline-flex; align-items:center; flex:none; }
 .switch { position:relative; overflow:visible; }
 .switch::after { content:''; position:absolute; inset:-4px 0; }
 .switch:disabled { opacity:.48; cursor:not-allowed; }
-.thumb { transition:background 160ms ease; }
-.singleChoice { display:flex; gap:8px; padding:3px; margin:0 -3px 8px; }
+.thumb { transition:background 320ms ease; }
+.singleChoice { margin-bottom:8px; }
+.choiceGroup { display:inline-flex; align-self:flex-start; gap:8px; padding:8px 24px; max-width:100%; }
+.choiceGroup [data-choice-item] { flex:none; transform-origin:center; }
 .choice { position:relative; display:inline-grid; place-items:center; min-height:36px; min-width:72px; padding:0 16px; cursor:pointer; }
 .choice input { position:absolute; inset:0; width:100%; height:100%; opacity:0; cursor:inherit; margin:0; }
 .choiceFace { position:absolute; inset:0; border-radius:var(--radius-control); background:var(--surface-canvas); pointer-events:none; }
@@ -74,10 +67,10 @@
 .choice input:checked ~ .choiceLabel { color:var(--text-inverse); }
 .choice input:focus-visible + .choiceFace { outline:2px solid var(--text-primary); outline-offset:3px; }
 .choice:has(input:disabled) { opacity:.48; cursor:not-allowed; }
-.tabs:not(.navigationTabs) { gap:8px; }
+.tabs { gap:8px; }
 .tab { min-height:36px; font-size:var(--text-small); transition:background 160ms ease,color 160ms ease; }
-@keyframes select-enter { from { opacity:0; transform:translateY(-3px); } to { opacity:1; transform:none; } }
-@keyframes select-exit { to { opacity:0; transform:translateY(-2px); } }
+@keyframes select-enter { from { opacity:0; transform:translateY(-8px) scale(.88,.8); } to { opacity:1; transform:none; } }
+@keyframes select-exit { to { opacity:0; transform:translateY(-5px) scale(.94,.88); } }
 @media (prefers-reduced-motion:reduce) { .selectionHighlight,.selectChevron,.tab,.thumb { transition:none !important; } .selectContent { animation:none !important; } }
 
-.tabs:not(.navigationTabs) .tab {position:relative;background:transparent;} .tabFace {position:absolute;inset:0;pointer-events:none;border-radius:inherit;background:var(--surface-canvas);} .tabFace[data-current="true"] {background:var(--text-primary);} .tabLabel {position:relative;pointer-events:none;}
+.tabs .tab {position:relative;background:transparent;} .tabFace {position:absolute;inset:0;pointer-events:none;border-radius:inherit;background:var(--surface-canvas);} .tabFace[data-current="true"] {background:var(--text-primary);} .tabLabel {position:relative;pointer-events:none;}

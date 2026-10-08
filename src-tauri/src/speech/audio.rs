@@ -250,35 +250,61 @@ impl TurnConverter {
 pub struct LocalMeter {
     pub level: f32,
     pub energies: [f32; 15],
+    pub bars: [f32; 15],
     pub capture_sequence: u64,
     pub duration_ms: u64,
 }
-// Fixed 50ms windows at the existing 16kHz capture rate. These are temporal
-// energies, not frequency energies. Packet boundaries do not change the features.
-#[derive(Default)]
+// Analysis is independent of the 50ms UI publication cadence and packet boundaries.
+// 128 samples at 16kHz preserve short temporal differences, not frequency bands.
 struct MeterWindow {
     energy: [f64; 15],
     counts: [usize; 15],
     samples: usize,
     frames: u64,
+    peak: f32,
+    bars: [f32; 15],
+}
+impl Default for MeterWindow {
+    fn default() -> Self {
+        Self {
+            energy: [0.0; 15],
+            counts: [0; 15],
+            samples: 0,
+            frames: 0,
+            peak: 0.05,
+            bars: [0.0; 15],
+        }
+    }
 }
 impl MeterWindow {
     fn push(&mut self, pcm: &[i16], mut publish: impl FnMut(LocalMeter)) {
         for sample in pcm {
-            let bin = self.samples * 15 / 800;
+            let bin = self.samples * 15 / 128;
             self.energy[bin] += (*sample as f64 / 32768.0).powi(2);
             self.counts[bin] += 1;
             self.samples += 1;
-            if self.samples == 800 {
+            if self.samples == 128 {
                 self.frames += 1;
-                let level = (self.energy.iter().sum::<f64>() / 800.0).sqrt() as f32;
-                let energies =
+                let level = (self.energy.iter().sum::<f64>() / 128.0).sqrt() as f32;
+                let energies: [f32; 15] =
                     std::array::from_fn(|i| (self.energy[i] / self.counts[i] as f64).sqrt() as f32);
+                // Independent implementation of whole-frame gain tracking, compression
+                // and attack/release. Constants are milliseconds, not callback counts.
+                let follow = 1.0 - (-8.0f32 / if level > self.peak { 22.4 } else { 1596.0 }).exp();
+                self.peak = (self.peak + (level - self.peak) * follow).clamp(0.02, 0.5);
+                let gain = 0.7 / self.peak;
+                for (i, rms) in energies.iter().enumerate() {
+                    let contour = 1.0 - 0.15 * ((i as f32 - 7.0) / 7.0).abs();
+                    let target = (rms * gain * 1.5).tanh() * contour;
+                    let time = if target > self.bars[i] { 13.4 } else { 62.6 };
+                    self.bars[i] += (target - self.bars[i]) * (1.0 - (-8.0f32 / time).exp());
+                }
                 publish(LocalMeter {
                     level,
                     energies,
+                    bars: self.bars,
                     capture_sequence: self.frames,
-                    duration_ms: self.frames * 50,
+                    duration_ms: self.frames * 8,
                 });
                 self.samples = 0;
                 self.energy.fill(0.0);
@@ -801,18 +827,20 @@ mod tests {
             frames
         };
         let expected = collect(2400);
-        assert_eq!(expected.len(), 3);
+        assert_eq!(expected.len(), 18);
         for size in [1, 53, 511, 800, 1024] {
             let actual = collect(size);
             for (a, b) in actual.iter().zip(&expected) {
                 assert_eq!(a.energies, b.energies);
+                assert_eq!(a.bars, b.bars);
                 assert_eq!(a.level, b.level);
                 assert_eq!(a.capture_sequence, b.capture_sequence);
                 assert_eq!(a.duration_ms, b.duration_ms);
             }
         }
         assert_eq!(expected[0].energies[0], 0.5);
-        assert_eq!(expected[0].energies[4], 0.0);
+        assert_eq!(expected[1].energies[14], 0.0);
+        assert_eq!(expected[1].duration_ms, 16);
     }
     #[tokio::test]
     async fn local_meter_keeps_publishing_during_network_backpressure_and_stops_on_finish() {
@@ -847,6 +875,46 @@ mod tests {
         task.await.unwrap();
         while samples.try_recv().is_ok() {}
         assert!(samples.recv().await.is_none());
+    }
+    #[test]
+    fn meter_short_transients_remain_independent_and_gain_recovers_without_saturation() {
+        let mut window = MeterWindow::default();
+        let mut frames = Vec::new();
+        let pcm: Vec<i16> = (0..16000)
+            .map(|i| if i % 128 < 8 { 12000 } else { 0 })
+            .collect();
+        window.push(&pcm, |m| frames.push(m));
+        let last = frames.last().unwrap();
+        assert!(last.bars[0] > last.bars[8] + 0.5);
+        assert!(last.bars.iter().all(|v| v.is_finite() && *v < 1.0));
+        window.push(&vec![0; 16000], |m| frames.push(m));
+        assert!(frames.last().unwrap().bars.iter().all(|v| *v < 0.001));
+    }
+    #[test]
+    #[ignore = "Offline visual comparison: explicit synthetic speech WAV and output JSON paths required"]
+    fn export_meter_speech_fixture() {
+        let input = std::env::var("SAYWEAVE_METER_FIXTURE").unwrap();
+        let output = std::env::var("SAYWEAVE_METER_OUTPUT").unwrap();
+        let reader = hound::WavReader::open(input).unwrap();
+        assert_eq!(reader.spec().sample_rate, 16000);
+        assert_eq!(reader.spec().channels, 1);
+        let pcm = reader
+            .into_samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut window = MeterWindow::default();
+        let mut frames = Vec::new();
+        window.push(&pcm, |m| {
+            frames.push(serde_json::json!({
+                "time": m.duration_ms, "level":m.level, "energies":m.energies, "bars":m.bars
+            }))
+        });
+        std::fs::write(output, serde_json::to_vec(&frames).unwrap()).unwrap();
+        println!(
+            "METER_FIXTURE samples={} frames={}",
+            pcm.len(),
+            frames.len()
+        );
     }
     #[tokio::test]
     async fn finish_stops_capture_while_the_audio_sender_is_blocked() {
@@ -899,7 +967,7 @@ mod tests {
         assert!(result.pcm.len() >= 16000);
         println!(
             "REAL_METER_PASS frames={frames} independent_frames={varied} peak_rms={peak:.6} duration_ms={}",
-            previous * 50
+            previous * 8
         );
         drop(result);
         drop(capture);

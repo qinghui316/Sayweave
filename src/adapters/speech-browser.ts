@@ -15,7 +15,7 @@ export class BrowserSpeech implements SpeechPort {
  async start(){
   if(this.active)throw new SpeechError('busy');clearTimeout(this.timer);this.active=true;
   const prior=this.value;this.value={...initialSpeech(),sequence:prior.sequence+1,lifecycle:prior.lifecycle+1,taskId:crypto.randomUUID(),source:'trial',attemptId:crypto.randomUUID(),recordId:this.settings.historyEnabled?crypto.randomUUID():null,modelName:'模拟语音模型',deviceName:'模拟麦克风',phase:'connecting'};this.emit();
-  this.timer=setTimeout(()=>{this.value.phase='recording';this.value.lifecycle++;this.value.text='这是浏览器模拟文字。';this.value.durationMs=1000;this.emit();let frame=0;this.meterTimer=setInterval(()=>{if(this.value.phase!=='recording')return;frame++;const energies=Array.from({length:15},(_,i)=>.04*(1+Math.sin(frame*.28+i*.6)));const meter:SpeechMeter={taskId:this.value.taskId!,sequence:frame,captureSequence:frame,level:energies.reduce((a,b)=>a+b,0)/15,energies,durationMs:1000+frame*50};for(const fn of this.meters)fn(meter);},50);},250);return this.snapshot();
+  this.timer=setTimeout(()=>{this.value.phase='recording';this.value.lifecycle++;this.value.text='这是浏览器模拟文字。';this.value.durationMs=1000;this.emit();let frame=0;this.meterTimer=setInterval(()=>{if(this.value.phase!=='recording')return;frame++;const energies=Array.from({length:15},(_,i)=>.04*(1+Math.sin(frame*.28+i*.6)));const meter:SpeechMeter={taskId:this.value.taskId!,sequence:frame,captureSequence:frame,level:energies.reduce((a,b)=>a+b,0)/15,energies,bars:energies.map(v=>Math.tanh(v*12)),durationMs:1000+frame*50};for(const fn of this.meters)fn(meter);},50);},250);return this.snapshot();
  }
  async control(id:string,action:'finish'|'cancel'){
   if(!this.active||id!==this.value.taskId)throw new SpeechError('staleSession');

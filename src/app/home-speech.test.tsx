@@ -19,7 +19,7 @@ it('Home stays idle for external tasks, including errors and meters',async()=>{
  const text=screen.getByRole('region',{name:'识别文字'});
  const original=text.textContent;
  publish({taskId:'outside',source:'external',phase:'recording',text:'外部口述'});
- act(()=>{for(const listener of port.meters)listener({taskId:'outside',sequence:1,captureSequence:1,energies:Array(15).fill(.9),level:.9,durationMs:5000});});
+ act(()=>{for(const listener of port.meters)listener({taskId:'outside',sequence:1,captureSequence:1,energies:Array(15).fill(.9),bars:Array(15).fill(.9),level:.9,durationMs:5000});});
  expect(text).toHaveTextContent(original!);expect(screen.queryByRole('button',{name:'结束录音'})).toBeNull();
  expect(screen.getByRole('button',{name:'开始录音'})).toBeDisabled();
  publish({taskId:'outside',source:'external',phase:'failed',text:'外部失败',error:'service'});
