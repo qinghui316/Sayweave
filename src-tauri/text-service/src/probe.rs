@@ -163,6 +163,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if interval > 3000 {
                     return Err("probe interval exceeds limit".into());
                 }
+                let begin_interval = args
+                    .get(6)
+                    .map(|s| s.parse::<u64>())
+                    .transpose()?
+                    .unwrap_or(interval);
+                let first_write_interval = args
+                    .get(7)
+                    .map(|s| s.parse::<u64>())
+                    .transpose()?
+                    .unwrap_or(interval);
+                if (args.len() > 6 && !owned_immediate)
+                    || begin_interval > 3000
+                    || first_write_interval > 3000
+                {
+                    return Err("independent intervals require a bounded owned fixture".into());
+                }
                 let first_boundary =
                     sayweave_text_service::settlement_boundary::SettlementBoundary::prepare(
                         "",
@@ -303,7 +319,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     range_epoch = reply.range_epoch;
                     previous_revision = revision;
-                    pump(Duration::from_millis(interval));
+                    pump(Duration::from_millis(match op {
+                        2 => begin_interval,
+                        3 => first_write_interval,
+                        _ => interval,
+                    }));
                 }
                 if keyboard()? != keyboard_before {
                     return Err("keyboard profile changed during probe".into());

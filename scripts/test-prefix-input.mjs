@@ -10,15 +10,28 @@ const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const folder=path.join(root,'.local','prefix-input',randomUUID());mkdirSync(folder,{recursive:true});
 const shape=process.argv[3]??'selected',engine=process.argv[4]??'chromium';
 const gap=process.argv[5]==='gap';
+const stepMs=Number(process.env.SAYWEAVE_PREFIX_STEP_MS??(gap?1500:250));
+if(!Number.isInteger(stepMs)||stepMs<100||stepMs>2000)throw Error('Invalid owned prefix step interval');
+const beginMs=Number(process.env.SAYWEAVE_PREFIX_BEGIN_MS??stepMs),firstMs=Number(process.env.SAYWEAVE_PREFIX_FIRST_MS??stepMs);
+if([beginMs,firstMs].some(ms=>!Number.isInteger(ms)||ms<0||ms>2000))throw Error('Invalid owned stage interval');
+const renderPauseMs=Number(process.env.SAYWEAVE_PREFIX_RENDER_PAUSE_MS??0);
+if(!Number.isInteger(renderPauseMs)||renderPauseMs<0||renderPauseMs>1000)throw Error('Invalid owned renderer pause');
+const renderPauseEvent=process.env.SAYWEAVE_PREFIX_RENDER_EVENT??'compositionstart';
+if(!['compositionstart','beforeinput','compositionend'].includes(renderPauseEvent))throw Error('Invalid owned pause event');
+const setup=process.env.SAYWEAVE_PREFIX_SETUP??'state';
+if(!['state','keyboard'].includes(setup))throw Error('Invalid owned selection setup');
+const returnFocus=process.env.SAYWEAVE_PREFIX_RETURN_FOCUS==='1';
 if(process.argv[5]&&!gap)throw Error('Unknown prefix continuation mode');
 const interference=process.argv[6];
 const suffixCase=['suffix','suffix-abort'].includes(interference);
 const abortTail=interference==='suffix-abort';
 if(interference&&(!gap||process.argv[2]!=='ProseMirror-single'||!['delete-prefix','replace-prefix','outside-edit','outside-delete','right-edit','caret-return','suffix','suffix-abort'].includes(interference)))throw Error('Invalid owned interference scenario');
 if(!['selected','empty','left','right'].includes(shape)||!['chromium','edge'].includes(engine))throw Error('Unknown fixture shape/runtime');
-const report={passed:false,shape,engine,gap,interference,cases:[],cleanup:false,nativeProtocol:Number(readFileSync(path.join(root,'src-tauri/text-service/src/wire.rs'),'utf8').match(/PROTOCOL: u32 = (\d+)/)[1])};
+const report={passed:false,shape,engine,gap,stepMs,beginMs,firstMs,renderPauseMs,renderPauseEvent,setup,returnFocus,interference,cases:[],cleanup:false,nativeProtocol:Number(readFileSync(path.join(root,'src-tauri/text-service/src/wire.rs'),'utf8').match(/PROTOCOL: u32 = (\d+)/)[1])};
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
-let browser,helper,probe;
+let browser,helper,probe,imeTraceSession;
+const imeTrace=[];
+const traceState={complete:false,truncated:false};
 const owned=new Set();
 function start(file,args,env={}){const child=spawn(file,args,{cwd:root,windowsHide:true,env:{...process.env,...env},stdio:['pipe','pipe','pipe']});owned.add(child);return child;}
 function exited(child){return child.exitCode!==null||child.signalCode!==null||child.pid===undefined;}
@@ -33,6 +46,16 @@ try{
  const focus=requestFixture(helper);await wait(400);
  browser=await chromium.launch({headless:false,...(engine==='edge'?{executablePath:'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'}:{}),args:['--force-renderer-accessibility']});
  report.browserVersion=browser.version();
+ if(process.env.SAYWEAVE_PREFIX_TRACE_IME==='1'){
+  imeTraceSession=await browser.newBrowserCDPSession();
+  imeTraceSession.on('Tracing.dataCollected',({value})=>{
+   const events=value.filter(item=>item.cat?.split(',').includes('ime'));
+   const remaining=10000-imeTrace.length;
+   if(events.length>remaining)traceState.truncated=true;
+   imeTrace.push(...events.slice(0,remaining));
+  });
+  await imeTraceSession.send('Tracing.start',{categories:'ime',transferMode:'ReportEvents'});
+ }
  const session=await browser.newBrowserCDPSession();
  const pid=(await session.send('SystemInfo.getProcessInfo')).processInfo.find(item=>item.type==='browser').id;await session.detach();
  const page=await browser.newPage();
@@ -48,11 +71,18 @@ try{
   const rich=control.startsWith('ProseMirror'),binding=control==='ProseMirrorInline'?'fixtureInlineEditor':'fixtureEditor';
   const sample={selected:{before:'前被选右',start:1,end:3},empty:{before:'',start:0,end:0},left:{before:'前',start:1,end:1},right:{before:'右',start:0,end:0}}[shape];
   const before=sample.before,startOffset=sample.start,endOffset=sample.end,left=before.slice(0,startOffset),right=before.slice(endOffset);
+  if(setup==='keyboard'){
+   const target=rich?page.locator(control==='ProseMirrorInline'?'#prosemirror-inline .ProseMirror':'#prosemirror .ProseMirror'):page.locator('#'+control);
+   await page.bringToFront();
+   const foreground=await focus({action:'focus-process',process:pid});if(foreground.foregroundProcess!==pid)throw Error('Owned browser did not receive foreground before selection');
+   await target.focus();
+  }
   // Only this synthetic fixture's generated marked breaks are decoded live.
   if([before,'ASR 第一段，第二段临时','第一段。','第二段。','尾部完成🙂'].some(text=>text.includes('\u2028')))throw Error('Literal U+2028 requires position-aware fixture assertions');
-  if(rich)await page.evaluate(({sample,binding})=>window[binding].set(sample.before,sample.start,sample.end),{sample:{before,start:startOffset,end:endOffset},binding});
-  else await page.locator('#'+control).evaluate((node,sample)=>{if('value'in node){node.value=sample.before;node.focus();node.setSelectionRange(sample.start,sample.end);}else{node.textContent=sample.before;node.focus();const selection=getSelection(),range=document.createRange();range.setStart(node.firstChild??node,sample.start);range.setEnd(node.firstChild??node,sample.end);selection.removeAllRanges();selection.addRange(range);}},{before,start:startOffset,end:endOffset});
+  if(rich)await page.evaluate(({sample,binding})=>window[binding].set(sample.before,sample.start,sample.end),{sample:{before,start:setup==='keyboard'?endOffset:startOffset,end:endOffset},binding});
+  else await page.locator('#'+control).evaluate((node,sample)=>{if('value'in node){node.value=sample.before;node.focus();node.setSelectionRange(sample.start,sample.end);}else{node.textContent=sample.before;node.focus();const selection=getSelection(),range=document.createRange();range.setStart(node.firstChild??node,sample.start);range.setEnd(node.firstChild??node,sample.end);selection.removeAllRanges();selection.addRange(range);}},{before,start:setup==='keyboard'?endOffset:startOffset,end:endOffset});
   await page.bringToFront();
+  if(renderPauseMs)await page.evaluate(({ms,event})=>document.addEventListener(event,()=>{const end=performance.now()+ms;while(performance.now()<end){/* Owned renderer stall for ordering acceptance. */}},{once:true}),{ms:renderPauseMs,event:renderPauseEvent});
   if(rich)await page.evaluate(binding=>{
    window.ownedPrefixEventController?.abort();
    window.ownedPrefixEventController=new AbortController();
@@ -65,8 +95,27 @@ try{
    },{capture:true,signal:window.ownedPrefixEventController.signal});
   },binding);
   const foreground=await focus({action:'focus-process',process:pid});if(foreground.foregroundProcess!==pid)throw Error('Owned browser did not receive foreground');
+  if(setup==='keyboard'&&startOffset!==endOffset){
+   const target=rich?page.locator(control==='ProseMirrorInline'?'#prosemirror-inline .ProseMirror':'#prosemirror .ProseMirror'):page.locator('#'+control);
+   for(let offset=endOffset;offset>startOffset;offset--)await target.press('Shift+ArrowLeft');
+   const selected=rich?await page.evaluate(binding=>{const value=window[binding].inspect().selection;return {start:value.from-1,end:value.to-1};},binding):await target.evaluate(node=>'selectionStart'in node?{start:node.selectionStart,end:node.selectionEnd}:{start:getSelection().getRangeAt(0).startOffset,end:getSelection().getRangeAt(0).endOffset});
+   if(selected.start!==startOffset||selected.end!==endOffset)throw Error('Owned keyboard selection precondition failed');
+  }
+  if(returnFocus){
+   const readSelection=()=>rich?page.evaluate(binding=>window[binding].inspect().selection,binding):page.locator('#'+control).evaluate(node=>'selectionStart'in node?{from:node.selectionStart,to:node.selectionEnd}:{from:getSelection().getRangeAt(0).startOffset,to:getSelection().getRangeAt(0).endOffset});
+   const before=await readSelection();
+   const left=await focus({action:'focus'});
+   const transition={before,expectedAwayProcess:helper.pid,awayProcess:left.foregroundProcess,expectedReturnProcess:pid};
+   (report.focusTransitions??=[]).push(transition);
+   if(left.foregroundProcess!==helper.pid)throw Error('Owned focus did not leave browser');
+   await wait(100);
+   const restored=await focus({action:'focus-process',process:pid});transition.returnProcess=restored.foregroundProcess;
+   if(restored.foregroundProcess!==pid)throw Error('Owned focus return failed');
+   transition.after=await readSelection();
+   if(transition.after.from!==before.from||transition.after.to!==before.to)throw Error('Owned focus return did not preserve selection');
+  }
   let output='',finished=false,code;
-  probe=start(path.join(root,'src-tauri/text-service/target/debug/tsf-probe.exe'),['probe',String(pid),'0',abortTail?'prefix-gap-abort':gap?'prefix-gap':multiline?'prefix-multiline':'prefix',gap?'1500':'250'],{SAYWEAVE_INPUT_ACCEPTANCE:'1'});
+  probe=start(path.join(root,'src-tauri/text-service/target/debug/tsf-probe.exe'),['probe',String(pid),'0',abortTail?'prefix-gap-abort':gap?'prefix-gap':multiline?'prefix-multiline':'prefix',String(stepMs),String(beginMs),String(firstMs)],{SAYWEAVE_INPUT_ACCEPTANCE:'1'});
   probe.stdout.on('data',b=>{output+=b.toString('utf8');});probe.stderr.on('data',b=>{output+=b.toString('utf8');});
   probe.on('error',error=>{output+=error.message;code=-1;finished=true;});probe.on('exit',exit=>{code=exit;finished=true;});
   const read=async()=>rich?page.evaluate(binding=>window[binding].read(),binding):page.locator('#'+control).evaluate(node=>'value'in node?node.value:node.innerText);
@@ -125,6 +174,15 @@ try{
 }catch(error){report.error=String(error);process.exitCode=1;}
 finally{
  const errors=[];
+ if(imeTraceSession){let timeout;try{
+  const done=new Promise(resolve=>imeTraceSession.once('Tracing.tracingComplete',resolve));
+  await Promise.race([(async()=>{await imeTraceSession.send('Tracing.end');await done;traceState.complete=true;})(),new Promise((_,reject)=>{timeout=setTimeout(()=>reject(Error('Owned trace completion timeout')),3000);})]);
+ }catch(error){errors.push('owned trace cleanup: '+String(error));}finally{
+  clearTimeout(timeout);
+  report.imeTrace={...traceState,eventCount:imeTrace.length};
+  try{writeFileSync(path.join(folder,'owned-ime-trace.json'),JSON.stringify({...report.imeTrace,events:imeTrace},null,2));}catch(error){errors.push('owned trace save: '+String(error));}
+  // Closing the owned browser below detaches the tracing session as well.
+ }}
  if(browser){try{await browser.close();}catch(error){errors.push('browser: '+String(error));}}
  if(helper&&!exited(helper)){try{helper.stdin.end();await wait(200);}catch(error){errors.push('helper: '+String(error));}}
  for(const child of owned){try{if(!await stop(child))errors.push('owned child did not exit: '+child.pid);}catch(error){errors.push('owned child cleanup: '+String(error));}}
