@@ -22,3 +22,18 @@ it('does not treat duplicate frames as new audio and resets task-local interpola
  expect(wave.draw(input,1001,50,true)).toEqual(Array(15).fill(.084));
  expect(wave.draw({...input,taskId:'two',bars:Array(15).fill(0),receivedAt:1100},1100,50,true)).toEqual(Array(15).fill(.084));
 });
+it('softens rapid height changes and reverses from the visible height without delaying reduced motion',()=>{
+ const wave=new WaveEnvelope(),high=frame(Array(15).fill(.8));
+ wave.draw(high,0,0,false);
+ const rising=wave.draw(high,50,50,false)[0]!;
+ // At half the transition, the loud bar is visible but has not snapped to its peak.
+ expect(rising).toBeGreaterThan(.4);expect(rising).toBeLessThan(.5);
+ const low={...frame(Array(15).fill(0),50),captureSequence:2};
+ expect(wave.draw(low,50,0,false)[0]).toBeCloseTo(rising);
+ const falling=wave.draw(low,100,50,false)[0]!;
+ expect(falling).toBeLessThan(rising);expect(falling).toBeGreaterThan(.25);
+ const renewed={...high,captureSequence:3,receivedAt:100};
+ expect(wave.draw(renewed,100,0,false)[0]).toBeCloseTo(falling);
+ expect(wave.draw(renewed,200,100,false)[0]).toBeGreaterThan(.8);
+ expect(wave.draw(low,200,0,true)[0]).toBe(.084);
+});

@@ -4,7 +4,7 @@ export function waveformLevel(rms: number) {
   if (!Number.isFinite(rms) || rms <= .001) return 0;
   return Math.max(0, Math.min(1, (20 * Math.log10(rms) + 60) / 45));
 }
-/** Native analysis owns gain/envelopes. This leaf only interpolates publication gaps. */
+/** Native analysis owns gain/envelopes. This leaf only interpolates publication gaps with an interruptible visual transition. */
 export class WaveEnvelope {
   private task:string|null=null;
   private sequence=-1;
@@ -24,7 +24,7 @@ export class WaveEnvelope {
     const fresh=age<=250;
     return this.visible.map((previous,i)=>{
       const target=legacyLevel!==undefined&&!frame?waveformLevel(legacyLevel):fresh?(this.targets[i]??0):0;
-      const progress=Math.min(1,Math.max(0,now-this.changedAt)/35);
+      const progress=Math.min(1,Math.max(0,now-this.changedAt)/100);
       const next=reduced||(!frame&&legacyLevel!==undefined)?target:!fresh?previous*Math.exp(-Math.max(0,dt)/180):(this.from[i]??0)+(target-(this.from[i]??0))*progress;
       this.visible[i]=next;
       const breath=!reduced&&age<1000?.018*(1+Math.sin(now*2*Math.PI/1800+i*.45))*(1-next):0;
