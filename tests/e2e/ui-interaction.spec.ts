@@ -4,7 +4,7 @@ test('shared controls retain geometry, keyboard semantics and latest controlled 
  await page.setViewportSize({width:960,height:640});await page.goto('/#/dev/components');
  const select=page.getByRole('combobox',{name:'选项',exact:true});await select.scrollIntoViewIfNeeded();
  await select.click();const options=page.getByRole('option');await expect(options).toHaveCount(3);
- const layer=page.locator('[data-selection-highlight]');await expect(layer).toHaveCSS('opacity','1');
+ const layer=page.locator('[data-selection-highlight]');await expect(layer).toHaveCSS('opacity','1');await expect(layer).toHaveCSS('transition-property','transform, opacity');
  const chosen=options.first();await chosen.press('ArrowDown');
  await expect(options.nth(1)).toBeFocused();await expect(chosen.locator('[class*="selectionMark"]')).toBeVisible();
  await expect.poll(async()=>{const a=await layer.boundingBox(),b=await options.nth(1).boundingBox();return !!a&&!!b&&Math.abs(a.y-b.y)<1&&Math.abs(a.height-b.height)<1;}).toBe(true);

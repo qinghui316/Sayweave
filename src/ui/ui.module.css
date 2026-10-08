@@ -51,7 +51,7 @@
 @media (prefers-reduced-motion: reduce) { .navigationTabs::before,.navigationTabs .tab::before { transition: none !important; } .navigationContent { animation: none !important; } }
 
 /* Shared selection motion: geometry stays fixed; only internal surfaces move. */
-.selectionHighlight { position:absolute; left:0; top:0; pointer-events:none; border-radius:8px; background:var(--surface-sidebar); opacity:0; transition-property:transform,width,height,opacity; transition-timing-function:cubic-bezier(.2,.8,.2,1); z-index:0; }
+.selectionHighlight { position:absolute; left:0; top:0; pointer-events:none; border-radius:8px; background:var(--surface-sidebar); opacity:0; transition-property:transform,opacity; transition-timing-function:cubic-bezier(.2,.8,.2,1); z-index:0; }
 .selectContent { position:relative; transform-origin:var(--radix-select-content-transform-origin); isolation:isolate; }
 .selectContent[data-motion="active"][data-state="open"] { animation:select-enter var(--duration-select-enter) cubic-bezier(.2,.8,.2,1); }
 .selectContent[data-motion="active"][data-state="closed"] { animation:select-exit var(--duration-select-exit) ease-in; }
