@@ -1,4 +1,6 @@
 //! All TSF state stays on the target apartment. IPC never carries COM pointers.
+#[path = "initial_selection.rs"]
+mod initial_selection;
 use crate::{
     composition_text::{CompositionText, TextPhase, equivalent_native_text},
     registration,
@@ -65,6 +67,8 @@ struct Pending {
 }
 #[derive(Default)]
 struct State {
+    #[cfg(feature = "acceptance")]
+    selection_probe: Option<(String, u64, u64, String)>,
     manager: Option<ITfThreadMgr>,
     client: u32,
     window: usize,
@@ -86,6 +90,9 @@ struct State {
     version: DraftVersion,
     context: Option<ITfContext>,
     composition: Option<ITfComposition>,
+    // An original selection is observed but is not composing until the first
+    // actual replacement. This is distinct from an already-submitted empty tail.
+    prepared: Option<PreparedSelection>,
     // A fully settled prefix may leave an empty insertion lease. There is no
     // dummy character and no live TSF composition until the next actual update.
     empty_range: Option<ITfRange>,
@@ -99,6 +106,12 @@ struct State {
     key_sink: bool,
     key_handoff: bool,
     key_failure: bool,
+}
+#[derive(Clone)]
+struct PreparedSelection {
+    range: ITfRange,
+    position: RangePosition,
+    writing: bool,
 }
 // Evidence for an exact write, valid only while its text and range still match.
 #[derive(Clone)]
@@ -231,8 +244,56 @@ fn paragraph_suffix_feedback(
 }
 #[derive(Clone)]
 enum Rollback {
-    OriginalSelection(ITfRangeBackup),
+    OriginalSelection(ITfRangeBackup, Option<OriginalText>),
     GeneratedTail,
+}
+#[derive(Clone)]
+struct OriginalText {
+    native: String,
+    semantic: String,
+}
+fn restore_original_selection(
+    context: &ITfContext,
+    range: &ITfRange,
+    backup: &ITfRangeBackup,
+    text: Option<&OriginalText>,
+    ec: u32,
+    guard: impl Fn() -> windows::core::Result<()>,
+) -> windows::core::Result<()> {
+    unsafe {
+        guard()?;
+        backup.Restore(ec, range)?;
+        if let Some(text) = text {
+            guard()?;
+            if range_text(range, ec)? != text.native {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            guard()?;
+            range.SetText(
+                ec,
+                TF_ST_CORRECTION,
+                &text.semantic.encode_utf16().collect::<Vec<_>>(),
+            )?;
+            guard()?;
+            if range_text(range, ec)? != text.semantic {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            let caret = range.Clone()?;
+            caret.Collapse(ec, TF_ANCHOR_END)?;
+            guard()?;
+            let mut selected = TF_SELECTION {
+                range: ManuallyDrop::new(Some(caret)),
+                style: TF_SELECTIONSTYLE {
+                    ase: TF_AE_NONE,
+                    fInterimChar: false.into(),
+                },
+            };
+            let result = context.SetSelection(ec, std::slice::from_ref(&selected));
+            ManuallyDrop::drop(&mut selected.range);
+            result?;
+        }
+        guard()
+    }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct NativeEditPosition {
@@ -508,6 +569,20 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
             );
             return;
         }
+        if shared.borrow().prepared.as_ref().is_some_and(|p| p.writing) {
+            // COM may reenter while SetText/StartComposition is in progress.
+            // It is no longer a no-write cancellation. Do not retire its backup
+            // or pretend that the in-flight operation had no external effect.
+            reply(
+                shared,
+                &r,
+                connection,
+                false,
+                "initialWriteInProgress",
+                Mutation::Uncertain,
+            );
+            return;
+        }
         {
             let mut s = shared.borrow_mut();
             s.generation = next_generation();
@@ -596,7 +671,8 @@ fn apply_cancel_then_retire(shared: &Shared, request: &Request, retire: impl FnO
     let epoch = {
         let mut state = shared.borrow_mut();
         state.version.applied(request);
-        state.empty_range.as_ref().map(|_| state.epoch)
+        (state.empty_range.is_some() || state.prepared.as_ref().is_some_and(|p| !p.writing))
+            .then_some(state.epoch)
     };
     retire(epoch);
 }
@@ -653,9 +729,30 @@ fn send_reply(
             operation: r.operation,
             revision: r.revision,
             applied,
-            code: code.into(),
+            code: {
+                #[cfg(feature = "acceptance")]
+                if matches!(r.action, Action::Begin | Action::Abort) {
+                    let evidence = s
+                        .selection_probe
+                        .as_ref()
+                        .filter(|(task, turn, operation, _)| {
+                            task == &r.task && *turn == r.turn && *operation == r.operation
+                        })
+                        .map(|(_, _, _, evidence)| evidence.as_str());
+                    evidence.map_or_else(|| code.into(), |evidence| format!("{code} {evidence}"))
+                } else {
+                    code.into()
+                }
+                #[cfg(not(feature = "acceptance"))]
+                {
+                    code.into()
+                }
+            },
             mutation,
-            range_epoch: if s.composition.is_some() || s.empty_range.is_some() {
+            range_epoch: if s.composition.is_some()
+                || s.empty_range.is_some()
+                || s.prepared.is_some()
+            {
                 s.epoch
             } else {
                 0
@@ -856,6 +953,7 @@ fn release_composition_with_failure(
         s.materialize_allowed = false;
         s.own_change = None;
         s.empty_range = None;
+        s.prepared = None;
         s.native_position = None;
         s.key_failure = semantic_failed;
         (
@@ -916,9 +1014,24 @@ fn end_owned(shared: &Shared) {
     end_owned_with_flags(shared, TF_ES_ASYNCDONTCARE);
 }
 fn end_owned_with_flags(shared: &Shared, flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS) -> bool {
+    let writing_epoch = {
+        let state = shared.borrow();
+        state
+            .prepared
+            .as_ref()
+            .filter(|p| p.writing)
+            .map(|_| state.epoch)
+    };
+    if let Some(epoch) = writing_epoch {
+        // A provider reentered during the first mutation or it failed partway.
+        // Relinquish resources without overwriting any possible user change;
+        // do not claim an untouched cancellation or successful handoff.
+        release_composition_with_failure(shared, epoch, None, true);
+        return false;
+    }
     let empty_epoch = {
         let state = shared.borrow();
-        state.empty_range.as_ref().map(|_| state.epoch)
+        (state.empty_range.is_some() || state.prepared.is_some()).then_some(state.epoch)
     };
     if let Some(epoch) = empty_epoch {
         release_composition(shared, epoch, None);
@@ -1388,6 +1501,7 @@ struct EditBinding {
     revision: u64,
     composition: Option<ITfComposition>,
     empty_range: Option<ITfRange>,
+    prepared_range: Option<ITfRange>,
 }
 impl EditBinding {
     fn matches(&self, state: &State) -> bool {
@@ -1397,6 +1511,7 @@ impl EditBinding {
             && state.version.revision == self.revision
             && state.composition == self.composition
             && state.empty_range == self.empty_range
+            && state.prepared.as_ref().map(|p| &p.range) == self.prepared_range.as_ref()
     }
     fn receipt_matches(&self, own: &OwnChange) -> bool {
         own.epoch == self.epoch
@@ -1424,6 +1539,7 @@ impl ITfTextEditSink_Impl for TextSink_Impl {
                     revision: s.version.revision,
                     composition: s.composition.clone(),
                     empty_range: s.empty_range.clone(),
+                    prepared_range: s.prepared.as_ref().map(|p| p.range.clone()),
                 },
                 s.expected.clone(),
                 s.selection.clone(),
@@ -1473,6 +1589,7 @@ impl ITfTextEditSink_Impl for TextSink_Impl {
                 None => binding
                     .empty_range
                     .clone()
+                    .or_else(|| binding.prepared_range.clone())
                     .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
             };
             let selected = selection(context, ec)?;
@@ -1578,6 +1695,10 @@ impl ITfTextEditSink_Impl for TextSink_Impl {
             let mut attributes = changed_attributes(context, record, &range, ec)?;
             if !binding.matches(&self.state.borrow()) {
                 return Ok(false);
+            }
+            if binding.prepared_range.is_some() && !attributes.is_empty() {
+                loss = "preparedAttributesChanged";
+                return Ok(true);
             }
             // SetText/partial commit may re-emit existing scalar properties.
             // Preserve a user change, not a notification of an unchanged value.
@@ -2221,6 +2342,205 @@ fn write_composing(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn apply_prepared(
+    shared: &Shared,
+    context: &ITfContext,
+    prepared: &PreparedSelection,
+    r: &Request,
+    generation: u64,
+    ec: u32,
+    mutation: &mut Mutation,
+    phase: &mut &'static str,
+    settlement: &mut Option<Settlement>,
+) -> windows::core::Result<()> {
+    unsafe {
+        let epoch = shared.borrow().epoch;
+        edit_identity(shared, r, generation, epoch)?;
+        if prepared.writing {
+            *mutation = Mutation::Uncertain;
+            *phase = "initialWriteInProgress";
+            return Err(failure(TF_E_LOCKED));
+        }
+        if matches!(r.action, Action::Abort | Action::Commit | Action::Handoff) {
+            // Nothing has been replaced: retiring preparation cannot restore or
+            // erase anything, even if the user has already moved the selection.
+            shared.borrow_mut().version.applied(r);
+            release_composition(shared, epoch, None);
+            return Ok(());
+        }
+        *phase = "preparedPosition";
+        let expected = shared.borrow().expected.clone();
+        let selected = selection(context, ec)?;
+        if range_position(context, &prepared.range, ec)? != prepared.position
+            || range_position(context, &selected, ec)? != prepared.position
+            || range_text(&prepared.range, ec)? != expected
+            || password(context, &prepared.range, ec)?
+        {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        let owner: ITfContextComposition = context.cast()?;
+        let mut entries = [None];
+        let mut count = 0;
+        owner.EnumCompositions()?.Next(&mut entries, &mut count)?;
+        if count != 0 {
+            return Err(failure(TF_E_LOCKED));
+        }
+        lease(shared, r, generation, context)?;
+        if r.action == Action::Update && r.text.is_empty() {
+            shared.borrow_mut().version.applied(r);
+            return Ok(());
+        }
+        if !matches!(r.action, Action::Update | Action::Settle) {
+            return Err(failure(E_INVALIDARG));
+        }
+        let text = if let Some(prefix) = &r.prefix {
+            if prefix.range_epoch != epoch
+                || prefix.expected_revision != shared.borrow().version.revision
+            {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            format!("{}{}", prefix.text, r.text)
+        } else {
+            r.text.clone()
+        };
+        // Replace first, then open composition while the same TSF write lock is
+        // held. The host receives new composing text, not reconversion of an old
+        // cross-paragraph range which compositionstart handlers may delete.
+        #[cfg(feature = "acceptance")]
+        if INITIAL_FAULT.load(Ordering::Acquire) == 3 {
+            INITIAL_FAULT.store(0, Ordering::Release);
+            inject_initial_abort(shared, r);
+        }
+        edit_identity(shared, r, generation, epoch)?;
+        shared
+            .borrow_mut()
+            .prepared
+            .as_mut()
+            .ok_or_else(|| failure(TF_E_DISCONNECTED))?
+            .writing = true;
+        if let Some(outcome) = settlement.as_mut() {
+            outcome.prefix_operation = r.operation;
+            outcome.prefix = Mutation::Uncertain;
+            note_prefix_progress(shared, r, generation, epoch, Mutation::Uncertain)?;
+        }
+        write_composing(
+            shared,
+            context,
+            &prepared.range,
+            r,
+            generation,
+            epoch,
+            ec,
+            mutation,
+            phase,
+            &text,
+            false,
+        )?;
+        *phase = "initialComposition";
+        let sink: ITfCompositionSink = CompositionSink {
+            state: shared.clone(),
+            epoch,
+            _lease: Lease::new(),
+        }
+        .into();
+        #[cfg(feature = "acceptance")]
+        let fault = INITIAL_FAULT.swap(0, Ordering::AcqRel);
+        #[cfg(feature = "acceptance")]
+        if fault == 2 {
+            inject_initial_abort(shared, r);
+        }
+        edit_identity(shared, r, generation, epoch)?;
+        let start = || {
+            #[cfg(feature = "acceptance")]
+            if fault == 1 {
+                return Err(failure(E_FAIL));
+            }
+            owner.StartComposition(ec, &prepared.range, &sink)
+        };
+        let next = match start() {
+            Ok(next) => next,
+            Err(error) => {
+                // SetText already succeeded. Only roll it back while its exact
+                // range/text and this task's lease still prove exclusive ownership.
+                let rollback = (|| -> windows::core::Result<()> {
+                    lease(shared, r, generation, context)?;
+                    let (expected, backup) = {
+                        let s = shared.borrow();
+                        (s.expected.clone(), s.backup.clone())
+                    };
+                    if range_text(&prepared.range, ec)? != expected
+                        || range_position(context, &prepared.range, ec)?.start
+                            != prepared.position.start
+                    {
+                        return Err(failure(TF_E_DISCONNECTED));
+                    }
+                    let Some(Rollback::OriginalSelection(backup, semantic)) = backup else {
+                        return Err(failure(TF_E_DISCONNECTED));
+                    };
+                    let mut compositions = [None];
+                    let mut fetched = 0;
+                    owner
+                        .EnumCompositions()?
+                        .Next(&mut compositions, &mut fetched)?;
+                    if fetched != 0 {
+                        return Err(failure(TF_E_LOCKED));
+                    }
+                    edit_identity(shared, r, generation, epoch)?;
+                    *mutation = Mutation::Uncertain;
+                    restore_original_selection(
+                        context,
+                        &prepared.range,
+                        &backup,
+                        semantic.as_ref(),
+                        ec,
+                        || edit_identity(shared, r, generation, epoch),
+                    )?;
+                    *mutation = Mutation::Changed;
+                    Ok(())
+                })();
+                *phase = if rollback.is_ok() {
+                    "initialCompositionRestored"
+                } else {
+                    "initialCompositionRollbackFailed"
+                };
+                if rollback.is_ok() {
+                    release_composition(shared, epoch, None);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = edit_identity(shared, r, generation, epoch) {
+            let _ = next.EndComposition(ec);
+            return Err(error);
+        }
+        {
+            let mut s = shared.borrow_mut();
+            s.composition = Some(next.clone());
+            s.prepared = None;
+            s.materialize_allowed = true;
+        }
+        if r.action == Action::Settle {
+            settle_prefix(
+                shared,
+                context,
+                &next,
+                &prepared.range,
+                r,
+                generation,
+                epoch,
+                ec,
+                mutation,
+                phase,
+                settlement.as_mut().ok_or_else(|| failure(E_INVALIDARG))?,
+            )
+        } else {
+            shared.borrow_mut().version.applied(r);
+            Ok(())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply(
     shared: &Shared,
     context: &ITfContext,
@@ -2268,7 +2588,8 @@ fn apply(
             shared.borrow_mut().ownership_detail = None;
             shared.borrow_mut().key_handoff = false;
             *phase = "beginSelection";
-            let range = selection(context, ec)?;
+            let mut range = selection(context, ec)?;
+            let mut original_semantic = None;
             *phase = "beginProperties";
             if password(context, &range, ec)? {
                 return Err(failure(E_ACCESSDENIED));
@@ -2281,11 +2602,120 @@ fn apply(
             if fetched != 0 {
                 return Err(failure(TF_E_LOCKED));
             }
+            {
+                let evidence =
+                    (|| -> windows::core::Result<(String, Option<initial_selection::Evidence>)> {
+                        let document = context.GetStart(ec)?;
+                        document.ShiftEndToRange(ec, &context.GetEnd(ec)?, TF_ANCHOR_END)?;
+                        let text = range_text(&document, ec)?;
+                        let position = range_position(context, &range, ec)?;
+                        let (evidence, raw_position) = initial_selection::inspect(&text);
+                        Ok((
+                            format!(
+                                "tsf_start={} tsf_end={} {evidence}",
+                                position.start, position.end
+                            ),
+                            raw_position,
+                        ))
+                    })()
+                    .unwrap_or_else(|e| {
+                        (format!("tsf_probe_error={:08x}", e.code().0 as u32), None)
+                    });
+                lease(shared, r, generation, context)?;
+                #[cfg(feature = "acceptance")]
+                {
+                    shared.borrow_mut().selection_probe =
+                        Some((r.task.clone(), r.turn, r.operation, evidence.0));
+                }
+                if let Some(proof) = evidence.1 {
+                    let position = range_position(context, &range, ec)?;
+                    // Only the reproduced collapsed-at-selection-end mismatch.
+                    if proof.start < proof.end
+                        && position.start == position.end
+                        && position.end == proof.end
+                    {
+                        let start = proof.start;
+                        let end = proof.end;
+                        let candidate = context.GetStart(ec)?;
+                        let mut moved = 0;
+                        candidate.ShiftEnd(ec, end, &mut moved, std::ptr::null())?;
+                        if moved != end {
+                            return Err(failure(E_INVALIDARG));
+                        }
+                        candidate.ShiftStart(ec, start, &mut moved, std::ptr::null())?;
+                        if moved != start || password(context, &candidate, ec)? {
+                            return Err(failure(E_ACCESSDENIED));
+                        }
+                        lease(shared, r, generation, context)?;
+                        let document = context.GetStart(ec)?;
+                        document.ShiftEndToRange(ec, &context.GetEnd(ec)?, TF_ANCHOR_END)?;
+                        proof.revalidate(&range_text(&document, ec)?)?;
+                        {
+                            let s = shared.borrow();
+                            if !s.active
+                                || s.generation != generation
+                                || !s.version.accepts(r)
+                                || s.cleanup
+                                || !r.live(GetTickCount64())
+                            {
+                                return Err(failure(TF_E_DISCONNECTED));
+                            }
+                        }
+                        let mut next = TF_SELECTION {
+                            range: ManuallyDrop::new(Some(candidate.clone())),
+                            style: TF_SELECTIONSTYLE {
+                                ase: TF_AE_NONE,
+                                fInterimChar: false.into(),
+                            },
+                        };
+                        let result = context.SetSelection(ec, std::slice::from_ref(&next));
+                        ManuallyDrop::drop(&mut next.range);
+                        result?;
+                        range = candidate;
+                        #[cfg(feature = "acceptance")]
+                        if let Some(value) = shared.borrow_mut().selection_probe.as_mut() {
+                            value.3.push_str(" selection_repaired=true");
+                        }
+                    }
+                    let position = range_position(context, &range, ec)?;
+                    if position.start == proof.start && position.end == proof.end {
+                        let document = context.GetStart(ec)?;
+                        document.ShiftEndToRange(ec, &context.GetEnd(ec)?, TF_ANCHOR_END)?;
+                        proof.revalidate(&range_text(&document, ec)?)?;
+                        let current = range_position(context, &range, ec)?;
+                        if current != position {
+                            return Err(failure(TF_E_DISCONNECTED));
+                        }
+                        let native = range_text(&range, ec)?;
+                        if native != proof.selected_text() {
+                            original_semantic = Some(OriginalText {
+                                native,
+                                semantic: proof.selected_text().to_owned(),
+                            });
+                        }
+                    }
+                }
+            }
             let backup = context.CreateRangeBackup(ec, &range)?;
             *phase = "beginText";
             let expected = range_text(&range, ec)?;
+            if original_semantic
+                .as_ref()
+                .is_some_and(|original| original.native != expected)
+            {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
             let original_selection = range.Clone()?;
             let native_position = native_edit_position(context)?;
+            let prepared = if !range.IsEmpty(ec)?.as_bool() {
+                Some(PreparedSelection {
+                    range: range.Clone()?,
+                    position: range_position(context, &range, ec)?,
+                    writing: false,
+                })
+            } else {
+                None
+            };
             lease(shared, r, generation, context)?;
             let epoch = COMPOSITION_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
             let sink: ITfCompositionSink = CompositionSink {
@@ -2308,7 +2738,14 @@ fn apply(
                 return Err(e);
             }
             *phase = "beginComposition";
-            let composition = match composition_context.StartComposition(ec, &range, &sink) {
+            let composition = match prepared.as_ref().map_or_else(
+                || {
+                    composition_context
+                        .StartComposition(ec, &range, &sink)
+                        .map(Some)
+                },
+                |_| Ok(None),
+            ) {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = source.UnadviseSink(cookie);
@@ -2316,15 +2753,18 @@ fn apply(
                 }
             };
             if shared.borrow().generation != generation || !shared.borrow().active {
-                let _ = composition.EndComposition(ec);
+                if let Some(composition) = &composition {
+                    let _ = composition.EndComposition(ec);
+                }
                 let _ = source.UnadviseSink(cookie);
                 return Err(failure(TF_E_DISCONNECTED));
             }
             let mut s = shared.borrow_mut();
             s.epoch = epoch;
-            s.composition = Some(composition);
+            s.composition = composition;
+            s.prepared = prepared;
             s.preserved_attributes.clear();
-            s.backup = Some(Rollback::OriginalSelection(backup));
+            s.backup = Some(Rollback::OriginalSelection(backup, original_semantic));
             s.context = Some(context.clone());
             s.expected = expected;
             s.text = None;
@@ -2334,6 +2774,30 @@ fn apply(
             s.text_cookie = Some(cookie);
             s.version.applied(r);
             return Ok(());
+        }
+        // Standard EDIT can expose an empty TSF range even while its native
+        // selection is nonempty. Its first-write evidence therefore belongs to
+        // both initial lifecycles, not just the prepared nonempty TSF range.
+        if matches!(r.action, Action::Update | Action::Settle) {
+            let initial = {
+                let s = shared.borrow();
+                (s.text.is_none() && matches!(s.backup, Some(Rollback::OriginalSelection(..))))
+                    .then_some((s.native_position, s.epoch))
+            };
+            if let Some((Some(proof), epoch)) = initial {
+                *phase = "initialNativePosition";
+                let actual = edit_selection(HWND(proof.window as *mut _));
+                edit_identity(shared, r, generation, epoch)?;
+                if actual != (proof.offset, proof.end) {
+                    return Err(failure(TF_E_DISCONNECTED));
+                }
+            }
+        }
+        let prepared = { shared.borrow().prepared.clone() };
+        if let Some(prepared) = prepared {
+            return apply_prepared(
+                shared, context, &prepared, r, generation, ec, mutation, phase, settlement,
+            );
         }
         *phase = "ownership";
         let (mut composition, expected, old_selection, epoch, empty_range, cancel_generated_tail) = {
@@ -2467,7 +2931,32 @@ fn apply(
                 lease(shared, r, generation, context)?;
                 *phase = "abortRestore";
                 match backup {
-                    Rollback::OriginalSelection(backup) => backup.Restore(ec, &range)?,
+                    Rollback::OriginalSelection(backup, semantic) => {
+                        restore_original_selection(
+                            context,
+                            &range,
+                            &backup,
+                            semantic.as_ref(),
+                            ec,
+                            || edit_identity(shared, r, generation, epoch),
+                        )?;
+                        // Restore the selected content; let the host retain its
+                        // normal caret after cancellation. Do not reselect text
+                        // asynchronously after the user may have resumed editing.
+                        #[cfg(feature = "acceptance")]
+                        {
+                            let evidence = (|| -> windows::core::Result<String> {
+                                let position = range_position(context, &range, ec)?;
+                                let selected = range_position(context, &selection(context, ec)?, ec)?;
+                                let profiles: ITfInputProcessorProfileMgr = CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)?;
+                                let mut profile = TF_INPUTPROCESSORPROFILE::default();
+                                profiles.GetActiveProfile(&GUID_TFCAT_TIP_KEYBOARD, &mut profile)?;
+                                Ok(format!("abort_range_start={} abort_range_end={} abort_selection_start={} abort_selection_end={} keyboard_profile_type={} keyboard_hkl_null={}", position.start, position.end, selected.start, selected.end, profile.dwProfileType, profile.hkl.0.is_null()))
+                            })().unwrap_or_else(|error| format!("abort_probe_error={:08x}", error.code().0 as u32));
+                            shared.borrow_mut().selection_probe =
+                                Some((r.task.clone(), r.turn, r.operation, evidence));
+                        }
+                    }
                     Rollback::GeneratedTail => range.SetText(ec, TF_ST_CORRECTION, &[])?,
                 }
                 *mutation = Mutation::Changed;
@@ -2520,6 +3009,28 @@ fn finish_empty_range(
 }
 #[cfg(feature = "acceptance")]
 static SETTLE_FAULT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "acceptance")]
+static INITIAL_FAULT: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "acceptance")]
+#[unsafe(no_mangle)]
+pub extern "system" fn SayweaveInitialFixtureFault(mode: usize) {
+    INITIAL_FAULT.store(mode, Ordering::Release);
+}
+#[cfg(feature = "acceptance")]
+fn inject_initial_abort(shared: &Shared, request: &Request) {
+    let connection = shared.borrow().connection;
+    dispatch(
+        shared,
+        Request {
+            action: Action::Abort,
+            operation: request.operation + 1,
+            text: String::new(),
+            prefix: None,
+            ..request.clone()
+        },
+        connection,
+    );
+}
 #[cfg(feature = "acceptance")]
 #[unsafe(no_mangle)]
 pub extern "system" fn SayweaveSettleFixtureFault(mode: usize) {
@@ -2871,6 +3382,7 @@ mod tests {
             ..Default::default()
         };
         let notice = EditBinding {
+            prepared_range: None,
             epoch: 7,
             generation: 12,
             revision: 4,

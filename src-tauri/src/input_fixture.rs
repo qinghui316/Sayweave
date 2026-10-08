@@ -85,7 +85,38 @@ fn selection_evidence(process: u32) -> serde_json::Value {
                 let current = pattern.GetSelection()?;
                 let stable = current.Length()? == 1 && selected.Compare(&current.GetElement(0)?)?.as_bool()
                     && auto.CompareElements(&element, &auto.GetFocusedElement()?)?.as_bool();
-                Ok::<_, windows::core::Error>(serde_json::json!({"stable":stable,"documentUtf16":count(&text),"startUtf16":count(&before),"endUtf16":count(&before)+count(&picked),"documentSha256":format!("{:x}",Sha256::digest(text.as_bytes()))}))
+                let msaa = (|| -> windows::core::Result<serde_json::Value> {
+                    use windows::Win32::System::Variant::*;
+                    let thread = GetWindowThreadProcessId(GetForegroundWindow(), None);
+                    let mut info = GUITHREADINFO { cbSize: std::mem::size_of::<GUITHREADINFO>() as u32, ..Default::default() };
+                    GetGUIThreadInfo(thread, &mut info)?;
+                    unsafe extern "system" fn child(window: HWND, parameter: LPARAM) -> BOOL {
+                        unsafe { let windows = &mut *(parameter.0 as *mut Vec<HWND>); if windows.len() < 64 { windows.push(window); BOOL(1) } else { BOOL(0) } }
+                    }
+                    let mut windows = vec![info.hwndFocus];
+                    let _ = EnumChildWindows(Some(info.hwndFocus), Some(child), LPARAM((&mut windows as *mut Vec<HWND>) as isize));
+                    let mut evidence = Vec::new();
+                    for window in windows {
+                    let mut class = [0u16; 128];
+                    let class_len = GetClassNameW(window, &mut class);
+                    let mut result: Option<IAccessible> = None;
+                    if AccessibleObjectFromWindow(window, OBJID_CLIENT.0 as u32, &IAccessible::IID, (&mut result as *mut Option<IAccessible>).cast()).is_err() {continue;}
+                    let mut object = result.ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?;
+                    let mut steps = Vec::new();
+                    for _ in 0..16 {
+                        let value = object.accFocus()?;
+                        let role = i32::try_from(&object.get_accRole(&VARIANT::from(0i32))?).ok();
+                        let service = object.cast::<IServiceProvider>();
+                        let service_raw = service.as_ref().ok().is_some_and(|service| service.QueryService::<IRawElementProviderSimple>(&IAccessible::IID).is_ok());
+                        steps.push(serde_json::json!({"role":role,"raw":object.cast::<IRawElementProviderSimple>().is_ok(),"ex":object.cast::<IAccessibleEx>().is_ok(),"service":service.is_ok(),"serviceRaw":service_raw,"focusType":value.Anonymous.Anonymous.vt.0,"focusChild":i32::try_from(&value).ok()}));
+                        if value.Anonymous.Anonymous.vt != VT_DISPATCH {break;}
+                        object = IDispatch::try_from(&value)?.cast()?;
+                    }
+                    evidence.push(serde_json::json!({"windowClass":String::from_utf16_lossy(&class[..class_len as usize]),"steps":steps}));
+                    }
+                    Ok(serde_json::json!(evidence))
+                })().unwrap_or_else(|e|serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}));
+                Ok::<_, windows::core::Error>(serde_json::json!({"stable":stable,"documentUtf16":count(&text),"startUtf16":count(&before),"endUtf16":count(&before)+count(&picked),"documentSha256":format!("{:x}",Sha256::digest(text.as_bytes())),"msaa":msaa}))
             })();
             CoUninitialize();
             result

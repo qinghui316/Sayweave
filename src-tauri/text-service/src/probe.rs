@@ -145,11 +145,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let multiline = args.get(4).map(String::as_str) == Some("multiline");
                 let prefix_probe = matches!(
                     args.get(4).map(String::as_str),
-                    Some("prefix" | "prefix-multiline" | "prefix-gap" | "prefix-gap-abort")
+                    Some(
+                        "prefix"
+                            | "prefix-multiline"
+                            | "prefix-gap"
+                            | "prefix-gap-abort"
+                            | "prefix-abort-before"
+                            | "prefix-abort-after"
+                    )
                 );
                 let prefix_gap = matches!(
                     args.get(4).map(String::as_str),
-                    Some("prefix-gap" | "prefix-gap-abort")
+                    Some(
+                        "prefix-gap"
+                            | "prefix-gap-abort"
+                            | "prefix-abort-before"
+                            | "prefix-abort-after"
+                    )
                 );
                 let prefix_abort = args.get(4).map(String::as_str) == Some("prefix-gap-abort");
                 let prefix_multiline = args.get(4).map(String::as_str) == Some("prefix-multiline");
@@ -261,6 +273,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if prefix_abort {
                     steps.truncate(5);
                     steps.push((6, 3, Action::Abort, "", None));
+                }
+                if matches!(
+                    args.get(4).map(String::as_str),
+                    Some("prefix-abort-before" | "prefix-abort-after")
+                ) {
+                    if !owned_immediate {
+                        return Err("initial abort requires an owned fixture".into());
+                    }
+                    let before = args[4] == "prefix-abort-before";
+                    steps.truncate(if before { 2 } else { 3 });
+                    steps.push((
+                        if before { 3 } else { 4 },
+                        if before { 0 } else { 1 },
+                        Action::Abort,
+                        "",
+                        None,
+                    ));
                 }
                 let mut range_epoch = 0;
                 let mut previous_revision = 0;
@@ -552,6 +581,9 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                 context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0
             );
             let pipe = Pipe::client(std::process::id(), GetCurrentThreadId())?;
+            if plain && std::env::var_os("SAYWEAVE_EDIT_SETTLEMENT_TRACE").is_some() {
+                return trace_native_initial_settlement(editor, &context, &pipe, &capability);
+            }
             let task = uuid::Uuid::new_v4().to_string();
             let mut expected = String::new();
             for (operation, revision, action, text) in [
@@ -613,7 +645,11 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
             }
             prefix_fixture(editor, &manager, &pipe, &capability)?;
             prefix_fault_fixture(component, editor, &pipe, &capability)?;
+            if !plain && std::env::var("SAYWEAVE_TSF_SELECTION_REPAIR").as_deref() == Ok("1") {
+                initial_selection_fixture(component, editor, &pipe, &capability)?;
+            }
             if plain {
+                prepared_native_selection_fixture(editor, &pipe, &capability)?;
                 let end = editor_text(editor)?.encode_utf16().count();
                 SendMessageW(
                     editor,
@@ -1562,6 +1598,290 @@ fn prefix_fixture(
     println!("owned prefix settle, live tail, Unicode/newline and cancel actual text=true");
     Ok(())
 }
+#[cfg(feature = "acceptance")]
+fn trace_native_initial_settlement(
+    editor: windows::Win32::Foundation::HWND,
+    context: &ITfContext,
+    pipe: &Pipe,
+    capability: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use windows::{Win32::Foundation::*, core::w};
+    unsafe {
+        for moved in [false, true] {
+            SendMessageW(
+                editor,
+                WM_SETTEXT,
+                None,
+                Some(LPARAM(w!("左原选区右").as_ptr() as isize)),
+            );
+            SendMessageW(editor, 0xB1, Some(WPARAM(1)), Some(LPARAM(4)));
+            pump(Duration::from_millis(100));
+            let task = uuid::Uuid::new_v4().to_string();
+            let snapshot = |stage: &str, reply: Option<&Reply>| {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "owned_edit_trace":true,"moved":moved,"stage":stage,
+                        "reply":reply.map(|r|serde_json::json!({"applied":r.applied,"mutation":format!("{:?}",r.mutation),"code":r.code})),
+                        "control":editor_text(editor).ok(),"selection":editor_selection(editor),
+                        "composition":composition_text(context).ok()
+                    })
+                );
+            };
+            snapshot("beforeBegin", None);
+            let begin = exchange(pipe, capability, &task, 1, 1, 0, Action::Begin, "", false)?;
+            snapshot("afterBegin", Some(&begin));
+            if moved {
+                SendMessageW(editor, 0xB1, Some(WPARAM(0)), Some(LPARAM(0)));
+            }
+            snapshot("beforeUpdate", None);
+            let update = exchange(
+                pipe,
+                capability,
+                &task,
+                1,
+                2,
+                1,
+                Action::Update,
+                "旧结果",
+                false,
+            )?;
+            snapshot("afterUpdate", Some(&update));
+            pump(Duration::from_millis(500));
+            snapshot("afterWait", None);
+            let commit = exchange(pipe, capability, &task, 1, 3, 1, Action::Commit, "", false)?;
+            snapshot("afterCommit", Some(&commit));
+            pump(Duration::from_millis(500));
+            snapshot("afterCommitWait", None);
+            if !moved
+                && (!update.applied || !commit.applied || editor_text(editor)? != "左旧结果右")
+            {
+                return Err("owned EDIT unchanged-selection control failed".into());
+            }
+            if moved
+                && std::env::var("SAYWEAVE_EDIT_SETTLEMENT_TRACE").as_deref() == Ok("assert")
+                && (update.applied
+                    || update.mutation != Mutation::NotAttempted
+                    || editor_text(editor)? != "左原选区右"
+                    || editor_selection(editor) != (0, 0))
+            {
+                return Err(
+                    "owned EDIT moved-selection changed immediately or after finalization".into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "acceptance")]
+fn prepared_native_selection_fixture(
+    editor: windows::Win32::Foundation::HWND,
+    pipe: &Pipe,
+    capability: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use windows::{Win32::Foundation::*, core::w};
+    unsafe {
+        SendMessageW(
+            editor,
+            WM_SETTEXT,
+            None,
+            Some(LPARAM(w!("左原选区右").as_ptr() as isize)),
+        );
+        SendMessageW(editor, 0xB1, Some(WPARAM(1)), Some(LPARAM(4)));
+        pump(Duration::from_millis(50));
+        let task = uuid::Uuid::new_v4().to_string();
+        let begin = exchange(pipe, capability, &task, 1, 1, 0, Action::Begin, "", false)?;
+        if !begin.applied || editor_text(editor)? != "左原选区右" {
+            return Err("native selected Begin failed".into());
+        }
+        // A programmatic native selection change emits no physical key event.
+        SendMessageW(editor, 0xB1, Some(WPARAM(0)), Some(LPARAM(0)));
+        let update = exchange(
+            pipe,
+            capability,
+            &task,
+            1,
+            2,
+            1,
+            Action::Update,
+            "旧结果",
+            false,
+        )?;
+        if update.applied
+            || update.mutation != Mutation::NotAttempted
+            || editor_text(editor)? != "左原选区右"
+            || editor_selection(editor) != (0, 0)
+        {
+            return Err(format!("native prepared selection protection failed applied={} mutation={:?} code={} text_unchanged={} selection={:?}", update.applied, update.mutation, update.code, editor_text(editor)? == "左原选区右", editor_selection(editor)).into());
+        }
+        pump(Duration::from_millis(250));
+        let commit = exchange(pipe, capability, &task, 1, 3, 1, Action::Commit, "", false)?;
+        pump(Duration::from_millis(250));
+        if commit.applied
+            || editor_text(editor)? != "左原选区右"
+            || editor_selection(editor) != (0, 0)
+        {
+            return Err("native rejected first write landed during finalization".into());
+        }
+        println!(
+            "owned native prepared selection change rejects old write with actual text/caret unchanged=true"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "acceptance")]
+fn initial_selection_fixture(
+    component: windows::Win32::Foundation::HMODULE,
+    editor: windows::Win32::Foundation::HWND,
+    pipe: &Pipe,
+    capability: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use windows::{
+        Win32::{Foundation::*, System::LibraryLoader::*},
+        core::{s, w},
+    };
+    unsafe {
+        let reset = || {
+            SendMessageW(
+                editor,
+                WM_SETTEXT,
+                None,
+                Some(LPARAM(w!("左原选区右").as_ptr() as isize)),
+            );
+            SendMessageW(editor, 0xB1, Some(WPARAM(1)), Some(LPARAM(4)));
+            pump(Duration::from_millis(50));
+        };
+        let receive = || -> Result<Reply, Box<dyn std::error::Error>> {
+            let start = Instant::now();
+            loop {
+                pump(Duration::from_millis(10));
+                if let Some(data) = pipe.receive()? {
+                    return Ok(serde_json::from_slice(&data)?);
+                }
+                if start.elapsed() > Duration::from_secs(2) {
+                    return Err("initial fixture timeout".into());
+                }
+            }
+        };
+        for action in [Action::Abort, Action::Commit, Action::Handoff] {
+            reset();
+            let task = uuid::Uuid::new_v4().to_string();
+            let begin = exchange(pipe, capability, &task, 1, 1, 0, Action::Begin, "", false)?;
+            if !begin.applied || begin.range_epoch == 0 || editor_text(editor)? != "左原选区右"
+            {
+                return Err("prepared Begin changed text or lost epoch".into());
+            }
+            let empty = exchange(pipe, capability, &task, 1, 2, 1, Action::Update, "", false)?;
+            let end = exchange(pipe, capability, &task, 1, 3, 1, action, "", false)?;
+            if !empty.applied
+                || empty.mutation != Mutation::NotAttempted
+                || !end.applied
+                || end.mutation != Mutation::NotAttempted
+                || editor_text(editor)? != "左原选区右"
+            {
+                return Err("prepared terminal changed original text".into());
+            }
+        }
+        let entry = GetProcAddress(component, s!("SayweaveInitialFixtureFault"))
+            .ok_or("missing initial fault fixture")?;
+        let inject: unsafe extern "system" fn(usize) = std::mem::transmute(entry);
+        for mode in 0..=3 {
+            reset();
+            let task = uuid::Uuid::new_v4().to_string();
+            let begin = exchange(pipe, capability, &task, 1, 1, 0, Action::Begin, "", false)?;
+            if !begin.applied || begin.range_epoch == 0 {
+                return Err("initial fault Begin failed".into());
+            }
+            inject(mode);
+            let request = Request {
+                protocol: sayweave_text_service::wire::PROTOCOL,
+                capability: capability.into(),
+                task: task.clone(),
+                turn: 1,
+                operation: 2,
+                revision: 1,
+                deadline_tick: windows::Win32::System::SystemInformation::GetTickCount64() + 2000,
+                action: if mode <= 1 {
+                    Action::Settle
+                } else {
+                    Action::Update
+                },
+                text: "尾".into(),
+                prefix: (mode <= 1).then(|| Prefix {
+                    text: "整理".into(),
+                    expected_revision: 0,
+                    range_epoch: begin.range_epoch,
+                }),
+            };
+            pipe.send(&serde_json::to_vec(&request)?)?;
+            let first = receive()?;
+            match mode {
+                0 => {
+                    if !first.applied
+                        || !first.settlement.is_some_and(|p| {
+                            p.prefix_operation == 2 && p.prefix == Mutation::Changed
+                        })
+                        || editor_text(editor)? != "左整理尾右"
+                    {
+                        return Err("direct initial Settle failed".into());
+                    }
+                    let abort =
+                        exchange(pipe, capability, &task, 1, 4, 1, Action::Abort, "", false)?;
+                    if !abort.applied || editor_text(editor)? != "左整理右" {
+                        return Err("initial Settle cancellation erased prefix".into());
+                    }
+                }
+                1 => {
+                    if first.applied
+                        || first.mutation == Mutation::NotAttempted
+                        || !first.settlement.is_some_and(|p| {
+                            p.prefix_operation == 2 && p.prefix == Mutation::Uncertain
+                        })
+                        || editor_text(editor)? != "左原选区右"
+                    {
+                        return Err(
+                            "initial partial failure was misclassified or not restored".into()
+                        );
+                    }
+                }
+                2 => {
+                    let original = receive()?;
+                    if first.operation != 3
+                        || first.applied
+                        || first.mutation != Mutation::Uncertain
+                        || original.operation != 2
+                        || !original.applied
+                        || editor_text(editor)? != "左尾右"
+                    {
+                        return Err("in-flight initial cancellation claimed no mutation".into());
+                    }
+                    let abort =
+                        exchange(pipe, capability, &task, 1, 4, 1, Action::Abort, "", false)?;
+                    if !abort.applied || editor_text(editor)? != "左原选区右" {
+                        return Err("in-flight refusal lost original backup".into());
+                    }
+                }
+                3 => {
+                    if first.operation != 3
+                        || !first.applied
+                        || first.mutation != Mutation::NotAttempted
+                        || editor_text(editor)? != "左原选区右"
+                    {
+                        return Err("pre-write reentrant cancellation changed original".into());
+                    }
+                }
+                _ => unreachable!(),
+            }
+            println!(
+                "owned initial-selection checkpoint={mode} actual text and mutation classification=true"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(feature = "acceptance")]
 fn editor_selection(window: windows::Win32::Foundation::HWND) -> (u32, u32) {
     use windows::Win32::Foundation::*;

@@ -1,5 +1,5 @@
 // Owned Windows/Chromium targets; no ASR, supplier, personal data or clipboard.
-import {chromium} from '@playwright/test';
+import {chromium,expect} from '@playwright/test';
 import {build} from 'vite';
 import {spawn} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
@@ -21,13 +21,20 @@ if(!['compositionstart','beforeinput','compositionend'].includes(renderPauseEven
 const setup=process.env.SAYWEAVE_PREFIX_SETUP??'state';
 if(!['state','keyboard'].includes(setup))throw Error('Invalid owned selection setup');
 const returnFocus=process.env.SAYWEAVE_PREFIX_RETURN_FOCUS==='1';
+const reselect=process.env.SAYWEAVE_PREFIX_RESELECT;
+if(reselect&&(!['collapse','move','other'].includes(reselect)||process.argv[2]!=='ProseMirror-single'))throw Error('Invalid owned programmatic selection case');
+const abortInitial=process.env.SAYWEAVE_PREFIX_ABORT_INITIAL;
+if(abortInitial&&!['before','after'].includes(abortInitial))throw Error('Unknown initial cancellation stage');
+const editPrepared=process.env.SAYWEAVE_PREFIX_EDIT_PREPARED;
+if(editPrepared&&(!['text','caret'].includes(editPrepared)||shape!=='selected'||process.argv[2]!=='ProseMirror-single'||abortInitial))throw Error('Invalid prepared selection edit case');
 if(process.argv[5]&&!gap)throw Error('Unknown prefix continuation mode');
 const interference=process.argv[6];
+if(abortInitial&&interference)throw Error('Initial cancellation cannot be combined with later interference');
 const suffixCase=['suffix','suffix-abort'].includes(interference);
 const abortTail=interference==='suffix-abort';
 if(interference&&(!gap||process.argv[2]!=='ProseMirror-single'||!['delete-prefix','replace-prefix','outside-edit','outside-delete','right-edit','caret-return','suffix','suffix-abort'].includes(interference)))throw Error('Invalid owned interference scenario');
-if(!['selected','empty','left','right'].includes(shape)||!['chromium','edge'].includes(engine))throw Error('Unknown fixture shape/runtime');
-const report={passed:false,shape,engine,gap,stepMs,beginMs,firstMs,renderPauseMs,renderPauseEvent,setup,returnFocus,interference,cases:[],cleanup:false,nativeProtocol:Number(readFileSync(path.join(root,'src-tauri/text-service/src/wire.rs'),'utf8').match(/PROTOCOL: u32 = (\d+)/)[1])};
+if(!['selected','selected-unicode','selected-second-line','selected-across-lines','empty','left','right'].includes(shape)||!['chromium','edge'].includes(engine))throw Error('Unknown fixture shape/runtime');
+const report={passed:false,shape,engine,gap,stepMs,beginMs,firstMs,renderPauseMs,renderPauseEvent,setup,returnFocus,reselect,abortInitial,editPrepared,interference,cases:[],cleanup:false,nativeProtocol:Number(readFileSync(path.join(root,'src-tauri/text-service/src/wire.rs'),'utf8').match(/PROTOCOL: u32 = (\d+)/)[1])};
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 let browser,helper,probe,imeTraceSession;
 const imeTrace=[];
@@ -68,9 +75,9 @@ try{
  const selectedCases=cases.filter(item=>(!gap||!item.multiline)&&(!selected||`${item.control}-${item.multiline?'multiline':'single'}`===selected));
  if(!selectedCases.length)throw Error('No matching owned prefix cases');
  for(const {control,multiline} of selectedCases){
-  const rich=control.startsWith('ProseMirror'),binding=control==='ProseMirrorInline'?'fixtureInlineEditor':'fixtureEditor';
-  const sample={selected:{before:'前被选右',start:1,end:3},empty:{before:'',start:0,end:0},left:{before:'前',start:1,end:1},right:{before:'右',start:0,end:0}}[shape];
-  const before=sample.before,startOffset=sample.start,endOffset=sample.end,left=before.slice(0,startOffset),right=before.slice(endOffset);
+  const rich=control.startsWith('ProseMirror');let binding=control==='ProseMirrorInline'?'fixtureInlineEditor':'fixtureEditor';
+  const sample={selected:{before:'前被选右',start:1,end:3},'selected-unicode':{before:'前🙂被选\n右',start:1,end:5},'selected-second-line':{before:'前\n🙂被选右',start:2,end:6},'selected-across-lines':{before:'前被\n选右',start:1,end:4},empty:{before:'',start:0,end:0},left:{before:'前',start:1,end:1},right:{before:'右',start:0,end:0}}[shape];
+  const before=sample.before;let startOffset=sample.start,endOffset=sample.end,left=before.slice(0,startOffset),right=before.slice(endOffset);
   if(setup==='keyboard'){
    const target=rich?page.locator(control==='ProseMirrorInline'?'#prosemirror-inline .ProseMirror':'#prosemirror .ProseMirror'):page.locator('#'+control);
    await page.bringToFront();
@@ -97,9 +104,9 @@ try{
   const foreground=await focus({action:'focus-process',process:pid});if(foreground.foregroundProcess!==pid)throw Error('Owned browser did not receive foreground');
   if(setup==='keyboard'&&startOffset!==endOffset){
    const target=rich?page.locator(control==='ProseMirrorInline'?'#prosemirror-inline .ProseMirror':'#prosemirror .ProseMirror'):page.locator('#'+control);
-   for(let offset=endOffset;offset>startOffset;offset--)await target.press('Shift+ArrowLeft');
-   const selected=rich?await page.evaluate(binding=>{const value=window[binding].inspect().selection;return {start:value.from-1,end:value.to-1};},binding):await target.evaluate(node=>'selectionStart'in node?{start:node.selectionStart,end:node.selectionEnd}:{start:getSelection().getRangeAt(0).startOffset,end:getSelection().getRangeAt(0).endOffset});
-   if(selected.start!==startOffset||selected.end!==endOffset)throw Error('Owned keyboard selection precondition failed');
+   const selectionSteps=[...new Intl.Segmenter().segment(before.slice(startOffset,endOffset))].length;
+   for(let index=0;index<selectionSteps;index++)await target.press('Shift+ArrowLeft');
+   await expect.poll(()=>rich?page.evaluate(binding=>window[binding].inspect().semanticSelection,binding):target.evaluate(node=>'selectionStart'in node?{start:node.selectionStart,end:node.selectionEnd}:{start:getSelection().getRangeAt(0).startOffset,end:getSelection().getRangeAt(0).endOffset}),{message:'Owned keyboard selection precondition',timeout:2000}).toEqual({start:startOffset,end:endOffset});
   }
   if(returnFocus){
    const readSelection=()=>rich?page.evaluate(binding=>window[binding].inspect().selection,binding):page.locator('#'+control).evaluate(node=>'selectionStart'in node?{from:node.selectionStart,to:node.selectionEnd}:{from:getSelection().getRangeAt(0).startOffset,to:getSelection().getRangeAt(0).endOffset});
@@ -115,11 +122,21 @@ try{
    if(transition.after.from!==before.from||transition.after.to!==before.to)throw Error('Owned focus return did not preserve selection');
   }
   let output='',finished=false,code;
+  if(reselect){
+   if(reselect==='collapse')startOffset=endOffset;
+   else if(reselect==='move'){startOffset=0;endOffset=1;}
+   else{
+    binding='fixtureInlineEditor';
+    await page.evaluate(({before,start,end})=>window.fixtureInlineEditor.set(before,start,end),{before,start:startOffset,end:endOffset});
+   }
+   await page.evaluate(({binding,start,end})=>window[binding].select(start,end),{binding,start:startOffset,end:endOffset});
+   left=before.slice(0,startOffset);right=before.slice(endOffset);
+  }
   if(process.env.SAYWEAVE_PREFIX_READ_SELECTION==='1'){
    const evidence=await focus({action:'inspect-selection',process:pid});
    (report.selectionEvidence??=[]).push({control,...evidence});
   }
-  probe=start(path.join(root,'src-tauri/text-service/target/debug/tsf-probe.exe'),['probe',String(pid),'0',abortTail?'prefix-gap-abort':gap?'prefix-gap':multiline?'prefix-multiline':'prefix',String(stepMs),String(beginMs),String(firstMs)],{SAYWEAVE_INPUT_ACCEPTANCE:'1'});
+  probe=start(path.join(root,'src-tauri/text-service/target/debug/tsf-probe.exe'),['probe',String(pid),'0',abortInitial?`prefix-abort-${abortInitial}`:abortTail?'prefix-gap-abort':gap?'prefix-gap':multiline?'prefix-multiline':'prefix',String(stepMs),String(beginMs),String(firstMs)],{SAYWEAVE_INPUT_ACCEPTANCE:'1'});
   probe.stdout.on('data',b=>{output+=b.toString('utf8');});probe.stderr.on('data',b=>{output+=b.toString('utf8');});
   probe.on('error',error=>{output+=error.message;code=-1;finished=true;});probe.on('exit',exit=>{code=exit;finished=true;});
   const read=async()=>rich?page.evaluate(binding=>window[binding].read(),binding):page.locator('#'+control).evaluate(node=>'value'in node?node.value:node.innerText);
@@ -127,6 +144,13 @@ try{
   let interfered=false,protectedText;
   while(!finished){
    observed.add((await read()).replace(/\r\n?/g,'\n').replace(/\u2028/g,'\n'));
+   if(editPrepared&&!interfered&&output.includes('operation=2 revision=0 applied=true')){
+    if(output.includes('operation=3'))throw Error('Prepared edit missed the first-write boundary');
+    interfered=true;
+    await page.evaluate(mode=>{if(mode==='text')window.fixtureEditor.edit(1,3,'用户');else window.fixtureEditor.select(0);},editPrepared);
+    protectedText=await read();
+    if(protectedText!==(editPrepared==='text'?'前用户右':before))throw Error('Prepared user edit did not apply');
+   }
    if(interference&&!interfered&&output.includes('operation=4 revision=2 applied=true')){
     interfered=true;await wait(350);
     const settled=await read();
@@ -158,17 +182,30 @@ try{
   probe=null;writeFileSync(path.join(folder,control+(multiline?'-multiline':'-single')+'.log'),output);
   const actual=(await read()).replace(/\r\n?/g,'\n');
   const line=multiline?'\n':'';
-  const expected=abortTail?`${left}第一段。${right}\n`:`${left}第一段。${line}第二段。${line}尾部完成🙂${right}${suffixCase?'\n':''}`;
+  const expected=editPrepared?protectedText:abortInitial?before:abortTail?`${left}第一段。${right}\n`:`${left}第一段。${line}第二段。${line}尾部完成🙂${right}${suffixCase?'\n':''}`;
   const liveAsr=observed.has(`${left}ASR 第一段${gap?'':'，第二段临时'}${right}`);
   const firstPrefix=observed.has(`${left}第一段。${line}${gap?'':'第二段临时'}${right}`);
   const growingTail=observed.has(`${left}第一段。${line}第二段续写🙂${right}${suffixCase?'\n':''}`);
   const secondPrefix=observed.has(`${left}第一段。${line}第二段。${line}${gap?'':'尾部🙂'}${right}${suffixCase?'\n':''}`);
   const finalDom=rich?await page.evaluate(binding=>window[binding].inspect(),binding):undefined;
+  if(reselect==='other'){
+   report.originalEditorPreserved=await page.evaluate(()=>window.fixtureEditor.read())===before;
+   if(!report.originalEditorPreserved)throw Error('Original editor was modified after switching to identical text');
+  }
   const screenshot=path.join(folder,control+(multiline?'-multiline':'-single')+'.png');await page.screenshot({path:screenshot});
   const events=rich&&actual!==expected?await page.evaluate(()=>window.ownedPrefixEvents):undefined;
   const focusEvidence=code!==0&&/foreground/.test(output)?await focus({action:'read'}):undefined;
   report.cases.push({control,multiline,code,liveAsr,firstPrefix,growingTail,secondPrefix,actualTextCorrect:actual===expected,screenshot,finalDom,...(focusEvidence?{focusEvidence:{expectedProcess:pid,actualProcess:focusEvidence.foregroundProcess}}:{}),...(actual!==expected?{ownedFixtureActual:actual,ownedFixtureExpected:expected,ownedFixtureSnapshots:[...observed],ownedFixtureEvents:events}:{})});
-  if(interference&&!suffixCase){
+  if(editPrepared){
+   report.cases.at(-1).editProtected=interfered&&code!==0&&/operation=3 revision=1 applied=false/.test(output)&&actual===protectedText&&!liveAsr;
+   if(!report.cases.at(-1).editProtected)throw Error('Prepared user edit was overwritten');
+  }else if(abortInitial){
+   const restored=rich?finalDom.semanticSelection:await page.locator('#'+control).evaluate(node=>'selectionStart'in node?{start:node.selectionStart,end:node.selectionEnd}:{start:getSelection().getRangeAt(0).startOffset,end:getSelection().getRangeAt(0).endOffset});
+   const selectionRestored=restored.start===startOffset&&restored.end===endOffset;
+   const caretAtRestoredEnd=restored.start===endOffset&&restored.end===endOffset;
+   Object.assign(report.cases.at(-1),{restoredSelection:restored,selectionRestored,caretAtRestoredEnd});
+   if(code!==0||actual!==before||(!selectionRestored&&!caretAtRestoredEnd)||(abortInitial==='after'&&!liveAsr))throw Error('Initial cancellation did not restore selected text with a valid final caret');
+  }else if(interference&&!suffixCase){
    const refused=code!==0&&/operation=5 revision=3 applied=false code=(draftOwnership|edit:(receiptPosition|position|selection|gapPosition))/.test(output);
    report.cases.at(-1).editProtected=interfered&&refused&&actual===protectedText;
    if(!report.cases.at(-1).editProtected)throw Error('Owned external edit was not protected');
