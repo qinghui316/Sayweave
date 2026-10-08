@@ -115,6 +115,10 @@ try{
    if(transition.after.from!==before.from||transition.after.to!==before.to)throw Error('Owned focus return did not preserve selection');
   }
   let output='',finished=false,code;
+  if(process.env.SAYWEAVE_PREFIX_READ_SELECTION==='1'){
+   const evidence=await focus({action:'inspect-selection',process:pid});
+   (report.selectionEvidence??=[]).push({control,...evidence});
+  }
   probe=start(path.join(root,'src-tauri/text-service/target/debug/tsf-probe.exe'),['probe',String(pid),'0',abortTail?'prefix-gap-abort':gap?'prefix-gap':multiline?'prefix-multiline':'prefix',String(stepMs),String(beginMs),String(firstMs)],{SAYWEAVE_INPUT_ACCEPTANCE:'1'});
   probe.stdout.on('data',b=>{output+=b.toString('utf8');});probe.stderr.on('data',b=>{output+=b.toString('utf8');});
   probe.on('error',error=>{output+=error.message;code=-1;finished=true;});probe.on('exit',exit=>{code=exit;finished=true;});

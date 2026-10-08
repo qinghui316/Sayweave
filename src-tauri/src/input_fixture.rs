@@ -48,6 +48,51 @@ fn context_status() -> serde_json::Value {
     })();
     result.unwrap_or_else(|e| serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}))
 }
+// Read-only evidence from a runner-owned target, on an independent MTA. Never
+// emit external text or use these measurements to move a production selection.
+fn selection_evidence(process: u32) -> serde_json::Value {
+    thread::spawn(move || {
+        use sha2::{Digest, Sha256};
+        use windows::{core::Interface, Win32::{System::Com::*, UI::Accessibility::*}};
+        let result = (|| unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+            let result = (|| {
+                let auto: IUIAutomation = CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)?;
+                let limits: IUIAutomation2 = auto.cast()?;
+                limits.SetConnectionTimeout(500)?;
+                limits.SetTransactionTimeout(500)?;
+                let element = auto.GetFocusedElement()?;
+                if element.CurrentProcessId()? != process as i32 || !element.CurrentHasKeyboardFocus()?.as_bool() || element.CurrentIsPassword()?.as_bool() {
+                    return Err(windows::core::Error::from_hresult(E_ACCESSDENIED));
+                }
+                let pattern: IUIAutomationTextPattern = element.GetCurrentPatternAs(UIA_TextPatternId)?;
+                let ranges = pattern.GetSelection()?;
+                if ranges.Length()? != 1 { return Err(windows::core::Error::from_hresult(E_FAIL)); }
+                let selected = ranges.GetElement(0)?;
+                let document = pattern.DocumentRange()?;
+                let prefix = document.Clone()?;
+                prefix.MoveEndpointByRange(TextPatternRangeEndpoint_End, &selected, TextPatternRangeEndpoint_Start)?;
+                let suffix = document.Clone()?;
+                suffix.MoveEndpointByRange(TextPatternRangeEndpoint_Start, &selected, TextPatternRangeEndpoint_End)?;
+                let text = document.GetText(16385)?.to_string();
+                let before = prefix.GetText(16385)?.to_string();
+                let picked = selected.GetText(16385)?.to_string();
+                let after = suffix.GetText(16385)?.to_string();
+                let count = |value: &str| value.encode_utf16().count();
+                if count(&text) > 16384 || text != format!("{before}{picked}{after}") {
+                    return Err(windows::core::Error::from_hresult(E_INVALIDARG));
+                }
+                let current = pattern.GetSelection()?;
+                let stable = current.Length()? == 1 && selected.Compare(&current.GetElement(0)?)?.as_bool()
+                    && auto.CompareElements(&element, &auto.GetFocusedElement()?)?.as_bool();
+                Ok::<_, windows::core::Error>(serde_json::json!({"stable":stable,"documentUtf16":count(&text),"startUtf16":count(&before),"endUtf16":count(&before)+count(&picked),"documentSha256":format!("{:x}",Sha256::digest(text.as_bytes()))}))
+            })();
+            CoUninitialize();
+            result
+        })();
+        result.unwrap_or_else(|e| serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}))
+    }).join().unwrap_or_else(|_| serde_json::json!({"error":"selectionWorker"}))
+}
 unsafe fn focus_window(window: HWND) {
     unsafe {
         use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -201,6 +246,23 @@ fn main() {
                 }
                 if value["action"] == "inspect-context" {
                     println!("{}", context_status());
+                    io::stdout().flush().unwrap();
+                    let _ = ok.send(());
+                    continue;
+                }
+                if value["action"] == "inspect-selection" {
+                    let process = value["process"]
+                        .as_u64()
+                        .and_then(|p| u32::try_from(p).ok())
+                        .unwrap_or(0);
+                    let mut foreground = 0;
+                    GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut foreground));
+                    let evidence = if process != 0 && foreground == process {
+                        selection_evidence(process)
+                    } else {
+                        serde_json::json!({"error":"ownedForegroundMismatch"})
+                    };
+                    println!("{evidence}");
                     io::stdout().flush().unwrap();
                     let _ = ok.send(());
                     continue;

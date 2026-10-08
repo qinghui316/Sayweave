@@ -127,6 +127,8 @@ Rust数据测试覆盖Unicode、约束、版本冲突、事务、迁移拒绝、
 
 选区与焦点准备应单独记录。默认 `SAYWEAVE_PREFIX_SETUP=state` 保留程序化初始选区；`keyboard` 先聚焦自有窗口，再通过浏览器键盘事件建立选区，并断言实际选区。`SAYWEAVE_PREFIX_RETURN_FOCUS=1` 在选区建立后切到自有原生夹具再返回，保留已有选区；它与开始口述后切换目标是不同场景。不能用其中一种准备方式通过，抹去另一种方式的失败，也不能把浏览器注入事件标成物理键盘验收。
 
+`SAYWEAVE_PREFIX_READ_SELECTION=1` 在开始输入前，用独立 MTA 只读核对自有前台目标的 UIA 选区。报告仅含受限正文的摘要、UTF-16 长度及选区位置；不输出正文，不移动选区，也不改变原生写入权限。`stable` 只表示两次接口读取相符，不代表 UIA 与 TSF 存在原子快照或共享变化版本。此取证会增加启动前查询，不能用于产品延迟测量。
+
 定向时序诊断支持 `SAYWEAVE_PREFIX_STEP_MS`（100—2000ms），以及分别控制 Begin 后、首次 Update 后间隔的 `SAYWEAVE_PREFIX_BEGIN_MS`／`SAYWEAVE_PREFIX_FIRST_MS`（0—2000ms）。`SAYWEAVE_PREFIX_RENDER_PAUSE_MS`（0—1000ms）只在自有页面的首次 `compositionstart`、`beforeinput` 或 `compositionend` 暂停一次，事件由 `SAYWEAVE_PREFIX_RENDER_EVENT` 指定。暂停不修改正文或选区，不进入产品代码；所有参数写入报告。极短间隔可能让轮询看不到中间帧：即使最终全文正确，原有中间帧断言仍保留为未通过，不能混称完整验收。可用 `SAYWEAVE_PREFIX_TRACE_IME=1` 留存隔离浏览器的输入事件追踪；空追踪不作为回调未发生的证据。退出时关闭追踪与所有自有测试资源。
 
 `node scripts/test-speech-desktop.mjs --polish` 使用实际Windows麦克风、WebView、已部署输入组件及自有原生编辑器，网络仅连接隔离TLS ASR与文字生成服务。先读取目标中的原始ASR再释放相应模型输出，分别断言两次整理前段、最新尾部、结束后的完整Unicode正文，以及独立原文/整理历史和摘要引用。原生EDIT的读取断言使用明确CRLF，历史语义正文使用LF；不全局转换原文U+2028。
