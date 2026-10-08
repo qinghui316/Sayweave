@@ -123,6 +123,8 @@ Rust数据测试覆盖Unicode、约束、版本冲突、事务、迁移拒绝、
 
 ### 完整分段整理链路
 
+空尾停顿接续使用 `node scripts/test-prefix-input.mjs ProseMirror-single empty chromium gap`：两次前段提交均留下空尾，间隔1500ms再续写，严格核对最终正文。第三个参数还可用 `left`、`right`、`selected`。末参数可指定 `delete-prefix`、`replace-prefix`、`outside-edit`、`outside-delete`、`right-edit`、`caret-return`，在相应正例通过后验证固定位置保护码及实际保留文字；左右编辑须使用对应的 `left`／`right` 形状。`suffix`、`suffix-abort` 在提交后向文档末尾增加段落，验证继续输入或取消只影响自有尾部，新增换行及右侧原文保持。测试使用程序化编辑事件；物理键鼠交接仍由原生输入和日常验收分别覆盖。
+
 `node scripts/test-speech-desktop.mjs --polish` 使用实际Windows麦克风、WebView、已部署输入组件及自有原生编辑器，网络仅连接隔离TLS ASR与文字生成服务。先读取目标中的原始ASR再释放相应模型输出，分别断言两次整理前段、最新尾部、结束后的完整Unicode正文，以及独立原文/整理历史和摘要引用。原生EDIT的读取断言使用明确CRLF，历史语义正文使用LF；不全局转换原文U+2028。
 
 第二次会话在前段已提交、下一语段仍等待模型时取消，断言实际前段保留、尾部及分隔符移除、历史只保留提交范围、待生成记录删除及录音不可用。夹具、凭据、窗口、监听和证书按UUID清理；测试不改个人模型、历史、剪贴板或输入法。观察屏障仅控制隔离服务，不为产品增加等待。

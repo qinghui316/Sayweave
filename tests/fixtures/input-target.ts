@@ -8,9 +8,12 @@ const host=document.createElement('div');host.id='prosemirror';document.body.app
 // This minimal fixture owns only paragraph/text nodes; other application UI is unchanged.
 const style=document.createElement('style');style.textContent='.ProseMirror{position:relative;white-space:pre-wrap;white-space:break-spaces;word-wrap:break-word;font-variant-ligatures:none;}';document.head.append(style);
 const view=new EditorView(host,{state:EditorState.create({schema})});
-declare global {interface Window {fixtureEditor:{set(text:string,start:number,end:number):void;read():string;inspect():unknown}}}
+declare global {interface Window {fixtureEditor:{set(text:string,start:number,end:number):void;edit(from:number,to:number,text:string):void;appendParagraph():void;select(position:number):void;read():string;inspect():unknown}}}
 window.fixtureEditor={
  set(text,start,end){const doc=schema.node('doc',null,[schema.node('paragraph',null,text?schema.text(text):undefined)]);view.updateState(EditorState.create({schema,doc,selection:TextSelection.create(doc,start+1,end+1)}));view.focus();},
+ edit(from,to,text){view.dispatch(view.state.tr.insertText(text,from+1,to+1));},
+ appendParagraph(){view.dispatch(view.state.tr.insert(view.state.doc.content.size,schema.nodes.paragraph.create()));},
+ select(position){view.dispatch(view.state.tr.setSelection(TextSelection.create(view.state.doc,position+1)));},
  read(){return view.state.doc.textBetween(0,view.state.doc.content.size,'\n');},
  inspect(){const selection=getSelection();return {html:view.dom.innerHTML,selection:{from:view.state.selection.from,to:view.state.selection.to},domSelection:selection?{anchor:{parent:selection.anchorNode?.parentElement?.tagName,offset:selection.anchorOffset,text:selection.anchorNode?.textContent},focus:{parent:selection.focusNode?.parentElement?.tagName,offset:selection.focusOffset,text:selection.focusNode?.textContent}}:null,document:view.state.doc.toJSON()};},
 };
@@ -23,6 +26,9 @@ const inlineView=new EditorView(inlineHost,{state:EditorState.create({schema:inl
 declare global {interface Window {fixtureInlineEditor:Window['fixtureEditor']}}
 window.fixtureInlineEditor={
  set(text,start,end){const doc=inlineSchema.node('doc',null,[inlineSchema.node('paragraph',null,text?inlineSchema.text(text):undefined)]);inlineView.updateState(EditorState.create({schema:inlineSchema,doc,selection:TextSelection.create(doc,start+1,end+1)}));inlineView.focus();},
+ edit(from,to,text){inlineView.dispatch(inlineView.state.tr.insertText(text,from+1,to+1));},
+ appendParagraph(){inlineView.dispatch(inlineView.state.tr.insert(inlineView.state.doc.content.size,inlineSchema.nodes.paragraph.create()));},
+ select(position){inlineView.dispatch(inlineView.state.tr.setSelection(TextSelection.create(inlineView.state.doc,position+1)));},
  read(){return inlineView.state.doc.textBetween(0,inlineView.state.doc.content.size,'\n',node=>node.type.name==='hard_break'?'\n':'');},
  inspect(){const selection=getSelection();return {html:inlineView.dom.innerHTML,selection:{from:inlineView.state.selection.from,to:inlineView.state.selection.to},domSelection:selection?{anchor:{parent:selection.anchorNode?.parentElement?.tagName,offset:selection.anchorOffset,text:selection.anchorNode?.textContent},focus:{parent:selection.focusNode?.parentElement?.tagName,offset:selection.focusOffset,text:selection.focusNode?.textContent}}:null,document:inlineView.state.doc.toJSON()};},
 };

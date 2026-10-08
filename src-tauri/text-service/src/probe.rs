@@ -145,8 +145,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let multiline = args.get(4).map(String::as_str) == Some("multiline");
                 let prefix_probe = matches!(
                     args.get(4).map(String::as_str),
-                    Some("prefix" | "prefix-multiline")
+                    Some("prefix" | "prefix-multiline" | "prefix-gap" | "prefix-gap-abort")
                 );
+                let prefix_gap = matches!(
+                    args.get(4).map(String::as_str),
+                    Some("prefix-gap" | "prefix-gap-abort")
+                );
+                let prefix_abort = args.get(4).map(String::as_str) == Some("prefix-gap-abort");
                 let prefix_multiline = args.get(4).map(String::as_str) == Some("prefix-multiline");
                 let interval = args
                     .get(5)
@@ -178,15 +183,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         },
                     )
                     .unwrap();
-                let first_tail = first_boundary.tail("第二段临时");
+                let first_tail =
+                    first_boundary.tail(if prefix_gap { "" } else { "第二段临时" });
                 let growing_tail = first_boundary.tail("第二段续写🙂");
-                let second_tail = second_boundary.tail("尾部🙂");
+                let second_tail = second_boundary.tail(if prefix_gap { "" } else { "尾部🙂" });
                 let final_tail = second_boundary.tail("尾部完成🙂");
-                let steps = if prefix_probe {
+                let mut steps = if prefix_probe {
                     vec![
                         (1, 0, Action::Inspect, "", None),
                         (2, 0, Action::Begin, "", None),
-                        (3, 1, Action::Update, "ASR 第一段，第二段临时", None),
+                        (
+                            3,
+                            1,
+                            Action::Update,
+                            if prefix_gap {
+                                "ASR 第一段"
+                            } else {
+                                "ASR 第一段，第二段临时"
+                            },
+                            None,
+                        ),
                         (
                             4,
                             2,
@@ -226,6 +242,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|(op, revision, action, text)| (op, revision, action, text, None))
                     .collect()
                 };
+                if prefix_abort {
+                    steps.truncate(5);
+                    steps.push((6, 3, Action::Abort, "", None));
+                }
                 let mut range_epoch = 0;
                 let mut previous_revision = 0;
                 for (op, revision, action, text, processed) in steps {

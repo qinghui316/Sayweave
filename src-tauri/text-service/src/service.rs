@@ -78,6 +78,8 @@ struct State {
     pending: Option<Pending>,
     epoch: u64,
     own_change: Option<OwnChange>,
+    ownership_loss: Option<&'static str>,
+    ownership_detail: Option<String>,
     cleanup: bool,
     cleanup_id: u64,
     materialize_allowed: bool,
@@ -98,8 +100,7 @@ struct State {
     key_handoff: bool,
     key_failure: bool,
 }
-// A single post-edit notification for an exact write we just performed. This is
-// range evidence, not permission to ignore arbitrary provider notifications.
+// Evidence for an exact write, valid only while its text and range still match.
 #[derive(Clone)]
 struct OwnChange {
     epoch: u64,
@@ -107,6 +108,126 @@ struct OwnChange {
     revision: u64,
     range: ITfRange,
     expected: String,
+    verified: bool,
+    position: Option<RangePosition>,
+    context_end: Option<i32>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RangePosition {
+    start: i32,
+    end: i32,
+}
+// Standard range traversal works for TIPs; ITfRangeACP is context-owner only.
+fn range_position(
+    context: &ITfContext,
+    range: &ITfRange,
+    ec: u32,
+) -> windows::core::Result<RangePosition> {
+    range_position_detailed(context, range, ec).map_err(|(error, _)| error)
+}
+fn range_position_detailed(
+    context: &ITfContext,
+    range: &ITfRange,
+    ec: u32,
+) -> Result<RangePosition, (windows::core::Error, String)> {
+    unsafe {
+        let diagnostic = |stage, error: windows::core::Error| {
+            let detail = format!("{stage}:{:08x}", error.code().0 as u32);
+            (error, detail)
+        };
+        let start = context.GetStart(ec).map_err(|e| diagnostic("origin", e))?;
+        let distance = |anchor| -> Result<i32, (windows::core::Error, String)> {
+            let point = range.Clone().map_err(|e| diagnostic("clone", e))?;
+            point
+                .Collapse(ec, anchor)
+                .map_err(|e| diagnostic("collapse", e))?;
+            let mut shifted = 0;
+            point
+                .ShiftStart(ec, -1_000_000, &mut shifted, std::ptr::null())
+                .map_err(|e| diagnostic("shift", e))?;
+            let compared = point
+                .CompareStart(ec, &start, TF_ANCHOR_START)
+                .map_err(|e| diagnostic("compare", e))?;
+            if compared != 0 {
+                return Err((
+                    failure(E_FAIL),
+                    format!(
+                        "originUnreached:anchor={} shifted={shifted} compared={compared}",
+                        anchor.0
+                    ),
+                ));
+            }
+            Ok(-shifted)
+        };
+        Ok(RangePosition {
+            start: distance(TF_ANCHOR_START)?,
+            end: distance(TF_ANCHOR_END)?,
+        })
+    }
+}
+// Rich-text stores may synchronize paragraph separators outside a fully
+// settled insertion point. Preserve that suffix; it is never part of our write.
+fn paragraph_suffix_feedback(
+    context: &ITfContext,
+    record: &ITfEditRecord,
+    own: &OwnChange,
+    range: &ITfRange,
+    selected: &ITfRange,
+    ec: u32,
+) -> windows::core::Result<bool> {
+    unsafe {
+        if !range.IsEmpty(ec)?.as_bool()
+            || range.CompareStart(ec, &own.range, TF_ANCHOR_END)? != 0
+            || !selected.IsEmpty(ec)?.as_bool()
+            || selected.CompareStart(ec, &own.range, TF_ANCHOR_END)? != 0
+            || selected.CompareEnd(ec, &own.range, TF_ANCHOR_END)? != 0
+        {
+            return Ok(false);
+        }
+        let Some(previous_end) = own.context_end else {
+            return Ok(false);
+        };
+        let suffix = context.GetEnd(ec)?;
+        let current_end = range_position(context, &suffix, ec)?.end;
+        if current_end <= previous_end {
+            return Ok(false);
+        }
+        let mut shifted = 0;
+        suffix.ShiftStart(
+            ec,
+            previous_end - current_end,
+            &mut shifted,
+            std::ptr::null(),
+        )?;
+        if shifted != previous_end - current_end {
+            return Ok(false);
+        }
+        let text = range_text(&suffix, ec)?;
+        if text.is_empty() || !text.chars().all(|c| matches!(c, '\r' | '\n')) {
+            return Ok(false);
+        }
+        let updates = record.GetTextAndPropertyUpdates(TF_GTP_INCL_TEXT, &[])?;
+        for _ in 0..64 {
+            let mut entries = [None];
+            let mut count = 0;
+            updates.Next(&mut entries, &mut count)?;
+            if count == 0 {
+                return Ok(true);
+            }
+            let changed = entries[0].as_ref().ok_or_else(|| failure(E_FAIL))?;
+            if changed.CompareStart(ec, &own.range, TF_ANCHOR_START)? >= 0
+                && changed.CompareEnd(ec, &own.range, TF_ANCHOR_END)? <= 0
+            {
+                continue;
+            }
+            if changed.CompareStart(ec, &suffix, TF_ANCHOR_START)? < 0
+                || changed.CompareEnd(ec, &suffix, TF_ANCHOR_END)? > 0
+            {
+                return Ok(false);
+            }
+        }
+        Ok(false)
+    }
 }
 #[derive(Clone)]
 enum Rollback {
@@ -459,12 +580,13 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
         return;
     }
     if let Err((stage, e)) = schedule(shared, &r, connection, inherited_settlement) {
+        let detail = shared.borrow().ownership_detail.clone().unwrap_or_default();
         reply_outcome(
             shared,
             &r,
             connection,
             false,
-            &format!("{stage}:{:08x}", e.code().0 as u32),
+            &format!("{stage}:{:08x}{detail}", e.code().0 as u32),
             Mutation::NotAttempted,
             inherited_settlement,
         );
@@ -645,7 +767,10 @@ fn schedule(
         let (manager, client, generation) = {
             let s = shared.borrow();
             if !s.version.accepts(r) {
-                return Err(("draftOwnership", failure(E_INVALIDARG)));
+                return Err((
+                    s.ownership_loss.unwrap_or("draftOwnership"),
+                    failure(E_INVALIDARG),
+                ));
             }
             if s.cleanup || r.action == Action::Begin && s.composition.is_some() {
                 return Err(("draftCleanup", failure(E_INVALIDARG)));
@@ -1331,6 +1456,8 @@ impl ITfTextEditSink_Impl for TextSink_Impl {
             }
             return Ok(());
         }
+        let mut loss = "draftOwnershipInspection";
+        let mut detail = None;
         let result: windows::core::Result<bool> = (|| unsafe {
             let context = context.as_ref().ok_or_else(|| failure(E_POINTER))?;
             if context.InWriteSession(client)?.as_bool() {
@@ -1363,20 +1490,64 @@ impl ITfTextEditSink_Impl for TextSink_Impl {
                     .filter(|own| binding.receipt_matches(own))
                     .cloned()
             };
+            let mut feedback_reason = "draftOwnershipTextNoReceipt";
+            let mut retain_receipt = false;
             let own_feedback = if let Some(own) = own_change.filter(|_| notified) {
                 let receipt_text = range_text(&own.range, ec)?;
                 let receipt_matches = receipt_text == own.expected
-                    || (own.range.CompareStart(ec, &range, TF_ANCHOR_START)? == 0
+                    || (!own.verified
+                        && own.range.CompareStart(ec, &range, TF_ANCHOR_START)? == 0
                         && own.range.CompareEnd(ec, &range, TF_ANCHOR_END)? == 0
                         && receipt_text == expected);
-                receipt_matches && updates_within(record, &own.range, ec)?
+                let mut position_unreadable = false;
+                let position_matches = own.position.is_some_and(|position| {
+                    match range_position_detailed(context, &own.range, ec) {
+                        Ok(current) if current == position => true,
+                        Ok(current) => {
+                            detail = Some(format!(
+                                " expected={position:?} actual={current:?} receipt={} revision={}",
+                                own.revision, binding.revision
+                            ));
+                            false
+                        }
+                        Err((_, why)) => {
+                            position_unreadable = true;
+                            detail = Some(format!(
+                                " positionRead={why} receipt={} revision={}",
+                                own.revision, binding.revision
+                            ));
+                            false
+                        }
+                    }
+                });
+                retain_receipt = own.verified && receipt_text == own.expected && position_matches;
+                let within = updates_within(record, &own.range, ec)?
+                    || (retain_receipt
+                        && binding.empty_range.is_some()
+                        && paragraph_suffix_feedback(
+                            context, record, &own, &range, &selected, ec,
+                        )?);
+                feedback_reason = if !receipt_matches {
+                    "draftOwnershipReceiptMismatch"
+                } else if own.position.is_some() && !position_matches {
+                    if position_unreadable {
+                        "draftOwnershipPositionUnreadable"
+                    } else {
+                        "draftOwnershipPositionChanged"
+                    }
+                } else if !within {
+                    "draftOwnershipNotificationOutside"
+                } else {
+                    "draftOwnershipOwnFeedback"
+                };
+                receipt_matches && (own.position.is_none() || position_matches) && within
             } else {
                 false
             };
             if !binding.matches(&self.state.borrow()) {
                 return Ok(false);
             }
-            if own_feedback {
+            if own_feedback && !retain_receipt {
                 let mut state = self.state.borrow_mut();
                 if state
                     .own_change
@@ -1386,11 +1557,22 @@ impl ITfTextEditSink_Impl for TextSink_Impl {
                     state.own_change = None;
                 }
             }
-            if (!own_feedback && (record.GetSelectionStatus()?.as_bool() || changed_text != 0))
-                || range_text(&range, ec)? != expected
-                || selected.CompareStart(ec, &expected_selection, TF_ANCHOR_START)? != 0
+            if range_text(&range, ec)? != expected {
+                loss = "draftOwnershipTextMismatch";
+                return Ok(true);
+            }
+            if selected.CompareStart(ec, &expected_selection, TF_ANCHOR_START)? != 0
                 || selected.CompareEnd(ec, &expected_selection, TF_ANCHOR_END)? != 0
             {
+                loss = "draftOwnershipSelectionMismatch";
+                return Ok(true);
+            }
+            if !own_feedback && changed_text != 0 {
+                loss = feedback_reason;
+                return Ok(true);
+            }
+            if !own_feedback && record.GetSelectionStatus()?.as_bool() {
+                loss = "draftOwnershipSelectionNotification";
                 return Ok(true);
             }
             let mut attributes = changed_attributes(context, record, &range, ec)?;
@@ -1420,6 +1602,7 @@ impl ITfTextEditSink_Impl for TextSink_Impl {
                     .filter(|(id, _)| !s.preserved_attributes.iter().any(|(known, _)| known == id))
                     .count();
                 if s.preserved_attributes.len() + added > 64 {
+                    loss = "draftOwnershipAttributes";
                     return Ok(true);
                 }
                 for (id, value) in attributes {
@@ -1443,6 +1626,14 @@ impl ITfTextEditSink_Impl for TextSink_Impl {
             binding.matches(&s) && s.version.owned
         };
         if current && !matches!(&result, Ok(false)) {
+            #[cfg(feature = "acceptance")]
+            eprintln!(
+                "owned loss={loss} detail={detail:?} revision={} empty={}",
+                binding.revision,
+                binding.empty_range.is_some()
+            );
+            self.state.borrow_mut().ownership_loss = Some(loss);
+            self.state.borrow_mut().ownership_detail = detail;
             end_owned(&self.state);
         }
         result?;
@@ -1791,7 +1982,52 @@ fn settle_prefix(
         // An IMM-backed provider can rebase ranges after prefix materialization.
         // Bind the receipt to its post-operation range representation, not to
         // the earlier combined buffer, and still require the current tail/caret.
-        let receipt_text = range_text(&written, ec)?;
+        // EndComposition can rebase pre-existing range clones. Reconstruct the
+        // full write from the verified tail, retaining the actual submitted
+        // prefix as evidence rather than accepting an empty rebased clone.
+        let footprint =
+            (|| -> windows::core::Result<_> {
+                // Legacy EDIT exposes a composition-only TSF text store which
+                // collapses on commit. Its existing native caret proof owns
+                // continuation; document coordinates cannot be frozen there.
+                if !r.text.is_empty() || shared.borrow().native_position.is_some() {
+                    return Ok(None);
+                }
+                let footprint = remaining.Clone()?;
+                edit_identity(shared, r, generation, epoch)?;
+                let mut restored = 0;
+                footprint.ShiftStart(ec, -units, &mut restored, std::ptr::null())?;
+                edit_identity(shared, r, generation, epoch)?;
+                let text = range_text(&footprint, ec)?;
+                Ok((restored == -units
+                    && equivalent_native_text(&text, &combined)
+                    && !text.is_empty())
+                .then_some((footprint, text)))
+            })()
+            .ok()
+            .flatten();
+        edit_identity(shared, r, generation, epoch)?;
+        let verified = footprint.is_some();
+        let (written, receipt_text) = if let Some(footprint) = footprint {
+            footprint
+        } else {
+            let receipt_text = range_text(&written, ec)?;
+            (written, receipt_text)
+        };
+        edit_identity(shared, r, generation, epoch)?;
+        let position = verified
+            .then(|| range_position(context, &written, ec).ok())
+            .flatten();
+        edit_identity(shared, r, generation, epoch)?;
+        let context_end = verified
+            .then(|| {
+                context
+                    .GetEnd(ec)
+                    .and_then(|end| range_position(context, &end, ec))
+                    .ok()
+                    .map(|position| position.end)
+            })
+            .flatten();
         edit_identity(shared, r, generation, epoch)?;
         let mut state = shared.borrow_mut();
         state.selection = Some(selected);
@@ -1801,6 +2037,9 @@ fn settle_prefix(
             revision: state.version.revision,
             range: written,
             expected: receipt_text,
+            verified,
+            position,
+            context_end,
         });
         outcome.tail_owned = true;
         drop(state);
@@ -1945,9 +2184,6 @@ fn write_composing(
             }
             s.expected = actual;
             s.text = Some(text);
-            if advance {
-                s.version.applied(r);
-            }
             s.selection = None;
         }
         *phase = "updateCaret";
@@ -1971,11 +2207,15 @@ fn write_composing(
         ManuallyDrop::drop(&mut selected.range);
         result?;
         let next_selection = selection(context, ec)?;
+        edit_identity(shared, r, generation, epoch)?;
         let mut s = shared.borrow_mut();
         if s.generation != generation || s.epoch != epoch || !s.version.owned {
             return Err(failure(TF_E_DISCONNECTED));
         }
         s.selection = Some(next_selection);
+        if advance {
+            s.version.applied(r);
+        }
         Ok(())
     }
 }
@@ -1991,9 +2231,41 @@ fn apply(
     phase: &mut &'static str,
     settlement: &mut Option<Settlement>,
 ) -> windows::core::Result<()> {
+    // Event records can be delayed. Recheck the immutable write position at
+    // execution, before clearing the receipt or opening another composition.
+    if r.action != Action::Begin {
+        let receipt = shared.borrow().own_change.clone();
+        if let Some(own) = receipt.filter(|own| own.verified && own.position.is_some()) {
+            *phase = "receiptPosition";
+            let current = range_position(context, &own.range, ec)?;
+            edit_identity(shared, r, generation, own.epoch)?;
+            let text = range_text(&own.range, ec)?;
+            edit_identity(shared, r, generation, own.epoch)?;
+            if Some(current) != own.position || text != own.expected {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            let empty = shared.borrow().empty_range.clone();
+            if let Some(empty) = empty {
+                let selected = selection(context, ec)?;
+                let anchored = unsafe {
+                    empty.IsEmpty(ec)?.as_bool()
+                        && empty.CompareStart(ec, &own.range, TF_ANCHOR_END)? == 0
+                        && selected.IsEmpty(ec)?.as_bool()
+                        && selected.CompareStart(ec, &own.range, TF_ANCHOR_END)? == 0
+                        && selected.CompareEnd(ec, &own.range, TF_ANCHOR_END)? == 0
+                };
+                edit_identity(shared, r, generation, own.epoch)?;
+                if !anchored {
+                    return Err(failure(TF_E_DISCONNECTED));
+                }
+            }
+        }
+    }
     shared.borrow_mut().own_change = None;
     unsafe {
         if r.action == Action::Begin {
+            shared.borrow_mut().ownership_loss = None;
+            shared.borrow_mut().ownership_detail = None;
             shared.borrow_mut().key_handoff = false;
             *phase = "beginSelection";
             let range = selection(context, ec)?;

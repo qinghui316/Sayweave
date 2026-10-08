@@ -9,8 +9,14 @@ import {fileURLToPath} from 'node:url';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const folder=path.join(root,'.local','prefix-input',randomUUID());mkdirSync(folder,{recursive:true});
 const shape=process.argv[3]??'selected',engine=process.argv[4]??'chromium';
+const gap=process.argv[5]==='gap';
+if(process.argv[5]&&!gap)throw Error('Unknown prefix continuation mode');
+const interference=process.argv[6];
+const suffixCase=['suffix','suffix-abort'].includes(interference);
+const abortTail=interference==='suffix-abort';
+if(interference&&(!gap||process.argv[2]!=='ProseMirror-single'||!['delete-prefix','replace-prefix','outside-edit','outside-delete','right-edit','caret-return','suffix','suffix-abort'].includes(interference)))throw Error('Invalid owned interference scenario');
 if(!['selected','empty','left','right'].includes(shape)||!['chromium','edge'].includes(engine))throw Error('Unknown fixture shape/runtime');
-const report={passed:false,shape,engine,cases:[],cleanup:false,nativeProtocol:Number(readFileSync(path.join(root,'src-tauri/text-service/src/wire.rs'),'utf8').match(/PROTOCOL: u32 = (\d+)/)[1])};
+const report={passed:false,shape,engine,gap,interference,cases:[],cleanup:false,nativeProtocol:Number(readFileSync(path.join(root,'src-tauri/text-service/src/wire.rs'),'utf8').match(/PROTOCOL: u32 = (\d+)/)[1])};
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 let browser,helper,probe;
 const owned=new Set();
@@ -36,7 +42,9 @@ try{
  const cases=[...['input','area','editable','ProseMirror'].map(control=>({control,multiline:false})),...['area','editable','ProseMirror','ProseMirrorInline'].map(control=>({control,multiline:true}))];
  const selected=process.argv[2]==='all'?null:process.argv[2];
  if(selected&&!cases.some(item=>`${item.control}-${item.multiline?'multiline':'single'}`===selected))throw Error('Unknown owned prefix case');
- for(const {control,multiline} of cases.filter(item=>!selected||`${item.control}-${item.multiline?'multiline':'single'}`===selected)){
+ const selectedCases=cases.filter(item=>(!gap||!item.multiline)&&(!selected||`${item.control}-${item.multiline?'multiline':'single'}`===selected));
+ if(!selectedCases.length)throw Error('No matching owned prefix cases');
+ for(const {control,multiline} of selectedCases){
   const rich=control.startsWith('ProseMirror'),binding=control==='ProseMirrorInline'?'fixtureInlineEditor':'fixtureEditor';
   const sample={selected:{before:'前被选右',start:1,end:3},empty:{before:'',start:0,end:0},left:{before:'前',start:1,end:1},right:{before:'右',start:0,end:0}}[shape];
   const before=sample.before,startOffset=sample.start,endOffset=sample.end,left=before.slice(0,startOffset),right=before.slice(endOffset);
@@ -58,26 +66,60 @@ try{
   },binding);
   const foreground=await focus({action:'focus-process',process:pid});if(foreground.foregroundProcess!==pid)throw Error('Owned browser did not receive foreground');
   let output='',finished=false,code;
-  probe=start(path.join(root,'src-tauri/text-service/target/debug/tsf-probe.exe'),['probe',String(pid),'0',multiline?'prefix-multiline':'prefix','250'],{SAYWEAVE_INPUT_ACCEPTANCE:'1'});
+  probe=start(path.join(root,'src-tauri/text-service/target/debug/tsf-probe.exe'),['probe',String(pid),'0',abortTail?'prefix-gap-abort':gap?'prefix-gap':multiline?'prefix-multiline':'prefix',gap?'1500':'250'],{SAYWEAVE_INPUT_ACCEPTANCE:'1'});
   probe.stdout.on('data',b=>{output+=b.toString('utf8');});probe.stderr.on('data',b=>{output+=b.toString('utf8');});
   probe.on('error',error=>{output+=error.message;code=-1;finished=true;});probe.on('exit',exit=>{code=exit;finished=true;});
   const read=async()=>rich?page.evaluate(binding=>window[binding].read(),binding):page.locator('#'+control).evaluate(node=>'value'in node?node.value:node.innerText);
   const observed=new Set(),deadline=Date.now()+18000;
-  while(!finished){observed.add((await read()).replace(/\r\n?/g,'\n').replace(/\u2028/g,'\n'));if(Date.now()>deadline){probe.kill();throw Error('Owned prefix probe timeout');}await wait(25);}
+  let interfered=false,protectedText;
+  while(!finished){
+   observed.add((await read()).replace(/\r\n?/g,'\n').replace(/\u2028/g,'\n'));
+   if(interference&&!interfered&&output.includes('operation=4 revision=2 applied=true')){
+    interfered=true;await wait(350);
+    const settled=await read();
+    if(settled!==`${left}第一段。${right}`)throw Error('Interference requires the fully settled first prefix');
+    observed.add(settled);
+    if(suffixCase){
+     await page.evaluate(()=>window.fixtureEditor.appendParagraph());
+    }else if(interference==='right-edit'){
+     if(!right)throw Error('Right edit requires right context');
+     await page.evaluate(position=>window.fixtureEditor.edit(position,position+1,'改'),left.length+4);
+    }else if(interference==='caret-return'){
+     await page.evaluate(()=>window.fixtureEditor.select(0));await wait(150);
+     const moved=await page.evaluate(()=>window.fixtureEditor.inspect());
+     if(moved.selection.from!==1||moved.selection.to!==1)throw Error('Caret did not leave the settled position');
+     await page.evaluate(position=>window.fixtureEditor.select(position),left.length+4);
+    }else{
+     if(interference.startsWith('outside-')&&!left)throw Error('Outside edit requires left context');
+     await page.evaluate(({mode,left})=>{
+      const from=mode.startsWith('outside-')?0:left.length;
+      window.fixtureEditor.edit(from,from+(mode==='delete-prefix'?4:1),mode.endsWith('delete')||mode==='delete-prefix'?'':'改');
+     },{mode:interference,left});
+    }
+    protectedText=await read();
+    const expectedEdit=suffixCase?`${left}第一段。${right}\n`:interference==='right-edit'?`${left}第一段。改${right.slice(1)}`:interference==='delete-prefix'?`${left}${right}`:interference==='replace-prefix'?`${left}改一段。${right}`:interference==='outside-edit'?`改${left.slice(1)}第一段。${right}`:interference==='outside-delete'?`${left.slice(1)}第一段。${right}`:`${left}第一段。${right}`;
+    if(protectedText!==expectedEdit)throw Error('Owned edit did not produce its expected text');
+   }
+   if(Date.now()>deadline){probe.kill();throw Error('Owned prefix probe timeout');}await wait(25);
+  }
   probe=null;writeFileSync(path.join(folder,control+(multiline?'-multiline':'-single')+'.log'),output);
   const actual=(await read()).replace(/\r\n?/g,'\n');
   const line=multiline?'\n':'';
-  const expected=`${left}第一段。${line}第二段。${line}尾部完成🙂${right}`;
-  const liveAsr=observed.has(`${left}ASR 第一段，第二段临时${right}`);
-  const firstPrefix=observed.has(`${left}第一段。${line}第二段临时${right}`);
-  const growingTail=observed.has(`${left}第一段。${line}第二段续写🙂${right}`);
-  const secondPrefix=observed.has(`${left}第一段。${line}第二段。${line}尾部🙂${right}`);
+  const expected=abortTail?`${left}第一段。${right}\n`:`${left}第一段。${line}第二段。${line}尾部完成🙂${right}${suffixCase?'\n':''}`;
+  const liveAsr=observed.has(`${left}ASR 第一段${gap?'':'，第二段临时'}${right}`);
+  const firstPrefix=observed.has(`${left}第一段。${line}${gap?'':'第二段临时'}${right}`);
+  const growingTail=observed.has(`${left}第一段。${line}第二段续写🙂${right}${suffixCase?'\n':''}`);
+  const secondPrefix=observed.has(`${left}第一段。${line}第二段。${line}${gap?'':'尾部🙂'}${right}${suffixCase?'\n':''}`);
   const finalDom=rich?await page.evaluate(binding=>window[binding].inspect(),binding):undefined;
   const screenshot=path.join(folder,control+(multiline?'-multiline':'-single')+'.png');await page.screenshot({path:screenshot});
   const events=rich&&actual!==expected?await page.evaluate(()=>window.ownedPrefixEvents):undefined;
   const focusEvidence=code!==0&&/foreground/.test(output)?await focus({action:'read'}):undefined;
   report.cases.push({control,multiline,code,liveAsr,firstPrefix,growingTail,secondPrefix,actualTextCorrect:actual===expected,screenshot,finalDom,...(focusEvidence?{focusEvidence:{expectedProcess:pid,actualProcess:focusEvidence.foregroundProcess}}:{}),...(actual!==expected?{ownedFixtureActual:actual,ownedFixtureExpected:expected,ownedFixtureSnapshots:[...observed],ownedFixtureEvents:events}:{})});
-  if(code!==0||!liveAsr||!firstPrefix||!growingTail||!secondPrefix||actual!==expected)throw Error('Owned '+control+' actual prefix/tail text assertions failed');
+  if(interference&&!suffixCase){
+   const refused=code!==0&&/operation=5 revision=3 applied=false code=(draftOwnership|edit:(receiptPosition|position|selection|gapPosition))/.test(output);
+   report.cases.at(-1).editProtected=interfered&&refused&&actual===protectedText;
+   if(!report.cases.at(-1).editProtected)throw Error('Owned external edit was not protected');
+  }else if(code!==0||!liveAsr||!firstPrefix||!growingTail||(!abortTail&&!secondPrefix)||actual!==expected||(suffixCase&&!interfered))throw Error('Owned '+control+' actual prefix/tail text assertions failed');
  }
  report.passed=true;
 }catch(error){report.error=String(error);process.exitCode=1;}
