@@ -14,7 +14,7 @@
 .failureText { color: var(--text-inverse); font-size: var(--text-small); padding-left: 30px; }.retry { width: 26px; height: 26px; background: var(--surface-canvas); }
 .srOnly { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); }
 .control[data-motion="static"] .wave i { animation: none; }
-.wave[data-live="true"] i { animation: none; transition: transform 80ms ease-out; }
+.wave[data-live="true"] i { animation:none; transition:none; background:linear-gradient(180deg,#a1ffb4,var(--signal) 55%,#58d875); box-shadow:none; }
 .control[data-motion="static"] .wave[data-live="true"] i { transition: none; }
 .control[data-motion="static"],.control[data-motion="static"] .statusGlyph { transition: opacity var(--duration-reduced); }
 @keyframes sound { to { transform: scaleY(.42); opacity: .65; } }

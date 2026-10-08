@@ -42,3 +42,5 @@
 .loadError { padding: 16px 0; display: flex; align-items: center; gap: 12px; }
 @media (hover: none) { .rowActions { opacity: 1; pointer-events: auto; } }
 @media (prefers-reduced-motion: reduce) { .row,.rowActions { transition: none; } }
+
+.pagination {display:flex;flex:none;align-items:center;justify-content:center;gap:16px;min-height:40px;font-size:var(--text-meta);color:var(--text-secondary);font-variant-numeric:tabular-nums;}

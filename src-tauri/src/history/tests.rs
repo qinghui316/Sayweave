@@ -184,6 +184,7 @@ fn browse(repo: &mut Repository, search: &str, cursor: Option<Cursor>) -> Feed {
         .history_operation(DbOperation::Browse(BrowseQuery {
             search: search.into(),
             cursor,
+            ..Default::default()
         }))
         .unwrap()
     {
@@ -257,7 +258,8 @@ fn summaries_bind_full_versions_and_keep_success_after_failed_retry() {
     assert!(
         repo.history_operation(DbOperation::Browse(BrowseQuery {
             search: "\u{0}".into(),
-            cursor: None
+            cursor: None,
+            ..Default::default()
         }))
         .is_err()
     );
@@ -1041,4 +1043,88 @@ fn migration_journal_refuses_late_writes_and_never_replays() {
         .query_row("SELECT COUNT(*) FROM delivery_attempts", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[test]
+fn bounded_reading_pages_reread_only_requested_summaries_and_share_search_rules() {
+    let root = tempfile::tempdir().unwrap();
+    let mut repo = Repository::open(root.path()).unwrap();
+    for _ in 0..21 {
+        let (_, a, _) = prepare(&mut repo, false);
+        finish(&mut repo, &a, "success", "目标文字");
+    }
+    let query =
+        |repo: &mut Repository, q| match repo.history_operation(DbOperation::Browse(q)).unwrap() {
+            DbOutput::Feed(page) => page,
+            _ => panic!("feed"),
+        };
+    let page = query(
+        &mut repo,
+        BrowseQuery {
+            page_size: Some(20),
+            ..Default::default()
+        },
+    );
+    assert_eq!(page.records.len(), 20);
+    assert_eq!(page.total, 21);
+    assert!(page.next_cursor.is_some());
+    let ids: Vec<_> = page.records.iter().map(|r| r.id.clone()).collect();
+    let original = record(&mut repo, &ids[0]);
+    repo.history_operation(DbOperation::MarkDelete {
+        id: ids[0].clone(),
+        revision: original.revision,
+    })
+    .unwrap();
+    repo.history_operation(DbOperation::DeleteRecord(ids[0].clone()))
+        .unwrap();
+    let reread = query(
+        &mut repo,
+        BrowseQuery {
+            ids: Some(ids.clone()),
+            search: "目标".into(),
+            ..Default::default()
+        },
+    );
+    assert_eq!(reread.records.len(), 19);
+    assert_eq!(reread.total, 20);
+    assert!(reread.next_cursor.is_none());
+    assert!(
+        reread
+            .records
+            .iter()
+            .all(|r| ids.contains(&r.id) && r.preview == "目标文字")
+    );
+    assert_eq!(
+        query(
+            &mut repo,
+            BrowseQuery {
+                ids: Some(ids.clone()),
+                search: "不匹配".into(),
+                ..Default::default()
+            }
+        )
+        .records
+        .len(),
+        0
+    );
+    for q in [
+        BrowseQuery {
+            page_size: Some(0),
+            ..Default::default()
+        },
+        BrowseQuery {
+            page_size: Some(51),
+            ..Default::default()
+        },
+        BrowseQuery {
+            ids: Some(vec![id(); 21]),
+            ..Default::default()
+        },
+        BrowseQuery {
+            ids: Some(vec![ids[1].clone(); 2]),
+            ..Default::default()
+        },
+    ] {
+        assert!(repo.history_operation(DbOperation::Browse(q)).is_err());
+    }
 }

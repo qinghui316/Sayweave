@@ -92,6 +92,12 @@ impl Repository {
                 Ok(DbOutput::Done)
             }
             DbOperation::Browse(q) => {
+                let page_size = q.page_size.unwrap_or(50) as usize;
+                if !(1..=50).contains(&page_size) || q.ids.as_ref().is_some_and(|ids| ids.len()>20 || q.cursor.is_some() || ids.iter().any(|id| uuid::Uuid::parse_str(id).is_err()) || ids.iter().collect::<std::collections::HashSet<_>>().len()!=ids.len()) {
+                    return Err(Error::new("invalid"));
+                }
+                let ids = q.ids.as_ref().map(serde_json::to_string).transpose().map_err(|_| Error::new("invalid"))?;
+
                 if q.search.chars().count() > 256 || q.search.chars().any(char::is_control)
                     || q.cursor.as_ref().is_some_and(|c| c.created_at < 0 || uuid::Uuid::parse_str(&c.id).is_err()) {
                     return Err(Error::new("invalid"));
@@ -108,14 +114,15 @@ impl Repository {
                     (SELECT a.id FROM speech_attempts a WHERE a.record_id=r.id AND (?1='' OR instr(a.search_key,?1)>0)
                      ORDER BY a.created_at DESC,a.id ASC LIMIT 1))
                     FROM speech_records r WHERE {filter} AND (?2 IS NULL OR r.created_at<?2 OR (r.created_at=?2 AND r.id>?3))
-                    ORDER BY r.created_at DESC,r.id ASC LIMIT 51");
-                let rows = tx.prepare(&sql).map_err(db_error)?.query_map(params![search,at,anchor], |r| Ok((
+                    AND (?4 IS NULL OR r.id IN (SELECT value FROM json_each(?4)))
+                    ORDER BY r.created_at DESC,r.id ASC LIMIT ?5");
+                let rows = tx.prepare(&sql).map_err(db_error)?.query_map(params![search,at,anchor,ids,(if q.ids.is_some() {21} else {page_size+1}) as i64], |r| Ok((
                     r.get::<_,String>(0)?, r.get::<_,i64>(1)?, r.get::<_,i64>(2)?, r.get::<_,String>(3)?,
                     r.get::<_,i64>(4)?, r.get::<_,Option<String>>(5)?, r.get::<_,Option<String>>(6)?
                 ))).map_err(db_error)?.collect::<Result<Vec<_>,_>>().map_err(db_error)?;
-                let more = rows.len() > 50;
-                let mut records = Vec::with_capacity(rows.len().min(50));
-                for (id,created_at,duration_ms,status,revision,current,_raw_attempt) in rows.into_iter().take(50) {
+                let more = q.ids.is_none() && rows.len() > page_size;
+                let mut records = Vec::with_capacity(rows.len().min(page_size));
+                for (id,created_at,duration_ms,status,revision,current,_raw_attempt) in rows.into_iter().take(if q.ids.is_some() {20} else {page_size}) {
                     let displayed=tx.query_row("SELECT kind,version,attempt,preview,truncated FROM (SELECT 'processed' AS kind,p.id AS version,a.id AS attempt,substr(p.text,1,240) AS preview,length(p.text)>240 AS truncated,(a.id=coalesce(?3,'')) AS current_rank,a.created_at AS at,0 AS type_rank FROM speech_attempts a JOIN processing_runs p ON p.attempt_id=a.id WHERE a.record_id=?1 AND p.state!='running' AND p.text!='' AND (?2='' OR instr(p.search_key,?2)>0) UNION ALL SELECT 'raw',a.id,a.id,substr(a.text,1,240),length(a.text)>240,(a.id=coalesce(?3,'')),a.created_at,1 FROM speech_attempts a WHERE a.record_id=?1 AND (?2='' OR instr(a.search_key,?2)>0)) ORDER BY current_rank DESC,at DESC,attempt ASC,type_rank ASC LIMIT 1",params![id,search,current],|r|Ok((TextReference {kind:r.get(0)?,id:r.get(1)?,attempt_id:r.get(2)?},r.get::<_,String>(3)?,r.get::<_,bool>(4)?))).optional().map_err(db_error)?;
                     let display_attempt=displayed.as_ref().map(|d|d.0.attempt_id.clone());
                     let display_reference=displayed.as_ref().map(|d|d.0.clone());

@@ -179,3 +179,10 @@ SAYWEAVE_SPEECH operation=transport_connect connection_id=<UUID> stage=tls_webso
 退出继续使用最多5秒协调，包含后台归档所有者；异常终止仍可能丢失尚未落盘的普通检查点，恢复不会重放外部输入。数据库007和输入协议8保持兼容。
 
 本分支的口述协调器管理 Session 身份与结束手势，语音服务管理采集及识别连接，SessionDraft 管理 Turn、累计草稿与编辑交接，Windows 输入模块管理 TSF 范围与提交。原始识别、存档、外部输入和展示结果分别维护，详见 [职责与边界](dictation.md)。组件只在目标线程操作组合范围；录音、密钥及数据库留在主程序。设置、网络与系统输入不占用数据库线程。组件维护与口述共用准入锁，维护期间不能启动新任务。有外部目标的任务在组件就绪及草稿建立后才启动录音；设置与准入共用当前用户状态查询。
+
+
+### Interaction presentation boundaries
+
+Shared selection controls own interaction and transient animation only; feature pages own current values, persistence and rollback. A standalone task-bound meter subscription feeds the waveform leaf without page-level frame updates. Native meter extraction and renderer envelopes are independently testable; microphone, recognition and input lifecycles remain owned by their existing services.
+
+History reading owns a bounded three-page summary cache and lightweight page identity/cursor bookmarks. Browse(pageSize≤50, default50) and reread(ids≤20) share repository summary selection and a transactional count. Reading navigation never loads full attempt bodies; detail and copy retain their existing explicit paths. Background changes reconcile IDs and mark new records without rearranging reading boundaries.

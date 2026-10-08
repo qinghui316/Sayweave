@@ -49,3 +49,35 @@
 .navigationContent { animation: tab-enter 120ms ease; }
 @keyframes tab-enter { from { opacity: 0; } to { opacity: 1; } }
 @media (prefers-reduced-motion: reduce) { .navigationTabs::before,.navigationTabs .tab::before { transition: none !important; } .navigationContent { animation: none !important; } }
+
+/* Shared selection motion: geometry stays fixed; only internal surfaces move. */
+.selectionHighlight { position:absolute; left:0; top:0; pointer-events:none; border-radius:8px; background:var(--surface-sidebar); opacity:0; transition-property:transform,width,height,opacity; transition-timing-function:cubic-bezier(.2,.8,.2,1); z-index:0; }
+.selectContent { position:relative; transform-origin:var(--radix-select-content-transform-origin); isolation:isolate; }
+.selectContent[data-motion="active"][data-state="open"] { animation:select-enter var(--duration-select-enter) cubic-bezier(.2,.8,.2,1); }
+.selectContent[data-motion="active"][data-state="closed"] { animation:select-exit var(--duration-select-exit) ease-in; }
+.selectItem { position:relative; z-index:1; min-height:36px; align-items:center; gap:12px; font-size:var(--text-small); }
+.selectItem[data-highlighted] { background:transparent; }
+.selectionMark { flex:none; width:16px; color:var(--text-primary); }
+.selectChevron { display:flex; transition:transform 180ms ease; }
+.select[data-state="open"] .selectChevron { transform:rotate(180deg); }
+.switchHit { min-height:36px; display:inline-flex; align-items:center; flex:none; }
+.switch { position:relative; overflow:visible; }
+.switch::after { content:''; position:absolute; inset:-4px 0; }
+.switch:disabled { opacity:.48; cursor:not-allowed; }
+.thumb { transition:background 160ms ease; }
+.singleChoice { display:flex; gap:8px; padding:3px; margin:0 -3px 8px; }
+.choice { position:relative; display:inline-grid; place-items:center; min-height:36px; min-width:72px; padding:0 16px; cursor:pointer; }
+.choice input { position:absolute; inset:0; width:100%; height:100%; opacity:0; cursor:inherit; margin:0; }
+.choiceFace { position:absolute; inset:0; border-radius:var(--radius-control); background:var(--surface-canvas); pointer-events:none; }
+.choiceLabel { position:relative; pointer-events:none; font-size:var(--text-small); }
+.choice input:checked + .choiceFace { background:var(--text-primary); }
+.choice input:checked ~ .choiceLabel { color:var(--text-inverse); }
+.choice input:focus-visible + .choiceFace { outline:2px solid var(--text-primary); outline-offset:3px; }
+.choice:has(input:disabled) { opacity:.48; cursor:not-allowed; }
+.tabs:not(.navigationTabs) { gap:8px; }
+.tab { min-height:36px; font-size:var(--text-small); transition:background 160ms ease,color 160ms ease; }
+@keyframes select-enter { from { opacity:0; transform:translateY(-3px); } to { opacity:1; transform:none; } }
+@keyframes select-exit { to { opacity:0; transform:translateY(-2px); } }
+@media (prefers-reduced-motion:reduce) { .selectionHighlight,.selectChevron,.tab,.thumb { transition:none !important; } .selectContent { animation:none !important; } }
+
+.tabs:not(.navigationTabs) .tab {position:relative;background:transparent;} .tabFace {position:absolute;inset:0;pointer-events:none;border-radius:inherit;background:var(--surface-canvas);} .tabFace[data-current="true"] {background:var(--text-primary);} .tabLabel {position:relative;pointer-events:none;}

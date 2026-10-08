@@ -113,6 +113,8 @@ pub(crate) struct Meter {
     pub(crate) task_id: String,
     sequence: u64,
     level: f32,
+    energies: [f32; 15],
+    capture_sequence: u64,
     duration_ms: u64,
 }
 #[derive(Clone)]
@@ -786,6 +788,8 @@ impl SpeechService {
                             task_id: id.clone(),
                             sequence,
                             level: sample.level,
+                            energies: sample.energies,
+                            capture_sequence: sample.capture_sequence,
                             duration_ms: sample.duration_ms,
                         };
                         if handle

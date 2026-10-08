@@ -1,8 +1,9 @@
 import { useId, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type Ref, type CSSProperties } from 'react';
 import { AnimatedIcon } from './AnimatedIcon';
 import { useMotion } from './useMotion';
-import * as SelectPrimitive from '@radix-ui/react-select';
-import * as SwitchPrimitive from '@radix-ui/react-switch';
+import {useChoiceFeedback} from './selection';
+export {Select, Switch, SingleChoice} from './selection';
+
 import * as TabsPrimitive from '@radix-ui/react-tabs';
 import { zh } from '../locales/zh-CN';
 import s from './ui.module.css';
@@ -30,14 +31,9 @@ export function PasswordInput(props: InputHTMLAttributes<HTMLInputElement>) {
   }
   return <div className={s.password}><TextInput {...props} ref={input} type={visible ? 'text' : 'password'} /><IconButton disabled={props.disabled} label={visible ? zh.dev.hidePassword : zh.dev.showPassword} onClick={toggle} aria-pressed={visible}><AnimatedIcon icon={visible ? 'eyeOff' : 'eye'} size={20}/></IconButton></div>;
 }
-export function Select({ value, onValueChange, options, label, id, disabled, ...accessibility }: { value: string; onValueChange: (value: string) => void; options: { value: string; label: string }[]; label: string; id?: string; disabled?: boolean; 'aria-describedby'?: string; 'aria-invalid'?: boolean }) {
-  return <SelectPrimitive.Root value={value} onValueChange={onValueChange} disabled={disabled}><SelectPrimitive.Trigger {...accessibility} className={s.select} aria-label={label} id={id}><SelectPrimitive.Value /><SelectPrimitive.Icon>⌄</SelectPrimitive.Icon></SelectPrimitive.Trigger><SelectPrimitive.Portal><SelectPrimitive.Content className={s.selectContent} position="popper" sideOffset={6}><SelectPrimitive.Viewport>{options.map(o => <SelectPrimitive.Item key={o.value} value={o.value} className={s.selectItem}><SelectPrimitive.ItemText>{o.label}</SelectPrimitive.ItemText><SelectPrimitive.ItemIndicator>✓</SelectPrimitive.ItemIndicator></SelectPrimitive.Item>)}</SelectPrimitive.Viewport></SelectPrimitive.Content></SelectPrimitive.Portal></SelectPrimitive.Root>;
-}
-export function Switch({ checked, onCheckedChange, label, disabled=false }: { checked: boolean; onCheckedChange: (value: boolean) => void; label: string; disabled?:boolean }) {
-  return <SwitchPrimitive.Root disabled={disabled} className={s.switch} checked={checked} onCheckedChange={onCheckedChange} aria-label={label}><SwitchPrimitive.Thumb className={s.thumb} /></SwitchPrimitive.Root>;
-}
 export function Tabs({ value, onValueChange, options, children, label, className, contentClassName, disabled, activationMode = 'automatic', variant = 'control' }: { value: string; onValueChange: (value: string) => void; options: {value: string; label: string}[]; children: ReactNode; label: string; className?: string; contentClassName?: string; disabled?: boolean; activationMode?: 'automatic'|'manual'; variant?: 'control'|'navigation' }) {
-  return <TabsPrimitive.Root className={className} value={value} onValueChange={onValueChange} activationMode={activationMode}><TabsPrimitive.List className={`${s.tabs} ${variant === 'navigation' ? s.navigationTabs : ''}`} aria-label={label} style={variant==='navigation'?{'--selected-tab':Math.max(0,options.findIndex(o=>o.value===value))} as CSSProperties:undefined}>{options.map(o => <TabsPrimitive.Trigger disabled={disabled} key={o.value} value={o.value} className={s.tab}>{o.label}</TabsPrimitive.Trigger>)}</TabsPrimitive.List><TabsPrimitive.Content className={`${contentClassName ?? ''} ${variant === 'navigation' ? s.navigationContent : ''}`} value={value}>{children}</TabsPrimitive.Content></TabsPrimitive.Root>;
+  const {ref,mark}=useChoiceFeedback(value,disabled);
+  return <TabsPrimitive.Root ref={ref} className={className} value={value} onValueChange={next=>variant==='control'?mark(next,()=>onValueChange(next)):onValueChange(next)} activationMode={activationMode}><TabsPrimitive.List className={`${s.tabs} ${variant === 'navigation' ? s.navigationTabs : ''}`} aria-label={label} style={variant==='navigation'?{'--selected-tab':Math.max(0,options.findIndex(o=>o.value===value))} as CSSProperties:undefined}>{options.map(o => <TabsPrimitive.Trigger disabled={disabled} key={o.value} value={o.value} className={s.tab}>{variant==='control'?<><span className={s.tabFace} data-choice-face="" data-current={value===o.value}/><span className={s.tabLabel}>{o.label}</span></>:o.label}</TabsPrimitive.Trigger>)}</TabsPrimitive.List><TabsPrimitive.Content className={`${contentClassName ?? ''} ${variant === 'navigation' ? s.navigationContent : ''}`} value={value}>{children}</TabsPrimitive.Content></TabsPrimitive.Root>;
 }
 export function InlineMessage({ children, status = 'info' }: { children: ReactNode; status?: 'info'|'error'|'success' }) {
   return <p className={s.message} role={status === 'error' ? 'alert' : 'status'}><span aria-hidden="true" className={status === 'success' ? s.confirm : ''}>{status === 'error' ? '!' : status === 'success' ? '✓' : 'i'}</span>{children}</p>;

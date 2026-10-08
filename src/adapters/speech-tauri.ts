@@ -24,7 +24,8 @@ class TauriHistory implements HistoryPort {
  readonly mode='native' as const;
  async status(retry=false){const s=await call('history_status',{retry});if(typeof s!=='object'||s===null||!('state'in s)||typeof s.state!=='string')throw speechError({code:'protocol'});return {state:s.state};}
  async list(search:string,page:number){return parseHistory(await call('history_list',{query:{search,page}}));}
- async browse(search:string,cursor:HistoryCursor|null=null){return parseFeed(await call('history_browse',{query:{search,cursor}}));}
+ async browse(search:string,cursor:HistoryCursor|null=null,pageSize=50){return parseFeed(await call('history_browse',{query:{search,cursor,pageSize}}));}
+ async reread(search:string,ids:string[]){return parseFeed(await call('history_browse',{query:{search,ids}}));}
  async detail(id:string){return parseRecord(await call('history_detail',{id}));}
  async delivery(id:string){return parseDeliveryReports(await call('history_delivery',{id}));}
  async usage(){return parseUsage(await call('history_usage'));}

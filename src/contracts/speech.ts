@@ -7,7 +7,9 @@ export interface SpeechSegment {id:number;sequence:number;text:string;confirmed:
 export type SpeechSource='trial'|'external'|'history';
 export interface SpeechSnapshot {protocol:1;sequence:number;lifecycle:number;taskId:string|null;source:SpeechSource|null;attemptId:string|null;recordId:string|null;phase:Phase;text:string;segments:SpeechSegment[];modelName:string|null;deviceName:string|null;durationMs:number;error:SpeechErrorCode|null;saveError:boolean;saved:boolean;retry:boolean;canRetry:boolean}
 export interface SpeechArchive {taskId:string;saved:boolean;saveError:boolean}
-export interface SpeechMeter {taskId:string;sequence:number;level:number;durationMs:number}
+export interface SpeechMeter {taskId:string;sequence:number;level:number;energies:number[];captureSequence:number;durationMs:number}
+export type SpeechMeterFrame=SpeechMeter & {receivedAt:number};
+export interface SpeechMeterSource {subscribe:(listener:()=>void)=>()=>void;getSnapshot:()=>SpeechMeterFrame|null}
 export interface Microphone {id:string;name:string;isDefault:boolean}
 export interface RecordingPreferences {deviceId:string|null;historyEnabled:boolean;audioEnabled:boolean;retentionDays:7|30|90|null;revision:number}
 export interface SpeechPort {
@@ -26,7 +28,7 @@ export function parseSpeech(v:unknown):SpeechSnapshot {
  for(const raw of s.segments){const p=object(raw);if(!count(p.id)||!count(p.sequence)||typeof p.text!=='string'||typeof p.confirmed!=='boolean'||!(p.beginMs===null||count(p.beginMs))||!(p.endMs===null||count(p.endMs)))throw new SpeechError('protocol');}
  if(s.error!==null&&!speechErrorCodes.includes(s.error as SpeechErrorCode))throw new SpeechError('protocol');return s as unknown as SpeechSnapshot;
 }
-export function parseMeter(v:unknown):SpeechMeter{const s=object(v);if(typeof s.taskId!=='string'||!count(s.sequence)||typeof s.level!=='number'||!Number.isFinite(s.level)||s.level<0||!count(s.durationMs))throw new SpeechError('protocol');return s as unknown as SpeechMeter;}
+export function parseMeter(v:unknown):SpeechMeter{const s=object(v);if(typeof s.taskId!=='string'||!count(s.sequence)||typeof s.level!=='number'||!Number.isFinite(s.level)||s.level<0||s.level>1||!count(s.captureSequence)||!Array.isArray(s.energies)||s.energies.length!==15||!s.energies.every(v=>typeof v==='number'&&Number.isFinite(v)&&v>=0&&v<=1)||!count(s.durationMs))throw new SpeechError('protocol');return s as unknown as SpeechMeter;}
 export function parsePreferences(v:unknown):RecordingPreferences{const p=object(v);if(!nullableText(p.deviceId)||typeof p.historyEnabled!=='boolean'||typeof p.audioEnabled!=='boolean'||!(p.retentionDays===null||typeof p.retentionDays==='number'&&[7,30,90].includes(p.retentionDays))||!count(p.revision)||p.revision===0)throw new SpeechError('protocol');return p as unknown as RecordingPreferences;}
 export function parseDevices(v:unknown):Microphone[]{if(!Array.isArray(v))throw new SpeechError('protocol');return v.map(raw=>{const d=object(raw);if(typeof d.id!=='string'||typeof d.name!=='string'||typeof d.isDefault!=='boolean')throw new SpeechError('protocol');return d as unknown as Microphone;});}
 

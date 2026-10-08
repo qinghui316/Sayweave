@@ -37,11 +37,13 @@ pub struct Cursor {
     pub created_at: i64,
     pub id: String,
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BrowseQuery {
     pub search: String,
     pub cursor: Option<Cursor>,
+    pub page_size: Option<u32>,
+    pub ids: Option<Vec<String>>,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

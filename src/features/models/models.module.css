@@ -30,3 +30,4 @@
 .modelOptions>button { justify-content:space-between; text-align:left; overflow-wrap:anywhere; flex-shrink:0; }
 
 .modelDialog { width:min(520px,calc(100vw - 48px)); height:auto; max-height:calc(100vh - 48px); padding:56px 24px 24px; z-index:61; }
+.modelOptions { position:relative; isolation:isolate; } .modelOptions > button { position:relative; z-index:1; background:transparent; }

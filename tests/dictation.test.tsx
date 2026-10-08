@@ -67,7 +67,7 @@ describe('shortcut settings',()=>{
   await user.click(screen.getByRole('button',{name:'更改快捷键'}));
   fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});
   await waitFor(()=>expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('Ctrl + D'));
-  await user.click(screen.getByRole('tab',{name:'按住'}));
+  await user.click(screen.getByRole('radio',{name:'按住'}));
   await user.click(screen.getByRole('button',{name:'保存快捷键'}));
   await screen.findByText('已启用：Ctrl + D');
   expect((await port.status()).saved).toEqual({binding:'Control+KeyD',mode:'hold',revision:2});
@@ -78,10 +78,10 @@ describe('shortcut settings',()=>{
   let guard:((action:()=>void)=>void)|null=null;const closed=vi.fn(),user=userEvent.setup();
   render(<ShortcutSettings port={port} onGuardChange={g=>{guard=g;}}/>);
   await screen.findByText('已启用：右 Alt');
-  await user.click(screen.getByRole('tab',{name:'按住'}));
+  await user.click(screen.getByRole('radio',{name:'按住'}));
   await user.click(screen.getByRole('button',{name:'保存快捷键'}));
   await screen.findByText('此快捷键已被占用，请换一个。');
-  expect(screen.getByRole('tab',{name:'按住'})).toHaveAttribute('aria-selected','true');
+  expect(screen.getByRole('radio',{name:'按住'})).toBeChecked();
   fireEvent.click(screen.getByRole('button',{name:'更改快捷键'}));
   await waitFor(()=>expect(guard).not.toBeNull());
   guard!(closed);await screen.findByRole('alertdialog',{name:'快捷键尚未保存'});

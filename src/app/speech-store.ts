@@ -1,8 +1,13 @@
-import {initialSpeech,type SpeechPort,type SpeechSnapshot,type SpeechMeter,type SpeechArchive} from '../contracts/speech';
+import {initialSpeech,type SpeechPort,type SpeechSnapshot,type SpeechMeter,type SpeechArchive,type SpeechMeterSource,type SpeechMeterFrame} from '../contracts/speech';
 export class SpeechStore {
  private value=initialSpeech();private level=0;private meterSequence=0;private display={snapshot:this.value,level:0};private listeners=new Set<()=>void>();
  private trialDisplay={snapshot:initialSpeech(),level:0};private trialMeterSequence=0;private trialListeners=new Set<()=>void>();
  private archiveFailure:SpeechArchive|null=null;private archiveListeners=new Set<()=>void>();
+ private meterValue:SpeechMeterFrame|null=null;private meterListeners=new Set<()=>void>();
+ private trialMeterValue:SpeechMeterFrame|null=null;private trialMeterListeners=new Set<()=>void>();
+ readonly liveMeter:SpeechMeterSource={getSnapshot:()=>this.meterValue,subscribe:fn=>{this.meterListeners.add(fn);return()=>{this.meterListeners.delete(fn);};}};
+ readonly trialMeter:SpeechMeterSource={getSnapshot:()=>this.trialMeterValue,subscribe:fn=>{this.trialMeterListeners.add(fn);return()=>{this.trialMeterListeners.delete(fn);};}};
+ private clearMeter(){this.meterValue=null;this.trialMeterValue=null;for(const fn of this.meterListeners)fn();for(const fn of this.trialMeterListeners)fn();}
  constructor(readonly port:SpeechPort){}
  subscribe=(fn:()=>void)=>{this.listeners.add(fn);return()=>{this.listeners.delete(fn);};};
  getSnapshot=()=>this.display;
@@ -15,7 +20,7 @@ export class SpeechStore {
  private emitTrial(){for(const fn of this.trialListeners)fn();}
  accept=(s:SpeechSnapshot)=>{
   const globalNew=s.sequence>this.value.sequence;
-  if(globalNew){if(s.taskId!==this.value.taskId){this.meterSequence=0;this.level=0;}this.value=s;if(s.phase!=='recording')this.level=0;}
+  if(globalNew){if(s.taskId!==this.value.taskId){this.meterSequence=0;this.level=0;this.clearMeter();}this.value=s;if(s.phase!=='recording'){this.level=0;this.clearMeter();}}
   let trialNew=false;
   if(s.source==='trial'&&s.sequence>this.trialDisplay.snapshot.sequence){
    const sameTask=s.taskId===this.trialDisplay.snapshot.taskId;if(!sameTask)this.trialMeterSequence=0;
@@ -30,14 +35,22 @@ export class SpeechStore {
   if(result.taskId===this.trialDisplay.snapshot.taskId){this.trialDisplay={...this.trialDisplay,snapshot:{...this.trialDisplay.snapshot,saved:result.saved,saveError:result.saveError}};this.emitTrial();}
  };
  meter=(m:SpeechMeter)=>{
-  if(m.taskId!==this.value.taskId||m.sequence<=this.meterSequence)return;
-  this.meterSequence=m.sequence;this.level=this.value.phase==='recording'?Math.min(m.level,1):0;
-  this.value={...this.value,durationMs:Math.max(this.value.durationMs,m.durationMs)};
+  if(m.taskId!==this.value.taskId||m.sequence<=this.meterSequence||this.value.phase!=='recording')return;
+  this.meterSequence=m.sequence;
+  if(this.meterValue&&m.captureSequence<=this.meterValue.captureSequence)return;
+  this.meterValue={...m,receivedAt:performance.now()};this.level=Math.min(m.level,1);
+  for(const fn of this.meterListeners)fn();
+  const durationMs=Math.max(this.value.durationMs,m.durationMs);
+  const secondChanged=Math.floor(durationMs/1000)!==Math.floor(this.value.durationMs/1000);
+  this.value={...this.value,durationMs};
   if(m.taskId===this.trialDisplay.snapshot.taskId&&m.sequence>this.trialMeterSequence){
-   this.trialMeterSequence=m.sequence;const snapshot=this.trialDisplay.snapshot;
-   this.trialDisplay={snapshot:{...snapshot,durationMs:Math.max(snapshot.durationMs,m.durationMs)},level:snapshot.phase==='recording'?this.level:0};
+   this.trialMeterSequence=m.sequence;this.trialMeterValue=this.meterValue;
+   for(const fn of this.trialMeterListeners)fn();
+   const snapshot=this.trialDisplay.snapshot;
+   this.trialDisplay={snapshot:{...snapshot,durationMs:Math.max(snapshot.durationMs,m.durationMs)},level:this.level};
+   if(secondChanged)this.emitTrial();
   }
-  this.emit();if(m.taskId===this.trialDisplay.snapshot.taskId)this.emitTrial();
+  if(secondChanged)this.emit();
  };
  async connect(){const release=await this.port.subscribe(s=>this.accept(s),m=>this.meter(m),this.archived);try{this.accept(await this.port.snapshot());return release;}catch(e){release();throw e;}}
  async resync(){this.accept(await this.port.snapshot());}

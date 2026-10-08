@@ -1,5 +1,5 @@
 import {useCallback,useEffect,useRef,useState} from 'react';
-import {Button,Dialog,Field,InlineMessage,Switch} from '../../ui';
+import {Button,Dialog,Field,InlineMessage,Switch,Select} from '../../ui';
 import {speechError,type RecordingPreferences,type SpeechPort} from '../../contracts/speech';
 import {speechMessages} from '../../locales/speech';
 import s from './history.module.css';
@@ -19,9 +19,9 @@ export function SaveSettings({speech,onGuardChange}:{speech:SpeechPort;onGuardCh
   if(alive.current){setSaved(value);setDraft(value);setNotice('已保存，下一次录音生效。');}
  }catch(e){if(alive.current)setError(speechMessages[speechError(e).code]);}finally{working.current=false;if(alive.current)setBusy(false);}}
  return <div className={s.preferences}>
-  {draft&&<><div className={s.preferenceRow}><div><strong>保存历史</strong><p className={s.meta}>识别文字保存在这台设备上。</p></div><Switch disabled={busy} label="保存历史" checked={draft.historyEnabled} onCheckedChange={v=>{setDraft({...draft,historyEnabled:v});setNotice('');}}/></div>
-  <div className={s.preferenceRow}><div><strong>保留录音</strong><p className={s.meta}>用于回放和重新识别。</p></div><label><input type="checkbox" aria-label="保留录音" disabled={busy||!draft.historyEnabled} checked={draft.audioEnabled} onChange={e=>{setDraft({...draft,audioEnabled:e.target.checked});setNotice('');}}/></label></div>
-  <Field label="录音保留时间">{p=><select {...p} disabled={busy||!draft.historyEnabled||!draft.audioEnabled} value={draft.retentionDays??'forever'} onChange={e=>{setDraft({...draft,retentionDays:e.target.value==='forever'?null:Number(e.target.value) as 7|30|90});setNotice('');}}><option value="7">7 天</option><option value="30">30 天</option><option value="90">90 天</option><option value="forever">永久</option></select>}</Field>
+  {draft&&<><div className={s.preferenceRow}><div><strong><label htmlFor="save-history">保存历史</label></strong><p className={s.meta}>识别文字保存在这台设备上。</p></div><Switch id="save-history" disabled={busy} label="保存历史" checked={draft.historyEnabled} onCheckedChange={v=>{setDraft({...draft,historyEnabled:v});setNotice('');}}/></div>
+  <div className={s.preferenceRow}><div><strong><label htmlFor="save-audio">保留录音</label></strong><p className={s.meta}>用于回放和重新识别。</p></div><Switch id="save-audio" label="保留录音" disabled={busy||!draft.historyEnabled} checked={draft.audioEnabled} onCheckedChange={value=>{setDraft({...draft,audioEnabled:value});setNotice('');}}/></div>
+  <Field label="录音保留时间">{p=><Select {...p} label="录音保留时间" disabled={busy||!draft.historyEnabled||!draft.audioEnabled} value={String(draft.retentionDays??'forever')} onValueChange={value=>{setDraft({...draft,retentionDays:value==='forever'?null:Number(value) as 7|30|90});setNotice('');}} options={[{value:'7',label:'7 天'},{value:'30',label:'30 天'},{value:'90',label:'90 天'},{value:'forever',label:'永久'}]}/>}</Field>
   <p className={s.meta}>录音到期后，文字仍会保留。使用云端识别时，录音会发送给所选服务。</p><div className={s.actions}><Button variant="primary" disabled={!dirty} loading={busy} onClick={()=>void save()}>保存设置</Button>{dirty&&<span className={s.meta}>有未保存的修改</span>}</div></>}
   {error&&<InlineMessage status="error">{error}</InlineMessage>}{!draft&&error&&<Button loading={busy} onClick={()=>void retryLoad()}>重试读取设置</Button>}{notice&&<InlineMessage status="success">{notice}</InlineMessage>}
   <Dialog confirmation open={leaving} onOpenChange={v=>{if(!v){setLeaving(false);pending.current=null;}}} title="有未保存的修改" description="要保留这次填写吗？"><div className={s.actions}><Button variant="primary" onClick={()=>{setLeaving(false);pending.current=null;}}>继续填写</Button><Button onClick={()=>{setDraft(saved);setLeaving(false);const action=pending.current;pending.current=null;action?.();}}>放弃修改</Button></div></Dialog>

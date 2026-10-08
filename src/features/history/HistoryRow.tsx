@@ -1,5 +1,5 @@
 import {memo,useEffect,useRef,useState} from 'react';
-import {ActionIcon,ActionMenu,Button,CopyFeedbackButton,Field,IconButton,InlineMessage} from '../../ui';
+import {ActionIcon,ActionMenu,Button,CopyFeedbackButton,Field,Select,IconButton,InlineMessage} from '../../ui';
 import {SpeechError,speechError,type SpeechPort,type SpeechSnapshot} from '../../contracts/speech';
 import {inputMessage} from '../../contracts/dictation';
 import {historySelection,historyVersion,type DeliveryReport,type HistoryPort,type HistoryRecord,type HistorySummary,type PlaybackState} from '../../contracts/history';
@@ -64,7 +64,7 @@ export const HistoryRow=memo(function HistoryRow({deliveryRevision='',summary:r,
   {expanded&&<div className={s.detail}>
    <div className={s.detailHeading}><span className={s.meta}>{new Date(r.createdAt).toLocaleString('zh-CN')} · {duration(r.durationMs)}</span><IconButton label="收起记录" disabled={busy} onClick={collapse}><ActionIcon name="close"/></IconButton></div>
    {loading?<p role="status" className={s.meta}>正在读取…</p>:record&&<>
-    {record.attempts.length+(record.processing?.filter(p=>p.state!=='running').length??0)>1&&<Field label="识别版本">{props=><select {...props} disabled={busy} value={version} onChange={e=>setVersion(e.target.value)}>{record.processing?.filter(p=>p.state!=='running').map(p=><option key={'processed:'+p.id} value={'processed:'+p.id}>整理结果 · {p.configName}{p.state==='partial'?' · 部分保留原文':''}</option>)}{record.attempts.map(a=><option key={a.id} value={a.id}>{new Date(a.createdAt).toLocaleString('zh-CN')} · {a.kind==='retry'?'重识别':'首次识别'} · {states[a.status]??a.status}{a.id===record.currentAttempt?' · 当前':''} · 原文</option>)}</select>}</Field>}
+    {record.attempts.length+(record.processing?.filter(p=>p.state!=='running').length??0)>1&&<Field label="识别版本">{props=><Select {...props} label="识别版本" disabled={busy} value={version} onValueChange={setVersion} options={[...(record.processing?.filter(p=>p.state!=='running').map(p=>({value:'processed:'+p.id,label:`整理结果 · ${p.configName}${p.state==='partial'?' · 部分保留原文':''}`}))??[]),...record.attempts.map(a=>({value:a.id,label:`${new Date(a.createdAt).toLocaleString('zh-CN')} · ${a.kind==='retry'?'重识别':'首次识别'} · ${states[a.status]??a.status}${a.id===record.currentAttempt?' · 当前':''} · 原文`}))]}/>}</Field>}
     <div className={s.fullText} role="region" aria-label="历史识别文字" tabIndex={0}>{fullText||message(attempt?.errorCode??null)||'未识别到文字'}</div>
     <div className={s.versionMeta}><span>{processed?.configName??attempt?.configName} · {processed?.modelId??attempt?.modelId}</span><CopyFeedbackButton key={version} compact disabled={!fullText||busy} onCopy={()=>copy(version||null,true)}/></div>
     {delivery&&<p role="status" className={s.meta}>{delivery.state==='confirmed'?'已填入':delivery.state==='unconfirmed'?'请确认输入结果':delivery.state==='copy'?'待复制':'填入未完成'}{delivery.error?' · '+inputMessage(delivery.error):''}</p>}

@@ -249,30 +249,42 @@ impl TurnConverter {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalMeter {
     pub level: f32,
+    pub energies: [f32; 15],
+    pub capture_sequence: u64,
     pub duration_ms: u64,
 }
+// Fixed 50ms windows at the existing 16kHz capture rate. These are temporal
+// energies, not frequency energies. Packet boundaries do not change the features.
 #[derive(Default)]
 struct MeterWindow {
-    energy: f64,
+    energy: [f64; 15],
+    counts: [usize; 15],
     samples: usize,
+    frames: u64,
 }
 impl MeterWindow {
-    fn push(&mut self, pcm: &[i16]) {
-        self.energy += pcm
-            .iter()
-            .map(|s| (*s as f64 / 32768.0).powi(2))
-            .sum::<f64>();
-        self.samples += pcm.len();
-    }
-    fn take(&mut self) -> f32 {
-        let level = if self.samples == 0 {
-            0.0
-        } else {
-            (self.energy / self.samples as f64).sqrt() as f32
-        };
-        self.energy = 0.0;
-        self.samples = 0;
-        level
+    fn push(&mut self, pcm: &[i16], mut publish: impl FnMut(LocalMeter)) {
+        for sample in pcm {
+            let bin = self.samples * 15 / 800;
+            self.energy[bin] += (*sample as f64 / 32768.0).powi(2);
+            self.counts[bin] += 1;
+            self.samples += 1;
+            if self.samples == 800 {
+                self.frames += 1;
+                let level = (self.energy.iter().sum::<f64>() / 800.0).sqrt() as f32;
+                let energies =
+                    std::array::from_fn(|i| (self.energy[i] / self.counts[i] as f64).sqrt() as f32);
+                publish(LocalMeter {
+                    level,
+                    energies,
+                    capture_sequence: self.frames,
+                    duration_ms: self.frames * 50,
+                });
+                self.samples = 0;
+                self.energy.fill(0.0);
+                self.counts.fill(0);
+            }
+        }
     }
 }
 pub fn publish_meter(
@@ -509,18 +521,13 @@ impl Capture {
                     let mut peak = 0;
                     let mut error = None;
                     let mut meter_window=MeterWindow::default();
-                    let mut meter_at=Instant::now();
                     let mut accept = |chunk: Vec<i16>| {
                         if chunk.is_empty() {
                             return;
                         }
                         if let Some(w) = &writer { w.push(&chunk); }
-                        meter_window.push(&chunk);
+                        meter_window.push(&chunk, |sample| { meter_tx.send_replace(sample); });
                         pcm.extend_from_slice(&chunk);
-                        if meter_at.elapsed()>=Duration::from_millis(50) {
-                            meter_tx.send_replace(LocalMeter{level:meter_window.take(),duration_ms:pcm.len() as u64/16});
-                            meter_at=Instant::now();
-                        }
                         if route.is_none() && sender
                             .try_send(Packet {
                                 pcm: chunk,
@@ -780,19 +787,40 @@ mod tests {
         assert_eq!(recording.len(), (old.len() + backlog.len()) / 3);
     }
     #[test]
-    fn meter_aggregates_samples_without_turning_an_empty_packet_into_silence() {
-        let mut window = MeterWindow::default();
-        window.push(&[16384; 800]);
-        window.push(&[]);
-        window.push(&[0; 800]);
-        assert!((window.take() - (0.125f32).sqrt()).abs() < 0.0001);
-        assert_eq!(window.take(), 0.0);
+    fn meter_features_are_packet_independent_and_empty_packets_do_not_advance_frames() {
+        let pcm: Vec<i16> = (0..2400)
+            .map(|i| if i % 400 < 200 { 16384 } else { 0 })
+            .collect();
+        let collect = |size| {
+            let mut window = MeterWindow::default();
+            let mut frames = Vec::new();
+            for chunk in pcm.chunks(size) {
+                window.push(chunk, |m| frames.push(m));
+                window.push(&[], |_| panic!("empty packet emitted a frame"));
+            }
+            frames
+        };
+        let expected = collect(2400);
+        assert_eq!(expected.len(), 3);
+        for size in [1, 53, 511, 800, 1024] {
+            let actual = collect(size);
+            for (a, b) in actual.iter().zip(&expected) {
+                assert_eq!(a.energies, b.energies);
+                assert_eq!(a.level, b.level);
+                assert_eq!(a.capture_sequence, b.capture_sequence);
+                assert_eq!(a.duration_ms, b.duration_ms);
+            }
+        }
+        assert_eq!(expected[0].energies[0], 0.5);
+        assert_eq!(expected[0].energies[4], 0.0);
     }
     #[tokio::test]
     async fn local_meter_keeps_publishing_during_network_backpressure_and_stops_on_finish() {
         let (tx, rx) = watch::channel(LocalMeter {
             level: 0.2,
             duration_ms: 50,
+            capture_sequence: 1,
+            ..Default::default()
         });
         let (control, signal) = watch::channel(0);
         let (seen, mut samples) = mpsc::unbounded_channel();
@@ -807,6 +835,8 @@ mod tests {
         tx.send_replace(LocalMeter {
             level: 0.8,
             duration_ms: 100,
+            capture_sequence: 2,
+            ..Default::default()
         });
         let next = tokio::time::timeout(Duration::from_millis(150), samples.recv())
             .await
@@ -834,5 +864,44 @@ mod tests {
         assert!(stop.load(Ordering::Acquire));
         assert!(!blocked.is_finished());
         blocked.abort();
+    }
+    #[tokio::test]
+    #[ignore = "Requires explicit local microphone acceptance; no file or network output"]
+    async fn real_microphone_meter_acceptance() {
+        let (control, signal) = watch::channel(0);
+        let mut capture = Capture::start(None, None, signal, None).await.unwrap();
+        let mut previous = 0;
+        let mut frames = 0;
+        let mut peak = 0.0f32;
+        let mut varied = 0;
+        let deadline = tokio::time::sleep(Duration::from_secs(6));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _=&mut deadline=>break,
+                packet=capture.packets.recv()=>{assert!(packet.is_some());},
+                changed=capture.meter.changed()=>{
+                    changed.unwrap();let value=*capture.meter.borrow_and_update();
+                    assert!(value.capture_sequence>previous);previous=value.capture_sequence;
+                    assert!(value.energies.iter().all(|v|v.is_finite()&&*v>=0.0&&*v<=1.0));
+                    peak=peak.max(value.level);frames+=1;
+                    if value.energies.windows(2).any(|w|(w[0]-w[1]).abs()>0.00001){varied+=1;}
+                }
+            }
+        }
+        control.send(1).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), &mut capture.done)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.error.is_none(), "capture error: {:?}", result.error);
+        assert!(frames >= 40);
+        assert!(result.pcm.len() >= 16000);
+        println!(
+            "REAL_METER_PASS frames={frames} independent_frames={varied} peak_rms={peak:.6} duration_ms={}",
+            previous * 50
+        );
+        drop(result);
+        drop(capture);
     }
 }

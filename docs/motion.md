@@ -57,3 +57,14 @@
 验证方法见 [测试说明](testing.md)。真实音量、跨应用输入、模型业务页、连续材质光效和其他显示器/缩放尚未完整实现或验证。
 
 外壳的有限状态width/height过渡保留280ms，以免图标和点击区域随整体缩放变形；循环波形只改变transform/opacity。尺寸转换仍有布局成本，需要实机测量；隐藏与减少动态停止过渡。
+
+
+## Shared selection and live meter revision
+
+Selection behavior stays in Radix Select/Switch and native radio inputs. Controlled page values own state; user callbacks run immediately. Menu highlighting follows the measured option rectangle, independently of the selected checkmark. Open/close is 180/120ms and highlight travel is 200ms. Radio and control-tab surfaces use a 220ms, at-most-6% local spring; labels remain still. The 48×28 switch has a 36px hit area and a 200ms, at-most-12% thumb stretch. Initial values, external restoration and rejected changes synchronize without replaying user feedback. Reduced motion removes deformation. Model search keeps its dialog and shares the measured row highlight.
+
+Capture computes total RMS and 15 temporal RMS values per fixed 800-sample window at 16kHz. These are time slices, not frequency bands. Device callbacks are unchanged; the capture consumer owns calculation. The existing publisher runs at most20Hz and carries a capture sequence distinct from publication sequence. Empty/duplicate frames cannot refresh capture freshness. No PCM crosses the renderer contract.
+
+SpeechStore exposes separate task-bound meter sources. High-frequency meter notifications do not notify page subscribers; visible elapsed seconds update at1Hz. Home retains its trial projection. MeterWave owns one requestAnimationFrame loop, bounded gain, soft compression and 50ms attack/180ms release. Bars use transform and opacity; no per-frame React setState. Fresh silence breathes at1.8s with a2–3px floor. After250ms without an advancing capture frame, sound decays; after1s, breathing stops. Each task owns its envelope, hidden/offscreen/unmounted views cancel their loops, and reduced motion keeps real amplitude while removing decorative breathing. Green uses the existing#75FB91 with a static related gradient. Compact overlay remains136×34 with bars no taller than24px.
+
+Reference mechanisms: React Bits Glide Select/Jelly Radio/Squish Switch (visual references); local fixed-version SayIt waveform source (mechanism study only). Implementation is independently written with existing dependencies; no reference source or new animation framework is included.

@@ -5,7 +5,7 @@ export class BrowserSpeech implements SpeechPort {
  value=initialSpeech();settings:RecordingPreferences={deviceId:null,historyEnabled:true,audioEnabled:true,retentionDays:30,revision:1};
  readonly listeners=new Set<(s:SpeechSnapshot)=>void>();readonly meters=new Set<(m:SpeechMeter)=>void>();readonly records:HistoryRecord[]=[];
  private timer:ReturnType<typeof setTimeout>|undefined;
- private active=false;
+ private active=false;private meterTimer:ReturnType<typeof setInterval>|undefined;
  async snapshot(){return structuredClone(this.value);}
  async subscribe(s:(v:SpeechSnapshot)=>void,m:(v:SpeechMeter)=>void){this.listeners.add(s);this.meters.add(m);return()=>{this.listeners.delete(s);this.meters.delete(m);};}
  async devices(){return[{id:'browser-simulated',name:'模拟麦克风（不采集声音）',isDefault:true}];}
@@ -15,11 +15,11 @@ export class BrowserSpeech implements SpeechPort {
  async start(){
   if(this.active)throw new SpeechError('busy');clearTimeout(this.timer);this.active=true;
   const prior=this.value;this.value={...initialSpeech(),sequence:prior.sequence+1,lifecycle:prior.lifecycle+1,taskId:crypto.randomUUID(),source:'trial',attemptId:crypto.randomUUID(),recordId:this.settings.historyEnabled?crypto.randomUUID():null,modelName:'模拟语音模型',deviceName:'模拟麦克风',phase:'connecting'};this.emit();
-  this.timer=setTimeout(()=>{this.value.phase='recording';this.value.lifecycle++;this.value.text='这是浏览器模拟文字。';this.value.durationMs=1000;this.emit();},250);return this.snapshot();
+  this.timer=setTimeout(()=>{this.value.phase='recording';this.value.lifecycle++;this.value.text='这是浏览器模拟文字。';this.value.durationMs=1000;this.emit();let frame=0;this.meterTimer=setInterval(()=>{if(this.value.phase!=='recording')return;frame++;const energies=Array.from({length:15},(_,i)=>.04*(1+Math.sin(frame*.28+i*.6)));const meter:SpeechMeter={taskId:this.value.taskId!,sequence:frame,captureSequence:frame,level:energies.reduce((a,b)=>a+b,0)/15,energies,durationMs:1000+frame*50};for(const fn of this.meters)fn(meter);},50);},250);return this.snapshot();
  }
  async control(id:string,action:'finish'|'cancel'){
   if(!this.active||id!==this.value.taskId)throw new SpeechError('staleSession');
-  if(action==='finish'&&this.value.phase!=='recording')throw new SpeechError('invalid');clearTimeout(this.timer);
+  if(action==='finish'&&this.value.phase!=='recording')throw new SpeechError('invalid');clearTimeout(this.timer);clearInterval(this.meterTimer);
   if(action==='cancel'){this.active=false;this.value.phase='cancelled';this.value.text='';this.value.recordId=null;this.value.lifecycle++;this.emit();return;}
   if(this.value.phase!=='recording')throw new SpeechError('invalid');this.value.phase='processing';this.value.lifecycle++;this.emit();
   this.timer=setTimeout(()=>{this.active=false;this.value.phase='completed';this.value.text='这是浏览器模拟文字，未访问麦克风或语音服务。';this.value.lifecycle++;this.value.saved=this.settings.historyEnabled;
@@ -33,11 +33,17 @@ export class BrowserHistory implements HistoryPort {
  readonly mode='simulation' as const;private playbackState:PlaybackState={resourceId:null,playing:false,positionMs:0,durationMs:0};
  constructor(private speech:BrowserSpeech){}
  async status(){return {state:'ready'};}
- async browse(search:string,cursor:HistoryCursor|null=null){
+ async browse(search:string,cursor:HistoryCursor|null=null,pageSize=50){
+  if(!Number.isInteger(pageSize)||pageSize<1||pageSize>50)throw new SpeechError('invalid');
   if([...search].length>256||[...search].some(c=>c.codePointAt(0)!<32||(c.codePointAt(0)!>=127&&c.codePointAt(0)!<=159)))throw new SpeechError('invalid');
   const all=this.speech.records.map(r=>summarizeHistory(r,search)).filter(r=>r!==null).sort((a,b)=>b.createdAt-a.createdAt||(a.id<b.id?-1:1));
   const remaining=all.filter(r=>!cursor||r.createdAt<cursor.createdAt||r.createdAt===cursor.createdAt&&r.id>cursor.id);
-  const records=remaining.slice(0,50);const last=records.at(-1);return {records,total:all.length,nextCursor:remaining.length>50&&last?{createdAt:last.createdAt,id:last.id}:null};
+  const records=remaining.slice(0,pageSize);const last=records.at(-1);return {records,total:all.length,nextCursor:remaining.length>pageSize&&last?{createdAt:last.createdAt,id:last.id}:null};
+ }
+ async reread(search:string,ids:string[]){
+  if(ids.length>20||new Set(ids).size!==ids.length)throw new SpeechError('invalid');
+  const all=this.speech.records.map(r=>summarizeHistory(r,search)).filter(r=>r!==null);
+  return {records:all.filter(r=>ids.includes(r.id)),total:all.length,nextCursor:null};
  }
  async list(search:string,page:number){const records=this.speech.records.filter(r=>historyText(r).toLowerCase().includes(search.trim().toLowerCase()));const actual=Math.max(1,Math.min(page,Math.ceil(records.length/50)||1));return {records:structuredClone(records.slice((actual-1)*50,actual*50)),total:records.length,page:actual,pageSize:50 as const};}
  async detail(id:string){const r=this.speech.records.find(r=>r.id===id);if(!r)throw new SpeechError('notFound');return structuredClone(r);}

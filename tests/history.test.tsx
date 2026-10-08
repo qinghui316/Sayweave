@@ -37,34 +37,41 @@ it('refreshes late delivery confirmation without changing the recognition record
  view.rerender(<MemoryRouter><History port={port} speech={f.speech} models={f.models} snapshot={initialSpeech()} deliveryRevision="confirmed"/></MemoryRouter>);
  expect(await screen.findByText('已填入')).toBeVisible();
 });
-it('loads 1,000 summaries by cursor, survives deletion of an anchor, and retains reading state',async()=>{
- const f=fixture(Array.from({length:1000},(_,n)=>record(n)));const store=new HistoryFeedStore(f.port);
- await store.refresh();expect(store.getSnapshot().records).toHaveLength(50);const cursor=store.getSnapshot().cursor!;
- await f.port.remove(cursor.id,1);store.remove(cursor.id);
- while(store.getSnapshot().cursor)await store.more();
- expect(store.getSnapshot().records).toHaveLength(999);expect(new Set(store.getSnapshot().records.map(r=>r.id)).size).toBe(999);
- store.setScroll(720);store.expand('record-700');await store.refresh();
- expect(store.getScroll()).toBe(720);expect(store.getSnapshot().expandedId).toBe('record-700');expect(store.getSnapshot().cursor).toBeNull();
- f.speech.records.push(record(2000));await store.refresh();expect(store.getSnapshot().newRecords).toBe(true);expect(store.getSnapshot().records.some(r=>r.id==='record-2000')).toBe(false);
+it('keeps 20-item reading boundaries across deletion, new records and cache eviction',async()=>{
+ const f=fixture(Array.from({length:1000},(_,n)=>record(n))),store=new HistoryFeedStore(f.port);
+ const reread=vi.spyOn(f.port,'reread');await store.refresh();expect(store.getSnapshot().records).toHaveLength(20);
+ const first=store.getSnapshot().records.map(r=>r.id),cursor=store.getSnapshot().cursor!;
+ await f.port.remove(cursor.id,1);store.remove(cursor.id);await store.refresh();
+ expect(store.getSnapshot().records).toHaveLength(19);expect(store.getSnapshot().cursor).toEqual(cursor);
+ const seen=new Set(store.getSnapshot().records.map(r=>r.id));
+ while(store.getSnapshot().cursor){await store.next();for(const r of store.getSnapshot().records){expect(seen.has(r.id)).toBe(false);seen.add(r.id);}}
+ expect(seen.size).toBe(999);
+ store.setScroll(720);await store.refresh();expect(store.getScroll()).toBe(720);
+ f.speech.records.push(record(2000));await store.refresh();expect(store.getSnapshot().newRecords).toBe(true);
+ await store.go(0);expect(reread).toHaveBeenCalledWith('',first.filter(id=>id!==cursor.id));
+ expect(store.getSnapshot().records.map(r=>r.id)).toEqual(first.filter(id=>id!==cursor.id));
+ await store.latest();expect(store.getSnapshot().page).toBe(1);expect(store.getSnapshot().records[0]?.id).toBe('record-2000');expect(store.getSnapshot().records).toHaveLength(20);
 });
 it('discards stale searches and a late page containing a deleted row',async()=>{
  const f=fixture([record(1,'旧字'),record(2,'新字')]);const store=new HistoryFeedStore(f.port);const old=deferred<Awaited<ReturnType<BrowserHistory['browse']>>>();
  const browse=vi.spyOn(f.port,'browse').mockReturnValueOnce(old.promise);
- const initial=store.refresh();await Promise.resolve();store.search('新字');await store.refresh();
+ const initial=store.refresh();await waitFor(()=>expect(browse).toHaveBeenCalledOnce());store.search('新字');await store.refresh();
  old.resolve({records:[summarizeHistory(record(1,'旧字'))!],total:1,nextCursor:null});await initial;
  expect(store.getSnapshot().records.map(r=>r.id)).toEqual(['record-2']);
  browse.mockRestore();
  const f2=fixture(Array.from({length:70},(_,n)=>record(n)));const s2=new HistoryFeedStore(f2.port);await s2.refresh();
- const late=deferred<Awaited<ReturnType<BrowserHistory['browse']>>>();vi.spyOn(f2.port,'browse').mockReturnValueOnce(late.promise);const more=s2.more();
+ const late=deferred<Awaited<ReturnType<BrowserHistory['browse']>>>();vi.spyOn(f2.port,'browse').mockReturnValueOnce(late.promise);const more=s2.next();
  s2.remove('record-69');late.resolve({records:[summarizeHistory(record(69))!],total:70,nextCursor:null});await more;
  expect(s2.getSnapshot().records.some(r=>r.id==='record-69')).toBe(false);
 });
-it('does not skip a gap when more than fifty new records arrive at the top',async()=>{
- const f=fixture(Array.from({length:100},(_,n)=>record(n)));const store=new HistoryFeedStore(f.port);await store.refresh();
- f.speech.records.push(...Array.from({length:60},(_,n)=>record(100+n)));await store.refresh();while(store.getSnapshot().cursor)await store.more();
- expect(store.getSnapshot().records).toHaveLength(160);expect(new Set(store.getSnapshot().records.map(r=>r.id)).size).toBe(160);
- const retry=vi.spyOn(f.port,'status');await store.refresh(undefined,true);expect(retry).toHaveBeenLastCalledWith(true);
- expect(summarizeHistory(record(1,'旧文字'),' 旧文字 ')?.preview).toBe('旧文字');
+it('keeps incoming records out of visited pages until explicit refresh',async()=>{
+ const f=fixture(Array.from({length:21},(_,n)=>record(n))),store=new HistoryFeedStore(f.port);await store.refresh();
+ const original=store.getSnapshot().records.map(r=>r.id);f.speech.records.push(...Array.from({length:60},(_,n)=>record(100+n)));
+ await store.refresh();expect(store.getSnapshot().records.map(r=>r.id)).toEqual(original);expect(store.getSnapshot().newRecords).toBe(true);
+ await store.next();expect(store.getSnapshot().records.map(r=>r.id)).toEqual(['record-0']);
+ await f.port.remove('record-0',1);store.remove('record-0');await waitFor(()=>expect(store.getSnapshot().page).toBe(1));
+ expect(store.getSnapshot().records.map(r=>r.id)).toEqual(original);
+ const retry=vi.spyOn(f.port,'status');await store.latest();expect(retry).toHaveBeenLastCalledWith(true);expect(store.getSnapshot().total).toBe(80);
 });
 it('validates bounded summaries and distinguishes a failed retry without losing success',()=>{
  const r=record(1,'当前成功');r.attempts.unshift({...r.attempts[0]!,id:'failed-retry',kind:'retry',createdAt:9000,status:'failed',text:'',errorCode:'timeout'});
@@ -82,7 +89,7 @@ it('copies the full matched old version and opens versions inline with keyboard 
  await waitFor(()=>expect(copy).toHaveBeenCalledWith(full));expect(within(row).getByRole('button',{name:'已复制'})).toBeVisible();
  const user=userEvent.setup();within(row).getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('menuitem',{name:'识别版本'}));
  expect(await screen.findByRole('region',{name:'历史识别文字'})).toHaveTextContent(full);expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
- expect(screen.getByRole('combobox',{name:'识别版本'})).toHaveValue('old');
+ expect(screen.getByRole('combobox',{name:'识别版本'})).toHaveTextContent('首次识别');
 });
 it('keeps a successful body beside a failed retry and deletes only after inline confirmation',async()=>{
  const r=record();r.attempts.unshift({...r.attempts[0]!,id:'retry',kind:'retry',createdAt:9000,status:'failed',text:'',errorCode:'timeout'});const f=fixture([r]);
@@ -105,8 +112,8 @@ it('a delayed full-text read cannot replace a newer copy or write after leaving'
 });
 it('protects unsaved retention and preserves a concurrent microphone selection on save',async()=>{
  const speech=new BrowserSpeech();let guard:DepartureGuard|null=null;render(<SaveSettings speech={speech} onGuardChange={v=>{guard=v;}}/>);
- const select=await screen.findByRole('combobox',{name:'录音保留时间'});fireEvent.change(select,{target:{value:'7'}});
- const leave=vi.fn();act(()=>guard!(leave));expect(leave).not.toHaveBeenCalled();fireEvent.click(screen.getByRole('button',{name:'继续填写'}));expect(select).toHaveValue('7');
+ const select=await screen.findByRole('combobox',{name:'录音保留时间'});const user=userEvent.setup();select.focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('option',{name:'7 天'}));
+ const leave=vi.fn();act(()=>guard!(leave));expect(leave).not.toHaveBeenCalled();fireEvent.click(screen.getByRole('button',{name:'继续填写'}));expect(select).toHaveTextContent('7 天');
  const dirtyGuard=guard;speech.settings={...speech.settings,deviceId:'new-device',revision:2};fireEvent.click(screen.getByRole('button',{name:'保存设置'}));
  await screen.findByText('已保存，下一次录音生效。');expect(speech.settings).toMatchObject({deviceId:'new-device',retentionDays:7,revision:3});
  // onGuardChange is an effect contract; observe its rebind before invoking it.
@@ -116,5 +123,44 @@ it('protects unsaved retention and preserves a concurrent microphone selection o
 it('can retry unavailable save settings without leaving the history page',async()=>{
  const speech=new BrowserSpeech();vi.spyOn(speech,'preferences').mockRejectedValueOnce({code:'unavailable'});
  render(<SaveSettings speech={speech}/>);fireEvent.click(await screen.findByRole('button',{name:'重试读取设置'}));
- expect(await screen.findByRole('combobox',{name:'录音保留时间'})).toHaveValue('30');
+ expect(await screen.findByRole('combobox',{name:'录音保留时间'})).toHaveTextContent('30 天');
+});
+
+it('coalesces a background notification received during navigation and handles empty stores',async()=>{
+ for(const count of [0,1,20,21]){const f=fixture(Array.from({length:count},(_,n)=>record(n))),store=new HistoryFeedStore(f.port);await store.refresh();expect(store.getSnapshot().records).toHaveLength(Math.min(20,count));expect(!!store.getSnapshot().cursor).toBe(count>20);}
+ const f=fixture(Array.from({length:41},(_,n)=>record(n))),store=new HistoryFeedStore(f.port);await store.refresh();
+ const page=await f.port.browse('',store.getSnapshot().cursor,20),wait=deferred<typeof page>();vi.spyOn(f.port,'browse').mockReturnValueOnce(wait.promise);
+ const navigation=store.next();f.speech.records.push(record(100));await store.refresh();wait.resolve(page);await navigation;
+ expect(store.getSnapshot().page).toBe(2);expect(store.getSnapshot().total).toBe(42);expect(store.getSnapshot().newRecords).toBe(true);expect(store.getSnapshot().records.some(r=>r.id==='record-100')).toBe(false);
+});
+it('rereads search membership by identity without filling a shrinking page',async()=>{
+ const f=fixture(Array.from({length:61},(_,n)=>record(n,'匹配'))),store=new HistoryFeedStore(f.port);store.search('匹配');await store.refresh();
+ const ids=store.getSnapshot().records.map(r=>r.id);await store.next();await store.next();await store.next();
+ f.speech.records.find(r=>r.id===ids[0])!.attempts[0]!.text='已修改';await store.refresh();await store.go(0);
+ expect(store.getSnapshot().records.map(r=>r.id)).toEqual(ids.slice(1));expect(store.getSnapshot().total).toBe(60);
+});
+
+it('skips an emptied middle bookmark without refilling or hiding later pages',async()=>{
+ const f=fixture(Array.from({length:60},(_,n)=>record(n))),store=new HistoryFeedStore(f.port);await store.refresh();await store.next();
+ const removed=store.getSnapshot().records.map(r=>r.id);
+ for(const id of removed){await f.port.remove(id,1);store.remove(id);}
+ await store.refresh();await waitFor(()=>expect(store.getSnapshot().page).toBe(1));
+ await store.next();expect(store.getSnapshot().page).toBe(3);expect(store.getSnapshot().records).toHaveLength(20);expect(store.getSnapshot().records[0]?.id).toBe('record-19');
+ await store.previous();expect(store.getSnapshot().page).toBe(1);
+ await store.next();expect(store.getSnapshot().page).toBe(3);
+});
+it('preserves navigation failure and its retry target when a pending update is reconciled',async()=>{
+ const f=fixture(Array.from({length:41},(_,n)=>record(n))),store=new HistoryFeedStore(f.port);await store.refresh();
+ let fail!:(e:unknown)=>void;const delayed=new Promise<never>((_,reject)=>{fail=reject;});vi.spyOn(f.port,'browse').mockReturnValueOnce(delayed);
+ const navigation=store.next();f.speech.records.push(record(100));await store.refresh();fail({code:'unavailable'});await navigation;
+ expect(store.getSnapshot()).toMatchObject({page:1,total:42,newRecords:true,error:'unavailable'});
+ await store.retry();expect(store.getSnapshot().page).toBe(2);expect(store.getSnapshot().error).toBeNull();
+});
+
+it('seeks forward when the first page is emptied and shows empty only after the remaining pages disappear',async()=>{
+ const f=fixture(Array.from({length:21},(_,n)=>record(n))),store=new HistoryFeedStore(f.port);await store.refresh();
+ for(const row of store.getSnapshot().records){await f.port.remove(row.id,1);store.remove(row.id);}
+ await store.refresh();await waitFor(()=>expect(store.getSnapshot().records.map(r=>r.id)).toEqual(['record-0']));
+ expect(store.getSnapshot().page).toBe(2);await f.port.remove('record-0',1);store.remove('record-0');await store.refresh();
+ expect(store.getSnapshot().records).toHaveLength(0);expect(store.getSnapshot().total).toBe(0);expect(store.getSnapshot().cursor).toBeNull();
 });
