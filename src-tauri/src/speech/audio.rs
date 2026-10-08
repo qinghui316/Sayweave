@@ -294,15 +294,22 @@ impl MeterWindow {
                 self.peak = (self.peak + (level - self.peak) * follow).clamp(0.02, 0.5);
                 let gain = 0.7 / self.peak;
                 for (i, rms) in energies.iter().enumerate() {
-                    let contour = 1.0 - 0.15 * ((i as f32 - 7.0) / 7.0).abs();
-                    let target = (rms * gain * 1.5).tanh() * contour;
+                    let target = (rms * gain * 1.5).tanh();
                     let time = if target > self.bars[i] { 13.4 } else { 62.6 };
                     self.bars[i] += (target - self.bars[i]) * (1.0 - (-8.0f32 / time).exp());
                 }
+                // Preserve the shared loudness response while making measured local
+                // differences legible in the small capsule. No synthetic/random energy.
+                let mean = self.bars.iter().sum::<f32>() / 15.0;
+                let bars = std::array::from_fn(|i| {
+                    let detail = (mean + (self.bars[i] - mean) * 1.8).clamp(0.0, 1.0);
+                    let contour = 1.0 - 0.15 * ((i as f32 - 7.0) / 7.0).abs();
+                    detail * contour
+                });
                 publish(LocalMeter {
                     level,
                     energies,
-                    bars: self.bars,
+                    bars,
                     capture_sequence: self.frames,
                     duration_ms: self.frames * 8,
                 });
