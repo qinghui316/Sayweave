@@ -135,6 +135,7 @@ impl RecognitionSession {
         let (audio, mut commands) = mpsc::channel(32);
         let (events_tx, events) = mpsc::channel(32);
         let worker = tokio::spawn(async move {
+            let began = Instant::now();
             let (mut writer, mut reader) = socket.split();
             // Encoding is independent of response state; use a separate encoder for the writer.
             let encoder = match &parser {
@@ -161,6 +162,7 @@ impl RecognitionSession {
                         .map_err(|_| Error::new("timeout"))?
                         .map_err(|_| Error::new("network"));
                     if let Some(ack) = ack {
+                        log::info!(target:"sayweave", "operation=asr_finish_sent task_id={} elapsed_ms={} success={}",task,began.elapsed().as_millis(),sent.is_ok());
                         let result = sent.clone();
                         let _ = ack.send(sent);
                         result?;
@@ -171,6 +173,7 @@ impl RecognitionSession {
                 }
             };
             let read = async {
+                let mut boundary = None;
                 while let Some(message) = reader.next().await {
                     let message = message.map_err(|_| Error::new("network"))?;
                     match message {
@@ -186,6 +189,25 @@ impl RecognitionSession {
                             let event = parser.event(message, &task)?;
                             let explicit = matches!(event, Event::Finished);
                             let finished = explicit || parser.finished();
+                            if let Event::Update(transcript) = &event {
+                                let counts = (
+                                    transcript.segments.len(),
+                                    transcript.segments.iter().filter(|s| s.confirmed).count(),
+                                    finished,
+                                );
+                                if boundary != Some(counts) {
+                                    let basis = if finished {
+                                        "task_final"
+                                    } else {
+                                        match &parser {
+                                            Parser::Qwen(_) => "sentence_end",
+                                            Parser::Doubao(_) => "definite",
+                                        }
+                                    };
+                                    log::info!(target:"sayweave", "operation=asr_boundary task_id={} basis={} segments={} confirmed={} terminal={} elapsed_ms={}", task,basis,counts.0,counts.1,finished,began.elapsed().as_millis());
+                                    boundary = Some(counts);
+                                }
+                            }
                             events_tx
                                 .send(Ok(event))
                                 .await

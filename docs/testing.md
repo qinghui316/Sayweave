@@ -144,3 +144,9 @@ Rust数据测试覆盖Unicode、约束、版本冲突、事务、迁移拒绝、
 `node scripts/test-speech-desktop.mjs --polish` 使用隔离模型、数据库、录音和实际编辑器验证分段整理；报告包含实际目标文字及组件哈希，结束后关闭自有窗口并清理测试凭据。若输入组件源码、协议和已验收产物均未变，可通过构建环境变量 `SAYWEAVE_TSF_PAYLOAD` 指定该已核实DLL，避免一次重建导致无功能变化的组件安装要求；必须记录来源提交与SHA256。未设置时按源码构建。这个变量只影响构建产物，不向前端开放组件路径。
 
 性能记录区分ASR句段确认、请求派发、服务返回、原生应用与保存完成。同一段文字确认状态改变仍须进入调度。真实服务可能直到结束才确认；在未采集相应时序前，只能报告受控接续通过。显式真实文字模型测试只上传固定合成语料、只读原配置和凭据；数据目录为空时拒绝网络请求。模型返回成功、正文可用及实际原生应用分别记录；内容质量通过人工评测判断，单次耗时不作为p95或客户端优化比例。
+
+### Explicit recording-time supplier acceptance
+
+The ignored `speech::doubao::live_segmentation::live_segmentation` test requires `SAYWEAVE_SEGMENTATION_ACCEPTANCE=synthetic-only`, a generated mono16kHz/i16 WAV in `SAYWEAVE_SEGMENTATION_WAV`, and `SAYWEAVE_SEGMENTATION_VARIANT=baseline|window|two-pass`. It reads only the selected daily speech configuration/credential and records raw confirmation counts against mapped counts before/after Finish. The two-pass variant is diagnostic only and is not a product setting. Use the same synthetic waveform for comparison; no microphone or daily recording is read.
+
+The ignored `speech::live_continuation::live_continuation` test requires `SAYWEAVE_LIVE_CONTINUATION=synthetic-only` and the same waveform variable. Build `input-fixture` with desktop-acceptance first. It uses the production RecognitionSession, serial draft actor, selected real text provider and installed TSF component against an owned foreground editor. It samples actual target text, requires at least two visibly changed model prefixes before Finish, and compares the complete final text with the settlement report. Daily settings/history are read-only; temporary storage is isolated. This does not exercise physical shortcuts, microphone capture or Codex rendering. Run explicitly in the same ordinary-user environment as the daily program, separately from aggregate tests; missing credentials are unverified, not a simulated pass.

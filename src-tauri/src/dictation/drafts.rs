@@ -286,6 +286,7 @@ struct State {
     separator: String,
     paused_at: Option<Instant>,
     merge_at: Option<Instant>,
+    dispatch_diagnostic: Option<(u64, &'static str)>,
     last_write: Option<Instant>,
     stopping: bool,
     handoff: bool,
@@ -351,6 +352,7 @@ impl SessionDraft {
                     separator: String::new(),
                     paused_at: None,
                     merge_at: None,
+                    dispatch_diagnostic: None,
                     last_write: None,
                     stopping: false,
                     handoff: false,
@@ -646,6 +648,42 @@ impl SessionDraft {
         }
         s.unit = Some(UnitSlot::Generating(Generating { unit, job }));
         Ok(())
+    }
+    fn trace_dispatch(&self, s: &mut State) {
+        let reason = if s.stop_error.is_some() {
+            "inputStopped"
+        } else if s.handoff {
+            "editingHandoff"
+        } else if self.context.is_none() {
+            "disabled"
+        } else if s.draft.is_none() {
+            "draftNotReady"
+        } else if matches!(s.unit, Some(UnitSlot::Generating(_))) {
+            "generating"
+        } else if matches!(s.unit, Some(UnitSlot::Ready(..))) {
+            "candidateWaiting"
+        } else if s
+            .latest
+            .segments
+            .iter()
+            .skip_while(|v| v.confirmed)
+            .any(|v| v.confirmed)
+        {
+            "confirmationGap"
+        } else if s
+            .merge_at
+            .is_some_and(|at| at.elapsed() < Duration::from_millis(150))
+        {
+            "merging"
+        } else if s.native.is_some() {
+            "nativePending"
+        } else {
+            "awaitingConfirmedSource"
+        };
+        if s.dispatch_diagnostic != Some((s.turn, reason)) {
+            log::info!(target:"sayweave", "operation=processing_dispatch task_id={} turn={} state={} source_sequence={} consumed={} finishing={}",self.task,s.turn,reason,s.latest.sequence,s.consumed,s.ending.is_some());
+            s.dispatch_diagnostic = Some((s.turn, reason));
+        }
     }
     fn prepare_settle(&self, s: &mut State, unit: Unit, result: Generation) -> Result<(), Error> {
         if s.activity != input_state::activity()
@@ -1160,6 +1198,7 @@ impl SessionDraft {
                     crate::contracts::speech::StopReason::Finish,
                 );
             }
+            self.trace_dispatch(&mut s);
             self.project(&s);
         }
     }

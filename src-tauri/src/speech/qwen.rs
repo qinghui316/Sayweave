@@ -121,9 +121,16 @@ pub async fn connect(base: &str, key: &str, model: &str, task: &str) -> Result<S
             .map_err(|_| Error::new("invalid"))?,
     );
     let mut socket = super::transport::connect(base, request).await?;
-    socket.send(Message::Text(json!({"header":{"action":"run-task","task_id":task,"streaming":"duplex"},"payload":{"task_group":"audio","task":"asr","function":"recognition","model":model,"parameters":{"format":"pcm","sample_rate":16000,"heartbeat":true},"input":{}}}).to_string().into())).await.map_err(|_|Error::new("network"))?;
+    socket
+        .send(Message::Text(start_request(model, task).to_string().into()))
+        .await
+        .map_err(|_| Error::new("network"))?;
     Ok(socket)
 }
+fn start_request(model: &str, task: &str) -> Value {
+    json!({"header":{"action":"run-task","task_id":task,"streaming":"duplex"},"payload":{"task_group":"audio","task":"asr","function":"recognition","model":model,"parameters":{"format":"pcm","sample_rate":16000,"heartbeat":true,"semantic_punctuation_enabled":false,"max_sentence_silence":800},"input":{}}})
+}
+
 pub async fn receive(socket: &mut Socket) -> Result<Value, Error> {
     loop {
         match socket.next().await {
@@ -136,6 +143,48 @@ pub async fn receive(socket: &mut Socket) -> Result<Value, Error> {
                 .map_err(|_| Error::new("network"))?,
             Some(Ok(Message::Pong(_))) => {}
             _ => return Err(Error::new("network")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    #[test]
+    fn both_models_use_sentence_vad_without_ending_the_connection() {
+        for model in [
+            "qwen-audio-3.0-asr-flash-streaming",
+            "qwen-audio-3.1-asr-flash-streaming",
+        ] {
+            let request = start_request(model, "task");
+            assert_eq!(request["header"]["action"], "run-task");
+            assert_eq!(
+                request["payload"]["parameters"]["max_sentence_silence"],
+                800
+            );
+            assert_eq!(
+                request["payload"]["parameters"]["semantic_punctuation_enabled"],
+                false
+            );
+            let mut transcript = Transcript::default();
+            for (id, text, confirmed) in [
+                (1, "第一段。", false),
+                (1, "第一段。", true),
+                (2, "尾部", false),
+                (2, "尾部。", true),
+            ] {
+                assert!(matches!(transcript.event(&json!({"header":{"task_id":"task","event":"result-generated"},"payload":{"output":{"sentence":{"sentence_id":id,"text":text,"sentence_end":confirmed}}}}),"task").unwrap(), Event::Segment));
+            }
+            assert_eq!(transcript.text(true), "第一段。尾部。");
+            assert!(matches!(
+                transcript
+                    .event(
+                        &json!({"header":{"task_id":"task","event":"task-finished"}}),
+                        "task"
+                    )
+                    .unwrap(),
+                Event::Finished
+            ));
         }
     }
 }

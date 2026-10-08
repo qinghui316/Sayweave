@@ -10,6 +10,9 @@ use std::io::{Read, Write};
 use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 const LIMIT: usize = 1024 * 1024;
+#[cfg(test)]
+#[path = "live_segmentation.rs"]
+mod live_segmentation;
 const RESOURCES: [&str; 2] = ["volc.seedasr.sauc.duration", "volc.seedasr.sauc.concurrent"];
 
 pub fn endpoint(base: &str) -> Result<String, Error> {
@@ -49,7 +52,7 @@ pub fn audio_frame(bytes: &[u8], last: bool) -> Result<Vec<u8>, Error> {
     encode(0x20, if last { 2 } else { 0 }, false, bytes)
 }
 fn initial_frame() -> Result<Vec<u8>, Error> {
-    encode(0x10, 0, true, json!({"user":{"uid":"sayweave"},"audio":{"format":"pcm","codec":"raw","rate":16000,"bits":16,"channel":1},"request":{"model_name":"bigmodel","enable_itn":true,"enable_punc":true,"show_utterances":true,"result_type":"full"}}).to_string().as_bytes())
+    encode(0x10, 0, true, json!({"user":{"uid":"sayweave"},"audio":{"format":"pcm","codec":"raw","rate":16000,"bits":16,"channel":1},"request":{"model_name":"bigmodel","enable_itn":true,"enable_punc":true,"show_utterances":true,"result_type":"full","end_window_size":800}}).to_string().as_bytes())
 }
 struct Response {
     value: Value,
@@ -384,6 +387,36 @@ pub async fn prepare(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sentence_confirmation_keeps_stream_open_and_same_body_update() {
+        let frame = initial_frame().unwrap();
+        let mut decoder = GzDecoder::new(&frame[8..]);
+        let mut payload = String::new();
+        decoder.read_to_string(&mut payload).unwrap();
+        let request: Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(request["request"]["end_window_size"], 800);
+        assert_eq!(request["request"]["show_utterances"], true);
+        let mut transcript = Transcript::default();
+        for confirmed in [false, true] {
+            let event = transcript
+                .event(Message::Binary(
+                    response(
+                        json!({"result":{"utterances":[{"text":"第一段。","definite":confirmed}]}}),
+                        0,
+                        true,
+                    )
+                    .into(),
+                ))
+                .unwrap();
+            assert!(matches!(event, Event::Update(_)));
+            assert_eq!(transcript.text.segments[0].confirmed, confirmed);
+            assert!(!transcript.finished);
+        }
+        transcript.event(Message::Binary(response(json!({"result":{"utterances":[{"text":"第一段。","definite":true},{"text":"第二段。","definite":true},{"text":"尾部","definite":false}]}}),0,true).into())).unwrap();
+        assert!(!transcript.finished);
+        assert_eq!(transcript.text.confirmed_text, "第一段。第二段。");
+        assert_eq!(transcript.text.text, "第一段。第二段。尾部");
+    }
     fn response(value: Value, flags: u8, compressed: bool) -> Vec<u8> {
         let mut frame = if compressed {
             encode(0x90, flags, true, value.to_string().as_bytes()).unwrap()

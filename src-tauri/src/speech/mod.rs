@@ -2,6 +2,8 @@ pub mod audio;
 pub mod commands;
 pub mod continuous;
 mod doubao;
+#[cfg(all(test, windows))]
+mod live_continuation;
 pub mod qwen;
 mod recognition;
 #[cfg(test)]

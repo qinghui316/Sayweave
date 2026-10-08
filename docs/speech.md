@@ -74,3 +74,9 @@ Connection diagnostics distinguish DNS, TCP, TLS/WebSocket upgrade and overall s
 The main and floating voice controls receive an explicit speech/demo presentation mode. Real sessions use recording and recognition status labels, independently of whether a microphone level is available. Decoder diagnostics contain only stage, stable error, frame type, flags and byte count; they exclude credentials and response content.
 
 首页试说仅显示从首页启动的任务和该任务的重识别结果。语音快照携带 trial、external 或 history 来源；全局语音服务与任务互斥继续共享，首页投影只接收 trial 的状态与音量。外部口述、历史重识别不会覆盖试说文字和反馈，本机用量仍随全部存档更新。试说结果保留到下一次主动试说；页面切换、隐藏恢复不会清空，前端重载期间如全局任务来自外部则试说恢复待机。后续任务替代旧录音后，旧试说仍可复制，重新识别入口停止使用。
+
+## Recording-time sentence boundaries
+
+Qwen-Audio 3.0/3.1 Streaming explicitly selects VAD sentence boundaries (`semantic_punctuation_enabled=false`, `max_sentence_silence=800`) while keeping heartbeat and the duplex session. Doubao sends `end_window_size=800` together with full utterance results. This is sentence endpointing, not a request to end recording or invoke the text model; silence PCM continues through the ordinary audio queue. No two-pass, semantic smoothing or speculative confirmation is enabled by this revision.
+
+`sentence_end` and `definite` make a source segment available to the existing draft scheduler. Task completion remains independent. The existing 150ms merge budget and source-bound model requests apply; model completion settles a prefix with the latest remaining ASR tail. Normal completion drains final recognition and remaining cleanup. Diagnostic boundary and dispatch-state changes contain task/turn identity, counts and timing, never recognized content.
