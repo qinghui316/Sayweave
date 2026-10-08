@@ -45,13 +45,23 @@ pub(crate) struct FinishOutcome {
     /// Acknowledgement of this Commit; prior visible text is independent.
     pub committed: bool,
     pub handed_off: bool,
+    /// Effective abort decision, independent of rollback or lease cleanup errors.
+    pub cancelled: bool,
+    pub rollback_failed: bool,
 }
 impl FinishOutcome {
+    pub(crate) fn record_cleanup(&mut self, failed: bool) {
+        if failed {
+            self.delivery.error = Some("compositionCleanup".into());
+        }
+    }
     fn rejected(code: &str) -> Self {
         Self {
             delivery: Delivery::not_submitted(code),
             committed: false,
             handed_off: false,
+            cancelled: false,
+            rollback_failed: false,
         }
     }
 }
@@ -158,7 +168,7 @@ impl Draft {
                             if turn!=host.turn {let _=reply.send(FinishOutcome::rejected("staleSession"));continue;}
                             let mut delivery=host.finish(&text,mode);
                             if keep {let _=reply.send(delivery);continue;}
-                            if host.close().is_err(){delivery.delivery.error=Some("compositionCleanup".into());}
+                            delivery.record_cleanup(host.close().is_err());
                             drop(host);let _=reply.send(delivery);return;
                         },
                         Err(mpsc::RecvTimeoutError::Disconnected)=>return,
@@ -256,6 +266,8 @@ impl Draft {
                 delivery: outcome,
                 committed: false,
                 handed_off: false,
+                cancelled: false,
+                rollback_failed: false,
             };
         }
         result.await.unwrap_or_else(|_| {
@@ -266,6 +278,8 @@ impl Draft {
                 delivery: outcome,
                 committed: false,
                 handed_off: false,
+                cancelled: false,
+                rollback_failed: false,
             }
         })
     }
@@ -294,6 +308,8 @@ struct Host {
     visible: bool,
     failure: Option<String>,
     range_open: bool,
+    /// Exact successful Settle that already ended an empty composition.
+    settled_empty_revision: Option<u64>,
     profile: ProfileLease,
     _lease: registration::HostLease,
     _apartment: Apartment,
@@ -356,6 +372,7 @@ impl Host {
             visible: false,
             failure: None,
             range_open: false,
+            settled_empty_revision: None,
             profile,
             _lease: lease,
             _apartment: apartment,
@@ -392,6 +409,7 @@ impl Host {
         self.anchor = anchor;
         self.turn = turn;
         self.revision = 0;
+        self.settled_empty_revision = None;
         self.text.clear();
         self.attempted = false;
         self.visible = false;
@@ -499,6 +517,7 @@ impl Host {
         }
     }
     fn settle(&mut self, prefix: &str, tail: &str, permit: &AtomicBool) -> PrefixOutcome {
+        self.settled_empty_revision = None;
         // Only this existing host's range/revision may settle a prefix. Never
         // choose a new target or replay a request after a possibly changed range.
         let expected = Prefix {
@@ -549,6 +568,13 @@ impl Host {
         if outcome.prefix == Mutation::Changed {
             self.visible = true;
         }
+        if outcome.prefix == Mutation::Changed
+            && outcome.tail_owned
+            && outcome.error.is_none()
+            && tail.is_empty()
+        {
+            self.settled_empty_revision = Some(self.revision);
+        }
         if outcome.error.is_some()
             && !(outcome.prefix == Mutation::NotAttempted
                 && outcome.error.as_deref() == Some("staleSnapshot"))
@@ -561,6 +587,7 @@ impl Host {
         if text == self.text {
             return Ok(());
         }
+        self.settled_empty_revision = None;
         let result = self.exchange(Action::Update, text, false);
         if result.is_ok() {
             self.text = text.into();
@@ -572,9 +599,14 @@ impl Host {
     fn finish(&mut self, text: &str, mode: Finish) -> FinishOutcome {
         let began = Instant::now();
         let aborted = mode == Finish::Abort;
+        let mut cancelled = aborted;
+        let mut rollback_failed = false;
         let mut handed_off = false;
+        let mut already_settled = false;
         let result = if aborted {
-            self.exchange(Action::Abort, "", true)
+            let result = self.exchange(Action::Abort, "", true);
+            rollback_failed = result.is_err();
+            result
         } else if let Finish::Handoff(reason) = &mode {
             let result = self.exchange(Action::Handoff, "", true);
             if result.is_ok() {
@@ -589,10 +621,23 @@ impl Host {
                 .and(Err(Error::new(self.failure.as_deref().unwrap())))
         } else {
             self.update(text).and_then(|_| {
+                // A successful empty-tail Settle already submitted the text
+                // and ended its composition. Only release the remaining lease;
+                // do not require an unchanged caret for a second empty Commit.
+                let settled =
+                    completed_prefix(self.settled_empty_revision, self.revision, &self.text, text);
                 if !self.gate.commit() {
-                    return self
-                        .exchange(Action::Abort, "", true)
-                        .and(Err(Error::new("cancelled")));
+                    cancelled = true;
+                    if settled {
+                        return Err(Error::new("cancelled"));
+                    }
+                    let result = self.exchange(Action::Abort, "", true);
+                    rollback_failed = result.is_err();
+                    return result.and(Err(Error::new("cancelled")));
+                }
+                if settled {
+                    already_settled = true;
+                    return Ok(());
                 }
                 self.exchange(Action::Commit, "", false)
             })
@@ -601,8 +646,8 @@ impl Host {
         // matching fresh UIA call can return the final Update's pre-commit cache.
         // There is no provider-correlated completion fence in this protocol, so
         // do not promote an acknowledged commit to independently confirmed input.
-        let committed = result.is_ok() && mode == Finish::Commit;
-        log::info!(target:"sayweave", "operation=draft_proof task_id={} turn={} revision={} phase=confirm submitted={} confirmed=false completion_boundary=unavailable", self.task,self.turn,self.revision,committed);
+        let committed = result.is_ok() && mode == Finish::Commit && !already_settled;
+        log::info!(target:"sayweave", "operation=draft_proof task_id={} turn={} revision={} phase=confirm submitted={} already_settled={} confirmed=false completion_boundary=unavailable", self.task,self.turn,self.revision,committed || already_settled,already_settled);
         let mut delivery = Delivery::not_submitted(
             result
                 .as_ref()
@@ -610,14 +655,14 @@ impl Host {
                 .map(|e| e.code.as_str())
                 .unwrap_or(if aborted { "cancelled" } else { "none" }),
         );
-        if aborted && result.is_err() {
+        if rollback_failed {
             delivery.error = Some("compositionRollback".into());
         }
         delivery.stage = "composition".into();
         delivery.elapsed_ms = began.elapsed().as_millis() as u64;
         if committed || self.visible && !aborted || self.attempted && result.is_err() {
             delivery.state = "unconfirmed".into();
-            if committed {
+            if committed || already_settled {
                 delivery.error = Some("inputUnconfirmed".into());
             }
             delivery.submission = if self.visible {
@@ -631,6 +676,8 @@ impl Host {
             delivery,
             committed,
             handed_off,
+            cancelled,
+            rollback_failed,
         }
     }
     fn close(&mut self) -> Result<(), Error> {
@@ -638,6 +685,9 @@ impl Host {
             .close()
             .map_err(|_| Error::new("compositionCleanup"))
     }
+}
+fn completed_prefix(receipt: Option<u64>, revision: u64, stored: &str, requested: &str) -> bool {
+    receipt == Some(revision) && stored.is_empty() && requested.is_empty()
 }
 fn reply_error(code: &str) -> &'static str {
     if code == "keyboardHandoffFailed" {
@@ -673,6 +723,15 @@ fn reply_error(code: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::reply_error;
+    #[test]
+    fn empty_tail_completion_requires_the_exact_settlement_and_no_remaining_text() {
+        assert!(super::completed_prefix(Some(9), 9, "", ""));
+        assert!(!super::completed_prefix(None, 9, "", ""));
+        assert!(!super::completed_prefix(Some(8), 9, "", ""));
+        assert!(!super::completed_prefix(Some(9), 9, "尾部", ""));
+        assert!(!super::completed_prefix(Some(9), 9, "", "\n"));
+        assert!(!super::completed_prefix(Some(9), 9, "", "新尾部"));
+    }
     #[test]
     fn foreign_ime_lock_remains_temporary_at_each_edit_boundary() {
         assert_eq!(

@@ -96,6 +96,56 @@ async fn acknowledge(actor: &SessionDraft, state: &mut State) {
 }
 
 #[tokio::test]
+async fn completed_date_correction_reaches_native_application_with_latest_tail() {
+    let raw = "呃，今天10月8号，哦，不对，今天10月7号。";
+    let cleaned = "今天10月7号。";
+    let fixture = Fixture::start(vec![response(cleaned)]);
+    let root = tempfile::tempdir().unwrap();
+    let data = crate::data::DataWorker::start(root.path().to_path_buf()).unwrap();
+    let context = Context::fixture(fixture.provider.clone(), fixture.input(), data.clone());
+    let (actor, mut state, native) = actor(Some(context));
+    actor.observe(
+        &mut state,
+        snapshot(1, vec![segment(1, raw, true), segment(2, "尾部", false)]),
+    );
+    state.merge_at = Some(Instant::now() - Duration::from_millis(151));
+    actor.start_generation(&mut state).unwrap();
+    generated(&mut state).await;
+    actor.observe(
+        &mut state,
+        snapshot(
+            2,
+            vec![segment(1, raw, true), segment(2, "最新尾部🙂", false)],
+        ),
+    );
+    actor.schedule(&mut state).unwrap();
+    let Command::Settle(_, prefix, tail, _, reply) = command(&native).await else {
+        panic!("corrected prefix expected")
+    };
+    assert_eq!(prefix, cleaned);
+    assert_eq!(tail, "最新尾部🙂");
+    reply
+        .send(PrefixOutcome {
+            prefix: Mutation::Changed,
+            tail_owned: true,
+            error: None,
+        })
+        .ok()
+        .unwrap();
+    acknowledge(&actor, &mut state).await;
+    assert_eq!(state.submitted, cleaned);
+    assert_eq!(state.consumed, raw.chars().count());
+    let record = &state.report.units[0];
+    assert_eq!(record.generation, "success");
+    assert_eq!(record.application, "applied");
+    assert_eq!(record.candidate.as_deref(), Some(cleaned));
+    assert!(record.error.is_none());
+    drop(state);
+    drop(actor);
+    data.shutdown().await;
+}
+
+#[tokio::test]
 async fn next_generation_overlaps_unacknowledged_prefix_and_uses_latest_tail() {
     let a = "甲。".repeat(256);
     let b = "第二段。";
@@ -252,4 +302,66 @@ async fn same_body_confirmation_keeps_source_revision_and_avoids_duplicate_nativ
     drop(state);
     drop(actor);
     data.shutdown().await;
+}
+
+#[test]
+fn winning_cancel_survives_cleanup_failure_and_trims_archive() {
+    let (actor, mut state, _native) = actor(None);
+    state.written_raw = "前段尾部".into();
+    state.submitted = "前段".into();
+    state.committed_source = 2;
+    let mut outcome = FinishOutcome {
+        delivery: Delivery::not_submitted("cancelled"),
+        committed: false,
+        handed_off: false,
+        cancelled: true,
+        rollback_failed: false,
+    };
+    outcome.record_cleanup(true);
+    let delivery = actor
+        .native_done(
+            &mut state,
+            &NativeKind::Final {
+                mode: Finish::Commit,
+                raw: "前段尾部".into(),
+                text: "前段尾部".into(),
+            },
+            NativeValue::Finalized(outcome),
+        )
+        .unwrap();
+    assert_eq!(delivery.error.as_deref(), Some("compositionCleanup"));
+    assert!(state.report.cancelled);
+    assert_eq!(state.report.raw, "前段");
+    assert_eq!(state.report.text, "前段");
+}
+
+#[test]
+fn rollback_and_cleanup_failure_preserve_uncommitted_recovery_text() {
+    let (actor, mut state, _native) = actor(None);
+    state.written_raw = "仍可能存在的尾部".into();
+    let mut outcome = FinishOutcome {
+        delivery: Delivery::not_submitted("compositionRollback"),
+        committed: false,
+        handed_off: false,
+        cancelled: true,
+        rollback_failed: true,
+    };
+    outcome.record_cleanup(true);
+    let delivery = actor
+        .native_done(
+            &mut state,
+            &NativeKind::Final {
+                mode: Finish::Abort,
+                raw: "仍可能存在的尾部".into(),
+                text: "仍可能存在的尾部".into(),
+            },
+            NativeValue::Finalized(outcome),
+        )
+        .unwrap();
+    assert_eq!(delivery.error.as_deref(), Some("compositionCleanup"));
+    assert!(state.report.cancelled);
+    assert!(state.report.rollback_failed);
+    assert!(state.report.raw.is_empty());
+    assert!(state.report.text.is_empty());
+    assert_eq!(state.report.recovery_raw, "仍可能存在的尾部");
 }

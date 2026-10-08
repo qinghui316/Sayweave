@@ -31,6 +31,3 @@ export function dictationPhase(snapshot:DictationSnapshot,phase:Phase,speech:Pic
  }
  return phase;
 }
-export function deliveryNotice(code:string|null):string {
- return ({targetChanged:'输入位置已改变，结果已保留。',keysHeld:'等待按键释放超时，结果已保留。',keyboardStateConflict:'快捷键状态冲突，结果已保留。',clipboardBusy:'暂时无法填入，结果已保留。',clipboardUnsupported:'暂时无法填入，结果已保留。',clipboardRestore:'剪贴板恢复未完成。',targetPassword:'此输入框需要手动输入。',targetReadonly:'此输入框不能编辑。',targetPermission:'此应用暂时无法填入，结果已保留。',inputComposition:'请先完成输入法组词。',saveFailed:'保存未完成，结果已保留。',cancelled:'已停止填入，结果已保留。',compositionRollback:'未能完整撤回草稿，请检查输入框。',compositionCleanup:'输入组件尚未释放，请检查输入结果。',compositionRejected:'草稿更新已停止，请检查输入框。',inputUnconfirmed:'请确认输入结果。',inputSubmitted:'请确认输入结果。'}[code??'']??'请检查输入结果。');
-}

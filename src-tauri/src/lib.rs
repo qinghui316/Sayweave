@@ -105,7 +105,7 @@ fn voice_layout(app: &tauri::AppHandle, phase: Phase) -> VoiceLayout {
     let size = if let Some((_, _, presentation)) = &view {
         match presentation {
             Presentation::Result => (384.0, 232.0),
-            Presentation::Notice | Presentation::Error => (384.0, 112.0),
+            Presentation::Error => (384.0, 112.0),
             _ => (160.0, 88.0),
         }
     } else {

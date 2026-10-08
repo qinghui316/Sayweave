@@ -87,6 +87,8 @@ fn ending_after_user_handoff_never_promotes_an_unknown_input_or_adds_normal_noti
             delivery,
             committed: false,
             handed_off,
+            cancelled: false,
+            rollback_failed: false,
         }
     };
     let done = closed_delivery(Some(receipt(true)), false, false, true);
@@ -186,6 +188,7 @@ pub(crate) struct Report {
     pub units: Vec<UnitResult>,
     pub error: Option<String>,
     pub cancelled: bool,
+    pub rollback_failed: bool,
 }
 struct Generating {
     unit: Unit,
@@ -664,7 +667,7 @@ impl SessionDraft {
                 record.output_tokens = value.usage.output;
                 record.elapsed_ms = value.elapsed_ms;
                 log::info!(target:"sayweave","operation=processing_result task_id={} unit_id={} first_output_ms={} elapsed_ms={} result=complete",self.task,unit.id,value.first_output_ms.map(|n|n.to_string()).unwrap_or_else(||"unavailable".into()),value.elapsed_ms);
-                match quality::validate(&unit.text, &value.text) {
+                match quality::validate_output(&value.text) {
                     Ok(()) => {
                         record.generation = "success".into();
                         record.candidate = Some(value.text.clone());
@@ -690,6 +693,7 @@ impl SessionDraft {
                 unit.text.clone()
             }
         };
+        log::info!(target:"sayweave","operation=processing_acceptance task_id={} unit_id={} generation={} error={}",self.task,unit.id,record.generation,record.error.as_deref().unwrap_or("none"));
         let source_body = unit.text.trim_end_matches(['\r', '\n']);
         let suffix = &unit.text[source_body.len()..];
         let output = quality::retain_boundaries(&unit.text, &output);
@@ -1005,10 +1009,10 @@ impl SessionDraft {
             }
             (NativeKind::Final { mode, raw, text }, NativeValue::Finalized(outcome)) => {
                 let delivery = outcome.delivery;
-                let cancelled =
-                    *mode == Finish::Abort || delivery.error.as_deref() == Some("cancelled");
+                let cancelled = *mode == Finish::Abort || outcome.cancelled;
                 if cancelled {
-                    if delivery.error.as_deref() == Some("compositionRollback") {
+                    if outcome.rollback_failed {
+                        s.report.rollback_failed = true;
                         s.report.recovery_raw = s.written_raw.clone();
                     }
                     self.archive_turn(

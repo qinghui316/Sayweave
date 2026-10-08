@@ -231,6 +231,73 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             "SAYWEAVE_COMPOSITION_SAMPLE_PASS actual_prefix=true cumulative=true final_single_copy=true"
         );
     }
+    // A fully settled prefix already ended its composition. Finishing must
+    // release resources, not require continued ownership of an empty caret.
+    for (move_caret, resume_tail, cancel_after) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        fixture.command(serde_json::json!({"action":"focus","text":"前后","start":1,"end":1}))?;
+        thread::sleep(Duration::from_millis(60));
+        let id = uuid::Uuid::new_v4().to_string();
+        let anchor = WindowsInputService::anchor().ok_or("settled fixture not foreground")?;
+        bind_watch(&id, &anchor, None).map_err(|e| e.code)?;
+        let gate = Arc::new(DeliveryGate::default());
+        let draft = runtime
+            .block_on(Draft::begin(id.clone(), 1, anchor, gate.clone()))
+            .map_err(|e| e.code)?;
+        runtime
+            .block_on(draft.replace(1, "今天10月8号，不对，今天10月7号。".into()))
+            .map_err(|e| e.code)?;
+        let settled = runtime.block_on(draft.settle(
+            2,
+            "今天10月7号。".into(),
+            String::new(),
+            Arc::new(AtomicBool::new(true)),
+        ));
+        if settled.prefix != sayweave_text_service::wire::Mutation::Changed
+            || !settled.tail_owned
+            || settled.error.is_some()
+        {
+            return Err(format!("empty-tail settlement failed: {:?}", settled.error));
+        }
+        thread::sleep(Duration::from_millis(80));
+        if move_caret {
+            fixture.command(serde_json::json!({"action":"caret-home"}))?;
+        }
+        let tail = if resume_tail { "继续输入🙂" } else { "" };
+        if resume_tail {
+            runtime
+                .block_on(draft.replace(3, tail.into()))
+                .map_err(|e| e.code)?;
+        }
+        if cancel_after {
+            gate.cancel();
+        }
+        let outcome = runtime.block_on(draft.finish_receipt(tail.into(), Finish::Commit));
+        let after = fixture.command(serde_json::json!({"action":"read"}))?;
+        if outcome.committed != resume_tail
+            || outcome.delivery.error.as_deref()
+                != Some(if cancel_after {
+                    "cancelled"
+                } else {
+                    "inputUnconfirmed"
+                })
+            || after["text"] != format!("前今天10月7号。{tail}后")
+            || move_caret && (after["start"] != 0 || after["end"] != 0)
+        {
+            return Err(format!(
+                "settled prefix finalization failed: moved={move_caret} resume={resume_tail} cancel={cancel_after} committed={} error={:?} actual={}",
+                outcome.committed, outcome.delivery.error, after
+            ));
+        }
+        release_watch(&id);
+        println!(
+            "SAYWEAVE_SETTLED_PREFIX_FINISH_PASS moved_caret={move_caret} resumed={resume_tail} cancelled={cancel_after} actual_text=true no_repeated_input=true"
+        );
+    }
     // Editor caret navigation is not keyboard-hook evidence in this fixture. The target
     // range must independently reject a later revision at the changed position.
     {

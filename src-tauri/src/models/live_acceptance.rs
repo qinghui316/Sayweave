@@ -83,11 +83,11 @@ async fn live_processing_acceptance() {
         report["inputTokens"] = json!(generated.usage.input);
         report["outputTokens"] = json!(generated.usage.output);
         report["qualityError"] = json!(
-            quality::validate(synthetic, &generated.text)
+            quality::validate_output(&generated.text)
                 .err()
                 .map(|e| e.code)
         );
-        report["passed"] = json!(quality::validate(synthetic, &generated.text).is_ok());
+        report["passed"] = json!(quality::validate_output(&generated.text).is_ok());
     } else if let Err(error) = &result {
         report["error"] = json!(error.code);
     }

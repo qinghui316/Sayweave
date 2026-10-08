@@ -48,7 +48,7 @@ pub fn text(turns: &[SourceTurn], records: &[UnitRecord]) -> String {
             };
             let candidate = record.candidate_text.as_deref().unwrap();
             if !unit.matches_in(source.turn, &indexed)
-                || quality::validate(&record.source_text, candidate).is_err()
+                || quality::validate_output(candidate).is_err()
             {
                 continue;
             }

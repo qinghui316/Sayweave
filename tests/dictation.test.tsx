@@ -117,11 +117,11 @@ it('shows only recognition feedback while final text is pending and clears compl
  expect(screen.getByRole('group',{name:'口述完成'})).toBeVisible();expect(screen.queryByText('口述完成')).not.toBeInTheDocument();expect(screen.queryByText('完整结果')).not.toBeInTheDocument();
  expect(screen.queryByRole('button',{name:'复制'})).not.toBeInTheDocument();
 });
-it('submitted input offers a closeable notice without a copy card',async()=>{
- const dismiss=vi.fn(),copy=vi.fn(),user=userEvent.setup();
- render(<VoiceSurface presentation="notice" phase="completed" text="已填入文字" delivery={{state:'unconfirmed',submission:'submitted',verification:'timeout',stage:'verify',submittedEvents:4,error:'inputUnconfirmed',restoreError:false,elapsedMs:1000}} start={()=>{}} finish={()=>{}} cancel={()=>{}} dismiss={dismiss} copy={copy}/>);
- expect(screen.getByText('请确认输入结果。')).toBeVisible();expect(screen.queryByRole('region',{name:'口述结果'})).not.toBeInTheDocument();
- expect(screen.queryByRole('button',{name:'复制'})).not.toBeInTheDocument();await user.click(screen.getByRole('button',{name:'关闭'}));expect(dismiss).toHaveBeenCalledOnce();expect(copy).not.toHaveBeenCalled();
+it('terminal input notices render no explanatory banner or actions',()=>{
+ render(<VoiceSurface presentation="notice" phase="completed" text="已填入文字" delivery={{state:'unconfirmed',submission:'submitted',verification:'timeout',stage:'verify',submittedEvents:4,error:'compositionRejected',restoreError:false,elapsedMs:1000}} start={()=>{}} finish={()=>{}} cancel={()=>{}} dismiss={()=>{}} copy={async()=>{}}/>);
+ expect(screen.queryByRole('region',{name:'口述提示'})).not.toBeInTheDocument();
+ expect(screen.queryByText('草稿更新已停止，请检查输入框。')).not.toBeInTheDocument();
+ expect(screen.queryByRole('button')).not.toBeInTheDocument();
 });
 it('no-target result retains its content and close action after copy failure',async()=>{
  const dismiss=vi.fn(),copy=vi.fn().mockRejectedValue(Error('clipboard busy')),user=userEvent.setup();
@@ -186,9 +186,9 @@ it('reports rejected live admission without a copy card and exposes settings',as
  expect(()=>parseDictation({...state,inputRoute:'paste'})).toThrow();
  expect(()=>parseDictation({...state,admission:'unknown'})).toThrow();
 });
-it('shows an archive failure separately from normal stage animation',()=>{
- render(<VoiceSurface presentation="notice" phase="completed" noticeText="保存未完成，结果已保留。" start={()=>{}} finish={()=>{}} cancel={()=>{}} dismiss={()=>{}}/>);
- expect(screen.getByRole('status')).toHaveTextContent('保存未完成，结果已保留。');
+it('does not display an archive explanation over the completed target',()=>{
+ render(<VoiceSurface presentation="notice" phase="completed" start={()=>{}} finish={()=>{}} cancel={()=>{}} dismiss={()=>{}}/>);
+ expect(screen.queryByRole('status')).not.toBeInTheDocument();
  expect(screen.queryByRole('region',{name:'口述结果'})).not.toBeInTheDocument();
- expect(screen.getByRole('button',{name:'关闭'})).toBeVisible();
+ expect(screen.queryByRole('button',{name:'关闭'})).not.toBeInTheDocument();
 });

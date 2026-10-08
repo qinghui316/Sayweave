@@ -800,15 +800,13 @@ impl DictationCoordinator {
             }
             // InputSettled: release admission and presentation without awaiting
             // ordinary persistence. The finalizer retains record/range reports.
-            let input_recovery = coordinator
-                .snapshot()
-                .ok()
-                .filter(|s| s.task_id.as_deref() == Some(&id))
-                .and_then(|s| s.delivery)
-                .is_some_and(|d| {
-                    d.submission != crate::windows_input::Submission::NotSubmitted
-                        && d.error.as_deref() == Some("compositionRollback")
-                });
+            #[cfg(windows)]
+            let input_recovery = draft
+                .as_ref()
+                .and_then(|d| d.report())
+                .is_some_and(|r| r.rollback_failed);
+            #[cfg(not(windows))]
+            let input_recovery = false;
             let mut archive_error = false;
             #[cfg(windows)]
             let cancel_prune = if let (Some(draft), Some(current)) = (&draft, &recognized_snapshot)

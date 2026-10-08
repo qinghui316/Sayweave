@@ -14,7 +14,6 @@ pub enum Presentation {
     Recognizing,
     Delivering,
     Completed,
-    Notice,
     Result,
     Error,
 }
@@ -22,7 +21,6 @@ impl Presentation {
     pub fn hide_after(self) -> Option<u64> {
         match self {
             Self::Completed => Some(600),
-            Self::Notice => Some(3500),
             Self::Idle => Some(0),
             _ => None,
         }
@@ -69,12 +67,13 @@ pub fn final_presentation(
     {
         return Presentation::Completed;
     }
-    // A failed rollback can leave visible text even when recognition itself was cancelled.
+    // Terminal failures remain in Delivery/history. Close the overlay without
+    // interpreting them as success or showing explanatory banners.
     if delivery.is_some_and(|d| {
         d.submission != Submission::NotSubmitted
             && (d.state != "confirmed" || d.error.is_some() || d.restore_error)
     }) {
-        return Presentation::Notice;
+        return Presentation::Idle;
     }
     if error == Some("cancelled")
         || delivery.is_some_and(|d| d.error.as_deref() == Some("cancelled"))
@@ -87,14 +86,14 @@ pub fn final_presentation(
         }
         // Submitted input can already be visible in the target. Never offer a duplicate paste.
         if delivery.submission != Submission::NotSubmitted {
-            return Presentation::Notice;
+            return Presentation::Idle;
         }
     }
     if !text.trim().is_empty() {
         if absent_target {
             Presentation::Result
         } else {
-            Presentation::Notice
+            Presentation::Idle
         }
     } else if error.is_some_and(|e| e != "cancelled" && e != "staleSession") {
         Presentation::Error
@@ -120,7 +119,7 @@ mod tests {
         delivery.error = Some("compositionRejected".into());
         assert_eq!(
             final_presentation(false, "text", Some(&delivery), None),
-            Presentation::Notice
+            Presentation::Idle
         );
     }
     #[test]
@@ -141,7 +140,7 @@ mod tests {
         let mut delivery = Delivery::not_submitted("targetChanged");
         assert_eq!(
             final_presentation(false, "文字", Some(&delivery), None),
-            Presentation::Notice
+            Presentation::Idle
         );
         assert_eq!(
             final_presentation(true, "文字", Some(&delivery), None),
@@ -151,7 +150,7 @@ mod tests {
         delivery.submission = Submission::Submitted;
         assert_eq!(
             final_presentation(true, "文字", Some(&delivery), None),
-            Presentation::Notice
+            Presentation::Idle
         );
         delivery.state = "confirmed".into();
         delivery.error = None;
@@ -162,17 +161,17 @@ mod tests {
         delivery.restore_error = true;
         assert_eq!(
             final_presentation(false, "文字", Some(&delivery), None),
-            Presentation::Notice
+            Presentation::Idle
         );
     }
     #[test]
-    fn cancelled_recognition_cannot_hide_failed_draft_rollback() {
+    fn terminal_feedback_closes_without_changing_internal_failure() {
         let mut delivery = Delivery::not_submitted("compositionRollback");
         delivery.state = "unconfirmed".into();
         delivery.submission = Submission::Submitted;
         assert_eq!(
             final_presentation(false, "部分文字", Some(&delivery), Some("cancelled")),
-            Presentation::Notice
+            Presentation::Idle
         );
         delivery.submission = Submission::NotSubmitted;
         delivery.error = Some("cancelled".into());
@@ -187,7 +186,7 @@ mod tests {
         );
         assert_eq!(
             final_presentation(false, "已提交前段", Some(&delivery), Some("saveFailed")),
-            Presentation::Notice
+            Presentation::Idle
         );
     }
     #[test]

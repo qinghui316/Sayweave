@@ -19,18 +19,12 @@ for(const reducedMotion of ['no-preference','reduce'] as const)test(`compact ove
   await page.screenshot({path:`tests/visual/compact-overlay-${kind}-${reducedMotion}.png`});
  }
 });
-test('interrupted input exposes only a compact closeable notice',async({page})=>{
+test('terminal input closes without an explanatory notice',async({page})=>{
  await page.setViewportSize({width:384,height:240});
  await page.goto('/tests/fixtures/voice-recovery.html');
- await expect(page.getByRole('status')).toHaveText('请确认输入结果。');
- await expect(page.getByRole('button',{name:'重试恢复剪贴板'})).toHaveCount(0);
- await expect(page.getByRole('button',{name:'复制',exact:true})).toHaveCount(0);
- for(const button of [page.getByRole('button',{name:'关闭',exact:true})]){
-  const rect=await button.boundingBox();expect(rect).not.toBeNull();
-  expect(rect!.y).toBeGreaterThanOrEqual(0);expect(rect!.y+rect!.height).toBeLessThanOrEqual(240);
-  expect(rect!.x).toBeGreaterThanOrEqual(0);expect(rect!.x+rect!.width).toBeLessThanOrEqual(384);
- }
- await page.getByRole('button',{name:'关闭',exact:true}).click();await expect(page.getByRole('status')).toHaveText('已关闭');
+ await expect(page.getByRole('status')).toHaveCount(0);
+ await expect(page.getByRole('region',{name:'口述提示'})).toHaveCount(0);
+ await expect(page.getByRole('button')).toHaveCount(0);
 });
 test('no-target results retain full text and close after failed copy without clipping',async({page})=>{
  await page.setViewportSize({width:384,height:232});
