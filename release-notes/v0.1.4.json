@@ -1,0 +1,23 @@
+{
+  "version": "0.1.4",
+  "zhCN": {
+    "summary": "Sayweave 首个公开 Windows 版本。",
+    "changes": [
+      "实时语音输入、分段整理与原生输入接续。",
+      "手动词典、自动入词和按应用个性化。",
+      "紧凑词典界面、稳定历史分页和更新入口。"
+    ]
+  },
+  "enUS": {
+    "summary": "The first public Windows release of Sayweave.",
+    "changes": [
+      "Real-time dictation with segmented rewriting and native input handoff.",
+      "Manual dictionary, automatic terms, and application-aware personalization.",
+      "Compact dictionary UI, stable history pages, and an update entry point."
+    ]
+  }
+}
+
+
+
+
