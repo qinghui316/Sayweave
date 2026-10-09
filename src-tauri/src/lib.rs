@@ -835,6 +835,10 @@ pub fn run() {
                 .build(app)?;
             println!("SAYWEAVE_NATIVE_READY");
             #[cfg(feature = "desktop-acceptance")]
+            if std::env::var("SAYWEAVE_LANGUAGE_ACTOR_ACCEPTANCE").as_deref() == Ok("1") {
+                models::language_actor_acceptance::start(app.handle().clone());
+            }
+            #[cfg(feature = "desktop-acceptance")]
             if std::env::var("SAYWEAVE_DESKTOP_ACCEPTANCE").as_deref() == Ok("1") {
                 let ids = menu
                     .items()?

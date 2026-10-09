@@ -1,5 +1,7 @@
 pub mod commands;
 mod credentials;
+#[cfg(feature = "desktop-acceptance")]
+pub(crate) mod language_actor_acceptance;
 mod latency;
 #[cfg(all(test, target_os = "windows"))]
 mod live_acceptance;
