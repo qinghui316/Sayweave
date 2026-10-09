@@ -8,7 +8,7 @@ if(manifest.version!==pkg.version||receipt.version!==pkg.version)throw new Error
 const target=manifest.platforms?.['windows-x86_64'];if(!target?.url||!target.signature)throw new Error('Windows update manifest incomplete');
 const installer=receipt.installer;const bytes=await readFile(join(dir,installer));const sha512=createHash('sha512').update(bytes).digest('base64');
 if(sha512!==receipt.installerSha512||bytes.length!==receipt.installerSize)throw new Error('Installer hash/size mismatch');
-const signaturePath=join(dir,`${installer}.sig`);if((await stat(signaturePath)).size<20)throw new Error('Installer signature is empty');
+const signaturePath=join(dir,`${installer}.sig`);if((await stat(signaturePath)).size<20)throw new Error('Installer signature is empty');const signature= (await readFile(signaturePath,'utf8')).trim();if(signature!==target.signature.trim())throw new Error('Manifest signature does not match installer signature');
 const config=JSON.parse(await readFile(resolve(root,'src-tauri/tauri.conf.json'),'utf8'));const publicKey=config.plugins?.updater?.pubkey;if(typeof publicKey!=='string'||!publicKey)throw new Error('Updater public key is missing');
 const verify=spawnSync('cargo',['run','--quiet','--manifest-path','src-tauri/Cargo.toml','--bin','verify-update-signature','--',publicKey,join(dir,installer),signaturePath],{cwd:root,encoding:'utf8',stdio:['ignore','pipe','pipe']});
 if(verify.status!==0)throw new Error(`Updater signature verification failed: ${verify.stderr||verify.stdout}`);
