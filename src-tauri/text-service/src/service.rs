@@ -642,8 +642,19 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
                 native: state.native_position,
             }
         };
+        let mut diagnostic = if valid {
+            "observation".to_owned()
+        } else {
+            "observationState".to_owned()
+        };
         let field = if valid && r.action == Action::ObserveStart {
-            initial_selection::FocusIdentity::capture().ok()
+            match initial_selection::FocusIdentity::capture() {
+                Ok(field) => Some(field),
+                Err(error) => {
+                    diagnostic = format!("observationFocus:{:08x}", error.code().0 as u32);
+                    None
+                }
+            }
         } else {
             None
         };
@@ -652,15 +663,32 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
         }
         if valid && r.action == Action::ObserveStart {
             valid = admission.matches(&shared.borrow(), &r);
+            if !valid {
+                diagnostic = "observationChanged".into();
+            }
             if valid {
                 stop_observations(shared);
                 let retired = ObservationAdmission {
                     epoch: admission.epoch + 1,
                     ..admission
                 };
-                valid = field.as_ref().is_some_and(|f| f.matches().unwrap_or(false));
+                valid = match field.as_ref().map(|f| f.matches()) {
+                    Some(Ok(true)) => true,
+                    Some(Ok(false)) => {
+                        diagnostic = "observationFieldChanged".into();
+                        false
+                    }
+                    Some(Err(error)) => {
+                        diagnostic = format!("observationField:{:08x}", error.code().0 as u32);
+                        false
+                    }
+                    None => false,
+                };
                 let mut state = shared.borrow_mut();
-                valid &= retired.matches(&state, &r);
+                if !retired.matches(&state, &r) {
+                    valid = false;
+                    diagnostic = "observationChanged".into();
+                }
                 if valid {
                     state.observation_task = Some((r.task.clone(), r.turn));
                     state.observation_native = admission.native;
@@ -674,11 +702,7 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
             &r,
             connection,
             valid,
-            if valid {
-                "observation"
-            } else {
-                "observationUnavailable"
-            },
+            if valid { "observation" } else { &diagnostic },
             Mutation::NotAttempted,
         );
         return;

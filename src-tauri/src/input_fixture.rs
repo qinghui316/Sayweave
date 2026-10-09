@@ -48,6 +48,40 @@ fn context_status() -> serde_json::Value {
     })();
     result.unwrap_or_else(|e| serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}))
 }
+// Metadata-only diagnostic for an explicitly owned foreground fixture. Never
+// reads a field name/value/body and never supplies production range authority.
+fn focus_metadata(process: u32) -> serde_json::Value {
+    std::thread::spawn(move || unsafe {
+        use windows::{core::Interface, Win32::{System::{Com::*, Variant::*}, UI::Accessibility::*}};
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let result = (|| {
+            let window=GetForegroundWindow();let mut actual=0;
+            let thread=GetWindowThreadProcessId(window,Some(&mut actual));
+            if actual!=process { return Err(windows::core::Error::from_hresult(E_ACCESSDENIED)); }
+            let mut info=GUITHREADINFO { cbSize:std::mem::size_of::<GUITHREADINFO>() as u32,..Default::default() };
+            GetGUIThreadInfo(thread,&mut info)?;
+            let mut routes=vec![];
+            for target in [info.hwndFocus,window] {
+                let mut accessible: Option<IAccessible>=None;
+                let value=AccessibleObjectFromWindow(target,OBJID_CLIENT.0 as u32,&IAccessible::IID,(&mut accessible as *mut Option<IAccessible>).cast());
+                let mut route=serde_json::json!({"window":target.0 as usize,"error":value.as_ref().err().map(|e|format!("{:08x}",e.code().0 as u32)),"chain":[]});
+                if value.is_ok() && let Some(mut current)=accessible {
+                    for _ in 0..16 {
+                        let child=VARIANT::from(0i32);
+                        let focus=current.accFocus();
+                        route["chain"].as_array_mut().unwrap().push(serde_json::json!({"focusVt":focus.as_ref().ok().map(|f|f.vt().0),"role":current.get_accRole(&child).ok().and_then(|r|i32::try_from(&r).ok()),"state":current.get_accState(&child).ok().and_then(|r|i32::try_from(&r).ok()),"focusError":focus.as_ref().err().map(|e|format!("{:08x}",e.code().0 as u32))}));
+                        let Ok(focus)=focus else { break; };
+                        let next=if focus.vt()==VT_DISPATCH { IDispatch::try_from(&focus).and_then(|v|v.cast()) } else if focus.vt()==VT_I4 && i32::try_from(&focus).unwrap_or(0)!=0 { current.get_accChild(&focus).and_then(|v|v.cast()) } else { break; };
+                        let Ok(next)=next else { break; };current=next;
+                    }
+                }
+                routes.push(route);
+            }
+            Ok::<_,windows::core::Error>(serde_json::json!({"routes":routes}))
+        })();
+        CoUninitialize();result.unwrap_or_else(|e|serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}))
+    }).join().unwrap_or_else(|_|serde_json::json!({"error":"metadataWorker"}))
+}
 // Read-only evidence from a runner-owned target, on an independent MTA. Never
 // emit external text or use these measurements to move a production selection.
 fn selection_evidence(process: u32) -> serde_json::Value {
@@ -294,6 +328,16 @@ fn main() {
                         serde_json::json!({"error":"ownedForegroundMismatch"})
                     };
                     println!("{evidence}");
+                    io::stdout().flush().unwrap();
+                    let _ = ok.send(());
+                    continue;
+                }
+                if value["action"] == "inspect-focus" {
+                    let process = value["process"]
+                        .as_u64()
+                        .and_then(|p| u32::try_from(p).ok())
+                        .unwrap_or(0);
+                    println!("{}", focus_metadata(process));
                     io::stdout().flush().unwrap();
                     let _ = ok.send(());
                     continue;
