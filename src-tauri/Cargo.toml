@@ -1,6 +1,6 @@
 [package]
 name = "sayweave"
-version = "0.1.0"
+version = "0.1.1"
 description = "Sayweave desktop frontend skeleton"
 default-run = "sayweave"
 edition = "2024"
@@ -71,3 +71,4 @@ tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 rcgen = "0.14"
 rustls = "0.23"
+
