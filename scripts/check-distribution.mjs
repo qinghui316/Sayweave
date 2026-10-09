@@ -9,6 +9,7 @@ const roots = new Set(['.gitattributes', '.gitignore', 'README.md', 'LICENSE', '
   'tsconfig.json', 'vite.config.ts']);
 const docs = new Set(['architecture.md', 'development.md', 'design.md', 'testing.md', 'local-data.md', 'motion.md', 'models.md', 'speech.md', 'history.md', 'dictation.md', 'personalization.md']);
 const releaseNotes = /^release-notes\/v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.json$/;
+const publicWorkflow = file => file === '.github/workflows/windows-release.yml';
 const scripts = new Set(['check-boundaries.mjs', 'check-native-boundaries.mjs', 'check-text.mjs', 'check-distribution.mjs', 'generate-update-manifest.mjs', 'verify-update-release.mjs',
   'test-desktop.ps1', 'test-dictionary-desktop.mjs', 'test-models-desktop.mjs', 'test-speech-desktop.mjs', 'test-prefix-input.mjs', 'test-input.ps1', 'desktop.mjs', 'test-language-actor.mjs', 'test-language-dashboard-live.mjs']);
 const testRoots = new Set(['contracts', 'e2e']);
@@ -18,6 +19,7 @@ const ownerLocal = /(?:^|\/)(?:\.agents|\.claude|\.codex|\.impeccable)(?:\/|$)|(
 function allowed(file) {
   if (generated.test(file) || ownerLocal.test(file) || /\.(?:sqlite(?:-journal|-shm|-wal)?|db|log|fig|wav|mp3)$/i.test(file)) return false;
   if (roots.has(file)) return true;
+  if (publicWorkflow(file)) return true;
   if (file.startsWith('src/') || file.startsWith('src-tauri/')) return true;
   if (file.startsWith('docs/')) return docs.has(file.slice(5));
   if (releaseNotes.test(file)) return true;
