@@ -3,6 +3,7 @@
 .local/
 node_modules/
 dist/
+release/
 src-tauri/target/
 src-tauri/text-service/target/
 test-results/
