@@ -15,6 +15,12 @@ use windows::{
     core::Error,
 };
 type Proc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM, usize, usize) -> LRESULT;
+#[cfg(feature = "acceptance")]
+static READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "acceptance")]
+pub(super) fn read_count() -> u64 {
+    READS.load(std::sync::atomic::Ordering::Relaxed)
+}
 #[link(name = "comctl32")]
 unsafe extern "system" {
     fn SetWindowSubclass(window: HWND, callback: Option<Proc>, id: usize, data: usize) -> i32;
@@ -84,6 +90,8 @@ unsafe fn selection(window: HWND) -> (u32, u32) {
 /// Line prefixes exist only in a bounded scratch buffer to address the span;
 /// only the receipt's interval is returned, retained or sent to the host.
 unsafe fn text(window: HWND, start: u32, end: u32) -> windows::core::Result<String> {
+    #[cfg(feature = "acceptance")]
+    READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     unsafe {
         if end < start || end - start > 16384 || end > length(window) {
             return Err(Error::from_hresult(E_INVALIDARG));
@@ -158,9 +166,19 @@ impl BoundEdit {
                 return false;
             }
             let hook = (&*self.raw).clone();
+            let reading = hook.reading.borrow();
+            if !reading.valid {
+                return false;
+            }
+            if reading.value.ended {
+                return !hook.incomplete.get();
+            }
+            drop(reading);
             let style = GetWindowLongPtrW(self.window, GWL_STYLE) as u32;
             if style & (ES_PASSWORD as u32 | ES_READONLY as u32) != 0 {
                 hook.reading.borrow_mut().valid = false;
+                // Retire read permission before the span verification below.
+                return false;
             }
             if GetFocus() != self.window {
                 hook.reading.borrow_mut().value.ended = true;
@@ -272,6 +290,10 @@ unsafe extern "system" fn procedure(
                 | WM_SETTEXT
         ) || message == WM_KEYDOWN && w.0 == 0x2E;
         if stopped || !changing {
+            return DefSubclassProc(window, message, w, l);
+        }
+        if !capable(window) {
+            reading.borrow_mut().valid = false;
             return DefSubclassProc(window, message, w, l);
         }
         if hook.depth.get() != 0 {

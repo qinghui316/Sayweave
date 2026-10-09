@@ -925,7 +925,12 @@ fn send_reply(
             applied,
             code: {
                 #[cfg(feature = "acceptance")]
-                if matches!(r.action, Action::Begin | Action::Abort) {
+                if r.action == Action::Inspect {
+                    format!(
+                        "{code} observationReads={}",
+                        edit_observation::native_read_count()
+                    )
+                } else if matches!(r.action, Action::Begin | Action::Abort) {
                     let evidence = s
                         .selection_probe
                         .as_ref()

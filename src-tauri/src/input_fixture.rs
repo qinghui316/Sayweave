@@ -52,7 +52,7 @@ fn context_status() -> serde_json::Value {
 // reads a field name/value/body and never supplies production range authority.
 fn focus_metadata(process: u32) -> serde_json::Value {
     std::thread::spawn(move || unsafe {
-        use windows::{core::Interface, Win32::{System::{Com::*, Variant::*}, UI::Accessibility::*}};
+        use windows::{core::Interface, Win32::{System::{Com::*, Ole::*, Variant::*}, UI::Accessibility::*}};
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let result = (|| {
             let window=GetForegroundWindow();let mut actual=0;
@@ -60,7 +60,8 @@ fn focus_metadata(process: u32) -> serde_json::Value {
             if actual!=process { return Err(windows::core::Error::from_hresult(E_ACCESSDENIED)); }
             let mut info=GUITHREADINFO { cbSize:std::mem::size_of::<GUITHREADINFO>() as u32,..Default::default() };
             GetGUIThreadInfo(thread,&mut info)?;
-            let mut routes=vec![];
+            let mut routes=vec![];let mut identities:Vec<windows::core::IUnknown>=vec![];
+            let mut stable=vec![];let mut runtime_ids=vec![];
             for target in [info.hwndFocus,window] {
                 let mut accessible: Option<IAccessible>=None;
                 let value=AccessibleObjectFromWindow(target,OBJID_CLIENT.0 as u32,&IAccessible::IID,(&mut accessible as *mut Option<IAccessible>).cast());
@@ -69,15 +70,31 @@ fn focus_metadata(process: u32) -> serde_json::Value {
                     for _ in 0..16 {
                         let child=VARIANT::from(0i32);
                         let focus=current.accFocus();
-                        route["chain"].as_array_mut().unwrap().push(serde_json::json!({"focusVt":focus.as_ref().ok().map(|f|f.vt().0),"role":current.get_accRole(&child).ok().and_then(|r|i32::try_from(&r).ok()),"state":current.get_accState(&child).ok().and_then(|r|i32::try_from(&r).ok()),"focusError":focus.as_ref().err().map(|e|format!("{:08x}",e.code().0 as u32))}));
+                        route["chain"].as_array_mut().unwrap().push(serde_json::json!({"focusVt":focus.as_ref().ok().map(|f|f.vt().0),"focusChild":focus.as_ref().ok().and_then(|f|i32::try_from(f).ok()),"role":current.get_accRole(&child).ok().and_then(|r|i32::try_from(&r).ok()),"state":current.get_accState(&child).ok().and_then(|r|i32::try_from(&r).ok()),"focusError":focus.as_ref().err().map(|e|format!("{:08x}",e.code().0 as u32))}));
                         let Ok(focus)=focus else { break; };
                         let next=if focus.vt()==VT_DISPATCH { IDispatch::try_from(&focus).and_then(|v|v.cast()) } else if focus.vt()==VT_I4 && i32::try_from(&focus).unwrap_or(0)!=0 { current.get_accChild(&focus).and_then(|v|v.cast()) } else { break; };
                         let Ok(next)=next else { break; };current=next;
                     }
+                    let mut opaque=std::ptr::null_mut();let mut length=0;
+                    let bytes=if let Ok(identity)=current.cast::<IAccIdentity>() {
+                        let result=identity.GetIdentityString(0,&mut opaque,&mut length);
+                        let bytes=if result.is_ok()&&!opaque.is_null()&&length>0&&length<=1024 {Some(std::slice::from_raw_parts(opaque,length as usize).to_vec())}else{None};
+                        if !opaque.is_null(){CoTaskMemFree(Some(opaque.cast()));}bytes
+                    }else{None};
+                    stable.push(bytes);
+                    let runtime_id=(|| {
+                        let raw=current.cast::<IRawElementProviderSimple>().or_else(|_|current.cast::<IServiceProvider>()?.QueryService(&IAccessible::IID))?;
+                        let read_only=raw.GetPatternProvider(UIA_TextPatternId).and_then(|p|p.cast::<ITextProvider>()).and_then(|p|p.DocumentRange()).and_then(|r|r.GetAttributeValue(UIA_IsReadOnlyAttributeId)).ok().and_then(|v|bool::try_from(&v).ok());
+                        route["uia"]=serde_json::json!({"controlType":raw.GetPropertyValue(UIA_ControlTypePropertyId).ok().and_then(|v|i32::try_from(&v).ok()),"keyboardFocus":raw.GetPropertyValue(UIA_HasKeyboardFocusPropertyId).ok().and_then(|v|bool::try_from(&v).ok()),"focusable":raw.GetPropertyValue(UIA_IsKeyboardFocusablePropertyId).ok().and_then(|v|bool::try_from(&v).ok()),"textReadOnly":read_only});
+                        let array=raw.cast::<IRawElementProviderFragment>()?.GetRuntimeId()?;
+                        let result=(||{if array.is_null()||SafeArrayGetDim(array)!=1||SafeArrayGetVartype(array)?!=VT_I4{return Err(windows::core::Error::from_hresult(E_NOINTERFACE));}let low=SafeArrayGetLBound(array,1)?;let high=SafeArrayGetUBound(array,1)?;if high<low||high-low>63{return Err(windows::core::Error::from_hresult(E_INVALIDARG));}let mut values=vec![];for index in low..=high {let mut value=0i32;SafeArrayGetElement(array,&index,(&mut value as *mut i32).cast())?;values.push(value);}Ok::<_,windows::core::Error>(values)})();
+                        if !array.is_null(){let _=SafeArrayDestroy(array);}result
+                    })();runtime_ids.push(runtime_id.ok());
+                    if let Ok(identity)=current.cast(){ identities.push(identity); }
                 }
                 routes.push(route);
             }
-            Ok::<_,windows::core::Error>(serde_json::json!({"routes":routes}))
+            Ok::<_,windows::core::Error>(serde_json::json!({"routes":routes,"sameObject":identities.len()==2&&identities[0]==identities[1],"opaqueIdentityPresent":stable.iter().all(Option::is_some),"opaqueIdentitySame":stable.len()==2&&stable[0].is_some()&&stable[0]==stable[1],"runtimeIds":runtime_ids}))
         })();
         CoUninitialize();result.unwrap_or_else(|e|serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}))
     }).join().unwrap_or_else(|_|serde_json::json!({"error":"metadataWorker"}))

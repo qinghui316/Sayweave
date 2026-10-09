@@ -14,7 +14,18 @@ struct Array(*mut SAFEARRAY);
 pub(super) struct FocusIdentity {
     window: HWND,
     class: String,
-    object: Option<IUnknown>,
+    object: Option<FieldIdentity>,
+}
+#[derive(Clone)]
+struct FieldIdentity {
+    fragment: FragmentIdentity,
+    element: Vec<i32>,
+    provider: IRawElementProviderSimple,
+}
+#[derive(Clone, PartialEq, Eq)]
+enum FragmentIdentity {
+    Runtime(Vec<i32>),
+    Window(usize),
 }
 impl FocusIdentity {
     pub(super) fn capture() -> Result<Self> {
@@ -63,7 +74,7 @@ impl FocusIdentity {
             })
         }
     }
-    unsafe fn focused_object(window: HWND) -> Result<IUnknown> {
+    unsafe fn focused_object(window: HWND) -> Result<FieldIdentity> {
         unsafe {
             let mut accessible: Option<IAccessible> = None;
             AccessibleObjectFromWindow(
@@ -97,9 +108,10 @@ impl FocusIdentity {
                         let role = i32::try_from(&accessible.get_accRole(&child)?)?;
                         let state = i32::try_from(&accessible.get_accState(&child)?)? as u32;
                         // EMPTY means no focused child, not that a pane/group
-                        // is an editable field. Require the editable text role.
-                        editable_focus(role, state)?;
-                        return accessible.cast();
+                        // is an editable field. A rich group also requires
+                        // explicit writable TextPattern evidence below.
+                        let rich_edit = editable_focus(role, state)?;
+                        return field_identity(&accessible, window, rich_edit);
                     }
                     _ => return Err(E_NOINTERFACE.into()),
                 }
@@ -114,17 +126,119 @@ impl FocusIdentity {
         let current = Self::capture()?;
         Ok(current.window == self.window
             && current.class == self.class
-            && current.object == self.object)
+            && match (&self.object, &current.object) {
+                (None, None) => true,
+                (Some(before), Some(after)) => {
+                    before.fragment==after.fragment
+                    && before.element==after.element
+                    // Keep and revalidate the original leaf, so reuse of a
+                    // runtime ID after a field dies cannot revive this scope.
+                    && unsafe { identity_bool(&before.provider.GetPropertyValue(UIA_HasKeyboardFocusPropertyId)?)? }
+                }
+                _ => false,
+            })
     }
 }
-fn editable_focus(role: i32, state: u32) -> Result<()> {
+// IUnknown equality is COM object identity, not UI element identity. Providers
+// may return a new wrapper for the same leaf. Keep the provider's runtime ID
+// together with its fragment identity and the enclosing native focus HWND.
+unsafe fn runtime_id(provider: &IRawElementProviderFragment) -> Result<Option<Vec<i32>>> {
+    unsafe {
+        let array = Array(provider.GetRuntimeId()?);
+        if array.0.is_null() {
+            return Ok(None);
+        }
+        if SafeArrayGetDim(array.0) != 1 || SafeArrayGetVartype(array.0)? != VT_I4 {
+            return Err(E_NOINTERFACE.into());
+        }
+        let low = SafeArrayGetLBound(array.0, 1)?;
+        let high = SafeArrayGetUBound(array.0, 1)?;
+        let count = identity_array_len(low, high)
+            .ok_or_else(|| windows::core::Error::from_hresult(E_INVALIDARG))?;
+        let mut values = Vec::with_capacity(count);
+        for index in low..=high {
+            let mut value = 0i32;
+            SafeArrayGetElement(array.0, &index, (&mut value as *mut i32).cast())?;
+            values.push(value);
+        }
+        Ok(Some(values))
+    }
+}
+fn identity_array_len(low: i32, high: i32) -> Option<usize> {
+    let count = i64::from(high) - i64::from(low) + 1;
+    (1..=64).contains(&count).then_some(count as usize)
+}
+unsafe fn field_identity(
+    accessible: &IAccessible,
+    window: HWND,
+    rich_edit: bool,
+) -> Result<FieldIdentity> {
+    unsafe {
+        let raw = raw_provider(accessible)?;
+        if !identity_bool(&raw.GetPropertyValue(UIA_HasKeyboardFocusPropertyId)?)? {
+            return Err(E_ACCESSDENIED.into());
+        }
+        if rich_edit {
+            // contenteditable/ProseMirror expose GROUPING, not MSAA TEXT.
+            // A group alone grants nothing: require a focused text provider
+            // whose field range explicitly reports writable. No text is read.
+            let text: ITextProvider = raw.GetPatternProvider(UIA_TextPatternId)?.cast()?;
+            if identity_bool(
+                &text
+                    .DocumentRange()?
+                    .GetAttributeValue(UIA_IsReadOnlyAttributeId)?,
+            )? {
+                return Err(E_ACCESSDENIED.into());
+            }
+        }
+        let provider: IRawElementProviderFragment = raw.cast()?;
+        let element = runtime_id(&provider)?
+            .ok_or_else(|| windows::core::Error::from_hresult(E_NOINTERFACE))?;
+        let root = provider.FragmentRoot()?;
+        let fragment = if let Some(id) = runtime_id(&root.cast()?)? {
+            FragmentIdentity::Runtime(id)
+        } else {
+            // A window-hosted top-level provider has no runtime ID. Bind the
+            // fragment to its proven same-thread native root, never to text.
+            let raw: IRawElementProviderSimple = root.cast()?;
+            let handle = i32::try_from(&raw.GetPropertyValue(UIA_NativeWindowHandlePropertyId)?)?
+                as u32 as usize;
+            let native = HWND(handle as *mut _);
+            if handle == 0
+                || native != GetAncestor(window, GA_ROOT)
+                || GetWindowThreadProcessId(native, None) != GetCurrentThreadId()
+            {
+                return Err(E_ACCESSDENIED.into());
+            }
+            FragmentIdentity::Window(handle)
+        };
+        Ok(FieldIdentity {
+            fragment,
+            element,
+            provider: raw,
+        })
+    }
+}
+fn identity_bool(value: &VARIANT) -> Result<bool> {
+    if value.vt() != VT_BOOL {
+        return Err(E_NOINTERFACE.into());
+    }
+    bool::try_from(value)
+}
+fn editable_focus(role: i32, state: u32) -> Result<bool> {
     if state & (STATE_SYSTEM_PROTECTED | STATE_SYSTEM_READONLY) != 0 {
         return Err(E_ACCESSDENIED.into());
     }
-    if role != ROLE_SYSTEM_TEXT as i32 || state & STATE_SYSTEM_FOCUSED == 0 {
+    if state & STATE_SYSTEM_FOCUSED == 0 {
         return Err(E_NOINTERFACE.into());
     }
-    Ok(())
+    if role == ROLE_SYSTEM_TEXT as i32 {
+        Ok(false)
+    } else if role == ROLE_SYSTEM_GROUPING as i32 {
+        Ok(true)
+    } else {
+        Err(E_NOINTERFACE.into())
+    }
 }
 impl Drop for Array {
     fn drop(&mut self) {
@@ -435,15 +549,23 @@ unsafe fn provider_module(pattern: &ITextProvider) -> String {
 mod tests {
     use super::mapped_document;
     #[test]
+    fn identity_array_bounds_are_bounded_before_allocation() {
+        assert_eq!(super::identity_array_len(8, 8), Some(1));
+        assert_eq!(super::identity_array_len(-4, 59), Some(64));
+        assert_eq!(super::identity_array_len(-4, 60), None);
+        assert_eq!(super::identity_array_len(8, 7), None);
+        assert_eq!(super::identity_array_len(i32::MIN, i32::MAX), None);
+        assert_eq!(super::identity_array_len(i32::MAX, i32::MIN), None);
+        assert_eq!(super::identity_array_len(i32::MAX, i32::MAX), Some(1));
+    }
+    #[test]
     fn focused_leaf_rejects_root_containers_and_security_states() {
         use super::*;
-        assert!(editable_focus(ROLE_SYSTEM_TEXT as i32, STATE_SYSTEM_FOCUSED).is_ok());
-        for role in [
-            ROLE_SYSTEM_PANE,
-            ROLE_SYSTEM_GROUPING,
-            ROLE_SYSTEM_DOCUMENT,
-            ROLE_SYSTEM_CLIENT,
-        ] {
+        assert!(!editable_focus(ROLE_SYSTEM_TEXT as i32, STATE_SYSTEM_FOCUSED).unwrap());
+        // This provisional classification requires the writable text attribute;
+        // GROUPING alone is never the final field identity.
+        assert!(editable_focus(ROLE_SYSTEM_GROUPING as i32, STATE_SYSTEM_FOCUSED).unwrap());
+        for role in [ROLE_SYSTEM_PANE, ROLE_SYSTEM_DOCUMENT, ROLE_SYSTEM_CLIENT] {
             assert_eq!(
                 editable_focus(role as i32, STATE_SYSTEM_FOCUSED)
                     .unwrap_err()
@@ -472,6 +594,10 @@ mod tests {
                 .code(),
             E_NOINTERFACE
         );
+        assert!(!identity_bool(&VARIANT::from(false)).unwrap());
+        assert!(identity_bool(&VARIANT::from(true)).unwrap());
+        assert!(identity_bool(&VARIANT::from(0i32)).is_err());
+        assert!(identity_bool(&VARIANT::default()).is_err());
     }
     #[test]
     fn full_document_representations_require_unique_selection_coordinates() {

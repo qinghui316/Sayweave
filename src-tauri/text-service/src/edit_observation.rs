@@ -3,6 +3,10 @@
 use super::{Lease, range_text};
 #[path = "native_observation.rs"]
 mod native_observation;
+#[cfg(feature = "acceptance")]
+pub(super) fn native_read_count() -> u64 {
+    native_observation::read_count()
+}
 use crate::wire::{ObservedEdit, Request};
 use std::{cell::RefCell, rc::Rc};
 use windows::{

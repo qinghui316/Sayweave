@@ -1345,9 +1345,10 @@ fn observation_ranges_fixture(
             ("revert", "术语", 0, 2, "词典", "词典", true),
             ("handoffExplicit", "术语", 0, 2, "词典", "词典", true),
             ("readonly", "术语", 0, 2, "词典", "词典", true),
+            ("password", "术语", 0, 2, "词典", "词典", true),
             ("originalRestore", "术语", 0, 2, "甲词", "甲词", false),
         ] {
-            if !plain && matches!(label, "ime" | "undo" | "readonly") {
+            if !plain && matches!(label, "ime" | "undo" | "readonly" | "password") {
                 continue;
             }
             // Legacy EDIT may expose an empty TSF original even with a native
@@ -1604,8 +1605,44 @@ fn observation_ranges_fixture(
                     return Err("revert did not restore actual output".into());
                 }
             }
+            let read_count = |operation| -> Result<u64, Box<dyn std::error::Error>> {
+                let reply = exchange(
+                    pipe,
+                    capability,
+                    &task,
+                    1,
+                    operation,
+                    1,
+                    Action::Inspect,
+                    "",
+                    false,
+                )?;
+                Ok(reply
+                    .code
+                    .split_whitespace()
+                    .find_map(|v| v.strip_prefix("observationReads="))
+                    .ok_or("acceptance read counter missing")?
+                    .parse()?)
+            };
+            let guarded = matches!(label, "readonly" | "password");
+            let before_reads = if guarded { Some(read_count(8)?) } else { None };
+            let original_style = GetWindowLongPtrW(editor, GWL_STYLE);
             if label == "readonly" {
                 SendMessageW(editor, 0x00CF, Some(WPARAM(1)), None);
+            }
+            if label == "password" {
+                SetWindowLongPtrW(editor, GWL_STYLE, original_style | ES_PASSWORD as isize);
+            }
+            if guarded {
+                let end = expected.encode_utf16().count();
+                SendMessageW(
+                    editor,
+                    0x00B1,
+                    Some(WPARAM(end)),
+                    Some(windows::Win32::Foundation::LPARAM(end as isize)),
+                );
+                SendMessageW(editor, WM_CHAR, Some(WPARAM(b'X' as usize)), None);
+                pump(Duration::from_millis(30));
             }
             let result = exchange(
                 pipe,
@@ -1622,10 +1659,29 @@ fn observation_ranges_fixture(
                 .edit_observation
                 .ok_or("receipt response missing")?
                 .records;
+            if let Some(before_reads) = before_reads {
+                if read_count(9)? != before_reads {
+                    return Err("protected/readonly observation performed a new span read".into());
+                }
+                let expected_actual = if label == "password" {
+                    format!("{expected}X")
+                } else {
+                    expected.into()
+                };
+                if !observation_text_equal(&editor_text(editor)?, &expected_actual) {
+                    return Err("observation retirement changed native edit behavior".into());
+                }
+                println!(
+                    "owned receipt scenario={label} native_observation_reads=0 original_message_delivered=true"
+                );
+            }
             if label == "readonly" {
                 SendMessageW(editor, 0x00CF, Some(WPARAM(0)), None);
             }
-            let valid = valid && !matches!(label, "undo" | "readonly" | "revert");
+            if label == "password" {
+                SetWindowLongPtrW(editor, GWL_STYLE, original_style);
+            }
+            let valid = valid && !matches!(label, "undo" | "readonly" | "password" | "revert");
             if result.mutation != Mutation::NotAttempted
                 || (valid
                     && (records.len() != 1
