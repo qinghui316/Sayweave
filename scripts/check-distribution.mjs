@@ -7,7 +7,7 @@ const roots = new Set(['.gitattributes', '.gitignore', 'README.md', 'LICENSE', '
   'CONTRIBUTING.md', 'SECURITY.md', 'CHANGELOG.md', 'package.json', 'package-lock.json',
   'eslint.config.js', 'index.html', 'playwright.config.ts', 'rust-toolchain.toml',
   'tsconfig.json', 'vite.config.ts']);
-const docs = new Set(['architecture.md', 'development.md', 'design.md', 'testing.md', 'local-data.md', 'motion.md', 'models.md', 'speech.md', 'history.md', 'dictation.md', 'personalization.md']);
+const docs = new Set(['architecture.md', 'development.md', 'design.md', 'testing.md', 'local-data.md', 'motion.md', 'models.md', 'speech.md', 'history.md', 'dictation.md', 'personalization.md', 'release.md']);
 const releaseNotes = /^release-notes\/v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.json$/;
 const publicWorkflow = file => file === '.github/workflows/windows-release.yml';
 const scripts = new Set(['check-boundaries.mjs', 'check-native-boundaries.mjs', 'check-text.mjs', 'check-distribution.mjs', 'generate-update-manifest.mjs', 'verify-update-release.mjs',
