@@ -29,7 +29,7 @@ import { Dictionary } from '../features/dictionary';
 import { Onboarding } from '../features/onboarding';
 import { VoiceSurface } from '../features/voice';
 import {createUpdatePort} from '../adapters/update-tauri';
-import {UpdateIndicator} from '../features/settings/UpdateIndicator';
+import {UpdateIndicator} from '../ui/UpdateIndicator';
 import brand from '../assets/brand.svg';
 import s from './app.module.css';
 const DevCatalogue = import.meta.env.DEV ? lazy(() => import('../dev/Catalogue')) : null;

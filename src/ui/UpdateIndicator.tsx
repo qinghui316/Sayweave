@@ -1,4 +1,4 @@
 import {useSyncExternalStore} from 'react';
-import type {UpdatePort} from '../../contracts/update';
-import s from './settings.module.css';
+import type {UpdatePort} from '../contracts/update';
+import s from './ui.module.css';
 export function UpdateIndicator({port}:{port:UpdatePort}){const value=useSyncExternalStore(port.subscribe,port.snapshot);const active=value.state!=='idle';const progress=value.progress??0;const dash=100-progress*.75;const label=value.state==='downloading'?`正在下载更新 ${value.progress===null?'':`${value.progress}%`}`:value.state==='readyToInstall'?`重启并更新到 ${value.version}`:value.state==='available'?`下载更新 ${value.version}`:value.error??'检查更新';const click=()=>value.state==='readyToInstall'?void port.install():void port.check(true);return <button type="button" className={`${s.updateIndicator} ${active?s.updateActive:''}`} aria-label={label} title={label} onClick={click}><svg viewBox="0 0 40 40" aria-hidden="true"><circle className={s.updateTrack} cx="20" cy="20" r="15"/><circle className={s.updateProgress} cx="20" cy="20" r="15" pathLength="100" strokeDasharray="100" strokeDashoffset={active?dash:100}/></svg>{value.state==='readyToInstall'&&<span className={s.updateGlyph}>↻</span>}</button>;}

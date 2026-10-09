@@ -12,7 +12,7 @@ import {TextServiceSettings} from './TextServiceSettings';
 import type {SettingsStores} from '../../settings/controllers';
 import {PersonalizationSettings} from './PersonalizationSettings';
 import type {UpdatePort} from '../../contracts/update';
-import {UpdateIndicator} from './UpdateIndicator';
+import {UpdateIndicator} from '../../ui/UpdateIndicator';
 export type SettingsTab = keyof typeof zh.settings.tabs;
 export {ProcessingSettings} from './ProcessingSettings';
 export function SettingsShell({ open, tab, onTabChange, onOpenChange, modelContent,speechPort,shortcutPort,textServicePort,settings,languagePort,visible,updatePort }: { open: boolean; tab: SettingsTab; onTabChange: (tab: SettingsTab) => void; onOpenChange: (open: boolean) => void; modelContent?:ReactNode;speechPort?:SpeechPort;shortcutPort?:ShortcutConfigPort;textServicePort?:TextServicePort;settings:SettingsStores;languagePort:LanguageSettingsPort;visible:boolean;updatePort:UpdatePort }) {
