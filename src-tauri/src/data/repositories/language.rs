@@ -11,9 +11,9 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 #[path = "language_tests.rs"]
 mod tests;
 
-fn settings(db: &Connection) -> Result<Settings, DataError> {
+fn feature_settings(db: &Connection, table: &str) -> Result<Settings, DataError> {
     db.query_row(
-        "SELECT enabled,revision FROM language_settings WHERE singleton=1",
+        &format!("SELECT enabled,revision FROM {table} WHERE singleton=1"),
         [],
         |r| {
             Ok(Settings {
@@ -24,8 +24,24 @@ fn settings(db: &Connection) -> Result<Settings, DataError> {
     )
     .map_err(db_error)
 }
+fn settings(db: &Connection) -> Result<LanguageSettings, DataError> {
+    Ok(LanguageSettings {
+        automatic_terms: feature_settings(db, "automatic_term_settings")?,
+        personalization: feature_settings(db, "language_settings")?,
+    })
+}
+fn save_feature(db: &Connection, table: &str, value: &Settings) -> Result<(), DataError> {
+    let current = feature_settings(db, table)?;
+    if current.revision != value.revision {
+        return Err(DataError::new("conflict"));
+    }
+    if current.enabled != value.enabled {
+        db.execute(&format!("UPDATE {table} SET enabled=?1,revision=revision+1 WHERE singleton=1 AND revision=?2"),params![value.enabled,value.revision]).map_err(db_error)?;
+    }
+    Ok(())
+}
 fn live(db: &Connection, revision: i64) -> Result<(), DataError> {
-    let current = settings(db)?;
+    let current = settings(db)?.personalization;
     if current.enabled && current.revision == revision {
         Ok(())
     } else {
@@ -147,12 +163,21 @@ impl Repository {
             }
             DbOperation::PendingEdits => {
                 let config = settings(&self.connection)?;
-                if !config.enabled {
+                if !config.automatic_terms.enabled && !config.personalization.enabled {
                     return Ok(DbOutput::PendingEdits(vec![]));
                 }
-                let mut query=self.connection.prepare("SELECT evidence FROM language_edits WHERE state='pending' AND settings_revision=?1 AND expires_at>?2 ORDER BY created_at,id LIMIT 16").map_err(db_error)?;
+                let mut query=self.connection.prepare("SELECT evidence FROM language_edits WHERE state='pending' AND expires_at>?1 AND ((automatic_terms_state='pending' AND automatic_terms_revision=?2 AND ?3) OR (personalization_state='pending' AND personalization_revision=?4 AND ?5)) ORDER BY created_at,id LIMIT 16").map_err(db_error)?;
                 let values = query
-                    .query_map(params![config.revision, now()], |r| r.get::<_, String>(0))
+                    .query_map(
+                        params![
+                            now(),
+                            config.automatic_terms.revision,
+                            config.automatic_terms.enabled,
+                            config.personalization.revision,
+                            config.personalization.enabled
+                        ],
+                        |r| r.get::<_, String>(0),
+                    )
                     .map_err(db_error)?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(db_error)?;
@@ -164,7 +189,7 @@ impl Repository {
                 ))
             }
             DbOperation::PendingScopes => {
-                let config = settings(&self.connection)?;
+                let config = settings(&self.connection)?.personalization;
                 if !config.enabled {
                     return Ok(DbOutput::PendingScopes(vec![]));
                 }
@@ -205,18 +230,23 @@ impl Repository {
             }
             DbOperation::Settings => Ok(DbOutput::Settings(settings(&self.connection)?)),
             DbOperation::SaveSettings(value) => {
+                if value.automatic_terms.is_none() && value.personalization.is_none() {
+                    return Err(DataError::new("invalid"));
+                }
                 let tx = self
                     .connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(db_error)?;
-                let changed=tx.execute("UPDATE language_settings SET enabled=?1,revision=revision+1 WHERE singleton=1 AND revision=?2",params![value.enabled,value.revision]).map_err(db_error)?;
-                if changed != 1 {
-                    return Err(DataError::new("conflict"));
+                if let Some(v) = &value.automatic_terms {
+                    save_feature(&tx, "automatic_term_settings", v)?;
                 }
-                if !value.enabled {
-                    tx.execute("UPDATE language_edits SET state='expired',evidence='{}' WHERE state='pending'",[]).map_err(db_error)?;
+                if let Some(v) = &value.personalization {
+                    save_feature(&tx, "language_settings", v)?;
                 }
                 let result = settings(&tx)?;
+                tx.execute("UPDATE language_edits SET automatic_terms_state='cancelled' WHERE state='pending' AND automatic_terms_state='pending' AND (automatic_terms_revision<>?1 OR NOT ?2)",params![result.automatic_terms.revision,result.automatic_terms.enabled]).map_err(db_error)?;
+                tx.execute("UPDATE language_edits SET personalization_state='cancelled' WHERE state='pending' AND personalization_state='pending' AND (personalization_revision<>?1 OR NOT ?2)",params![result.personalization.revision,result.personalization.enabled]).map_err(db_error)?;
+                tx.execute("UPDATE language_edits SET state='expired',evidence='{}' WHERE state='pending' AND automatic_terms_state<>'pending' AND personalization_state<>'pending'",[]).map_err(db_error)?;
                 tx.commit().map_err(db_error)?;
                 Ok(DbOutput::Settings(result))
             }
@@ -226,7 +256,7 @@ impl Repository {
                     preferences(&self.connection, &application.key)?;
                 let (shared_version, shared, _) = preferences(&self.connection, "shared")?;
                 selected.extend(shared);
-                if !config.enabled {
+                if !config.personalization.enabled {
                     selected.clear();
                 }
                 Ok(DbOutput::Snapshot(Snapshot {
@@ -255,11 +285,14 @@ impl Repository {
                     return Err(DataError::new("invalid"));
                 }
                 let tx = self.connection.transaction().map_err(db_error)?;
-                live(&tx, evidence.settings_revision)?;
+                let eligible = evidence.eligibility.live(&settings(&tx)?);
+                if !eligible.any() {
+                    return Err(DataError::new("conflict"));
+                }
                 // An immutable identity is never replaced by a repeated poll.
-                tx.execute("INSERT OR IGNORE INTO language_edits(id,task_id,scope,settings_revision,evidence,state,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,'pending',?6,?7)",params![evidence.id,evidence.task,evidence.application.key,evidence.settings_revision,json(&evidence)?,now(),evidence.expires_at]).map_err(db_error)?;
+                tx.execute("INSERT OR IGNORE INTO language_edits(id,task_id,scope,settings_revision,evidence,state,created_at,expires_at,automatic_terms_revision,personalization_revision,automatic_terms_state,personalization_state) VALUES(?1,?2,?3,0,?4,'pending',?5,?6,?7,?8,?9,?10)",params![evidence.id,evidence.task,evidence.application.key,json(&evidence)?,now(),evidence.expires_at,evidence.eligibility.automatic_terms,evidence.eligibility.personalization,if eligible.automatic_terms.is_some(){"pending"}else{"inactive"},if eligible.personalization.is_some(){"pending"}else{"inactive"}]).map_err(db_error)?;
                 tx.execute("UPDATE language_edits SET state='expired',evidence='{}' WHERE expires_at<?1 AND state='pending'",[now()]).map_err(db_error)?;
-                let ready:Option<String>=tx.query_row("SELECT evidence FROM language_edits WHERE id=?1 AND state='pending' AND settings_revision=?2 AND expires_at>?3",params![evidence.id,evidence.settings_revision,now()],|r|r.get(0)).optional().map_err(db_error)?;
+                let ready:Option<String>=tx.query_row("SELECT evidence FROM language_edits WHERE id=?1 AND state='pending' AND expires_at>?2",params![evidence.id,now()],|r|r.get(0)).optional().map_err(db_error)?;
                 tx.commit().map_err(db_error)?;
                 Ok(DbOutput::EditReady(
                     ready.as_deref().map(parse).transpose()?,
@@ -267,7 +300,7 @@ impl Repository {
             }
             DbOperation::ClassifyEdit {
                 id,
-                settings_revision,
+                eligibility,
                 decision,
                 analysis,
             } => {
@@ -275,13 +308,21 @@ impl Repository {
                     .connection
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(db_error)?;
-                live(&tx, settings_revision)?;
-                let source:Option<String>=tx.query_row("SELECT evidence FROM language_edits WHERE id=?1 AND state='pending' AND settings_revision=?2 AND expires_at>=?3",params![id,settings_revision,now()],|r|r.get(0)).optional().map_err(db_error)?;
+                let source:Option<String>=tx.query_row("SELECT evidence FROM language_edits WHERE id=?1 AND state='pending' AND expires_at>=?2",params![id,now()],|r|r.get(0)).optional().map_err(db_error)?;
                 let Some(source) = source else {
                     return Err(DataError::new("conflict"));
                 };
                 let source: EditEvidence = parse(&source)?;
-                if matches!(decision.class, EditClass::Lexical | EditClass::Ambiguous) {
+                if source.eligibility != eligibility {
+                    return Err(DataError::new("conflict"));
+                }
+                let eligible = eligibility.live(&settings(&tx)?);
+                if !eligible.any() {
+                    return Err(DataError::new("conflict"));
+                }
+                if let Some(settings_revision) = eligible.automatic_terms
+                    && matches!(decision.class, EditClass::Lexical | EditClass::Ambiguous)
+                {
                     let original = decision
                         .original
                         .as_deref()
@@ -332,7 +373,9 @@ impl Repository {
                             tx.execute("INSERT OR IGNORE INTO language_lexical_candidates(id,term_key,term,original,scope,created_at) VALUES(?1,?2,?3,?4,?5,?6)",params![id,key(term),term,original,source.application.key,now()]).map_err(db_error)?;
                         }
                     }
-                } else if decision.class == EditClass::Style {
+                } else if let Some(settings_revision) = eligible.personalization
+                    && decision.class == EditClass::Style
+                {
                     let summary = decision
                         .summary
                         .as_deref()
@@ -351,6 +394,7 @@ impl Repository {
                     };
                     tx.execute("INSERT OR IGNORE INTO language_observations(id,task_id,scope,settings_revision,kind,observation,created_at) VALUES(?1,?2,?3,?4,'edit',?5,?6)",params![id,source.task,source.application.key,settings_revision,json(&observation)?,now()]).map_err(db_error)?;
                 }
+                tx.execute("UPDATE language_edits SET automatic_terms_state=CASE WHEN automatic_terms_state='pending' THEN ?2 ELSE automatic_terms_state END,personalization_state=CASE WHEN personalization_state='pending' THEN ?3 ELSE personalization_state END WHERE id=?1",params![id,if eligible.automatic_terms.is_some(){"settled"}else{"cancelled"},if eligible.personalization.is_some(){"settled"}else{"cancelled"}]).map_err(db_error)?;
                 tx.execute("UPDATE language_edits SET state='settled',decision=?2,analysis=?3,evidence='{}' WHERE id=?1",params![id,json(&decision)?,json(&analysis)?]).map_err(db_error)?;
                 tx.commit().map_err(db_error)?;
                 Ok(DbOutput::Done)
@@ -380,7 +424,7 @@ impl Repository {
                 if !scope(&requested) {
                     return Err(DataError::new("invalid"));
                 }
-                let config = settings(&self.connection)?;
+                let config = settings(&self.connection)?.personalization;
                 if !config.enabled {
                     return Ok(DbOutput::Batch(None));
                 }

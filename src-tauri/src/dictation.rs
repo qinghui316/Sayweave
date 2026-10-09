@@ -547,20 +547,23 @@ impl DictationCoordinator {
             None
         };
         #[cfg(windows)]
-        if let (Some(native), Some(language)) =
-            (&raw_draft, language.as_ref().filter(|s| s.settings.enabled))
-        {
+        if let (Some(native), Some(language)) = (
+            &raw_draft,
+            language.as_ref().filter(|s| {
+                crate::contracts::language::LearningEligibility::capture(&s.settings).any()
+            }),
+        ) {
+            app.state::<crate::language_learning::LanguageLearning>()
+                .observation_control()
+                .publish(&language.settings);
             let handle = app.clone();
             let _ = native
                 .observe(Arc::new(
                     crate::windows_input::composition::ObservationSink {
                         snapshot: language.clone(),
-                        permit: app
+                        control: app
                             .state::<crate::language_learning::LanguageLearning>()
-                            .observation_permit(),
-                        current_revision: app
-                            .state::<crate::language_learning::LanguageLearning>()
-                            .observation_revision(),
+                            .observation_control(),
                         emit: Arc::new(move |e| {
                             handle
                                 .state::<crate::language_learning::LanguageLearning>()
@@ -988,7 +991,7 @@ impl DictationCoordinator {
                 if saved
                     && !archive_error
                     && let (Some(language), Some(recognition)) = (&language, &language_source)
-                    && language.settings.enabled
+                    && language.settings.personalization.enabled
                     && recognition.phase == Phase::Completed
                     && let Some(attempt) = &recognition.attempt_id
                 {
@@ -997,7 +1000,7 @@ impl DictationCoordinator {
                             id: format!("speech:{id}"),
                             task: id.clone(),
                             application: language.application.clone(),
-                            settings_revision: language.settings.revision,
+                            settings_revision: language.settings.personalization.revision,
                             language: crate::contracts::language::WritingLanguage::of(
                                 &recognition.text,
                             ),

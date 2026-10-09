@@ -101,7 +101,7 @@ test('processing controls follow saved text models and protect unsaved changes',
  const toggle=dialog.getByRole('switch',{name:'整理口述'});await expect(toggle).toBeChecked();await toggle.click();
  await dialog.getByRole('button',{name:'关闭',exact:true}).click();
  const confirmation=page.getByRole('alertdialog');await expect(confirmation).toBeVisible();await confirmation.getByRole('button',{name:'继续填写'}).click();
- await dialog.getByRole('button',{name:'保存整理设置'}).click();await expect(dialog.getByRole('button',{name:'保存整理设置'})).toHaveCount(0);
+ await dialog.getByRole('button',{name:'保存设置'}).click();await expect(dialog.getByRole('button',{name:'保存设置'})).toHaveCount(0);
  await dialog.getByRole('button',{name:'关闭',exact:true}).click();
  await page.getByRole('button',{name:'配置模型',exact:true}).click();const reopened=page.getByRole('dialog');await reopened.getByRole('tab',{name:'文字处理'}).click();await expect(reopened.getByRole('switch',{name:'整理口述'})).not.toBeChecked();
 });

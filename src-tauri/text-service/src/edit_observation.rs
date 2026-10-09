@@ -23,12 +23,14 @@ struct Reading {
     continuation: bool,
     epoch: u64,
     original: Option<Rc<str>>,
+    end_reason: &'static str,
 }
 pub(super) struct Watch {
     field: super::initial_selection::FocusIdentity,
     context: ITfContext,
     data: Rc<RefCell<Reading>>,
     cookie: Option<u32>,
+    notifications: Option<Rc<super::TextNotifications>>,
     _native: Option<native_observation::BoundEdit>,
 }
 impl Drop for Watch {
@@ -41,10 +43,12 @@ impl Drop for Watch {
         data.epoch = data.epoch.wrapping_add(1);
         drop(data);
         unsafe {
-            if let Some(cookie) = self.cookie
-                && let Ok(source) = self.context.cast::<ITfSource>()
-            {
-                let _ = source.UnadviseSink(cookie);
+            if let Some(cookie) = self.cookie {
+                if let Some(notifications) = &self.notifications {
+                    notifications.retire(self.context.clone(), cookie);
+                } else if let Ok(source) = self.context.cast::<ITfSource>() {
+                    let _ = source.UnadviseSink(cookie);
+                }
             }
         }
     }
@@ -60,6 +64,7 @@ impl Watch {
         completed_tick: u64,
         field: super::initial_selection::FocusIdentity,
         original: Option<Rc<str>>,
+        notifications: Rc<super::TextNotifications>,
     ) -> windows::core::Result<Self> {
         unsafe {
             if context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0
@@ -98,19 +103,21 @@ impl Watch {
                 continuation: false,
                 epoch: 0,
                 original,
+                end_reason: "none",
             }));
             let sink: ITfTextEditSink = Sink {
                 field: field.clone(),
                 range,
                 client,
                 data: data.clone(),
+                notifications: notifications.clone(),
                 _lease: Lease::new(),
             }
             .into();
             let source: ITfSource = context.cast()?;
             let cookie = source.AdviseSink(&ITfTextEditSink::IID, &sink)?;
             if !field.matches().unwrap_or(false) {
-                let _ = source.UnadviseSink(cookie);
+                notifications.retire(context.clone(), cookie);
                 return Err(windows::core::Error::from_hresult(
                     windows::Win32::Foundation::E_ACCESSDENIED,
                 ));
@@ -120,6 +127,7 @@ impl Watch {
                 context: context.clone(),
                 data,
                 cookie: Some(cookie),
+                notifications: Some(notifications),
                 _native: None,
             })
         }
@@ -169,6 +177,7 @@ impl Watch {
                 continuation: false,
                 epoch: 0,
                 original,
+                end_reason: "none",
             }));
             let native = native_observation::BoundEdit::attach(
                 windows::Win32::Foundation::HWND(window as *mut _),
@@ -183,6 +192,7 @@ impl Watch {
                 context: context.clone(),
                 data,
                 cookie: None,
+                notifications: None,
                 _native: Some(native),
             })
         }
@@ -203,6 +213,7 @@ impl Watch {
             let mut data = self.data.borrow_mut();
             if field.is_err() {
                 data.valid = false;
+                data.end_reason = "fieldUnavailable";
             }
             if data.value.before != data.value.after
                 && data.original.as_deref().is_some_and(|original| {
@@ -212,12 +223,43 @@ impl Watch {
                 // Restoring the known original selection is not new correction
                 // evidence. This negative check never grants read/write ownership.
                 data.valid = false;
+                data.end_reason = "originalRestored";
+            }
+            if data.end_reason == "none" {
+                data.end_reason = if stop {
+                    "stopped"
+                } else if field == Ok(false) {
+                    "fieldChanged"
+                } else if !focused {
+                    "contextChanged"
+                } else if now.saturating_sub(data.start) >= 60000 {
+                    "expired"
+                } else if now.saturating_sub(data.changed) >= 15000 {
+                    "quiet"
+                } else if !data.valid {
+                    "invalidated"
+                } else {
+                    "none"
+                };
             }
             data.value.ended |= stop
                 || field == Ok(false)
                 || !focused
                 || now.saturating_sub(data.start) >= 60000
                 || now.saturating_sub(data.changed) >= 15000;
+            #[cfg(feature = "acceptance")]
+            if data.value.ended {
+                eprintln!(
+                    "owned observation end stop={} field_match={} context_match={} age_ms={} quiet_ms={} valid={} sequence={}",
+                    stop,
+                    field == Ok(true),
+                    focused,
+                    now.saturating_sub(data.start),
+                    now.saturating_sub(data.changed),
+                    data.valid,
+                    data.value.sequence
+                );
+            }
             (data.valid
                 && complete
                 && !data.value.composing
@@ -228,6 +270,15 @@ impl Watch {
     pub(super) fn ended(&self) -> bool {
         self.data.borrow().value.ended || !self.data.borrow().valid
     }
+    pub(super) fn diagnostic(&self) -> (bool, bool, u64, &'static str) {
+        let data = self.data.borrow();
+        (
+            data.valid,
+            data.value.composing,
+            data.value.sequence,
+            data.end_reason,
+        )
+    }
 }
 #[implement(ITfTextEditSink)]
 struct Sink {
@@ -235,6 +286,7 @@ struct Sink {
     range: ITfRange,
     client: u32,
     data: Rc<RefCell<Reading>>,
+    notifications: Rc<super::TextNotifications>,
     _lease: Lease,
 }
 impl ITfTextEditSink_Impl for Sink_Impl {
@@ -244,6 +296,9 @@ impl ITfTextEditSink_Impl for Sink_Impl {
         ec: u32,
         record: Ref<ITfEditRecord>,
     ) -> windows::core::Result<()> {
+        let _notification = super::TextNotification::enter(self.notifications.clone());
+        #[cfg(feature = "acceptance")]
+        super::observation_fixture_reentry()?;
         unsafe {
             let Some(context) = context.as_ref() else {
                 return Ok(());
@@ -254,15 +309,21 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                 (data.value.ended || !data.valid, data.epoch)
             };
             if stopped {
+                #[cfg(feature = "acceptance")]
+                eprintln!("owned observer callback stopped=true epoch={epoch}");
                 return Ok(());
             }
             match context.InWriteSession(self.client) {
                 Ok(own) if own.as_bool() => {
+                    #[cfg(feature = "acceptance")]
+                    eprintln!("owned observer callback own=true epoch={epoch}");
                     self.data.borrow_mut().continuation = false;
                     return Ok(());
                 }
                 Err(_) => {
-                    self.data.borrow_mut().valid = false;
+                    let mut data = self.data.borrow_mut();
+                    data.valid = false;
+                    data.end_reason = "writeQueryFailed";
                     return Ok(());
                 }
                 _ => (),
@@ -270,11 +331,15 @@ impl ITfTextEditSink_Impl for Sink_Impl {
             match self.field.matches() {
                 Ok(true) => (),
                 Ok(false) => {
-                    self.data.borrow_mut().value.ended = true;
+                    let mut data = self.data.borrow_mut();
+                    data.value.ended = true;
+                    data.end_reason = "fieldChanged";
                     return Ok(());
                 }
                 Err(_) => {
-                    self.data.borrow_mut().valid = false;
+                    let mut data = self.data.borrow_mut();
+                    data.valid = false;
+                    data.end_reason = "fieldUnavailable";
                     return Ok(());
                 }
             }
@@ -346,6 +411,11 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                 }
                 // Native ranges track edits inside the receipt; unrelated text stays outside.
                 let after = range_text(&self.range, ec)?;
+                #[cfg(feature = "acceptance")]
+                eprintln!(
+                    "owned observer callback own=false epoch={epoch} changed_text={changed_text} after_units={}",
+                    after.encode_utf16().count()
+                );
                 if !self.field.matches()? {
                     return Err(windows::core::Error::from_hresult(
                         windows::Win32::Foundation::E_ACCESSDENIED,
@@ -372,10 +442,12 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                 Ok(true) => (),
                 Ok(false) => {
                     data.value.ended = true;
+                    data.end_reason = "fieldChanged";
                     return Ok(());
                 }
                 Err(_) => {
                     data.valid = false;
+                    data.end_reason = "fieldUnavailable";
                     return Ok(());
                 }
             }
@@ -390,7 +462,16 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                         data.value.changed_tick = data.changed;
                     }
                 }
-                Err(_) => data.valid = false,
+                Err(error) => {
+                    #[cfg(feature = "acceptance")]
+                    eprintln!(
+                        "owned observer callback failed epoch={epoch} hr={:08x}",
+                        error.code().0 as u32
+                    );
+                    let _ = error;
+                    data.valid = false;
+                    data.end_reason = "readFailed";
+                }
             }
             Ok(())
         }

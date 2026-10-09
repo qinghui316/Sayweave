@@ -149,7 +149,10 @@ async fn selected_language_evaluation() {
             region: "tail".into(),
             expires_at: crate::data::repository::now() + 600000,
             application: app.clone(),
-            settings_revision: 1,
+            eligibility: LearningEligibility {
+                automatic_terms: Some(1),
+                personalization: Some(1),
+            },
             raw: before.into(),
             before: before.into(),
             after: after.into(),
@@ -187,7 +190,10 @@ async fn selected_language_evaluation() {
                         &data,
                         DbOperation::ClassifyEdit {
                             id: e.id,
-                            settings_revision: 1,
+                            eligibility: LearningEligibility {
+                                automatic_terms: Some(1),
+                                personalization: Some(1),
+                            },
                             decision,
                             analysis: stamp(&id, revision, &input, "lexical-v1"),
                         },
@@ -216,7 +222,10 @@ async fn selected_language_evaluation() {
             region: "tail".into(),
             expires_at: crate::data::repository::now() + 600000,
             application: app.clone(),
-            settings_revision: 1,
+            eligibility: LearningEligibility {
+                automatic_terms: Some(1),
+                personalization: Some(1),
+            },
             raw: "修改这里，发给我。".into(),
             before: "修改这里，发给我。".into(),
             after: "麻烦修改一下这里，再发给我吧。".into(),
@@ -228,7 +237,10 @@ async fn selected_language_evaluation() {
             &data,
             DbOperation::ClassifyEdit {
                 id: e.id.clone(),
-                settings_revision: 1,
+                eligibility: LearningEligibility {
+                    automatic_terms: Some(1),
+                    personalization: Some(1),
+                },
                 decision: LexicalDecision {
                     class: EditClass::Style,
                     original: None,
@@ -335,7 +347,7 @@ async fn selected_observed_edit_evaluation() {
     assert!(std::env::var_os("SAYWEAVE_DATA_ACCEPTANCE_ID").is_none());
     let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.local");
     let native: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(folder.join("language-registered-observation.json")).unwrap(),
+        &std::fs::read(folder.join("language-registered-settle-observation.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(native["passed"], true);
@@ -384,12 +396,26 @@ async fn selected_observed_edit_evaluation() {
     let provider = Provider::new(Arc::new(crate::network::RequestCoordinator::default())).unwrap();
     let root = tempfile::tempdir().unwrap();
     let data = DataWorker::start(root.path().to_path_buf()).unwrap();
+    language_learning::operation(
+        &data,
+        DbOperation::SaveSettings(LanguageSettingsPatch {
+            personalization: Some(Settings {
+                enabled: false,
+                revision: 1,
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
     let frozen = language_learning::snapshot(&data, evidence.application.clone())
         .await
         .unwrap();
+    assert!(frozen.settings.automatic_terms.enabled);
+    assert!(!frozen.settings.personalization.enabled);
     // Rebase only the isolated database setting epoch; the native task/turn/op,
     // actual before/after, application and expiry remain the captured receipt.
-    evidence.settings_revision = frozen.settings.revision;
+    evidence.eligibility = LearningEligibility::capture(&frozen.settings);
     language_learning::operation(&data, DbOperation::SaveEdit(evidence.clone()))
         .await
         .unwrap();
@@ -420,7 +446,7 @@ async fn selected_observed_edit_evaluation() {
         &data,
         DbOperation::ClassifyEdit {
             id: evidence.id.clone(),
-            settings_revision: frozen.settings.revision,
+            eligibility: LearningEligibility::capture(&frozen.settings),
             decision: decision.clone(),
             analysis: stamp(&id, revision, &input, "lexical-v1"),
         },

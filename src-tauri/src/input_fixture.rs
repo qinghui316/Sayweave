@@ -101,8 +101,12 @@ fn focus_metadata(process: u32) -> serde_json::Value {
 }
 // Read only known static product labels from the explicitly owned application.
 // A native PID is not proof that the frontend rendered.
-fn product_surface(process:u32)->serde_json::Value {
-    if std::env::var("SAYWEAVE_DAILY_OWNED_PID").ok().and_then(|p|p.parse().ok())!=Some(process) {
+fn product_surface(process: u32) -> serde_json::Value {
+    if std::env::var("SAYWEAVE_DAILY_OWNED_PID")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        != Some(process)
+    {
         return serde_json::json!({"error":"ownedProductRequired"});
     }
     thread::spawn(move || unsafe {
@@ -256,9 +260,12 @@ fn main() {
     if std::env::var("SAYWEAVE_INPUT_ACCEPTANCE").as_deref() != Ok("1") {
         return;
     }
-    if std::env::args().nth(1).as_deref()==Some("inspect-product") {
-        let process=std::env::args().nth(2).and_then(|v|v.parse().ok()).unwrap_or(0);
-        println!("{}",product_surface(process));
+    if std::env::args().nth(1).as_deref() == Some("inspect-product") {
+        let process = std::env::args()
+            .nth(2)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        println!("{}", product_surface(process));
         return;
     }
     unsafe {
@@ -396,10 +403,15 @@ fn main() {
                     let _ = ok.send(());
                     continue;
                 }
-                if value["action"]=="inspect-product" {
-                    let process=value["process"].as_u64().and_then(|p|u32::try_from(p).ok()).unwrap_or(0);
-                    println!("{}",product_surface(process));
-                    io::stdout().flush().unwrap();let _=ok.send(());continue;
+                if value["action"] == "inspect-product" {
+                    let process = value["process"]
+                        .as_u64()
+                        .and_then(|p| u32::try_from(p).ok())
+                        .unwrap_or(0);
+                    println!("{}", product_surface(process));
+                    io::stdout().flush().unwrap();
+                    let _ = ok.send(());
+                    continue;
                 }
                 if value["action"] != "type"
                     && let Some(text) = value["text"].as_str()

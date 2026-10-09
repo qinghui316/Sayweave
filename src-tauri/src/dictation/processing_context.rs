@@ -135,11 +135,11 @@ impl Context {
             &self.dictionary,
             self.language
                 .as_ref()
-                .filter(|s| s.settings.enabled)
+                .filter(|s| s.settings.personalization.enabled)
                 .map(|s| &s.application),
             self.language
                 .as_ref()
-                .filter(|s| s.settings.enabled)
+                .filter(|s| s.settings.personalization.enabled)
                 .map_or(&[], |s| s.preferences.as_slice()),
         )
         .map_err(|e| ModelError::new(e.code))?;

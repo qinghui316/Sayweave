@@ -131,16 +131,61 @@ pub struct Preference {
     pub evidence: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Settings {
     pub enabled: bool,
     pub revision: i64,
 }
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LanguageSettings {
+    pub automatic_terms: Settings,
+    pub personalization: Settings,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LanguageSettingsPatch {
+    pub automatic_terms: Option<Settings>,
+    pub personalization: Option<Settings>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LearningEligibility {
+    pub automatic_terms: Option<i64>,
+    pub personalization: Option<i64>,
+}
+impl LearningEligibility {
+    pub fn capture(settings: &LanguageSettings) -> Self {
+        Self {
+            automatic_terms: settings
+                .automatic_terms
+                .enabled
+                .then_some(settings.automatic_terms.revision),
+            personalization: settings
+                .personalization
+                .enabled
+                .then_some(settings.personalization.revision),
+        }
+    }
+    pub fn live(&self, settings: &LanguageSettings) -> Self {
+        Self {
+            automatic_terms: self.automatic_terms.filter(|r| {
+                settings.automatic_terms.enabled && *r == settings.automatic_terms.revision
+            }),
+            personalization: self.personalization.filter(|r| {
+                settings.personalization.enabled && *r == settings.personalization.revision
+            }),
+        }
+    }
+    pub fn any(&self) -> bool {
+        self.automatic_terms.is_some() || self.personalization.is_some()
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
-    pub settings: Settings,
+    pub settings: LanguageSettings,
     pub application: ApplicationContext,
     pub profile_version: i64,
     pub shared_version: i64,
@@ -158,7 +203,7 @@ pub struct EditEvidence {
     pub region: String,
     pub expires_at: i64,
     pub application: ApplicationContext,
-    pub settings_revision: i64,
+    pub eligibility: LearningEligibility,
     pub raw: String,
     pub before: String,
     pub after: String,
@@ -236,12 +281,12 @@ pub struct AnalysisStamp {
 #[derive(Clone, Debug)]
 pub enum DbOperation {
     Settings,
-    SaveSettings(Settings),
+    SaveSettings(LanguageSettingsPatch),
     Snapshot(ApplicationContext),
     SaveEdit(EditEvidence),
     ClassifyEdit {
         id: String,
-        settings_revision: i64,
+        eligibility: LearningEligibility,
         decision: LexicalDecision,
         analysis: AnalysisStamp,
     },
@@ -268,7 +313,7 @@ pub enum DbOperation {
 }
 #[derive(Debug)]
 pub enum DbOutput {
-    Settings(Settings),
+    Settings(LanguageSettings),
     Snapshot(Snapshot),
     Batch(Option<ProfileBatch>),
     Done,

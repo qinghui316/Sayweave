@@ -510,7 +510,7 @@ pub(super) fn run(exe: &std::path::Path) -> Result<(), String> {
 /// host and its optional receipt sink. It never directly loads a component DLL.
 pub(super) fn observation_run(process: u32) -> Result<(), String> {
     use super::composition::{Draft, Finish, ObservationSink, stop_observer};
-    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::atomic::AtomicBool;
     if std::env::var("SAYWEAVE_TSF_OWNED_PID")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -524,6 +524,7 @@ pub(super) fn observation_run(process: u32) -> Result<(), String> {
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
     let (send, evidence) = std::sync::mpsc::channel();
     let mut draft = None;
+    let mut gate: Option<Arc<DeliveryGate>> = None;
     let mut task = String::new();
     let result = (|| {
         println!("{}", serde_json::json!({"ready":true}));
@@ -543,27 +544,39 @@ pub(super) fn observation_run(process: u32) -> Result<(), String> {
                     let application = super::application::resolve(&anchor);
                     task = uuid::Uuid::new_v4().to_string();
                     bind_watch(&task, &anchor, None).map_err(|e| e.code)?;
+                    let current_gate = Arc::new(DeliveryGate::default());
                     let current = runtime
-                        .block_on(Draft::begin(
-                            task.clone(),
-                            1,
-                            anchor,
-                            Arc::new(DeliveryGate::default()),
-                        ))
+                        .block_on(Draft::begin(task.clone(), 1, anchor, current_gate.clone()))
                         .map_err(|e| e.code)?;
                     let sink = Arc::new(ObservationSink {
                         snapshot: crate::contracts::language::Snapshot {
                             application: application.clone(),
-                            settings: crate::contracts::language::Settings {
-                                enabled: true,
-                                revision: 0,
+                            settings: crate::contracts::language::LanguageSettings {
+                                automatic_terms: crate::contracts::language::Settings {
+                                    enabled: true,
+                                    revision: 0,
+                                },
+                                personalization: crate::contracts::language::Settings {
+                                    enabled: true,
+                                    revision: 0,
+                                },
                             },
                             profile_version: 0,
                             shared_version: 0,
                             preferences: vec![],
                         },
-                        permit: Arc::new(AtomicBool::new(true)),
-                        current_revision: Arc::new(AtomicU64::new(0)),
+                        control: Arc::new(crate::language_policy::LearningControl::new(
+                            crate::contracts::language::LanguageSettings {
+                                automatic_terms: crate::contracts::language::Settings {
+                                    enabled: true,
+                                    revision: 0,
+                                },
+                                personalization: crate::contracts::language::Settings {
+                                    enabled: true,
+                                    revision: 0,
+                                },
+                            },
+                        )),
                         emit: Arc::new({
                             let send = send.clone();
                             move |value| {
@@ -575,6 +588,7 @@ pub(super) fn observation_run(process: u32) -> Result<(), String> {
                     response["application"] =
                         serde_json::to_value(application).map_err(|e| e.to_string())?;
                     draft = Some(current);
+                    gate = Some(current_gate);
                 }
                 "replace" => {
                     runtime
@@ -585,7 +599,25 @@ pub(super) fn observation_run(process: u32) -> Result<(), String> {
                         ))
                         .map_err(|e| e.code)?;
                 }
-                "commit" | "handoff" => {
+                "settle" => {
+                    let outcome =
+                        runtime.block_on(draft.as_ref().ok_or("begin first")?.settle_with_source(
+                            value["sequence"].as_u64().ok_or("sequence required")?,
+                            value["text"].as_str().ok_or("text required")?.into(),
+                            value["tail"].as_str().unwrap_or("").into(),
+                            Some((
+                                value["raw"].as_str().ok_or("raw required")?.into(),
+                                value["tailRaw"].as_str().unwrap_or("").into(),
+                            )),
+                            Arc::new(AtomicBool::new(true)),
+                        ));
+                    response["prefixChanged"] =
+                        (outcome.prefix == sayweave_text_service::wire::Mutation::Changed).into();
+                    response["tailOwned"] = outcome.tail_owned.into();
+                    response["error"] =
+                        serde_json::to_value(outcome.error).map_err(|e| e.to_string())?;
+                }
+                "commit" | "handoff" | "abort" => {
                     let outcome = runtime.block_on(
                         draft
                             .as_ref()
@@ -594,6 +626,8 @@ pub(super) fn observation_run(process: u32) -> Result<(), String> {
                                 value["text"].as_str().unwrap_or("").into(),
                                 if action == "commit" {
                                     Finish::Commit
+                                } else if action == "abort" {
+                                    Finish::Abort
                                 } else {
                                     Finish::Handoff("editing".into())
                                 },
@@ -602,8 +636,13 @@ pub(super) fn observation_run(process: u32) -> Result<(), String> {
                     );
                     response["committed"] = outcome.committed.into();
                     response["handedOff"] = outcome.handed_off.into();
+                    response["cancelled"] = outcome.cancelled.into();
+                    response["rollbackFailed"] = outcome.rollback_failed.into();
                     response["delivery"] =
                         serde_json::to_value(outcome.delivery).map_err(|e| e.to_string())?;
+                }
+                "cancel-gate" => {
+                    gate.as_ref().ok_or("begin first")?.cancel();
                 }
                 "drain" => {}
                 "stop" => {

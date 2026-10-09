@@ -4,7 +4,7 @@ use crate::{
     data::{DataWorker, Operation, Output},
     models::{ModelService, types::ModelError},
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -42,28 +42,12 @@ impl Drop for CompletionGuard {
         }
     }
 }
-fn apply_settings(
-    revision: &Mutex<i64>,
-    enabled: &AtomicBool,
-    published: &AtomicU64,
-    value: &Settings,
-) {
-    if let Ok(mut latest) = revision.lock()
-        && value.revision >= *latest
-    {
-        *latest = value.revision;
-        published.store(value.revision as u64, Ordering::Release);
-        enabled.store(value.enabled, Ordering::Release);
-    }
-}
 pub struct LanguageLearning {
     sender: mpsc::Sender<Job>,
     stop: watch::Sender<bool>,
     current: Arc<Mutex<Option<String>>>,
     epoch: Arc<AtomicU64>,
-    enabled: Arc<AtomicBool>,
-    settings_revision: Arc<Mutex<i64>>,
-    published_revision: Arc<AtomicU64>,
+    control: Arc<crate::language_policy::LearningControl>,
     interrupted: watch::Sender<u64>,
     finished: watch::Receiver<bool>,
 }
@@ -76,10 +60,8 @@ impl LanguageLearning {
         let epoch = Arc::new(AtomicU64::new(0));
         let generation = epoch.clone();
         let (interrupted, _) = watch::channel(0);
-        let enabled = Arc::new(AtomicBool::new(false));
-        let settings_revision = Arc::new(Mutex::new(0));
-        let published_revision = Arc::new(AtomicU64::new(0));
-        let accepting = enabled.clone();
+        let control = Arc::new(crate::language_policy::LearningControl::default());
+        let accepting = control.clone();
         let (finished_sender, finished) = watch::channel(false);
         let completion = Arc::new(WorkerCompletion {
             remaining: AtomicUsize::new(2),
@@ -89,9 +71,7 @@ impl LanguageLearning {
         // input or a network request. Both workers still share one DataWorker.
         let maintenance_app = app.clone();
         let maintenance_sender = sender.clone();
-        let maintenance_enabled = enabled.clone();
-        let maintenance_revision = settings_revision.clone();
-        let maintenance_published = published_revision.clone();
+        let maintenance_control = control.clone();
         let mut maintenance_stop = stop.subscribe();
         let maintenance_guard = CompletionGuard(completion.clone());
         tauri::async_runtime::spawn(async move {
@@ -106,7 +86,7 @@ impl LanguageLearning {
                         let maintenance = async {
                             let _ = operation(&data, DbOperation::Expire).await;
                             if let Ok(DbOutput::Settings(settings)) = operation(&data, DbOperation::Settings).await {
-                                apply_settings(&maintenance_revision, &maintenance_enabled, &maintenance_published, &settings);
+                                maintenance_control.publish(&settings);
                             }
                             if let Ok(DbOutput::PendingScopes(pending)) = operation(&data, DbOperation::PendingScopes).await {
                                 let _ = maintenance_sender.try_send(Job::Pending(pending));
@@ -133,14 +113,15 @@ impl LanguageLearning {
                 tokio::select! {biased;
                     _=stopped.changed()=>{if *stopped.borrow(){return;}},
                     Some(job)=async { match retry.take() { Some(e)=>Some(Job::Edit(e)),None=>receiver.recv().await } }=>{
-                        if !accepting.load(Ordering::Acquire){continue;}
+                        if !accepting.any(){continue;}
                         if let Job::Pending(pending) = job { scopes.extend(pending); continue; }
+                        let interest=match &job {Job::Edit(e)=>e.eligibility.clone(),Job::Speech(o)=>LearningEligibility{automatic_terms:None,personalization:Some(o.settings_revision)},Job::Pending(_)=>unreachable!()};
                         let deadline=match &job{Job::Edit(e)=>Some(e.expires_at),_=>None};
                         let scope=match &job{Job::Edit(e)=>e.application.key.clone(),Job::Speech(o)=>o.application.key.clone(),Job::Pending(_)=>unreachable!()};
                         // Keep the event frozen while foreground work runs. A bounded channel
                         // limits producers; this actor never spawns a second model request.
-                        while accepting.load(Ordering::Acquire) && foreground(&app) && deadline.is_none_or(|t|t>crate::data::repository::now()) {tokio::select!{_=stopped.changed()=>return,_=tokio::time::sleep(Duration::from_millis(100))=>{}}}
-                        if !accepting.load(Ordering::Acquire) || deadline.is_some_and(|t|t<=crate::data::repository::now()){continue;}
+                        while accepting.live(&interest).any() && foreground(&app) && deadline.is_none_or(|t|t>crate::data::repository::now()) {tokio::select!{_=stopped.changed()=>return,_=tokio::time::sleep(Duration::from_millis(100))=>{}}}
+                        if !accepting.live(&interest).any() || deadline.is_some_and(|t|t<=crate::data::repository::now()){continue;}
                         let ticket=generation.load(Ordering::Acquire);
                         let interrupted_edit=match &job {Job::Edit(e)=>Some(e.clone()),_=>None};
                         let result=match job {
@@ -149,15 +130,15 @@ impl LanguageLearning {
                             Job::Pending(_)=>unreachable!(),
                         };
                         if let Err(error)=result {
-                            if error.code=="cancelled" && accepting.load(Ordering::Acquire) && !*stopped.borrow() {
-                                retry=interrupted_edit.filter(|e|e.expires_at>crate::data::repository::now());
+                            if error.code=="cancelled" && accepting.any() && !*stopped.borrow() {
+                                retry=interrupted_edit.filter(|e|e.expires_at>crate::data::repository::now()&&accepting.live(&e.eligibility).any());
                             }
                             log::info!(target:"sayweave","operation=language_background result=skipped error={}",error.code);
                         }
                         else {if scopes.len()<64{scopes.insert(scope);scopes.insert("shared".into());} }
                     },
                     _=timer.tick()=>{
-                        if !accepting.load(Ordering::Acquire){scopes.clear();due.clear();continue;}
+                        if !accepting.snapshot().personalization.enabled{scopes.clear();due.clear();continue;}
                         let activity=crate::input_state::activity();
                         if foreground(&app)||activity!=last_activity||crate::input_state::editing_key_held(){idle=None;last_activity=activity;continue;}
                         let since=idle.get_or_insert_with(tokio::time::Instant::now);
@@ -175,29 +156,32 @@ impl LanguageLearning {
             stop,
             current,
             epoch,
-            enabled,
-            settings_revision,
-            published_revision,
+            control,
             interrupted,
             finished,
         }
     }
     pub fn edit(&self, evidence: EditEvidence) {
-        if !self.enabled.load(Ordering::Acquire) || *self.stop.borrow() {
+        if !self.control.live(&evidence.eligibility).any() || *self.stop.borrow() {
             return;
         }
         if self.sender.try_send(Job::Edit(evidence)).is_err() {
             log::info!(target:"sayweave","operation=language_queue result=full");
         }
     }
-    pub fn observation_permit(&self) -> Arc<AtomicBool> {
-        self.enabled.clone()
-    }
-    pub fn observation_revision(&self) -> Arc<AtomicU64> {
-        self.published_revision.clone()
+    pub fn observation_control(&self) -> Arc<crate::language_policy::LearningControl> {
+        self.control.clone()
     }
     pub fn speech(&self, observation: StyleObservation) {
-        if !self.enabled.load(Ordering::Acquire) || *self.stop.borrow() {
+        if !self
+            .control
+            .live(&LearningEligibility {
+                automatic_terms: None,
+                personalization: Some(observation.settings_revision),
+            })
+            .any()
+            || *self.stop.borrow()
+        {
             return;
         }
         if self.sender.try_send(Job::Speech(observation)).is_err() {
@@ -214,7 +198,6 @@ impl LanguageLearning {
         }
     }
     pub fn shutdown(&self) {
-        self.enabled.store(false, Ordering::Release);
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.stop.send_replace(true);
     }
@@ -257,7 +240,13 @@ async fn generate(
         return Err(ModelError::new("cancelled"));
     }
     let config = await_background(
-        service.text_config(),
+        async {
+            app.state::<LanguageLearning>()
+                .control
+                .while_valid(&request.eligibility, service.text_config())
+                .await
+                .map_err(|_| ModelError::new("cancelled"))?
+        },
         stop,
         &mut interrupted,
         deadline,
@@ -285,9 +274,22 @@ async fn generate(
         return Err(ModelError::new("cancelled"));
     }
     let result = await_background(
-        service
-            .provider
-            .generate_unit(&config.input, &config.key, &id, messages, deadline),
+        async {
+            app.state::<LanguageLearning>()
+                .control
+                .while_valid(
+                    &request.eligibility,
+                    service.provider.generate_unit(
+                        &config.input,
+                        &config.key,
+                        &id,
+                        messages,
+                        deadline,
+                    ),
+                )
+                .await
+                .map_err(|_| ModelError::new("cancelled"))?
+        },
         stop,
         &mut interrupted,
         deadline,
@@ -319,6 +321,7 @@ async fn generate(
 struct AnalysisRequest<'a> {
     template: &'a str,
     expires_at: Option<i64>,
+    eligibility: LearningEligibility,
 }
 struct AnalysisOutput {
     text: String,
@@ -382,6 +385,7 @@ async fn classify(
 ) -> Result<(), ModelError> {
     let data = app.state::<DataWorker>();
     let id = evidence.id.clone();
+    let eligibility = evidence.eligibility.clone();
     let result = classify_frozen(&data, evidence, |messages, expires_at| async move {
         generate(
             app,
@@ -393,6 +397,7 @@ async fn classify(
             AnalysisRequest {
                 template: "lexical-v1",
                 expires_at: Some(expires_at),
+                eligibility,
             },
         )
         .await
@@ -446,7 +451,7 @@ where
         data,
         DbOperation::ClassifyEdit {
             id: evidence.id,
-            settings_revision: evidence.settings_revision,
+            eligibility: evidence.eligibility,
             decision,
             analysis: text.analysis,
         },
@@ -536,6 +541,10 @@ async fn consolidate(
         AnalysisRequest {
             template: "app-style-v1",
             expires_at: None,
+            eligibility: LearningEligibility {
+                automatic_terms: None,
+                personalization: Some(batch.settings_revision),
+            },
         },
     )
     .await;
@@ -671,7 +680,7 @@ pub(crate) fn profile_proposal(
 pub async fn language_settings(
     window: tauri::WebviewWindow,
     data: tauri::State<'_, DataWorker>,
-) -> Result<Settings, DataError> {
+) -> Result<LanguageSettings, DataError> {
     crate::contracts::dictionary::authorize(window.label())?;
     let DbOutput::Settings(value) = operation(&data, DbOperation::Settings).await? else {
         return Err(DataError::new("unavailable"));
@@ -683,27 +692,21 @@ pub async fn language_save(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     data: tauri::State<'_, DataWorker>,
-    settings: Settings,
-) -> Result<Settings, DataError> {
+    settings: LanguageSettingsPatch,
+) -> Result<LanguageSettings, DataError> {
     crate::contracts::dictionary::authorize(window.label())?;
-    app.state::<LanguageLearning>().interrupt(&app);
     let DbOutput::Settings(value) = operation(&data, DbOperation::SaveSettings(settings)).await?
     else {
         return Err(DataError::new("unavailable"));
     };
-    app.state::<LanguageLearning>().interrupt(&app);
     let learning = app.state::<LanguageLearning>();
-    apply_settings(
-        &learning.settings_revision,
-        &learning.enabled,
-        &learning.published_revision,
-        &value,
-    );
+    learning.control.publish(&value);
     Ok(value)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
     #[tokio::test]
     async fn interruption_before_watch_subscription_does_not_poll_configuration() {
         let (_stop, mut stopped) = watch::channel(false);
@@ -741,7 +744,10 @@ mod tests {
             region: "tail".into(),
             expires_at: crate::data::repository::now() + 600000,
             application: ApplicationContext::from_identity(None, "Codex.exe"),
-            settings_revision: 1,
+            eligibility: LearningEligibility {
+                automatic_terms: Some(1),
+                personalization: Some(1),
+            },
             raw: "请用 SQLit".into(),
             before: "请用 SQLit".into(),
             after: "请用 SQLite".into(),
@@ -792,7 +798,10 @@ mod tests {
             &data,
             DbOperation::ClassifyEdit {
                 id: evidence.id.clone(),
-                settings_revision: 1,
+                eligibility: LearningEligibility {
+                    automatic_terms: Some(1),
+                    personalization: Some(1),
+                },
                 decision: LexicalDecision {
                     class: EditClass::Lexical,
                     original: Some("SQLit".into()),
@@ -951,49 +960,50 @@ mod tests {
     }
     #[test]
     fn stale_settings_read_cannot_reenable_learning_after_off_on() {
-        let revision = Mutex::new(0);
-        let enabled = AtomicBool::new(false);
-        let published = AtomicU64::new(0);
-        apply_settings(
-            &revision,
-            &enabled,
-            &published,
-            &Settings {
+        let control = crate::language_policy::LearningControl::default();
+        let first = LanguageSettings {
+            automatic_terms: Settings {
                 enabled: true,
                 revision: 1,
             },
-        );
-        apply_settings(
-            &revision,
-            &enabled,
-            &published,
-            &Settings {
+            personalization: Settings {
+                enabled: true,
+                revision: 1,
+            },
+        };
+        let old = LearningEligibility::capture(&first);
+        control.publish(&first);
+        control.publish(&LanguageSettings {
+            automatic_terms: first.automatic_terms.clone(),
+            personalization: Settings {
                 enabled: false,
                 revision: 2,
             },
+        });
+        control.publish(&first);
+        assert_eq!(
+            control.live(&old),
+            LearningEligibility {
+                automatic_terms: Some(1),
+                personalization: None
+            }
         );
-        apply_settings(
-            &revision,
-            &enabled,
-            &published,
-            &Settings {
-                enabled: true,
-                revision: 1,
+        control.publish(&LanguageSettings {
+            automatic_terms: Settings {
+                enabled: false,
+                revision: 2,
             },
-        );
-        assert!(!enabled.load(Ordering::Acquire));
-        assert_eq!(published.load(Ordering::Acquire), 2);
-        apply_settings(
-            &revision,
-            &enabled,
-            &published,
-            &Settings {
+            personalization: Settings {
                 enabled: true,
                 revision: 3,
             },
+        });
+        assert!(!control.live(&old).any());
+        assert!(
+            control
+                .live(&LearningEligibility::capture(&control.snapshot()))
+                .any()
         );
-        assert!(enabled.load(Ordering::Acquire));
-        assert_ne!(published.load(Ordering::Acquire), 1);
     }
     #[test]
     fn both_background_workers_must_finish_before_drain_completes() {

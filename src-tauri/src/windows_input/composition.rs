@@ -52,15 +52,16 @@ pub(crate) enum Command {
 }
 pub(crate) struct ObservationSink {
     pub snapshot: crate::contracts::language::Snapshot,
-    pub permit: Arc<AtomicBool>,
-    pub current_revision: Arc<AtomicU64>,
+    pub control: Arc<crate::language_policy::LearningControl>,
     pub emit: Arc<dyn Fn(crate::contracts::language::EditEvidence) + Send + Sync>,
 }
 impl ObservationSink {
     fn allowed(&self) -> bool {
-        self.permit.load(Ordering::Acquire)
-            && self.current_revision.load(Ordering::Acquire)
-                == self.snapshot.settings.revision as u64
+        self.control
+            .live(&crate::contracts::language::LearningEligibility::capture(
+                &self.snapshot.settings,
+            ))
+            .any()
     }
 }
 struct SourceReceipt {
@@ -468,7 +469,8 @@ impl Host {
         }
         self.observer_reversal = crate::input_state::reversal_epoch();
         if !self.supports_observation
-            || !sink.snapshot.settings.enabled
+            || !crate::contracts::language::LearningEligibility::capture(&sink.snapshot.settings)
+                .any()
             || sink.snapshot.application.key == "unknown"
         {
             return false;
@@ -535,7 +537,9 @@ impl Host {
                 .into(),
                 expires_at,
                 application: sink.snapshot.application.clone(),
-                settings_revision: sink.snapshot.settings.revision,
+                eligibility: crate::contracts::language::LearningEligibility::capture(
+                    &sink.snapshot.settings,
+                ),
                 raw: source.raw.clone(),
                 before: value.before,
                 after: value.after,
@@ -564,6 +568,9 @@ impl Host {
         }
         self.poll_at = Instant::now();
         if let Ok(reply) = self.exchange_reply(Action::ObservePoll, "", None, true, None) {
+            if let Some(value) = &reply.edit_observation {
+                log::info!(target:"sayweave","operation=observation_poll task_id={} turn={} active={} records={}",self.task,self.turn,value.active,value.records.len());
+            }
             let active = reply
                 .edit_observation
                 .as_ref()
@@ -899,12 +906,21 @@ impl Host {
         let aborted = mode == Finish::Abort;
         let mut cancelled = aborted;
         let mut rollback_failed = false;
+        let mut cleanup_failed = false;
         let mut handed_off = false;
         let mut already_settled = false;
         let result = if aborted {
-            let result = self.exchange(Action::Abort, "", true);
-            rollback_failed = result.is_err();
-            result
+            let settled =
+                completed_prefix(self.settled_empty_revision, self.revision, &self.text, "");
+            if settled {
+                let result = self.release_empty_write_lease();
+                cleanup_failed = result.is_err();
+                result
+            } else {
+                let result = self.exchange(Action::Abort, "", true);
+                rollback_failed = result.is_err();
+                result
+            }
         } else if let Finish::Handoff(reason) = &mode {
             let result = self.exchange(Action::Handoff, "", true);
             if result.is_ok() {
@@ -924,18 +940,25 @@ impl Host {
                 // do not require an unchanged caret for a second empty Commit.
                 let settled =
                     completed_prefix(self.settled_empty_revision, self.revision, &self.text, text);
-                if !self.gate.commit() {
-                    cancelled = true;
-                    if settled {
-                        return Err(Error::new("cancelled"));
+                let accepted = self.gate.commit();
+                if settled {
+                    // Keep the read-only receipts, but retire the write-side
+                    // insertion lease and its sink before post-delivery edits.
+                    // Handoff releases the lease without another text commit.
+                    let released = self.release_empty_write_lease();
+                    cleanup_failed = released.is_err();
+                    if !accepted {
+                        cancelled = true;
+                        return released.and(Err(Error::new("cancelled")));
                     }
+                    already_settled = true;
+                    return released;
+                }
+                if !accepted {
+                    cancelled = true;
                     let result = self.exchange(Action::Abort, "", true);
                     rollback_failed = result.is_err();
                     return result.and(Err(Error::new("cancelled")));
-                }
-                if settled {
-                    already_settled = true;
-                    return Ok(());
                 }
                 self.exchange(Action::Commit, "", false)
             })
@@ -970,6 +993,9 @@ impl Host {
             };
             delivery.verification = Verification::Unavailable;
         }
+        if cleanup_failed {
+            delivery.error = Some("compositionCleanup".into());
+        }
         FinishOutcome {
             delivery,
             committed,
@@ -977,6 +1003,13 @@ impl Host {
             cancelled,
             rollback_failed,
         }
+    }
+    fn release_empty_write_lease(&mut self) -> Result<(), Error> {
+        let result = self.exchange(Action::Handoff, "", true);
+        if result.is_ok() {
+            self.range_open = false;
+        }
+        result
     }
     fn close(&mut self) -> Result<(), Error> {
         self.stop_observation();
@@ -1119,13 +1152,19 @@ mod tests {
     #[test]
     fn observation_off_on_does_not_reactivate_a_frozen_settings_revision() {
         use crate::contracts::language::*;
-        let enabled = Arc::new(AtomicBool::new(true));
-        let revision = Arc::new(AtomicU64::new(1));
-        let mut snapshot = Snapshot {
-            settings: Settings {
+        let first = LanguageSettings {
+            automatic_terms: Settings {
                 enabled: true,
                 revision: 1,
             },
+            personalization: Settings {
+                enabled: true,
+                revision: 1,
+            },
+        };
+        let control = Arc::new(crate::language_policy::LearningControl::new(first.clone()));
+        let mut snapshot = Snapshot {
+            settings: first.clone(),
             application: ApplicationContext::default(),
             profile_version: 0,
             shared_version: 0,
@@ -1133,22 +1172,44 @@ mod tests {
         };
         let old = ObservationSink {
             snapshot: snapshot.clone(),
-            permit: enabled.clone(),
-            current_revision: revision.clone(),
+            control: control.clone(),
             emit: Arc::new(|_| {}),
         };
         assert!(old.allowed());
-        revision.store(2, Ordering::Release);
-        enabled.store(false, Ordering::Release);
+        control.publish(&LanguageSettings {
+            automatic_terms: first.automatic_terms,
+            personalization: Settings {
+                enabled: false,
+                revision: 2,
+            },
+        });
+        assert!(old.allowed());
+        control.publish(&LanguageSettings {
+            automatic_terms: Settings {
+                enabled: false,
+                revision: 2,
+            },
+            personalization: Settings {
+                enabled: false,
+                revision: 2,
+            },
+        });
         assert!(!old.allowed());
-        revision.store(3, Ordering::Release);
-        enabled.store(true, Ordering::Release);
+        control.publish(&LanguageSettings {
+            automatic_terms: Settings {
+                enabled: true,
+                revision: 3,
+            },
+            personalization: Settings {
+                enabled: false,
+                revision: 2,
+            },
+        });
         assert!(!old.allowed());
-        snapshot.settings.revision = 3;
+        snapshot.settings = control.snapshot();
         let new = ObservationSink {
             snapshot,
-            permit: enabled,
-            current_revision: revision,
+            control,
             emit: Arc::new(|_| {}),
         };
         assert!(new.allowed());

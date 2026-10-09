@@ -10,7 +10,7 @@ use crate::{
     wire::*,
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ffi::c_void,
     mem::ManuallyDrop,
     rc::Rc,
@@ -76,6 +76,7 @@ struct State {
     observation_cursor: u32,
     observation_pending: Vec<ObservationCandidate>,
     observation_field: Option<initial_selection::FocusIdentity>,
+    observation_note: String,
     #[cfg(feature = "acceptance")]
     selection_probe: Option<(String, u64, u64, String)>,
     manager: Option<ITfThreadMgr>,
@@ -114,6 +115,8 @@ struct State {
     selection: Option<ITfRange>,
     preserved_attributes: Vec<(GUID, i32)>,
     text_cookie: Option<u32>,
+    text_notifications: Rc<TextNotifications>,
+    retired_bridges: Vec<usize>,
     key_sink: bool,
     key_handoff: bool,
     key_failure: bool,
@@ -412,6 +415,96 @@ fn edit_selection(window: HWND) -> (u32, u32) {
     (start, end)
 }
 type Shared = Rc<RefCell<State>>;
+struct BridgeData {
+    state: Shared,
+    // A deferred bridge must keep the DLL loaded even after its service and
+    // subscriptions have been released during reentrant deactivation.
+    _lease: Lease,
+}
+#[cfg(feature = "acceptance")]
+thread_local! {
+    static OBSERVATION_FIXTURE_STATE: RefCell<std::rc::Weak<RefCell<State>>> = const { RefCell::new(std::rc::Weak::new()) };
+}
+#[cfg(feature = "acceptance")]
+pub(super) fn observation_fixture_reentry() -> windows::core::Result<()> {
+    let mode = SETTLE_FAULT.load(Ordering::Acquire);
+    if !matches!(mode, 8 | 10) {
+        return Ok(());
+    }
+    let shared = OBSERVATION_FIXTURE_STATE
+        .with(|s| s.borrow().upgrade())
+        .ok_or_else(|| failure(E_FAIL))?;
+    if mode == 10 {
+        SETTLE_FAULT.store(0, Ordering::Release);
+        let (manager, client, window) = {
+            let state = shared.borrow();
+            if state.text_notifications.depth.get() == 0 {
+                return Err(failure(E_FAIL));
+            }
+            (
+                state.manager.clone().ok_or_else(|| failure(E_FAIL))?,
+                state.client,
+                state.window,
+            )
+        };
+        let service: ITfTextInputProcessor = Service {
+            state: shared.clone(),
+            _lease: Lease::new(),
+        }
+        .into();
+        unsafe {
+            service.Deactivate()?;
+            service.Activate(&manager, client)?;
+        }
+        let state = shared.borrow();
+        if !state.active
+            || state.window == window
+            || !state.retired_bridges.contains(&window)
+            || state.text_notifications.retired.borrow().is_empty()
+        {
+            return Err(failure(E_FAIL));
+        }
+        eprintln!("owned observer reentry lifecycle old_bridge_retained=true new_activation=true");
+    }
+    let before = {
+        let state = shared.borrow();
+        if state.text_notifications.depth.get() == 0 {
+            return Err(failure(E_FAIL));
+        }
+        (
+            state.version.operation,
+            state.text_notifications.retired.borrow().len(),
+            state.retired_bridges.len(),
+        )
+    };
+    poll(&shared);
+    let state = shared.borrow();
+    if before
+        != (
+            state.version.operation,
+            state.text_notifications.retired.borrow().len(),
+            state.retired_bridges.len(),
+        )
+    {
+        return Err(failure(E_FAIL));
+    }
+    eprintln!("owned observer reentry skipped=true queued={}", before.1);
+    Ok(())
+}
+#[cfg(feature = "acceptance")]
+#[unsafe(no_mangle)]
+pub extern "system" fn SayweaveObservationFixtureRetired() -> bool {
+    OBSERVATION_FIXTURE_STATE
+        .with(|s| s.borrow().upgrade())
+        .is_some_and(|shared| {
+            let state = shared.borrow();
+            state.text_notifications.depth.get() == 0
+                && state.text_notifications.retired.borrow().is_empty()
+                && state.retired_bridges.is_empty()
+                && state.active
+                && state.window != 0
+        })
+}
 #[implement(ITfTextInputProcessor)]
 struct Service {
     state: Shared,
@@ -420,6 +513,8 @@ struct Service {
 impl ITfTextInputProcessor_Impl for Service_Impl {
     fn Activate(&self, manager: Ref<ITfThreadMgr>, client: u32) -> windows::core::Result<()> {
         unsafe {
+            #[cfg(feature = "acceptance")]
+            OBSERVATION_FIXTURE_STATE.with(|s| *s.borrow_mut() = Rc::downgrade(&self.state));
             if self.state.borrow().active
                 || self.state.borrow().composition.is_some()
                 || self.state.borrow().cleanup
@@ -449,7 +544,10 @@ impl ITfTextInputProcessor_Impl for Service_Impl {
                 Some(module()?),
                 None,
             )?;
-            let data = Box::new(self.state.clone());
+            let data = Box::new(BridgeData {
+                state: self.state.clone(),
+                _lease: Lease::new(),
+            });
             SetWindowLongPtrW(window, GWLP_USERDATA, Box::into_raw(data) as isize);
             {
                 let mut s = self.state.borrow_mut();
@@ -511,24 +609,29 @@ impl ITfTextInputProcessor_Impl for Service_Impl {
                 s.window = 0;
                 values
             };
+            if window != 0 {
+                self.state.borrow_mut().retired_bridges.push(window);
+            }
             if key_sink
                 && let Some(manager) = &manager
                 && let Ok(keys) = manager.cast::<ITfKeystrokeMgr>()
             {
                 let _ = keys.UnadviseKeyEventSink(client);
             }
-            let _ = DestroyWindow(HWND(window as *mut _));
-            let _ = UnregisterClassW(w!("SayweaveTsfBridge"), Some(module()?));
+            drain_text_watches(&self.state);
             Ok(())
         }
     }
 }
 unsafe extern "system" fn procedure(window: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
-        let data = GetWindowLongPtrW(window, GWLP_USERDATA) as *mut Shared;
+        let data = GetWindowLongPtrW(window, GWLP_USERDATA) as *mut BridgeData;
         if !data.is_null() {
             if message == WM_TIMER {
-                poll(&*data);
+                // Retirement may destroy this bridge. Keep the apartment state
+                // independently alive after WM_NCDESTROY frees its user data.
+                let state = (&*data).state.clone();
+                poll(&state);
                 return LRESULT(0);
             }
             if message == WM_NCDESTROY {
@@ -554,6 +657,7 @@ fn disconnect(shared: &Shared) {
         }
     }
     end_owned(shared);
+    drain_text_watches(shared);
 }
 fn read_request(shared: &Shared) -> Result<Option<(Request, u64)>, ()> {
     let mut s = shared.borrow_mut();
@@ -602,6 +706,15 @@ fn read_request(shared: &Shared) -> Result<Option<(Request, u64)>, ()> {
     }
 }
 fn poll(shared: &Shared) {
+    // Do not mutate TSF subscriptions or admit a new write while TSF is
+    // delivering the current edit notification to its remaining listeners.
+    if shared.borrow().text_notifications.depth.get() != 0 {
+        return;
+    }
+    drain_text_watches(shared);
+    if !shared.borrow().active {
+        return;
+    }
     activate_observations(shared);
     let (r, connection) = match read_request(shared) {
         Ok(Some(r)) => r,
@@ -769,7 +882,7 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
         if shared.borrow().composition.is_none() {
             // Finalize cancellation before retiring ranges/sinks, which can
             // reenter and establish a new task. No old version write follows COM.
-            apply_cancel_then_retire(shared, &r, |epoch| {
+            apply_terminal_then_retire(shared, &r, |epoch| {
                 if let Some(epoch) = epoch {
                     release_composition(shared, epoch, None);
                 }
@@ -797,6 +910,45 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
             connection,
             false,
             "prefixBoundaryUnsupported",
+            Mutation::NotAttempted,
+        );
+        return;
+    }
+    let settled_release = {
+        let state = shared.borrow();
+        r.action == Action::Handoff
+            && r.text.is_empty()
+            && r.live(unsafe { GetTickCount64() })
+            && state.active
+            && state.connected
+            && state.connection == connection
+            && state.capability.as_deref() == Some(r.capability.as_str())
+            && state.pending.is_none()
+            && !state.cleanup
+            && !state.key_failure
+            && state.composition.is_none()
+            && state.prepared.is_none()
+            && state.empty_range.is_some()
+            && state.text.is_none()
+            && state.expected.is_empty()
+            && matches!(state.backup, Some(Rollback::GeneratedTail))
+            && state.version.accepts(&r)
+            && state.version.revision == r.revision
+    };
+    if settled_release {
+        // Only relinquish an already-ended range. No current caret, field,
+        // property or text read grants further write authority here.
+        apply_terminal_then_retire(shared, &r, |epoch| {
+            if let Some(epoch) = epoch {
+                release_composition(shared, epoch, None);
+            }
+        });
+        reply(
+            shared,
+            &r,
+            connection,
+            true,
+            "settledReleased",
             Mutation::NotAttempted,
         );
         return;
@@ -845,7 +997,11 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
         );
     }
 }
-fn apply_cancel_then_retire(shared: &Shared, request: &Request, retire: impl FnOnce(Option<u64>)) {
+fn apply_terminal_then_retire(
+    shared: &Shared,
+    request: &Request,
+    retire: impl FnOnce(Option<u64>),
+) {
     let epoch = {
         let mut state = shared.borrow_mut();
         state.version.applied(request);
@@ -924,6 +1080,21 @@ fn send_reply(
             revision: r.revision,
             applied,
             code: {
+                let diagnostic;
+                let code = if matches!(
+                    r.action,
+                    Action::ObserveStart | Action::ObservePoll | Action::ObserveStop
+                ) {
+                    diagnostic = format!(
+                        "{code} pending={} watches={} note={}",
+                        s.observation_pending.len(),
+                        s.observations.len(),
+                        s.observation_note
+                    );
+                    diagnostic.as_str()
+                } else {
+                    code
+                };
                 #[cfg(feature = "acceptance")]
                 if r.action == Action::Inspect {
                     format!(
@@ -1031,6 +1202,11 @@ fn observed_edits(shared: &Shared, request: &Request) -> EditObservation {
         }
         if !watch.ended() {
             keep.push(watch);
+        } else {
+            let (valid, composing, sequence, reason) = watch.diagnostic();
+            shared.borrow_mut().observation_note = format!(
+                "retired:valid-{valid}:composing-{composing}:sequence-{sequence}:cause-{reason}"
+            );
         }
     }
     let mut state = shared.borrow_mut();
@@ -1115,11 +1291,13 @@ fn prepare_observation(
 }
 fn observation_current(shared: &Shared, candidate: &ObservationCandidate) -> bool {
     if !candidate.field.matches().unwrap_or(false) {
+        shared.borrow_mut().observation_note = "candidate:field".into();
         return false;
     }
     if candidate.completed
         && unsafe { GetTickCount64() }.saturating_sub(candidate.completed_tick) > 1000
     {
+        shared.borrow_mut().observation_note = "candidate:age".into();
         return false;
     }
     let manager = shared.borrow().manager.clone();
@@ -1129,13 +1307,18 @@ fn observation_current(shared: &Shared, candidate: &ObservationCandidate) -> boo
             .and_then(|m| m.GetTop().ok())
     };
     let state = shared.borrow();
-    focused.as_ref() == Some(&candidate.context)
+    let valid = focused.as_ref() == Some(&candidate.context)
         && state.active
         && state.connected
         && state.connection == candidate.connection
         && state.observation_epoch == candidate.epoch
         && state.observation_task.as_ref()
-            == Some(&(candidate.request.task.clone(), candidate.request.turn))
+            == Some(&(candidate.request.task.clone(), candidate.request.turn));
+    drop(state);
+    if !valid {
+        shared.borrow_mut().observation_note = "candidate:context-or-epoch".into();
+    }
+    valid
 }
 fn publish_observation(
     shared: &Shared,
@@ -1145,6 +1328,7 @@ fn publish_observation(
     if observation_current(shared, candidate) {
         let mut state = shared.borrow_mut();
         if state.observations.len() < 16 {
+            state.observation_note = "attach:ready".into();
             state.observations.push(watch);
             return;
         }
@@ -1191,7 +1375,17 @@ fn activate_observations_with_flags(shared: &Shared, flags: TF_CONTEXT_EDIT_CONT
                     _lease: Lease::new(),
                 }
                 .into();
-                let _ = context.RequestEditSession(client, &edit, flags | TF_ES_READ);
+                match context.RequestEditSession(client, &edit, flags | TF_ES_READ) {
+                    Ok(result) if result.is_err() => {
+                        shared.borrow_mut().observation_note =
+                            format!("attach:session-{:08x}", result.0 as u32)
+                    }
+                    Err(error) => {
+                        shared.borrow_mut().observation_note =
+                            format!("attach:request-{:08x}", error.code().0 as u32)
+                    }
+                    _ => (),
+                }
             }
         }
     }
@@ -1224,6 +1418,12 @@ impl ITfEditSession_Impl for ObserveAttach_Impl {
                     return Err(failure(E_ACCESSDENIED));
                 }
                 let actual = range_text(&range, ec)?;
+                shared.borrow_mut().observation_note = format!(
+                    "attach:expected-{}:actual-{}:match-{}",
+                    candidate.expected.encode_utf16().count(),
+                    actual.encode_utf16().count(),
+                    equivalent_native_text(&actual, &candidate.expected)
+                );
                 if !equivalent_native_text(&actual, &candidate.expected)
                     || !observation_current(&shared, candidate)
                 {
@@ -1238,11 +1438,19 @@ impl ITfEditSession_Impl for ObserveAttach_Impl {
                     candidate.completed_tick,
                     candidate.field.clone(),
                     candidate.original.clone(),
+                    shared.borrow().text_notifications.clone(),
                 )
             }
         })();
         if let Ok(watch) = result {
             publish_observation(&shared, candidate, watch);
+        } else if let Err(error) = result {
+            let mut state = shared.borrow_mut();
+            let prior = state.observation_note.clone();
+            state.observation_note = format!("{prior}:hr-{:08x}", error.code().0 as u32)
+                .chars()
+                .take(160)
+                .collect();
         }
         // Optional learning probes never report failure to a host edit session.
         Ok(())
@@ -1411,6 +1619,62 @@ fn unwatch(context: Option<&ITfContext>, cookie: Option<u32>) {
         }
     }
 }
+fn drain_text_watches(shared: &Shared) {
+    let (notifications, bridges) = {
+        let mut state = shared.borrow_mut();
+        if state.text_notifications.depth.get() != 0 {
+            return;
+        }
+        (
+            state.text_notifications.clone(),
+            std::mem::take(&mut state.retired_bridges),
+        )
+    };
+    notifications.drain();
+    for window in bridges {
+        unsafe {
+            let _ = DestroyWindow(HWND(window as *mut _));
+            if let Ok(instance) = module() {
+                let _ = UnregisterClassW(w!("SayweaveTsfBridge"), Some(instance));
+            }
+        }
+    }
+}
+#[derive(Default)]
+struct TextNotifications {
+    depth: Cell<u32>,
+    retired: RefCell<Vec<(ITfContext, u32)>>,
+}
+impl TextNotifications {
+    fn retire(&self, context: ITfContext, cookie: u32) {
+        if self.depth.get() != 0 {
+            self.retired.borrow_mut().push((context, cookie));
+        } else {
+            unwatch(Some(&context), Some(cookie));
+        }
+    }
+    fn drain(&self) {
+        if self.depth.get() != 0 {
+            return;
+        }
+        let retired = std::mem::take(&mut *self.retired.borrow_mut());
+        for (context, cookie) in retired {
+            unwatch(Some(&context), Some(cookie));
+        }
+    }
+}
+struct TextNotification(Rc<TextNotifications>);
+impl TextNotification {
+    fn enter(notifications: Rc<TextNotifications>) -> Self {
+        notifications.depth.set(notifications.depth.get() + 1);
+        Self(notifications)
+    }
+}
+impl Drop for TextNotification {
+    fn drop(&mut self) {
+        self.0.depth.set(self.0.depth.get() - 1);
+    }
+}
 fn release_composition(shared: &Shared, epoch: u64, composition: Option<&ITfComposition>) {
     release_composition_with_failure(shared, epoch, composition, false);
 }
@@ -1458,7 +1722,13 @@ fn release_composition_with_failure(
     if let Some(pending) = &old.6 {
         reply_interrupted_prefix(shared, pending);
     }
-    unwatch(old.0.as_ref(), old.1);
+    if let (Some(context), Some(cookie)) = (&old.0, old.1) {
+        // Ownership is already revoked above. Removing this listener while
+        // TSF enumerates it can skip the read-only listener for this same edit.
+        // The apartment's next poll performs Unadvise outside the notification.
+        let notifications = shared.borrow().text_notifications.clone();
+        notifications.retire(context.clone(), cookie);
+    }
     drop(old);
 }
 fn reply_interrupted_prefix(shared: &Shared, pending: &Pending) {
@@ -1492,7 +1762,12 @@ fn reply_interrupted_prefix(shared: &Shared, pending: &Pending) {
 /// Retire only the captured range. Semantic conversion has a separate guarded authority;
 /// it never searches a new target or restores a backup over user changes.
 fn end_owned(shared: &Shared) {
-    end_owned_with_flags(shared, TF_ES_ASYNCDONTCARE);
+    let flags = if shared.borrow().text_notifications.depth.get() != 0 {
+        TF_ES_ASYNC
+    } else {
+        TF_ES_ASYNCDONTCARE
+    };
+    end_owned_with_flags(shared, flags);
 }
 fn end_owned_with_flags(shared: &Shared, flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS) -> bool {
     let writing_epoch = {
@@ -2058,6 +2333,7 @@ impl ITfTextEditSink_Impl for TextSink_Impl {
         ec: u32,
         record: Ref<ITfEditRecord>,
     ) -> windows::core::Result<()> {
+        let _notification = TextNotification::enter(self.state.borrow().text_notifications.clone());
         let (client, binding, expected, expected_selection) = {
             let s = self.state.borrow();
             if s.epoch != self.epoch || !s.version.owned && !s.cleanup {
@@ -2684,6 +2960,27 @@ fn settle_prefix(
             .flatten();
         edit_identity(shared, r, generation, epoch)?;
         let verified = footprint.is_some();
+        #[cfg(feature = "acceptance")]
+        if SETTLE_FAULT.load(Ordering::Acquire) == 6 {
+            SETTLE_FAULT.store(0, Ordering::Release);
+            eprintln!("owned post-End receipt verified={verified}");
+            // Emulate a provider rebasing a pre-End clone while the core's
+            // post-End receipt remains valid. This changes no target text.
+            let candidate = {
+                let mut state = shared.borrow_mut();
+                state
+                    .observation_pending
+                    .iter()
+                    .position(|c| c.request.operation == r.operation && c.request.task == r.task)
+                    .map(|i| state.observation_pending.remove(i))
+            };
+            if let Some(candidate) = candidate {
+                if verified {
+                    candidate.range.Collapse(ec, TF_ANCHOR_END)?;
+                }
+                shared.borrow_mut().observation_pending.push(candidate);
+            }
+        }
         let (written, receipt_text) = if let Some(footprint) = footprint {
             footprint
         } else {
@@ -2691,6 +2988,39 @@ fn settle_prefix(
             (written, receipt_text)
         };
         edit_identity(shared, r, generation, epoch)?;
+        if verified && r.text.is_empty() {
+            // EndComposition may have rebased the pre-End clone. The core
+            // operation has already proved this post-End full prefix; reuse
+            // that same receipt for optional observation without another read.
+            let mut replacement = Some(written.clone());
+            let retired = {
+                let mut state = shared.borrow_mut();
+                let connection = state.connection;
+                let observation_epoch = state.observation_epoch;
+                state
+                    .observation_pending
+                    .iter_mut()
+                    .find(|c| {
+                        c.native.is_none()
+                            && !c.completed
+                            && c.connection == connection
+                            && c.epoch == observation_epoch
+                            && c.request.task == r.task
+                            && c.request.turn == r.turn
+                            && c.request.operation == r.operation
+                            && c.request.revision == r.revision
+                            && c.request.action == Action::Settle
+                    })
+                    .map(|candidate| {
+                        (
+                            std::mem::replace(&mut candidate.range, replacement.take().unwrap()),
+                            candidate.boundary.take(),
+                        )
+                    })
+            };
+            drop(retired);
+            edit_identity(shared, r, generation, epoch)?;
+        }
         let position = verified
             .then(|| range_position(context, &written, ec).ok())
             .flatten();
@@ -3734,7 +4064,7 @@ mod tests {
             prefix: None,
         };
         let shared = Rc::new(RefCell::new(State::default()));
-        apply_cancel_then_retire(&shared, &request, |_| {
+        apply_terminal_then_retire(&shared, &request, |_| {
             assert_eq!(shared.borrow().version.task, old);
             assert_eq!(shared.borrow().version.operation, 4);
             // UnadviseSink/range Release can reenter and establish a new task.

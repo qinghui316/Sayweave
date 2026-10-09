@@ -37,6 +37,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "language_learning_v1",
         include_str!("migrations/008_language_learning.sql"),
     ),
+    (
+        "learning_controls_v1",
+        include_str!("migrations/009_learning_controls.sql"),
+    ),
 ];
 pub fn now() -> i64 {
     SystemTime::now()

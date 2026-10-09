@@ -751,7 +751,7 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 println!("owned receipt observation before_after_actual_text=true read_only=true");
                 observation_ranges_fixture(
-                    editor,
+                    (component, editor),
                     &context,
                     &manager,
                     &pipe,
@@ -1297,7 +1297,10 @@ struct UserTextEdit {
 }
 #[cfg(feature = "acceptance")]
 fn observation_ranges_fixture(
-    editor: windows::Win32::Foundation::HWND,
+    target: (
+        windows::Win32::Foundation::HMODULE,
+        windows::Win32::Foundation::HWND,
+    ),
     context: &ITfContext,
     manager: &ITfThreadMgr,
     pipe: &Pipe,
@@ -1305,6 +1308,7 @@ fn observation_ranges_fixture(
     foreign: u32,
     plain: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let (component, editor) = target;
     use windows::{
         Win32::{Foundation::*, UI::Input::KeyboardAndMouse::*},
         core::PCWSTR,
@@ -1347,6 +1351,13 @@ fn observation_ranges_fixture(
             ("readonly", "术语", 0, 2, "词典", "词典", true),
             ("password", "术语", 0, 2, "词典", "词典", true),
             ("originalRestore", "术语", 0, 2, "甲词", "甲词", false),
+            ("settleHandoff", "术语", 0, 2, "词典", "词典", true),
+            // Read-only can replace the host context. Releasing an already
+            // submitted lease must succeed, but must not reclaim observation.
+            ("settleReadonly", "术语", 0, 2, "词典", "词典", false),
+            ("settleRebase", "术语", 0, 2, "词典", "词典", true),
+            ("settleReentry", "术语", 0, 2, "词典", "词典", true),
+            ("settleReactivate", "术语", 0, 2, "词典", "词典", false),
         ] {
             if !plain && matches!(label, "ime" | "undo" | "readonly" | "password") {
                 continue;
@@ -1355,6 +1366,9 @@ fn observation_ranges_fixture(
             // selection. Its real WM_UNDO is tested above; do not invent an
             // original-text proof for an ordinary typed replacement.
             if plain && label == "originalRestore" {
+                continue;
+            }
+            if plain && label.starts_with("settle") {
                 continue;
             }
             let prefix = if label == "outside" { "同词" } else { "" };
@@ -1377,6 +1391,7 @@ fn observation_ranges_fixture(
             );
             pump(Duration::from_millis(60));
             let task = uuid::Uuid::new_v4().to_string();
+            let mut range_epoch = 0;
             for (op, rev, action, text) in [
                 (1, 0, Action::Begin, ""),
                 (2, 0, Action::ObserveStart, ""),
@@ -1388,9 +1403,107 @@ fn observation_ranges_fixture(
                 } else {
                     action
                 };
-                let result = exchange(pipe, capability, &task, 1, op, rev, action, text, false)?;
+                let result = if label.starts_with("settle") && action == Action::Commit {
+                    use windows::Win32::System::LibraryLoader::GetProcAddress;
+                    let entry =
+                        GetProcAddress(component, windows::core::s!("SayweaveSettleFixtureFault"))
+                            .ok_or("settle fault hook missing")?;
+                    let inject: unsafe extern "system" fn(usize) = std::mem::transmute(entry);
+                    inject(6);
+                    let request = Request {
+                        protocol: PROTOCOL,
+                        capability: capability.into(),
+                        task: task.clone(),
+                        turn: 1,
+                        operation: op,
+                        revision: 2,
+                        deadline_tick: windows::Win32::System::SystemInformation::GetTickCount64()
+                            + 2000,
+                        action: Action::Settle,
+                        text: String::new(),
+                        prefix: Some(Prefix {
+                            text: input.into(),
+                            range_epoch,
+                            expected_revision: 1,
+                        }),
+                    };
+                    pipe.send(&serde_json::to_vec(&request)?)?;
+                    let started = Instant::now();
+                    loop {
+                        pump(Duration::from_millis(10));
+                        if let Some(frame) = pipe.receive()? {
+                            break serde_json::from_slice::<Reply>(&frame)?;
+                        }
+                        if started.elapsed() > Duration::from_secs(2) {
+                            return Err("owned settlement receipt timeout".into());
+                        }
+                    }
+                } else {
+                    exchange(pipe, capability, &task, 1, op, rev, action, text, false)?
+                };
                 if !result.applied {
                     return Err(format!("receipt setup {label}: {}", result.code).into());
+                }
+                range_epoch = result.range_epoch;
+            }
+            if label == "settleReentry" {
+                let update = exchange(
+                    pipe,
+                    capability,
+                    &task,
+                    1,
+                    5,
+                    3,
+                    Action::Update,
+                    input,
+                    false,
+                )?;
+                let request = Request {
+                    protocol: PROTOCOL,
+                    capability: capability.into(),
+                    task: task.clone(),
+                    turn: 1,
+                    operation: 6,
+                    revision: 4,
+                    deadline_tick: windows::Win32::System::SystemInformation::GetTickCount64()
+                        + 2000,
+                    action: Action::Settle,
+                    text: String::new(),
+                    prefix: Some(Prefix {
+                        text: input.into(),
+                        range_epoch: update.range_epoch,
+                        expected_revision: 3,
+                    }),
+                };
+                pipe.send(&serde_json::to_vec(&request)?)?;
+                let started = Instant::now();
+                loop {
+                    pump(Duration::from_millis(10));
+                    if let Some(frame) = pipe.receive()? {
+                        let reply: Reply = serde_json::from_slice(&frame)?;
+                        if !reply.applied {
+                            return Err(format!("second observed prefix: {}", reply.code).into());
+                        }
+                        break;
+                    }
+                    if started.elapsed() > Duration::from_secs(2) {
+                        return Err("second observed prefix timeout".into());
+                    }
+                }
+            }
+            if matches!(label, "settleHandoff" | "settleReadonly") {
+                if label == "settleReadonly" {
+                    SendMessageW(editor, 0x00CF, Some(WPARAM(1)), None);
+                }
+                let reply = exchange(pipe, capability, &task, 1, 5, 2, Action::Handoff, "", false)?;
+                if !reply.applied || reply.mutation != Mutation::NotAttempted {
+                    return Err(format!("settle handoff: {}", reply.code).into());
+                }
+                if !observation_text_equal(&editor_text(editor)?, input) {
+                    return Err("settled lease release changed actual text".into());
+                }
+                if label == "settleReadonly" {
+                    SendMessageW(editor, 0x00CF, Some(WPARAM(0)), None);
                 }
             }
             pump(Duration::from_millis(120));
@@ -1399,7 +1512,12 @@ fn observation_ranges_fixture(
             } else {
                 editor_text(editor)?
             };
-            if !observation_text_equal(&before, &format!("{prefix}{input}")) {
+            let before_expected = if label == "settleReentry" {
+                format!("{input}{input}")
+            } else {
+                format!("{prefix}{input}")
+            };
+            if !observation_text_equal(&before, &before_expected) {
                 return Err(format!("receipt initial text {label}").into());
             }
             if label == "undo" {
@@ -1489,6 +1607,14 @@ fn observation_ranges_fixture(
                     return Err("receipt input incomplete".into());
                 }
             } else {
+                if matches!(label, "settleReentry" | "settleReactivate") {
+                    use windows::Win32::System::LibraryLoader::GetProcAddress;
+                    let entry =
+                        GetProcAddress(component, windows::core::s!("SayweaveSettleFixtureFault"))
+                            .ok_or("observation reentry hook missing")?;
+                    let inject: unsafe extern "system" fn(usize) = std::mem::transmute(entry);
+                    inject(if label == "settleReactivate" { 10 } else { 8 });
+                }
                 let edit: ITfEditSession = UserTextEdit {
                     context: context.clone(),
                     start: from as i32,
@@ -1502,13 +1628,33 @@ fn observation_ranges_fixture(
             }
             pump(Duration::from_millis(50));
             let actual = editor_text(editor)?;
-            let expected_all = if label != "outside" {
+            let expected_all = if label == "settleReentry" {
+                format!("{expected}{input}")
+            } else if label != "outside" {
                 expected.to_owned()
             } else {
                 format!("{expected}{input}")
             };
             if !observation_text_equal(&actual, &expected_all) {
                 return Err(format!("receipt actual text {label}: {actual:?}").into());
+            }
+            if label == "settleReactivate" {
+                use windows::Win32::System::LibraryLoader::GetProcAddress;
+                let entry = GetProcAddress(
+                    component,
+                    windows::core::s!("SayweaveObservationFixtureRetired"),
+                )
+                .ok_or("observation retirement hook missing")?;
+                let retired: unsafe extern "system" fn() -> bool = std::mem::transmute(entry);
+                if !retired() {
+                    return Err(
+                        "reentrant retirement did not drain or retired the new activation".into(),
+                    );
+                }
+                println!(
+                    "owned receipt scenario=settleReactivate actual_text=true old_resources_retired=true new_activation_retained=true"
+                );
+                continue;
             }
             if label == "ime" {
                 let reading = exchange(
@@ -1690,8 +1836,9 @@ fn observation_ranges_fixture(
                 || (!valid && !records.is_empty())
             {
                 return Err(format!(
-                    "receipt scope assertion {label} records={} fixture_values={:?}",
+                    "receipt scope assertion {label} records={} diagnostic={} fixture_values={:?}",
                     records.len(),
+                    result.code,
                     records
                         .iter()
                         .map(|r| (&r.before, &r.after, r.composing, r.ended))

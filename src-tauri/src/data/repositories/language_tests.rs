@@ -1,5 +1,221 @@
 use super::*;
 use crate::contracts::dictionary::{Input, Kind, Query, Source};
+#[test]
+fn independent_controls_cover_all_four_learning_combinations() {
+    for automatic in [false, true] {
+        for personalized in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut repo = Repository::open(root.path()).unwrap();
+            repo.language_operation(DbOperation::SaveSettings(LanguageSettingsPatch {
+                automatic_terms: Some(Settings {
+                    enabled: automatic,
+                    revision: 1,
+                }),
+                personalization: Some(Settings {
+                    enabled: personalized,
+                    revision: 1,
+                }),
+            }))
+            .unwrap();
+            let config = settings(&repo.connection).unwrap();
+            for (before, after, class, term) in [
+                ("赛维", "Sayweave", EditClass::Lexical, Some("Sayweave")),
+                ("请修改", "请修改，并保留理由", EditClass::Style, None),
+            ] {
+                let mut e = evidence("Codex.exe", before, after);
+                e.eligibility = LearningEligibility::capture(&config);
+                if automatic || personalized {
+                    settle(&mut repo, &e, class, term);
+                } else {
+                    assert!(repo.language_operation(DbOperation::SaveEdit(e)).is_err());
+                }
+            }
+            assert_eq!(terms(&mut repo).len(), usize::from(automatic));
+            let styles: i64 = repo
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM language_observations WHERE kind='edit'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(styles, i64::from(personalized));
+        }
+    }
+}
+#[test]
+fn disabling_one_domain_keeps_shared_evidence_for_the_other_and_off_on_does_not_revive_it() {
+    for disable_terms in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let mut repo = Repository::open(root.path()).unwrap();
+        let e = if disable_terms {
+            evidence("Codex.exe", "请修改", "请修改，并保留理由")
+        } else {
+            evidence("Codex.exe", "赛维", "Sayweave")
+        };
+        repo.language_operation(DbOperation::SaveEdit(e.clone()))
+            .unwrap();
+        let patch = if disable_terms {
+            LanguageSettingsPatch {
+                automatic_terms: Some(Settings {
+                    enabled: false,
+                    revision: 1,
+                }),
+                ..Default::default()
+            }
+        } else {
+            LanguageSettingsPatch {
+                personalization: Some(Settings {
+                    enabled: false,
+                    revision: 1,
+                }),
+                ..Default::default()
+            }
+        };
+        repo.language_operation(DbOperation::SaveSettings(patch))
+            .unwrap();
+        let raw: String = repo
+            .connection
+            .query_row(
+                "SELECT evidence FROM language_edits WHERE id=?1",
+                [&e.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(raw, "{}");
+        let DbOutput::PendingEdits(pending) =
+            repo.language_operation(DbOperation::PendingEdits).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(pending.len(), 1);
+        settle(
+            &mut repo,
+            &e,
+            if disable_terms {
+                EditClass::Style
+            } else {
+                EditClass::Lexical
+            },
+            if disable_terms {
+                None
+            } else {
+                Some("Sayweave")
+            },
+        );
+        assert_eq!(terms(&mut repo).len(), usize::from(!disable_terms));
+        let styles: i64 = repo
+            .connection
+            .query_row(
+                "SELECT count(*) FROM language_observations WHERE kind='edit'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(styles, i64::from(disable_terms));
+    }
+    let root = tempfile::tempdir().unwrap();
+    let mut repo = Repository::open(root.path()).unwrap();
+    let old = evidence("Codex.exe", "赛维", "Sayweave");
+    repo.language_operation(DbOperation::SaveEdit(old.clone()))
+        .unwrap();
+    for (enabled, revision) in [(false, 1), (true, 2)] {
+        repo.language_operation(DbOperation::SaveSettings(LanguageSettingsPatch {
+            automatic_terms: Some(Settings { enabled, revision }),
+            ..Default::default()
+        }))
+        .unwrap();
+    }
+    settle(&mut repo, &old, EditClass::Lexical, Some("Sayweave"));
+    assert!(terms(&mut repo).is_empty());
+    let mut new = evidence("Codex.exe", "赛维", "Sayweave");
+    new.eligibility = LearningEligibility::capture(&settings(&repo.connection).unwrap());
+    settle(&mut repo, &new, EditClass::Lexical, Some("Sayweave"));
+    assert_eq!(terms(&mut repo).len(), 1);
+}
+#[test]
+fn combined_settings_conflict_rolls_back_both_and_noop_keeps_live_revisions() {
+    let root = tempfile::tempdir().unwrap();
+    let mut repo = Repository::open(root.path()).unwrap();
+    let first = settings(&repo.connection).unwrap();
+    assert!(
+        repo.language_operation(DbOperation::SaveSettings(LanguageSettingsPatch {
+            automatic_terms: Some(Settings {
+                enabled: false,
+                revision: 1
+            }),
+            personalization: Some(Settings {
+                enabled: false,
+                revision: 0
+            })
+        }))
+        .is_err()
+    );
+    assert_eq!(settings(&repo.connection).unwrap(), first);
+    repo.language_operation(DbOperation::SaveSettings(LanguageSettingsPatch {
+        automatic_terms: Some(first.automatic_terms.clone()),
+        personalization: Some(first.personalization.clone()),
+    }))
+    .unwrap();
+    assert_eq!(settings(&repo.connection).unwrap(), first);
+}
+#[test]
+fn controls_migration_preserves_existing_language_data_and_retires_legacy_pending() {
+    use crate::data::repository::{MIGRATIONS, configure, migrate};
+    let root = tempfile::tempdir().unwrap();
+    let mut db = Connection::open(root.path().join("dictionary.sqlite")).unwrap();
+    configure(&db).unwrap();
+    migrate(&mut db, root.path(), &MIGRATIONS[..8]).unwrap();
+    db.execute(
+        "UPDATE language_settings SET enabled=0 WHERE singleton=1",
+        [],
+    )
+    .unwrap();
+    db.execute("INSERT INTO dictionary_terms(id,term,normalized_term,category,category_key,revision,created_at,updated_at) VALUES('saved-term','SQLite','sqlite',NULL,NULL,1,1,1)",[]).unwrap();
+    db.execute("INSERT INTO language_term_sources(term_id,source,settings_revision,created_at) VALUES('saved-term','automatic',1,1)",[]).unwrap();
+    db.execute(
+        "INSERT INTO language_suppression(term_key,updated_at) VALUES('suppressed',1)",
+        [],
+    )
+    .unwrap();
+    for (id, state) in [("legacy-pending", "pending"), ("legacy-settled", "settled")] {
+        db.execute("INSERT INTO language_edits(id,task_id,scope,settings_revision,evidence,state,created_at,expires_at) VALUES(?1,'task','web',1,'{\"legacy\":true}',?2,1,9999999999999)",params![id,state]).unwrap();
+    }
+    db.execute("INSERT INTO language_lexical_candidates(id,term_key,term,original,scope,created_at) VALUES('legacy-settled','candidate','Candidate','错词','web',1)",[]).unwrap();
+    db.execute("INSERT INTO language_profile_revisions(scope,version,predecessor,watermark,settings_revision,preferences,candidates,evidence,reason,analysis,created_at) VALUES('web',1,0,0,1,'[]','[]','[]','retained','{}',1)",[]).unwrap();
+    migrate(&mut db, root.path(), MIGRATIONS).unwrap();
+    let config = settings(&db).unwrap();
+    assert!(config.automatic_terms.enabled);
+    assert!(!config.personalization.enabled);
+    for table in [
+        "dictionary_terms",
+        "language_term_sources",
+        "language_suppression",
+        "language_lexical_candidates",
+        "language_profile_revisions",
+    ] {
+        let count: i64 = db
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+    let pending: (String, String) = db
+        .query_row(
+            "SELECT state,evidence FROM language_edits WHERE id='legacy-pending'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(pending, ("expired".into(), "{}".into()));
+    let saved: String = db
+        .query_row(
+            "SELECT evidence FROM language_edits WHERE id='legacy-settled'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(saved, "{\"legacy\":true}");
+}
 fn analysis() -> AnalysisStamp {
     AnalysisStamp {
         config_id: "test".into(),
@@ -20,7 +236,10 @@ fn evidence(app: &str, before: &str, after: &str) -> EditEvidence {
         region: "tail".into(),
         expires_at: now() + 600000,
         application: ApplicationContext::from_identity(None, app),
-        settings_revision: 1,
+        eligibility: LearningEligibility {
+            automatic_terms: Some(1),
+            personalization: Some(1),
+        },
         raw: before.into(),
         before: before.into(),
         after: after.into(),
@@ -32,7 +251,7 @@ fn settle(repo: &mut Repository, e: &EditEvidence, class: EditClass, term: Optio
     repo.language_operation(DbOperation::ClassifyEdit {
         analysis: analysis(),
         id: e.id.clone(),
-        settings_revision: e.settings_revision,
+        eligibility: e.eligibility.clone(),
         decision: LexicalDecision {
             class,
             original: term.map(|_| e.before.clone()),
@@ -65,7 +284,10 @@ fn clear_correction_learns_once_ambiguity_does_not_and_deleted_words_stay_delete
         repo.language_operation(DbOperation::ClassifyEdit {
             analysis: analysis(),
             id: e.id.clone(),
-            settings_revision: 1,
+            eligibility: LearningEligibility {
+                automatic_terms: Some(1),
+                personalization: Some(1)
+            },
             decision: LexicalDecision {
                 class: EditClass::Lexical,
                 original: Some("赛维".into()),
@@ -155,9 +377,12 @@ fn scope_evidence_and_immutable_versions_prevent_cross_application_and_stale_pub
         panic!()
     };
     assert!(chat.preferences.is_empty());
-    repo.language_operation(DbOperation::SaveSettings(Settings {
-        enabled: false,
-        revision: 1,
+    repo.language_operation(DbOperation::SaveSettings(LanguageSettingsPatch {
+        personalization: Some(Settings {
+            enabled: false,
+            revision: 1,
+        }),
+        ..Default::default()
     }))
     .unwrap();
     let DbOutput::Snapshot(off) = repo
@@ -166,7 +391,7 @@ fn scope_evidence_and_immutable_versions_prevent_cross_application_and_stale_pub
     else {
         panic!()
     };
-    assert!(!off.settings.enabled);
+    assert!(!off.settings.personalization.enabled);
     assert!(off.preferences.is_empty());
     assert_eq!(first.preferences.len(), 1);
 }
@@ -177,16 +402,25 @@ fn disabling_learning_invalidates_pending_edits_without_affecting_manual_diction
     let e = evidence("Codex.exe", "赛维", "Sayweave");
     repo.language_operation(DbOperation::SaveEdit(e.clone()))
         .unwrap();
-    repo.language_operation(DbOperation::SaveSettings(Settings {
-        enabled: false,
-        revision: 1,
+    repo.language_operation(DbOperation::SaveSettings(LanguageSettingsPatch {
+        automatic_terms: Some(Settings {
+            enabled: false,
+            revision: 1,
+        }),
+        personalization: Some(Settings {
+            enabled: false,
+            revision: 1,
+        }),
     }))
     .unwrap();
     assert!(
         repo.language_operation(DbOperation::ClassifyEdit {
             analysis: analysis(),
             id: e.id,
-            settings_revision: 1,
+            eligibility: LearningEligibility {
+                automatic_terms: Some(1),
+                personalization: Some(1)
+            },
             decision: LexicalDecision {
                 class: EditClass::Lexical,
                 original: Some("赛维".into()),
@@ -262,7 +496,10 @@ fn unchanged_context_is_not_a_lexical_edit_and_capitalization_remains_supported(
         repo.language_operation(DbOperation::ClassifyEdit {
             analysis: analysis(),
             id: e.id,
-            settings_revision: 1,
+            eligibility: LearningEligibility {
+                automatic_terms: Some(1),
+                personalization: Some(1)
+            },
             decision: LexicalDecision {
                 class: EditClass::Lexical,
                 original: Some("Sqlite".into()),
