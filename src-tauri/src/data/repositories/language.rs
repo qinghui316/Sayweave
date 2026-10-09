@@ -346,6 +346,7 @@ impl Repository {
                         language: WritingLanguage::of(&source.after),
                         kind: "edit".into(),
                         summary: summary.into(),
+                        summary_complete: true,
                         source_ref: Some(id.clone()),
                     };
                     tx.execute("INSERT OR IGNORE INTO language_observations(id,task_id,scope,settings_revision,kind,observation,created_at) VALUES(?1,?2,?3,?4,'edit',?5,?6)",params![id,source.task,source.application.key,settings_revision,json(&observation)?,now()]).map_err(db_error)?;
@@ -430,6 +431,7 @@ impl Repository {
                             continue;
                         };
                         value.summary = body.chars().take(100).collect();
+                        value.summary_complete = body.chars().count() <= 100;
                     }
                     observations.push(value);
                 }
@@ -466,6 +468,7 @@ impl Repository {
                                 continue;
                             };
                             value.summary = body.chars().take(60).collect();
+                            value.summary_complete = body.chars().count() <= 60;
                         }
                         support.push(value);
                     }

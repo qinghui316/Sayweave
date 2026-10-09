@@ -563,16 +563,19 @@ impl SpeechService {
         let hotwords = if let Some(context) = &context {
             context.hotwords.clone()
         } else {
-            match app
-                .state::<crate::data::DataWorker>()
-                .request_admitted(crate::data::Operation::Processing(
-                    crate::contracts::processing::DbOperation::DictionarySnapshot,
-                ))
-                .await
+            match tokio::time::timeout(
+                Duration::from_secs(2),
+                app.state::<crate::data::DataWorker>().request_admitted(
+                    crate::data::Operation::Processing(
+                        crate::contracts::processing::DbOperation::DictionarySnapshot,
+                    ),
+                ),
+            )
+            .await
             {
-                Ok(crate::data::Output::Processing(
+                Ok(Ok(crate::data::Output::Processing(
                     crate::contracts::processing::DbOutput::Dictionary(records),
-                )) => crate::processing::prompt::DictionaryIndex::new(records).hotwords(),
+                ))) => crate::processing::prompt::DictionaryIndex::new(records).hotwords(),
                 _ => vec![],
             }
         };

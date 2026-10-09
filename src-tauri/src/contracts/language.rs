@@ -191,7 +191,12 @@ pub struct StyleObservation {
     pub language: WritingLanguage,
     pub kind: String,
     pub summary: String,
+    #[serde(default = "complete_summary")]
+    pub summary_complete: bool,
     pub source_ref: Option<String>,
+}
+fn complete_summary() -> bool {
+    true
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]

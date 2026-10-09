@@ -436,19 +436,48 @@ impl DictationCoordinator {
         self.update(&app, &id, |_| {});
         let input = app.state::<WindowsInputService>();
         let mut anchor = anchor;
-        let dictionary = processing_context::dictionary(&app).await.unwrap_or_else(|error| {
+        let preparation_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let optional = async {
+            let dictionary = processing_context::dictionary(&app).await.unwrap_or_else(|error| {
             log::info!(target:"sayweave", "operation=dictionary_prepare task_id={} result=unavailable error={}", id,error.code);
             Arc::new(crate::processing::prompt::DictionaryIndex::new(vec![]))
         });
-        let hotwords = dictionary.hotwords();
-        let application = crate::windows_input::application_context(anchor.clone()).await;
-        let language = if source == "external" {
-            crate::language_learning::snapshot(&app.state::<crate::data::DataWorker>(), application)
+            let application = crate::windows_input::application_context(anchor.clone()).await;
+            let language = if source == "external" {
+                crate::language_learning::snapshot(
+                    &app.state::<crate::data::DataWorker>(),
+                    application,
+                )
                 .await
                 .ok()
-        } else {
-            None
+            } else {
+                None
+            };
+            (dictionary, language)
         };
+        let (dictionary, language) = match crate::task_stop::optional_read(
+            optional,
+            tx.subscribe(),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        {
+            crate::task_stop::OptionalRead::Ready(value) => value,
+            crate::task_stop::OptionalRead::Unavailable => {
+                log::info!(target:"sayweave","operation=language_prepare task_id={} result=unavailable",id);
+                (
+                    Arc::new(crate::processing::prompt::DictionaryIndex::new(vec![])),
+                    None,
+                )
+            }
+            crate::task_stop::OptionalRead::Stopped => {
+                let error = Error::new("cancelled");
+                self.reject_preparation(&app, &id, speech_source, &error, &gate)
+                    .await;
+                return Err(error);
+            }
+        };
+        let hotwords = dictionary.hotwords();
         #[cfg(windows)]
         let processing = if source == "external" {
             match processing_context::Context::prepare(
@@ -457,6 +486,7 @@ impl DictationCoordinator {
                 &id,
                 dictionary,
                 language.clone(),
+                preparation_deadline,
             )
             .await
             {
@@ -973,6 +1003,7 @@ impl DictationCoordinator {
                             ),
                             kind: "speech".into(),
                             summary: String::new(),
+                            summary_complete: false,
                             source_ref: Some(attempt.clone()),
                         });
                 }

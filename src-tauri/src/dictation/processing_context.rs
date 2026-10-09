@@ -7,12 +7,9 @@ use crate::{
     models::{ExecutableConfiguration, ModelService, types::ModelError},
     processing::{prompt, units::Unit},
 };
-use std::{
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, Ordering},
 };
 use tauri::Manager;
 use tokio::sync::watch;
@@ -88,6 +85,7 @@ impl Context {
         task_id: &str,
         dictionary: Arc<prompt::DictionaryIndex>,
         language: Option<crate::contracts::language::Snapshot>,
+        deadline: tokio::time::Instant,
     ) -> Result<Option<Self>, ModelError> {
         let preparation = async {
             let data = app.state::<DataWorker>();
@@ -122,7 +120,7 @@ impl Context {
         tokio::select! {
             biased;
             _=cancel.changed()=>Err(ModelError::new("cancelled")),
-            value=tokio::time::timeout(Duration::from_secs(15),preparation)=>value.unwrap_or_else(|_|Err(ModelError::new("timeout"))),
+            value=tokio::time::timeout_at(deadline,preparation)=>value.unwrap_or_else(|_|Err(ModelError::new("timeout"))),
         }
     }
     pub async fn generate(

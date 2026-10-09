@@ -603,7 +603,7 @@ pub(crate) fn profile_messages(
     let mut count = batch.observations.len();
     loop {
         for excerpt in [128, 64, 32, 16] {
-            let project = |o: &StyleObservation| serde_json::json!({"id":o.id,"session":o.task,"app":o.application.key,"kind":o.kind,"language":o.language,"summary":o.summary.chars().take(excerpt).collect::<String>(),"summaryComplete":o.summary.chars().count()<=excerpt});
+            let project = |o: &StyleObservation| serde_json::json!({"id":o.id,"session":o.task,"app":o.application.key,"kind":o.kind,"language":o.language,"summary":o.summary.chars().take(excerpt).collect::<String>(),"summaryComplete":o.summary_complete && o.summary.chars().count()<=excerpt});
             let observations = batch.observations[..count]
                 .iter()
                 .map(project)
@@ -852,6 +852,7 @@ mod tests {
                     language: WritingLanguage::Han,
                     kind: "edit".into(),
                     summary: "证".repeat(512),
+                    summary_complete: true,
                     source_ref: None,
                 });
                 assert!(item < 8);
@@ -873,6 +874,7 @@ mod tests {
                 language: WritingLanguage::Han,
                 kind: "edit".into(),
                 summary: "新".repeat(512),
+                summary_complete: true,
                 source_ref: None,
             })
             .collect();

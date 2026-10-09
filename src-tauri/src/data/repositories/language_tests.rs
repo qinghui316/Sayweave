@@ -342,6 +342,7 @@ fn ten_full_speech_observations_are_counted_before_prompt_sampling() {
             language: WritingLanguage::Han,
             kind: "speech".into(),
             summary: String::new(),
+            summary_complete: false,
             source_ref: Some(attempt),
         }))
         .unwrap();
@@ -353,6 +354,52 @@ fn ten_full_speech_observations_are_counted_before_prompt_sampling() {
         panic!("ten speech records must dispatch");
     };
     assert_eq!(batch.observations.len(), 10);
+    assert!(
+        batch
+            .observations
+            .iter()
+            .all(|o| !o.summary_complete && o.summary.chars().count() == 100)
+    );
+    let first = batch.observations[0].id.clone();
+    repo.language_operation(DbOperation::Publish(ProfileProposal {
+        scope: batch.scope.clone(),
+        settings_revision: 1,
+        previous_version: 0,
+        watermark: batch.watermark,
+        evidence: vec![first.clone()],
+        preferences: vec![Preference {
+            scope: batch.scope.clone(),
+            rule: "保留表达次序".into(),
+            language: WritingLanguage::Han,
+            context: None,
+            evidence: vec![first],
+        }],
+        candidates: vec![],
+        reason: "测试来源节选标记".into(),
+        analysis: analysis(),
+    }))
+    .unwrap();
+    for _ in 0..3 {
+        let e = evidence("Codex.exe", "修改", "请修改");
+        settle(&mut repo, &e, EditClass::Style, None);
+    }
+    repo.connection
+        .execute(
+            "UPDATE language_profiles SET published_at=?1",
+            [now() - 600001],
+        )
+        .unwrap();
+    let DbOutput::Batch(Some(next)) = repo
+        .language_operation(DbOperation::Batch(batch.scope))
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(
+        next.support
+            .iter()
+            .any(|o| o.kind == "speech" && !o.summary_complete && o.summary.chars().count() == 60)
+    );
 }
 #[test]
 fn each_shared_rule_needs_its_own_cross_app_evidence_and_cooldown_survives_reopen() {
