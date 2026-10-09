@@ -38,6 +38,10 @@ pub fn native_checks(fixture: &std::path::Path) -> Result<(), String> {
 pub fn composition_checks(fixture: &std::path::Path) -> Result<(), String> {
     acceptance::composition_run(fixture)
 }
+#[cfg(feature = "desktop-acceptance")]
+pub fn observation_checks(process: u32) -> Result<(), String> {
+    acceptance::observation_run(process)
+}
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

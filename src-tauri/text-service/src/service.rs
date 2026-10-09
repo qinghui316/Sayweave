@@ -145,7 +145,8 @@ struct ObservationAdmission {
 }
 impl ObservationAdmission {
     fn matches(&self, state: &State, r: &Request) -> bool {
-        state.active
+        r.live(unsafe { GetTickCount64() })
+            && state.active
             && state.connected
             && state.pending.is_none()
             && state.connection == self.connection

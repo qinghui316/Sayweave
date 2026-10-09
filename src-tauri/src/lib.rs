@@ -45,6 +45,10 @@ pub fn composition_acceptance(fixture: &std::path::Path) -> Result<(), String> {
     windows_input::composition_checks(fixture)
 }
 #[cfg(feature = "desktop-acceptance")]
+pub fn observation_acceptance(process: u32) -> Result<(), String> {
+    windows_input::observation_checks(process)
+}
+#[cfg(feature = "desktop-acceptance")]
 #[tauri::command]
 fn acceptance_exit(app: tauri::AppHandle, window: WebviewWindow) -> Result<(), RuntimeError> {
     if window.label() != "main"

@@ -40,6 +40,31 @@ impl FocusIdentity {
                     object: None,
                 });
             }
+            let object = Self::focused_object(window).or_else(|error| {
+                // Chromium-style hosts expose their focused editable leaf on
+                // the root provider, while the native focus HWND is a child.
+                // Use the same-thread root route already used by selection
+                // evidence; a generic document/window is still rejected.
+                // A known protected/read-only field is an explicit rejection,
+                // not a missing provider for which another route may be tried.
+                if error.code() == E_ACCESSDENIED {
+                    return Err(error);
+                }
+                let root = GetAncestor(window, GA_ROOT);
+                if root == window || GetWindowThreadProcessId(root, None) != GetCurrentThreadId() {
+                    return Err(E_ACCESSDENIED.into());
+                }
+                Self::focused_object(root)
+            })?;
+            Ok(Self {
+                window,
+                class,
+                object: Some(object),
+            })
+        }
+    }
+    unsafe fn focused_object(window: HWND) -> Result<IUnknown> {
+        unsafe {
             let mut accessible: Option<IAccessible> = None;
             AccessibleObjectFromWindow(
                 window,
@@ -55,8 +80,15 @@ impl FocusIdentity {
                     VT_DISPATCH => {
                         accessible = IDispatch::try_from(&focus)?.cast()?;
                     }
-                    VT_I4 => {
-                        let child = i32::try_from(&focus)?;
+                    VT_I4 | VT_EMPTY => {
+                        // A focused MSAA leaf can return EMPTY because it has
+                        // no focused child. Verify its role/state, never accept
+                        // EMPTY by itself as proof of an editable field.
+                        let child = if focus.vt() == VT_I4 {
+                            i32::try_from(&focus)?
+                        } else {
+                            0
+                        };
                         if child != 0 {
                             accessible = accessible.get_accChild(&focus)?.cast()?;
                             continue;
@@ -64,23 +96,10 @@ impl FocusIdentity {
                         let child = VARIANT::from(0i32);
                         let role = i32::try_from(&accessible.get_accRole(&child)?)?;
                         let state = i32::try_from(&accessible.get_accState(&child)?)? as u32;
-                        // A generic window/document focus is not an editable field identity.
-                        if [
-                            ROLE_SYSTEM_WINDOW as i32,
-                            ROLE_SYSTEM_CLIENT as i32,
-                            ROLE_SYSTEM_DOCUMENT as i32,
-                        ]
-                        .contains(&role)
-                            || state & STATE_SYSTEM_FOCUSED == 0
-                            || state & (STATE_SYSTEM_PROTECTED | STATE_SYSTEM_READONLY) != 0
-                        {
-                            return Err(E_ACCESSDENIED.into());
-                        }
-                        return Ok(Self {
-                            window,
-                            class,
-                            object: Some(accessible.cast()?),
-                        });
+                        // EMPTY means no focused child, not that a pane/group
+                        // is an editable field. Require the editable text role.
+                        editable_focus(role, state)?;
+                        return accessible.cast();
                     }
                     _ => return Err(E_NOINTERFACE.into()),
                 }
@@ -97,6 +116,15 @@ impl FocusIdentity {
             && current.class == self.class
             && current.object == self.object)
     }
+}
+fn editable_focus(role: i32, state: u32) -> Result<()> {
+    if state & (STATE_SYSTEM_PROTECTED | STATE_SYSTEM_READONLY) != 0 {
+        return Err(E_ACCESSDENIED.into());
+    }
+    if role != ROLE_SYSTEM_TEXT as i32 || state & STATE_SYSTEM_FOCUSED == 0 {
+        return Err(E_NOINTERFACE.into());
+    }
+    Ok(())
 }
 impl Drop for Array {
     fn drop(&mut self) {
@@ -406,6 +434,45 @@ unsafe fn provider_module(pattern: &ITextProvider) -> String {
 #[cfg(test)]
 mod tests {
     use super::mapped_document;
+    #[test]
+    fn focused_leaf_rejects_root_containers_and_security_states() {
+        use super::*;
+        assert!(editable_focus(ROLE_SYSTEM_TEXT as i32, STATE_SYSTEM_FOCUSED).is_ok());
+        for role in [
+            ROLE_SYSTEM_PANE,
+            ROLE_SYSTEM_GROUPING,
+            ROLE_SYSTEM_DOCUMENT,
+            ROLE_SYSTEM_CLIENT,
+        ] {
+            assert_eq!(
+                editable_focus(role as i32, STATE_SYSTEM_FOCUSED)
+                    .unwrap_err()
+                    .code(),
+                E_NOINTERFACE
+            );
+        }
+        for state in [STATE_SYSTEM_PROTECTED, STATE_SYSTEM_READONLY] {
+            // This code is also the no-fallback marker, even for a container.
+            assert_eq!(
+                editable_focus(ROLE_SYSTEM_TEXT as i32, STATE_SYSTEM_FOCUSED | state)
+                    .unwrap_err()
+                    .code(),
+                E_ACCESSDENIED
+            );
+            assert_eq!(
+                editable_focus(ROLE_SYSTEM_PANE as i32, STATE_SYSTEM_FOCUSED | state)
+                    .unwrap_err()
+                    .code(),
+                E_ACCESSDENIED
+            );
+        }
+        assert_eq!(
+            editable_focus(ROLE_SYSTEM_TEXT as i32, 0)
+                .unwrap_err()
+                .code(),
+            E_NOINTERFACE
+        );
+    }
     #[test]
     fn full_document_representations_require_unique_selection_coordinates() {
         assert_eq!(mapped_document("甲\n", "甲", "\n", "甲\n\n"), None);

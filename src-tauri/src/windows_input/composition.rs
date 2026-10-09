@@ -412,6 +412,8 @@ impl Drop for Apartment {
 }
 struct Host {
     supports_observation: bool,
+    abandoned_optional: Vec<(u64, u64)>,
+    optional_disabled: bool,
     observer_reversal: u64,
     sink: Option<Arc<ObservationSink>>,
     raw_tail: Option<SourceReceipt>,
@@ -618,6 +620,8 @@ impl Host {
         };
         let mut host = Self {
             supports_observation: false,
+            abandoned_optional: Vec::new(),
+            optional_disabled: false,
             observer_reversal: crate::input_state::reversal_epoch(),
             sink: None,
             raw_tail: None,
@@ -714,6 +718,13 @@ impl Host {
         permission: Option<&AtomicBool>,
     ) -> Result<Reply, Error> {
         self.transport_attempted = false;
+        let optional = matches!(
+            action,
+            Action::ObserveStart | Action::ObservePoll | Action::ObserveStop
+        );
+        if optional && self.optional_disabled {
+            return Err(Error::new("observationUnavailable"));
+        }
         if !cleanup {
             target_ready(&self.task, &self.anchor, &self.gate)?;
         }
@@ -765,6 +776,12 @@ impl Host {
             {
                 let reply: Reply = serde_json::from_slice(&frame)
                     .map_err(|_| Error::new("compositionProtocol"))?;
+                // Only a timed-out optional read may finish after its caller
+                // abandoned it. Its exact receipt must not poison the next
+                // write. Unknown/core mismatches remain protocol failures.
+                if discard_optional_reply(&mut self.abandoned_optional, reply.operation, reply.revision) {
+                    continue;
+                }
                 if reply.operation != request.operation || reply.revision != request.revision {
                     return Err(Error::new("compositionProtocol"));
                 }
@@ -785,6 +802,13 @@ impl Host {
                 return Ok(reply);
             }
             if at.elapsed() >= Duration::from_secs(2) {
+                if optional {
+                    self.abandoned_optional
+                        .push((request.operation, request.revision));
+                    // Never evict an outstanding identity to make room for
+                    // another read. Stop optional work at the fixed bound.
+                    self.optional_disabled = self.abandoned_optional.len() >= 16;
+                }
                 return Err(Error::new("compositionTimeout"));
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -962,6 +986,17 @@ impl Host {
             .map_err(|_| Error::new("compositionCleanup"))
     }
 }
+fn discard_optional_reply(abandoned: &mut Vec<(u64, u64)>, operation: u64, revision: u64) -> bool {
+    if let Some(index) = abandoned
+        .iter()
+        .position(|value| *value == (operation, revision))
+    {
+        abandoned.swap_remove(index);
+        true
+    } else {
+        false
+    }
+}
 fn completed_prefix(receipt: Option<u64>, revision: u64, stored: &str, requested: &str) -> bool {
     receipt == Some(revision) && stored.is_empty() && requested.is_empty()
 }
@@ -1124,5 +1159,25 @@ mod tests {
         assert!(edit_expiry(700000, 100000, 1000000).is_none());
         assert!(edit_expiry(100, 101, 1000000).is_none());
         assert!(edit_expiry(100, 0, 1000000).is_none());
+    }
+    #[test]
+    fn late_optional_receipt_is_discarded_without_accepting_unknown_write_receipts() {
+        // ObserveStart(2,0) exceeded its budget; Update(3,1) is now waiting.
+        let mut abandoned = vec![(2, 0)];
+        let frames = [(2, 0), (3, 1)];
+        let mut accepted = vec![];
+        for (operation, revision) in frames {
+            if !discard_optional_reply(&mut abandoned, operation, revision) {
+                assert_eq!((operation, revision), (3, 1));
+                accepted.push((operation, revision));
+            }
+        }
+        assert_eq!(accepted, vec![(3, 1)]);
+        assert!(abandoned.is_empty());
+        // A duplicate or a wrong revision is not silently swallowed.
+        assert!(!discard_optional_reply(&mut abandoned, 2, 0));
+        abandoned.push((4, 1));
+        assert!(!discard_optional_reply(&mut abandoned, 4, 2));
+        assert_eq!(abandoned, vec![(4, 1)]);
     }
 }

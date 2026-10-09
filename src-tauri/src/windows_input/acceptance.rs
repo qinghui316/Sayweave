@@ -505,3 +505,125 @@ pub(super) fn run(exe: &std::path::Path) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// Scripted operator for a strictly owned target, using the registered production
+/// host and its optional receipt sink. It never directly loads a component DLL.
+pub(super) fn observation_run(process: u32) -> Result<(), String> {
+    use super::composition::{Draft, Finish, ObservationSink, stop_observer};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    if std::env::var("SAYWEAVE_TSF_OWNED_PID")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        != Some(process)
+        || process == std::process::id()
+    {
+        return Err("owned observation target required".into());
+    }
+    let input = WindowsInputService::new();
+    let _evidence = EvidenceLease::new()?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    let (send, evidence) = std::sync::mpsc::channel();
+    let mut draft = None;
+    let mut task = String::new();
+    let result = (|| {
+        println!("{}", serde_json::json!({"ready":true}));
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        for line in std::io::stdin().lock().lines() {
+            let value: serde_json::Value = serde_json::from_str(&line.map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+            let action = value["action"].as_str().ok_or("action required")?;
+            let mut response = serde_json::json!({"action":action});
+            match action {
+                "begin" => {
+                    let anchor =
+                        WindowsInputService::anchor().ok_or("owned foreground required")?;
+                    if anchor.process != process || draft.is_some() {
+                        return Err("owned foreground/session mismatch".into());
+                    }
+                    let application = super::application::resolve(&anchor);
+                    task = uuid::Uuid::new_v4().to_string();
+                    bind_watch(&task, &anchor, None).map_err(|e| e.code)?;
+                    let current = runtime
+                        .block_on(Draft::begin(
+                            task.clone(),
+                            1,
+                            anchor,
+                            Arc::new(DeliveryGate::default()),
+                        ))
+                        .map_err(|e| e.code)?;
+                    let sink = Arc::new(ObservationSink {
+                        snapshot: crate::contracts::language::Snapshot {
+                            application: application.clone(),
+                            settings: crate::contracts::language::Settings {
+                                enabled: true,
+                                revision: 0,
+                            },
+                            profile_version: 0,
+                            shared_version: 0,
+                            preferences: vec![],
+                        },
+                        permit: Arc::new(AtomicBool::new(true)),
+                        current_revision: Arc::new(AtomicU64::new(0)),
+                        emit: Arc::new({
+                            let send = send.clone();
+                            move |value| {
+                                let _ = send.send(value);
+                            }
+                        }),
+                    });
+                    response["observing"] = runtime.block_on(current.observe(sink)).into();
+                    response["application"] =
+                        serde_json::to_value(application).map_err(|e| e.to_string())?;
+                    draft = Some(current);
+                }
+                "replace" => {
+                    runtime
+                        .block_on(draft.as_ref().ok_or("begin first")?.replace_with_source(
+                            value["sequence"].as_u64().ok_or("sequence required")?,
+                            value["text"].as_str().ok_or("text required")?.into(),
+                            Some(value["raw"].as_str().ok_or("raw required")?.into()),
+                        ))
+                        .map_err(|e| e.code)?;
+                }
+                "commit" | "handoff" => {
+                    let outcome = runtime.block_on(
+                        draft
+                            .as_ref()
+                            .ok_or("begin first")?
+                            .finish_receipt_with_source(
+                                value["text"].as_str().unwrap_or("").into(),
+                                if action == "commit" {
+                                    Finish::Commit
+                                } else {
+                                    Finish::Handoff("editing".into())
+                                },
+                                value["raw"].as_str().unwrap_or("").into(),
+                            ),
+                    );
+                    response["committed"] = outcome.committed.into();
+                    response["handedOff"] = outcome.handed_off.into();
+                    response["delivery"] =
+                        serde_json::to_value(outcome.delivery).map_err(|e| e.to_string())?;
+                }
+                "drain" => {}
+                "stop" => {
+                    runtime.block_on(stop_observer()).map_err(|e| e.code)?;
+                }
+                "exit" => break,
+                _ => return Err("unknown observation fixture action".into()),
+            }
+            response["edits"] = serde_json::to_value(evidence.try_iter().collect::<Vec<_>>())
+                .map_err(|e| e.to_string())?;
+            println!("{response}");
+            std::io::stdout().flush().map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })();
+    if let Some(draft) = draft {
+        let _ = runtime.block_on(draft.finish(String::new(), Finish::Abort));
+    }
+    let _ = runtime.block_on(stop_observer());
+    release_watch(&task);
+    input.shutdown();
+    result
+}

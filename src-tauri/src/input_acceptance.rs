@@ -20,10 +20,14 @@ fn main() {
     let fixture = std::env::current_exe()
         .unwrap()
         .with_file_name("input-fixture.exe");
-    let result = if std::env::args().nth(1).as_deref() == Some("composition") {
-        sayweave_lib::composition_acceptance(&fixture)
-    } else {
-        sayweave_lib::input_acceptance(&fixture)
+    let result = match std::env::args().nth(1).as_deref() {
+        Some("observation") => std::env::args()
+            .nth(2)
+            .and_then(|p| p.parse().ok())
+            .ok_or_else(|| "owned fixture PID required".to_string())
+            .and_then(sayweave_lib::observation_acceptance),
+        Some("composition") => sayweave_lib::composition_acceptance(&fixture),
+        _ => sayweave_lib::input_acceptance(&fixture),
     };
     match result {
         Ok(()) => println!("SAYWEAVE_INPUT_ACCEPTANCE_PASS"),
