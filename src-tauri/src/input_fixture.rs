@@ -99,6 +99,38 @@ fn focus_metadata(process: u32) -> serde_json::Value {
         CoUninitialize();result.unwrap_or_else(|e|serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}))
     }).join().unwrap_or_else(|_|serde_json::json!({"error":"metadataWorker"}))
 }
+// Read only known static product labels from the explicitly owned application.
+// A native PID is not proof that the frontend rendered.
+fn product_surface(process:u32)->serde_json::Value {
+    if std::env::var("SAYWEAVE_DAILY_OWNED_PID").ok().and_then(|p|p.parse().ok())!=Some(process) {
+        return serde_json::json!({"error":"ownedProductRequired"});
+    }
+    thread::spawn(move || unsafe {
+        use windows::Win32::{System::Com::*,UI::Accessibility::*};
+        let result=(|| {
+            CoInitializeEx(None,COINIT_MULTITHREADED).ok()?;
+            let mut target=ProcessWindow{process,window:HWND::default(),overlay:false};
+            // The owned-window callback deliberately stops enumeration once
+            // matched; FALSE with last-error0 is not a failed lookup.
+            let _=EnumWindows(Some(process_window),LPARAM(&mut target as *mut _ as isize));
+            if target.window.0.is_null(){return Err(windows::core::Error::from_hresult(E_FAIL));}
+            let automation:IUIAutomation=CoCreateInstance(&CUIAutomation,None,CLSCTX_INPROC_SERVER)?;
+            let root=automation.ElementFromHandle(target.window)?;
+            let elements=root.FindAll(TreeScope_Descendants,&automation.CreateTrueCondition()?)?;
+            let wanted=["首页","历史记录","词典","设置","开始口述","本机用量"];
+            let mut found=std::collections::BTreeSet::new();let mut connection_error=false;
+            for index in 0..elements.Length()?.min(1000) {
+                let item=elements.GetElement(index)?;
+                if item.CurrentIsOffscreen()?.as_bool(){continue;}
+                let name=item.CurrentName()?.to_string();
+                for label in wanted {if name==label{found.insert(label);}}
+                connection_error|=name.contains("无法访问此页面")||name.contains("ERR_CONNECTION_REFUSED");
+            }
+            Ok::<_,windows::core::Error>(serde_json::json!({"process":process,"knownLabels":found,"frontendReady":wanted.iter().all(|n|found.contains(n)),"connectionError":connection_error}))
+        })();
+        CoUninitialize();result.unwrap_or_else(|e|serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}))
+    }).join().unwrap_or_else(|_|serde_json::json!({"error":"surfaceWorker"}))
+}
 // Read-only evidence from a runner-owned target, on an independent MTA. Never
 // emit external text or use these measurements to move a production selection.
 fn selection_evidence(process: u32) -> serde_json::Value {
@@ -222,6 +254,11 @@ unsafe extern "system" fn process_window(window: HWND, parameter: LPARAM) -> BOO
 }
 fn main() {
     if std::env::var("SAYWEAVE_INPUT_ACCEPTANCE").as_deref() != Ok("1") {
+        return;
+    }
+    if std::env::args().nth(1).as_deref()==Some("inspect-product") {
+        let process=std::env::args().nth(2).and_then(|v|v.parse().ok()).unwrap_or(0);
+        println!("{}",product_surface(process));
         return;
     }
     unsafe {
@@ -358,6 +395,11 @@ fn main() {
                     io::stdout().flush().unwrap();
                     let _ = ok.send(());
                     continue;
+                }
+                if value["action"]=="inspect-product" {
+                    let process=value["process"].as_u64().and_then(|p|u32::try_from(p).ok()).unwrap_or(0);
+                    println!("{}",product_surface(process));
+                    io::stdout().flush().unwrap();let _=ok.send(());continue;
                 }
                 if value["action"] != "type"
                     && let Some(text) = value["text"].as_str()
