@@ -520,7 +520,7 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                     data.continuation = continuation;
                     // Both the previous captured edit and this clearing session
                     // must be complete; ending IME cannot promote an interim edit.
-                    if cleared && !composing && data.freeze_before_clear() {
+                    if (cleared || after.is_empty()) && !composing && data.freeze_before_clear() {
                         return Ok(());
                     }
                     data.value.composing = composing;

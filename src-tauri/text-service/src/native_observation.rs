@@ -383,8 +383,12 @@ unsafe extern "system" fn procedure(
         hook.end.set(next);
         hook.continuation.set(selection(window) == (next, next));
         if let Ok(after) = text(window, start, next) {
+            let previous_complete = !hook.incomplete.get();
             hook.incomplete.set(false);
             let mut record = reading.borrow_mut();
+            if after.is_empty() && previous_complete && record.freeze_before_clear() {
+                return result;
+            }
             if after != record.value.after {
                 record.value.after = after;
                 record.value.sequence += 1;

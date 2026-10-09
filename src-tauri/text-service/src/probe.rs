@@ -63,6 +63,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             #[cfg(feature = "acceptance")]
             Some("fixture") => fixture()?,
+            #[cfg(feature = "acceptance")]
+            Some("observation-script") => {
+                observation_script(args.get(2).ok_or("owned PID required")?.parse()?)?;
+            }
             Some("register") => {
                 let path = std::fs::canonicalize(args.get(2).ok_or("DLL path required")?)?;
                 registration::register(&path.to_string_lossy())?;
@@ -389,6 +393,110 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok(())
     }
+}
+#[cfg(feature = "acceptance")]
+fn observation_script(expected: u32) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::{BufRead, Write};
+    if expected == 0
+        || std::env::var("SAYWEAVE_TSF_OWNED_PID")
+            .ok()
+            .and_then(|p| p.parse::<u32>().ok())
+            != Some(expected)
+    {
+        return Err("owned fixture identity required".into());
+    }
+    let capability = uuid::Uuid::new_v4().to_string();
+    let _host = registration::host_capability(std::process::id(), &capability)?;
+    let before = keyboard()?;
+    let mut profile = sayweave_text_service::client::ProfileLease::open()?;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut process = 0;
+        let thread = unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut process)) };
+        if process != expected {
+            return Err("owned foreground mismatch; no write attempted".into());
+        }
+        let began = Instant::now();
+        let pipe = loop {
+            if let Ok(pipe) = Pipe::client(process, thread) {
+                break pipe;
+            }
+            if began.elapsed() > Duration::from_secs(3) {
+                return Err("owned bridge unavailable".into());
+            }
+            pump(Duration::from_millis(20));
+        };
+        let task = uuid::Uuid::new_v4().to_string();
+        for (operation, revision, action, text) in [
+            (1, 0, Action::Begin, ""),
+            (2, 0, Action::ObserveStart, ""),
+            (3, 1, Action::Update, "项目名是起蓝。"),
+            (4, 1, Action::Commit, ""),
+        ] {
+            let reply = exchange(
+                &pipe,
+                &capability,
+                &task,
+                1,
+                operation,
+                revision,
+                action,
+                text,
+                false,
+            )?;
+            if !reply.applied {
+                return Err(format!("owned observation initialization: {}", reply.code).into());
+            }
+        }
+        println!("{{\"ready\":true}}");
+        std::io::stdout().flush()?;
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lock().lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                if send.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let began = Instant::now();
+        loop {
+            if let Ok(line) = receive.try_recv() {
+                let command: serde_json::Value = serde_json::from_str(&line)?;
+                if command["action"] != "stop" {
+                    return Err("only owned observation stop is supported".into());
+                }
+                let reply = exchange(
+                    &pipe,
+                    &capability,
+                    &task,
+                    1,
+                    5,
+                    1,
+                    Action::ObserveStop,
+                    "",
+                    false,
+                )?;
+                println!(
+                    "{}",
+                    serde_json::json!({"applied":reply.applied,"edit_observation":reply.edit_observation})
+                );
+                std::io::stdout().flush()?;
+                break;
+            }
+            if began.elapsed() > Duration::from_secs(12) {
+                return Err("owned observation deadline".into());
+            }
+            pump(Duration::from_millis(10));
+        }
+        Ok(())
+    })();
+    profile.close()?;
+    if keyboard()? != before {
+        return Err("owned observation changed keyboard profile".into());
+    }
+    result
 }
 fn input_profiles() -> windows::core::Result<Vec<TF_INPUTPROCESSORPROFILE>> {
     unsafe {
@@ -1353,8 +1461,10 @@ fn observation_ranges_fixture(
             ("clearWithoutEdit", "术语", 0, 2, "术语", "术语", false),
             ("clearRestored", "术语", 0, 2, "词典", "词典", false),
             ("rangeClear", "术语", 0, 2, "", "", true),
+            ("rangeClearAfterEdit", "术语", 0, 2, "词典", "词典", true),
             ("clearComposing", "术语", 0, 2, "词典", "词典", false),
             ("clearComposingEnded", "术语", 0, 2, "词典", "词典", false),
+            ("clearIncomplete", "术语", 0, 2, "词典", "词典", false),
             ("readonly", "术语", 0, 2, "词典", "词典", true),
             ("password", "术语", 0, 2, "词典", "词典", true),
             ("originalRestore", "术语", 0, 2, "甲词", "甲词", false),
@@ -1369,7 +1479,7 @@ fn observation_ranges_fixture(
             if !plain
                 && matches!(
                     label,
-                    "ime" | "clearComposing" | "undo" | "readonly" | "password"
+                    "ime" | "clearComposing" | "clearIncomplete" | "undo" | "readonly" | "password"
                 )
             {
                 continue;
@@ -1389,12 +1499,12 @@ fn observation_ranges_fixture(
             let user_composition = std::rc::Rc::new(std::cell::RefCell::new(None));
             let prefix = if label == "outside" {
                 "同词"
-            } else if label == "rangeClear" {
+            } else if matches!(label, "rangeClear" | "rangeClearAfterEdit") {
                 "正文"
             } else {
                 ""
             };
-            let (from, to) = if label == "rangeClear" {
+            let (from, to) = if matches!(label, "rangeClear" | "rangeClearAfterEdit") {
                 (
                     from + prefix.encode_utf16().count(),
                     to + prefix.encode_utf16().count(),
@@ -1672,7 +1782,7 @@ fn observation_ranges_fixture(
             let actual = editor_text(editor)?;
             let expected_all = if label == "settleReentry" {
                 format!("{expected}{input}")
-            } else if label == "rangeClear" {
+            } else if matches!(label, "rangeClear" | "rangeClearAfterEdit") {
                 format!("{prefix}{expected}")
             } else if label != "outside" {
                 expected.to_owned()
@@ -1743,6 +1853,55 @@ fn observation_ranges_fixture(
                 pump(Duration::from_millis(30));
                 if !editor_text(editor)?.is_empty() {
                     return Err("IME end/clear did not empty actual field".into());
+                }
+            }
+            if label == "clearIncomplete" {
+                let size = expected.encode_utf16().count();
+                SendMessageW(
+                    editor,
+                    0x00B1,
+                    Some(WPARAM(size)),
+                    Some(LPARAM(size as isize)),
+                );
+                SendMessageW(editor, WM_CHAR, Some(WPARAM(0xd83d)), None);
+                if SendMessageW(editor, WM_GETTEXTLENGTH, None, None).0 != (size + 1) as isize {
+                    return Err("incomplete surrogate fixture was not inserted".into());
+                }
+                SendMessageW(
+                    editor,
+                    0x00B1,
+                    Some(WPARAM(0)),
+                    Some(LPARAM((size + 1) as isize)),
+                );
+                SendMessageW(editor, WM_CHAR, Some(WPARAM(8)), None);
+                if !editor_text(editor)?.is_empty() {
+                    return Err("incomplete fixture was not cleared".into());
+                }
+            }
+            if label == "rangeClearAfterEdit" {
+                if plain {
+                    SendMessageW(
+                        editor,
+                        0x00B1,
+                        Some(WPARAM(from)),
+                        Some(LPARAM(to as isize)),
+                    );
+                    SendMessageW(editor, WM_CHAR, Some(WPARAM(8)), None);
+                } else {
+                    let edit: ITfEditSession = UserTextEdit {
+                        context: context.clone(),
+                        start: from as i32,
+                        length: (to - from) as i32,
+                        text: String::new(),
+                    }
+                    .into();
+                    context
+                        .RequestEditSession(foreign, &edit, TF_ES_SYNC | TF_ES_READWRITE)?
+                        .ok()?;
+                }
+                pump(Duration::from_millis(30));
+                if editor_text(editor)? != prefix {
+                    return Err("cleared receipt changed neighboring text".into());
                 }
             }
             if label == "ime" {
@@ -1926,7 +2085,7 @@ fn observation_ranges_fixture(
             let valid = valid && !matches!(label, "undo" | "readonly" | "password" | "revert");
             let cleared_negative = matches!(
                 label,
-                "clearWithoutEdit" | "clearRestored" | "clearComposingEnded"
+                "clearWithoutEdit" | "clearRestored" | "clearComposingEnded" | "clearIncomplete"
             );
             if result.mutation != Mutation::NotAttempted
                 || (valid
