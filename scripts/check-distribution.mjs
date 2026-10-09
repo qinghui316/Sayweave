@@ -3,12 +3,13 @@ import { readdirSync } from 'node:fs';
 import path from 'node:path';
 
 // Keep the source distribution explicit. Add new public files here during review.
-const roots = new Set(['.gitattributes', '.gitignore', 'README.md', 'LICENSE',
+const roots = new Set(['.gitattributes', '.gitignore', 'README.md', 'LICENSE', 'NOTICE',
   'CONTRIBUTING.md', 'SECURITY.md', 'CHANGELOG.md', 'package.json', 'package-lock.json',
   'eslint.config.js', 'index.html', 'playwright.config.ts', 'rust-toolchain.toml',
   'tsconfig.json', 'vite.config.ts']);
 const docs = new Set(['architecture.md', 'development.md', 'design.md', 'testing.md', 'local-data.md', 'motion.md', 'models.md', 'speech.md', 'history.md', 'dictation.md', 'personalization.md']);
-const scripts = new Set(['check-boundaries.mjs', 'check-native-boundaries.mjs', 'check-text.mjs', 'check-distribution.mjs',
+const releaseNotes = /^release-notes\/v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.json$/;
+const scripts = new Set(['check-boundaries.mjs', 'check-native-boundaries.mjs', 'check-text.mjs', 'check-distribution.mjs', 'generate-update-manifest.mjs', 'verify-update-release.mjs',
   'test-desktop.ps1', 'test-dictionary-desktop.mjs', 'test-models-desktop.mjs', 'test-speech-desktop.mjs', 'test-prefix-input.mjs', 'test-input.ps1', 'desktop.mjs', 'test-language-actor.mjs', 'test-language-dashboard-live.mjs']);
 const testRoots = new Set(['contracts', 'e2e']);
 const testFixtures = new Set(['voice-recovery.html', 'voice-recovery.tsx', 'input-target.ts', 'faithful-v1.txt']);
@@ -19,6 +20,7 @@ function allowed(file) {
   if (roots.has(file)) return true;
   if (file.startsWith('src/') || file.startsWith('src-tauri/')) return true;
   if (file.startsWith('docs/')) return docs.has(file.slice(5));
+  if (releaseNotes.test(file)) return true;
   if (file.startsWith('scripts/')) return scripts.has(file.slice(8));
   if (file.startsWith('tests/')) {
     const remainder = file.slice(6);

@@ -1,0 +1,119 @@
+name: Sayweave Windows release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sayweave-windows-release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'qinghui316/Sayweave'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm run test:e2e
+      - run: npm run check:distribution
+
+  draft:
+    if: startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave'
+    needs: verify
+    runs-on: windows-latest
+    environment: windows-signing
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Verify tag identity
+        shell: pwsh
+        run: |
+          if ('${{ github.ref_name }}' -ne "v$(node -p "require('./package.json').version")") { throw 'Tag and package version differ.' }
+      - name: Build signed NSIS package
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          SAYWEAVE_RELEASE_TAG: ${{ github.ref_name }}
+          SAYWEAVE_RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          npm run desktop:package
+          npm run desktop:release:manifest
+          npm run desktop:release:verify
+      - name: Create immutable draft
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view '${{ github.ref_name }}' --repo '${{ github.repository }}' 2>$null
+          if ($LASTEXITCODE -eq 0) { throw 'Release tag already exists.' }
+          $notes = "release-notes/$($env:GITHUB_REF_NAME).json"
+          if (-not (Test-Path -LiteralPath $notes)) { throw "Release notes are missing: $notes" }
+          gh release create '${{ github.ref_name }}' --repo '${{ github.repository }}' --draft --verify-tag --target '${{ github.sha }}' --title "Sayweave ${{ github.ref_name }}" --notes-file $notes release/sayweave/*
+      - name: Re-download and verify draft
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $download = Join-Path $env:RUNNER_TEMP 'sayweave-release'
+          New-Item -ItemType Directory -Force -Path $download | Out-Null
+          gh release download '${{ github.ref_name }}' --repo '${{ github.repository }}' --dir $download
+          if ($LASTEXITCODE -ne 0) { throw 'Draft download failed.' }
+          $env:SAYWEAVE_RELEASE_DIR = $download
+          node scripts/verify-update-release.mjs
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave'
+    needs: draft
+    runs-on: windows-latest
+    environment: windows-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Re-download and verify approved draft
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $download = Join-Path $env:RUNNER_TEMP 'sayweave-approved-release'
+          New-Item -ItemType Directory -Force -Path $download | Out-Null
+          gh release download '${{ github.ref_name }}' --repo '${{ github.repository }}' --dir $download
+          $env:SAYWEAVE_RELEASE_DIR = $download
+          node scripts/verify-update-release.mjs
+      - name: Publish latest release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit '${{ github.ref_name }}' --repo '${{ github.repository }}' --draft=false --latest

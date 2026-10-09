@@ -39,4 +39,8 @@ npm run desktop:build   # 桌面发布构建，不生成安装包
 
 ## 许可
 
-项目自身的开源许可尚未确定。第三方字体、图标及动效依赖的许可见 [src/assets/licenses](src/assets/licenses)。
+Sayweave 采用 [Apache-2.0](./LICENSE) 开源。第三方字体、图标及动效依赖的许可见 [src/assets/licenses](src/assets/licenses) 和 [NOTICE](./NOTICE)。
+
+## Windows 发布与更新
+
+公开安装包发布在 [GitHub Releases](https://github.com/qinghui316/Sayweave/releases)。安装后的稳定版会在后台检查新版本，下载时显示圆形进度；下载完成后由用户点击“重启并更新”。源码构建用于开发和验证，不会接入稳定版更新通道。

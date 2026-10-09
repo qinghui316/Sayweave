@@ -35,12 +35,29 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": [
+      "nsis"
+    ],
+    "license": "Apache-2.0",
+    "licenseFile": "../LICENSE",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVENjkzMzJDRTAxNERDRTcKUldUbjNCVGdMRE5wWGJ1OXFkbHk5WDRTanBKSWlMQnN6amdoaFVLQUhKZzIwTVNuYVZZUkV6VFUK",
+      "endpoints": [
+        "https://github.com/qinghui316/Sayweave/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

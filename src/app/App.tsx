@@ -28,6 +28,8 @@ import { History, HistoryFeedStore } from '../features/history';
 import { Dictionary } from '../features/dictionary';
 import { Onboarding } from '../features/onboarding';
 import { VoiceSurface } from '../features/voice';
+import {createUpdatePort} from '../adapters/update-tauri';
+import {UpdateIndicator} from '../features/settings/UpdateIndicator';
 import brand from '../assets/brand.svg';
 import s from './app.module.css';
 const DevCatalogue = import.meta.env.DEV ? lazy(() => import('../dev/Catalogue')) : null;
@@ -56,6 +58,7 @@ function RuntimeApp() {
   const [store] = useState(() => new RuntimeStore(createRuntime()));
   const [dictionary] = useState(createDictionary);
   const [models] = useState(createModels);
+  const [updates] = useState(createUpdatePort);
   const [processing]=useState(()=>createProcessing(models));
   const [language]=useState(createLanguageSettings);
   const [settings]=useState(()=>createSettingsStores(processing,language,ports.speech,dictationPorts.shortcuts));
@@ -110,6 +113,7 @@ function RuntimeApp() {
   const startSpeech=()=>{setSpeechFailure('');void ports.speech.start().then(speechStore.accept).catch(e=>setSpeechFailure(speechMessages[speechError(e).code]));};
   const controlSpeech=(action:'finish'|'cancel')=>{const id=speech.snapshot.taskId;if(id)void ports.speech.control(id,action).catch(e=>setSpeechFailure(speechMessages[speechError(e).code]));};
   const occupied=['connecting','recording','processing'].includes(speech.snapshot.phase)||['preparing','recognizing','delivering'].includes(dictation.stage)||dictation.stage==='result'&&['recognizing','delivering'].includes(dictation.presentation);
+  useEffect(()=>{updates.setInstallAllowed(!occupied&&!archiveFailure);},[updates,occupied,archiveFailure]);
   const trialCurrent=trial.snapshot.taskId!==null&&speech.snapshot.taskId===trial.snapshot.taskId&&speech.snapshot.source==='trial'&&(!dictationPorts.dictation||dictation.taskId===trial.snapshot.taskId);
   const trialPhase=!trialCurrent&&['connecting','recording','processing'].includes(trial.snapshot.phase)?'idle':trial.snapshot.phase;
   const startTrial=()=>{
@@ -139,7 +143,7 @@ function RuntimeApp() {
   return <MotionScope enabled={snapshot.windows.main}><div className={s.window}>
     <aside className={s.sidebar}><div className={s.brand} data-tauri-drag-region><img src={brand} alt="" width={24} height={24}/><span>{zh.brand}</span></div>
       <nav className={s.navigation} aria-label={zh.navigation.home}><NavItem to="/" onClick={event=>navigation(event,'/')} icon="house">{zh.navigation.home}</NavItem><NavItem to="/history" onClick={event=>navigation(event,'/history')} icon="clock">{zh.navigation.history}</NavItem><NavItem to="/dictionary" onClick={event=>navigation(event,'/dictionary')} icon="book-open">{zh.navigation.dictionary}</NavItem><NavItem to="/preferences" onClick={event=>navigation(event,'/preferences')} icon="sliders-horizontal">{zh.navigation.preferences}</NavItem></nav>
-      <footer className={s.sidebarFooter}>{import.meta.env.DEV && <Link to="/dev/components" className={s.devEntry}>{zh.dev.component}</Link>}<div className={s.utility}><button onClick={()=>openSettings('device')}><Icon name="settings" size={18}/>{zh.navigation.settings}</button><IconButton label={zh.navigation.about} onClick={()=>openSettings('about')}><Icon name="info" size={18}/></IconButton></div></footer>
+      <footer className={s.sidebarFooter}>{import.meta.env.DEV && <Link to="/dev/components" className={s.devEntry}>{zh.dev.component}</Link>}<div className={s.utility}><button onClick={()=>openSettings('device')}><Icon name="settings" size={18}/>{zh.navigation.settings}</button><IconButton label={zh.navigation.about} onClick={()=>openSettings('about')}><Icon name="info" size={18}/></IconButton><UpdateIndicator port={updates}/></div></footer>
     </aside>
     <div className={s.body}><header className={s.titlebar} data-tauri-drag-region><IconButton label={zh.window.minimize} onClick={()=>windowAction('main','minimize')}><Icon name="minus" size={16}/></IconButton><IconButton label={zh.window.maximize} onClick={()=>windowAction('main','toggleMaximize')}><Icon name="square" size={16}/></IconButton><IconButton label={zh.window.close} onClick={()=>windowAction('main','hide')}><Icon name="x" size={16}/></IconButton></header>
       <main className={`${s.content} ${location.pathname==='/history'?s.historyContent:''}`}>{archiveFailure&&<div role="status"><InlineMessage status="error">有一条口述未完整保存，已输入的文字不受影响。</InlineMessage><Button onClick={speechStore.dismissArchiveFailure}>关闭</Button></div>}{speechFailure&&!speech.snapshot.error&&<InlineMessage status="error">{speechFailure}</InlineMessage>}{error && <div className={s.error}><InlineMessage status="error">{zh.error[error]}</InlineMessage><Button onClick={()=>{setError(null);setConnection(x=>x+1);}}>{zh.error.retry}</Button></div>}
@@ -149,7 +153,7 @@ function RuntimeApp() {
     <SettingsShell languagePort={language} visible={snapshot.windows.main} shortcutPort={dictationPorts.shortcuts} textServicePort={dictationPorts.textService} settings={settings} speechPort={ports.speech} open={settingsVisible} tab={activeSettingsTab}
       onTabChange={tab=>guardSettings(()=>{if(preferenceRoute){setSettingsOpen(true);navigate('/',{replace:true});}setSettingsTab(tab);})}
       onOpenChange={open=>{if(!open)guardSettings(()=>{setSettingsOpen(false);if(preferenceRoute)navigate('/',{replace:true});});else setSettingsOpen(true);}}
-      modelContent={settingsVisible&&activeSettingsTab==='models'?<ModelPanel extraContent={<ProcessingSettings port={processing} store={settings.polish} revision={dataRevision}/>} onChanged={dataChanged} onHelp={openModelHelp} onSpeech={()=>{setSettingsOpen(false);navigate('/');}} port={models} onGuardChange={updateModelGuard}/>:undefined}/>
+      updatePort={updates} modelContent={settingsVisible&&activeSettingsTab==='models'?<ModelPanel extraContent={<ProcessingSettings port={processing} store={settings.polish} revision={dataRevision}/>} onChanged={dataChanged} onHelp={openModelHelp} onSpeech={()=>{setSettingsOpen(false);navigate('/');}} port={models} onGuardChange={updateModelGuard}/>:undefined}/>
   </div></MotionScope>;
 }
 export function App() { return <ErrorBoundary><HashRouter><RuntimeApp/></HashRouter></ErrorBoundary>; }
