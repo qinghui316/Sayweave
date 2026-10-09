@@ -1,0 +1,5 @@
+.setting { margin-bottom:var(--space-20); }
+.row { display:flex;align-items:center;justify-content:space-between;gap:var(--space-20); }
+.row>div { min-width:0; }
+.setting h3 { font-size:var(--text-mode);line-height:var(--line-mode);font-weight:500; }
+.setting p { margin-top:var(--space-8);font-size:var(--text-small);line-height:var(--line-small);color:var(--text-secondary);max-width:520px; }

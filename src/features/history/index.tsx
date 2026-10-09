@@ -8,25 +8,26 @@ import type {ModelConfigPort} from '../../contracts/models';
 import {speechMessages} from '../../locales/speech';
 import {HistoryFeedStore} from './feed';
 import {HistoryRow,type ExpandMode} from './HistoryRow';
-import {SaveSettings,type DepartureGuard} from './SaveSettings';
+import {SaveSettings} from './SaveSettings';
+import type {RecordingPreferences} from '../../contracts/speech';
+import type {SettingStore} from '../../settings/store';
 import {useHistoryPlayback} from './usePlayback';
 import s from './history.module.css';
 export {HistoryFeedStore} from './feed';
 const quietSpeech=initialSpeech();
 const day=(at:number)=>new Date(at).toLocaleDateString('zh-CN');
 function dateLabel(at:number){const date=day(at),today=new Date(),yesterday=new Date(today);yesterday.setDate(today.getDate()-1);return date===day(today.getTime())?'今天':date===day(yesterday.getTime())?'昨天':date;}
-export const History=memo(function History({deliveryRevision='',contentRevision=0,port,speech,models,snapshot,reading,visible=true,onChanged,onGuardChange}:{deliveryRevision?:string;contentRevision?:number;port:HistoryPort;speech:SpeechPort;models:ModelConfigPort;snapshot:SpeechSnapshot;reading?:HistoryFeedStore;visible?:boolean;onChanged?:()=>void;onGuardChange?:(guard:DepartureGuard|null)=>void}){
+export const History=memo(function History({deliveryRevision='',contentRevision=0,port,speech,models,snapshot,reading,visible=true,onChanged,recordingSettings}:{deliveryRevision?:string;contentRevision?:number;port:HistoryPort;speech:SpeechPort;models:ModelConfigPort;snapshot:SpeechSnapshot;reading?:HistoryFeedStore;visible?:boolean;onChanged?:()=>void;recordingSettings:SettingStore<RecordingPreferences>}){
  const navigate=useNavigate();
  const [own]=useState(()=>new HistoryFeedStore(port));const feed=reading??own;const state=useSyncExternalStore(feed.subscribe,feed.getSnapshot);
  const [mode,setMode]=useState<ExpandMode>('text'),[activation,setActivation]=useState(0),[settings,setSettings]=useState(false),[documentVisible,setDocumentVisible]=useState(()=>!document.hidden);
- const scroller=useRef<HTMLDivElement>(null),guard=useRef<DepartureGuard|null>(null),opening=useRef(0),anchor=useRef<{id:string;offset:number}|null>(null);
+ const scroller=useRef<HTMLDivElement>(null),opening=useRef(0),anchor=useRef<{id:string;offset:number}|null>(null);
  const [navigationError,setNavigationError]=useState(''),[navigating,setNavigating]=useState(false);const navigationPending=useRef(false);
  const alive=useRef(false),copyGeneration=useRef(0);
  useEffect(()=>{alive.current=true;return()=>{alive.current=false;};},[]);
  const copyFull=useCallback(async(id:string,attemptId:string|null,current:()=>boolean)=>{if(navigationPending.current)return false;const token=++copyGeneration.current;const epoch=feed.getSnapshot().epoch;const full=await port.detail(id);if(!alive.current||token!==copyGeneration.current||epoch!==feed.getSnapshot().epoch||!current())return false;const selected=historyVersion(full,attemptId);if(!selected.text)throw new SpeechError('notFound');await speech.copy(selected.text);return true;},[feed,port,speech]);
  const playback=useHistoryPlayback(port,visible&&documentVisible);const play=playback.control;const [emptyPlayer]=useState({resourceId:null,playing:false,positionMs:0,durationMs:0});
- const bindGuard=useCallback((value:DepartureGuard|null)=>{guard.current=value;onGuardChange?.(value);},[onGuardChange]);
- const recordAgain=useCallback(()=>{const action=()=>navigate('/');if(guard.current)guard.current(action);else action();},[navigate]);
+ const recordAgain=useCallback(()=>navigate('/'),[navigate]);
  useEffect(()=>{const update=()=>setDocumentVisible(!document.hidden);document.addEventListener('visibilitychange',update);return()=>document.removeEventListener('visibilitychange',update);},[]);
  useEffect(()=>{if(visible&&documentVisible)void feed.refresh();},[feed,visible,documentVisible,contentRevision]);
  useLayoutEffect(()=>{if(scroller.current)scroller.current.scrollTop=feed.getScroll();},[feed]);
@@ -37,7 +38,7 @@ export const History=memo(function History({deliveryRevision='',contentRevision=
  const expand=useCallback(async(id:string,next:ExpandMode)=>{if(navigationPending.current)return false;const token=++opening.current,epoch=feed.getSnapshot().epoch;if(feed.getSnapshot().expandedId!==id)await play('stop');if(!alive.current||token!==opening.current||epoch!==feed.getSnapshot().epoch||feed.getSnapshot().loadingMore)return false;remember();setMode(next);setActivation(value=>value+1);feed.expand(id);return true;},[feed,play,remember]);
  const collapse=useCallback(()=>{opening.current++;void play('stop').catch(()=>{});feed.expand(null);},[feed,play]);
  const changed=useCallback((id:string,removed=false)=>{remember();if(removed){const node=scroller.current;if(node&&anchor.current?.id===id){const rows=[...node.querySelectorAll<HTMLElement>('[data-record-id]')];const index=rows.findIndex(row=>row.dataset.recordId===id);const next=rows[index+1]??rows[index-1];anchor.current=next?{id:next.dataset.recordId!,offset:next.offsetTop-node.scrollTop}:null;}feed.remove(id);}else void feed.update(id);onChanged?.();},[feed,remember,onChanged]);
- function toggleSettings(){const action=()=>setSettings(v=>!v);if(guard.current)guard.current(action);else action();}
+ function toggleSettings(){setSettings(v=>!v);}
  async function navigatePage(action:()=>Promise<void>){
   if(navigationPending.current||state.loadingMore)return;
   const epoch=feed.getSnapshot().epoch;navigationPending.current=true;setNavigating(true);setNavigationError('');copyGeneration.current++;opening.current++;
@@ -48,8 +49,8 @@ export const History=memo(function History({deliveryRevision='',contentRevision=
  function latest(){void navigatePage(()=>feed.latest());}
  useLayoutEffect(()=>{anchor.current=null;if(scroller.current)scroller.current.scrollTop=feed.getScroll();},[feed,state.page,state.search]);
  return <section className={s.page}>
-  <header className={s.heading}><h1>历史记录</h1><Button aria-expanded={settings} aria-controls="history-settings" onClick={toggleSettings}>保存设置</Button></header>
-  {settings&&<div id="history-settings"><SaveSettings speech={speech} onGuardChange={bindGuard}/></div>}
+  <header className={s.heading}><h1>历史记录</h1><Button aria-expanded={settings} aria-controls="history-settings" onClick={toggleSettings}>历史保存设置</Button></header>
+  {settings&&<div id="history-settings"><SaveSettings settings={recordingSettings}/></div>}
   <div className={s.toolbar}><TextInput aria-label="搜索识别文字" placeholder="搜索识别文字" maxLength={256} value={state.search} onChange={e=>{copyGeneration.current++;anchor.current=null;feed.search(e.target.value);if(scroller.current)scroller.current.scrollTop=0;}}/><span className={s.meta}>{state.total} 条</span><IconButton label="刷新历史" disabled={navigating||state.loadingMore} onClick={latest}><ActionIcon name="retry"/></IconButton></div>
   {port.mode==='simulation'&&<p className={s.meta}>浏览器模拟 · 记录仅在本次运行中保留</p>}
   {state.newRecords&&<Button className={s.newRecords} onClick={latest}>有新记录，查看最新</Button>}

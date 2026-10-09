@@ -25,8 +25,8 @@ function fromRecord(c:ModelRecord):Editor {
  const input = {name:c.name, protocol:c.protocol, baseUrl:c.baseUrl, modelId:c.modelId, usages:[...c.usages]};
  return {input, initial:structuredClone(input), key:'', record:c, automaticName:false};
 }
-export interface ModelPanelProps {port:ModelConfigPort; onSpeech?:()=>void; onChanged?:()=>void; onHelp?:(help:import('../../contracts/models').ModelHelp)=>Promise<void>; onGuardChange?:(guard:((action:()=>void)=>void)|null)=>void;extraContent?:ReactNode;extraGuard?:(action:()=>void)=>void}
-export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,extraContent,extraGuard}: ModelPanelProps) {
+export interface ModelPanelProps {port:ModelConfigPort; onSpeech?:()=>void; onChanged?:()=>void; onHelp?:(help:import('../../contracts/models').ModelHelp)=>Promise<void>; onGuardChange?:(guard:((action:()=>void)=>void)|null)=>void;extraContent?:ReactNode}
+export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,extraContent}: ModelPanelProps) {
  const [usage, setUsage] = useState<ModelUsage>('speech');
  const [view, setView] = useState<ModelOverview|null>(null);
  const [editor, setEditor] = useState<Editor|null>(null);
@@ -40,6 +40,7 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
  const [confirmation, setConfirmation] = useState<{record:ModelRecord; expectation:ModelExpectation}|null>(null);
  const [leaving, setLeaving] = useState(false);
  const nextAction = useRef<(()=>void)|null>(null);
+ const saveFlight=useRef(false);
  const generation = useRef(0), loadVersion = useRef(0), request = useRef<string|null>(null), alive = useRef(false);
  const form = useRef<HTMLFormElement|null>(null);
  const formId = useId();
@@ -85,12 +86,12 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
   return () => {stopped = true; alive.current = false; counter.current++; const id = request.current; if(id) void port.cancelRequest(id).catch(() => {}); request.current = null;};
  }, [port, load]);
  const localGuard = useCallback((action:()=>void) => {
-  if(saving) {setNotice('正在保存，请稍候。'); return;}
+  if(saveFlight.current) return;
   cancel();
   if(changed) {setConfirmation(null); nextAction.current = action; setLeaving(true);}
   else {setEditor(null); action();}
- }, [saving, cancel, changed]);
- const guard=useCallback((action:()=>void)=>localGuard(()=>{if(extraGuard)extraGuard(action);else action();}),[localGuard,extraGuard]);
+ }, [cancel, changed]);
+ const guard=localGuard;
  useEffect(() => {onGuardChange?.(localGuard); return () => onGuardChange?.(null);}, [localGuard, onGuardChange]);
  useEffect(() => {if(error?.field) form.current?.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus();}, [error, advanced]);
  function resetFeedback() {setError(null); setNotice(''); setTested(null); setNetworkError(null); setConfirmation(null); setAdvanced(false);}
@@ -130,15 +131,22 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
   } catch(e) {if(alive.current && generation.current === version) setNetworkError(errors[modelError(e).code]);}
   finally {if(alive.current && generation.current === version) {request.current = null; setNetwork(null);}}
  }
+ async function saveAndLeave(){
+  if(saveFlight.current)return;
+  const action=nextAction.current;nextAction.current=null;setLeaving(false);
+  if(form.current&&!form.current.reportValidity())return;
+  if(await save()&&alive.current)action?.();
+ }
  async function save() {
-  if(!editor || !view || saving) return;
-  cancel(); setSaving(true); setError(null); setNotice('');
+  if(!editor || !view || saveFlight.current) return false;
+  saveFlight.current=true;cancel(); setSaving(true); setError(null); setNotice('');
   try {
    const result = await port.save({...draft(), expectation:editor.record ? modelExpectation(view, editor.record.id, editor.input.usages) : null});
-   if(!alive.current) return;
+   if(!alive.current) return false;
    setView(result); setEditor(null); setTested(null); onChanged?.();
    setNotice(result.cleanupPending ? '已保存，密钥清理稍后重试。' : '已保存。');
-  } catch(e) {if(alive.current) report(e, usage);} finally {if(alive.current) setSaving(false);}
+   return true;
+  } catch(e) {if(alive.current) report(e, usage);return false;} finally {saveFlight.current=false;if(alive.current) setSaving(false);}
  }
  async function remove() {
   if(!confirmation || saving) return;
@@ -160,7 +168,7 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
   } catch(e) {if(alive.current) report(e);} finally {if(alive.current) setSaving(false);}
  }
  function continueEditing() {setLeaving(false); nextAction.current = null;}
- function discard() {cancel(); setEditor(null); setLeaving(false); const action = nextAction.current; nextAction.current = null; action?.();}
+
  const originChanged = !!editor?.record && (editor.record.protocol !== editor.input.protocol || !modelSameOrigin(editor.record.baseUrl, editor.input.baseUrl));
  const fieldError = (key:string) => error?.field === key ? error.text : undefined;
  const selected = view?.defaults.find(d => d.usage === usage)?.configId;
@@ -206,10 +214,10 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
    {notice && <InlineMessage>{notice}</InlineMessage>}
    {editor && usage === 'text' && (network || networkError || tested) && <AsyncStatusFeedback status={network ? 'pending' : networkError ? 'error' : 'success'} message={network ? '正在测试连接…' : networkError ?? (port.mode === 'native' ? '连接成功' : '模拟连接成功')}/>}
    {editor && usage === 'text' && <p className={s.meta}>{port.mode === 'native' ? '测试会发送一条短请求，可能产生少量费用。' : '浏览器测试为模拟结果。'}</p>}
-   <div className={s.actions}>{editor ? <><Button type="submit" form={formId} variant="primary" loading={saving}>保存</Button>{usage === 'text' && <Button disabled={saving || network !== null} loading={network !== null} onClick={() => void check()}>测试连接</Button>}{network && <Button variant="quiet" onClick={() => {cancel(); setNetworkError('请求已取消。');}}>取消请求</Button>}{records.length > 0 && <Button disabled={saving} onClick={() => guard(() => setEditor(null))}>取消编辑</Button>}</> : usage === 'speech' && current && onSpeech && <Button variant="primary" disabled={saving || current.credentialStatus !== 'present'} onClick={() => guard(onSpeech)}>去首页试说</Button>}</div>
+   <div className={s.actions}>{editor ? <><Button type="submit" form={formId} variant="primary" loading={saving}>保存</Button>{usage === 'text' && <Button disabled={saving || network !== null} loading={network !== null} onClick={() => void check()}>测试连接</Button>}{network && <Button variant="quiet" onClick={() => {cancel(); setNetworkError('请求已取消。');}}>取消请求</Button>}<Button disabled={saving} onClick={()=>{cancel();setEditor(null);resetFeedback();}}>取消编辑</Button></> : usage === 'speech' && current && onSpeech && <Button variant="primary" disabled={saving || current.credentialStatus !== 'present'} onClick={() => guard(onSpeech)}>去首页试说</Button>}</div>
    {port.mode === 'simulation' && <p className={s.simulation}>浏览器模拟 · 保存仅在当前页面有效</p>}
   </footer>
-  <Dialog confirmation open={leaving} onOpenChange={open => {if(!open) continueEditing();}} title="有未保存的修改" description="要保留这次填写吗？"><div className={s.actions}><Button variant="primary" onClick={continueEditing}>继续填写</Button><Button onClick={discard}>放弃修改</Button></div></Dialog>
+  <Dialog confirmation open={leaving} onOpenChange={open => {if(!open) continueEditing();}} title="有未保存的修改" description="保存后继续，或取消并返回编辑。"><div className={s.actions}><Button variant="primary" disabled={saving} onClick={()=>void saveAndLeave()}>保存</Button><Button disabled={saving} onClick={continueEditing}>取消</Button></div></Dialog>
   <Dialog confirmation open={!!confirmation} onOpenChange={open => {if(!open && !saving) setConfirmation(null);}} title={'删除“'+(confirmation?.record.name ?? '')+'”？'} description="删除后无法撤销。">
    {confirmation?.expectation.replacements.map(r => {const target = view?.configs.find(c => c.id === r.configId); return <p className={s.replacement} key={r.usage}>{label(r.usage)}将{target ? <>改用 <strong>{target.name}</strong><br/>{target.modelId}<br/>{target.baseUrl}</> : '清空，请重新选择模型。'}</p>;})}
    <div className={s.actions}><Button disabled={saving} onClick={() => setConfirmation(null)}>取消</Button><Button variant="primary" loading={saving} onClick={() => void remove()}>确认删除</Button></div>

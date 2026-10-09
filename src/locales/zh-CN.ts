@@ -3,7 +3,7 @@ export const zh = {
     title:'词典', description:'管理专有名词和常见纠错，内容保存在本机。', memory:'浏览器预览：仅保存在内存，刷新后重置。',
     terms:'专有名词', corrections:'常见纠错', tabs:'词典类型', search:'搜索词条', addTerm:'新增词条', addCorrection:'新增纠错', edit:'编辑', remove:'删除',
     original:'词条', heard:'听成', replacement:'改为', category:'分类（可选）', categoryColumn:'分类', actions:'操作',
-    save:'保存', cancel:'取消', retry:'重新加载', empty:'还没有词条', emptyDescription:'添加你常用的名称或表达。这里暂不执行语音识别或自动替换。', noMatches:'没有匹配的词条',
+    save:'保存', cancel:'取消', retry:'重新加载', empty:'还没有词条', emptyDescription:'添加常用名称、专业术语或正确写法。', noMatches:'没有匹配的词条',
     editTitle:'编辑词条', newTitle:'新增词条', formDescription:'填写后保存到词典。', removeTitle:'删除词条', removeDescription:'删除当前词典中的记录；升级备份可能仍保留副本。',
     saved:'已保存', deleted:'已删除', loading:'正在加载词典', viewExisting:'查看已有词条', reloadConflict:'重新读取当前记录',
     previous:'上一页', next:'下一页', total:(n:number)=>`${n} 条`, page:(n:number,total:number)=>`第 ${n} / ${Math.max(1,Math.ceil(total/50))} 页`,
@@ -31,7 +31,7 @@ export const zh = {
   voice: { start: '开始预设演示', cancel: '取消演示', finish: '完成演示', retry: '重试演示', hide: '隐藏悬浮窗', statuses: { idle: '待机', connecting: '连接中', recording: '录音展示', processing: '处理中', completed: '完成', cancelled: '已取消', failed: '演示失败' }, liveStatuses: { idle: '待机', connecting: '连接中', recording: '录音中', processing: '识别中', completed: '识别完成', cancelled: '已取消', failed: '识别失败' }, liveHints: { idle:'点击麦克风开始录音', connecting:'正在连接语音服务', recording:'左侧取消，右侧结束录音', processing:'正在等待最终结果', completed:'识别完成', cancelled:'已取消，可重新开始', failed:'录音可用时，可以重识别' } },
   settings: {
     title: '设置', close: '关闭设置', description: '调整设备、模型和应用偏好。',
-    tabs: { device: '设备与快捷键', models: '模型', language: '语言与翻译', appearance: '外观与历史保存', about: '关于' },
+    tabs: { device: '设备与快捷键', models: '模型', personalization:'个性化', language: '语言与翻译', appearance: '外观与历史保存', about: '关于' },
     notImplemented: '此项功能稍后提供。',
     deviceHeading: '设备与快捷键', microphone: '麦克风', microphoneHelp: '真实设备检测在系统能力阶段接入。', notConfigured: '未配置',
     modelsHeading: '模型', modelsBody: '模型配置会直接在当前面板展开，API 与本地来源同属模型。完整表单在下一阶段接入。',

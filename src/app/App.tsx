@@ -5,6 +5,8 @@ import {createSpeechPorts} from '../adapters/speech-tauri';
 import {SpeechStore} from './speech-store';
 import {createDictationPorts} from '../adapters/dictation-tauri';
 import {createProcessing} from '../adapters/processing-tauri';
+import {createLanguageSettings} from '../adapters/language-tauri';
+import {createSettingsStores} from '../settings/controllers';
 import {dictationPhase,initialDictation,inputMessage,shortcutLabel,type ShortcutStatus} from '../contracts/dictation';
 import {speechError} from '../contracts/speech';
 import {readReadyModel} from './ready-model';
@@ -24,7 +26,6 @@ import { Home } from '../features/home';
 import { SettingsShell,ProcessingSettings, type SettingsTab } from '../features/settings';
 import { History, HistoryFeedStore } from '../features/history';
 import { Dictionary } from '../features/dictionary';
-import { Preferences } from '../features/preferences';
 import { Onboarding } from '../features/onboarding';
 import { VoiceSurface } from '../features/voice';
 import brand from '../assets/brand.svg';
@@ -38,8 +39,6 @@ function RuntimeApp() {
   const [dictationPorts]=useState(createDictationPorts);
   const [dictation,setDictation]=useState(initialDictation);
   const [shortcut,setShortcut]=useState<ShortcutStatus|null>(null);
-  const shortcutGuard=useRef<((action:()=>void)=>void)|null>(null);
-  const updateShortcutGuard=useCallback((guard:((action:()=>void)=>void)|null)=>{shortcutGuard.current=guard;},[]);
   useEffect(()=>{let alive=true;const releases:(()=>void)[]=[];const accept=(v:ReturnType<typeof initialDictation>)=>{if(alive)setDictation(old=>v.sequence>=old.sequence?v:old);};
     if(dictationPorts.dictation){void dictationPorts.dictation.subscribe(accept).then(r=>{if(alive)releases.push(r);else r();}).catch(()=>{});void dictationPorts.dictation.snapshot().then(accept).catch(()=>{});}
     let shortcutSequence=-1;const keys=(v:ShortcutStatus)=>{if(alive&&v.sequence>shortcutSequence){shortcutSequence=v.sequence;setShortcut(v);}};void dictationPorts.shortcuts.subscribe(keys).then(r=>{if(alive)releases.push(r);else r();}).catch(()=>{});void dictationPorts.shortcuts.status().then(keys).catch(()=>{});
@@ -58,11 +57,7 @@ function RuntimeApp() {
   const [dictionary] = useState(createDictionary);
   const [models] = useState(createModels);
   const [processing]=useState(()=>createProcessing(models));
-  const processingGuard=useRef<((action:()=>void)=>void)|null>(null);
-  const updateProcessingGuard=useCallback((guard:((action:()=>void)=>void)|null)=>{processingGuard.current=guard;},[]);
-  const guardProcessing=useCallback((action:()=>void)=>{if(processingGuard.current)processingGuard.current(action);else action();},[]);
-  const historyGuard=useRef<((action:()=>void)=>void)|null>(null);
-  const updateHistoryGuard=useCallback((guard:((action:()=>void)=>void)|null)=>{historyGuard.current=guard;},[]);
+  const [settings]=useState(()=>createSettingsStores(processing,createLanguageSettings(),ports.speech,dictationPorts.shortcuts));
   const [dataRevision,setDataRevision]=useState(0);
   const dataChanged=useCallback(()=>setDataRevision(value=>value+1),[]);
   useEffect(()=>{if(!processing.onArchived)return;let stopped=false;let release:(()=>void)|undefined;void processing.onArchived(dataChanged).then(value=>{if(stopped)value();else release=value;});return()=>{stopped=true;release?.();};},[processing,dataChanged]);
@@ -74,6 +69,14 @@ function RuntimeApp() {
   const [connection,setConnection]=useState(0);
   const [settingsOpen,setSettingsOpen]=useState(false);
   const [settingsTab,setSettingsTab]=useState<SettingsTab>('device');
+  useEffect(()=>{
+    if(store.port.surface!=='main')return;
+    const refresh=()=>{if(!document.hidden)for(const value of Object.values(settings))void value.load();};
+    refresh();window.addEventListener('focus',refresh);document.addEventListener('visibilitychange',refresh);
+    return()=>{window.removeEventListener('focus',refresh);document.removeEventListener('visibilitychange',refresh);};
+  },[settings,store]);
+  const preferenceRoute=location.pathname==='/preferences';
+  const settingsVisible=settingsOpen||preferenceRoute,activeSettingsTab:SettingsTab=preferenceRoute?'personalization':settingsTab;
   const report=useCallback((e: unknown) => setError(e instanceof RuntimeError ? e.code : 'unavailable'),[]);
   useEffect(()=>{if(!dictationPorts.dictation||store.port.surface!=='main')return;let disposed=false;let release:(()=>void)|undefined;void dictationPorts.dictation.onSettings(()=>{setSettingsTab('device');setSettingsOpen(true);}).then(r=>{if(disposed)r();else release=r;}).catch(report);return()=>{disposed=true;release?.();};},[dictationPorts,store,report]);
   useEffect(() => {
@@ -123,14 +126,15 @@ function RuntimeApp() {
   };
   const demo=useCallback((action: DemoAction) => { setError(null); store.port.demo(action,store.getSnapshot().session.id).then(store.accept).catch(report); },[store,report]);
   const windowAction=useCallback((surface: Surface,action: WindowAction) => { store.port.windowAction(surface,action).then(store.accept).catch(report); },[store,report]);
-  const openSettings=(tab: SettingsTab) => { const action=()=>{setSettingsTab(tab);setSettingsOpen(true);};if(historyGuard.current)historyGuard.current(action);else action(); };
-  const guardSettings=(action:()=>void)=>{const next=()=>{if(modelGuard.current)modelGuard.current(()=>guardProcessing(action));else guardProcessing(action);};if(shortcutGuard.current)shortcutGuard.current(next);else next();};
-  const navigation=(event:React.MouseEvent<HTMLAnchorElement>,to:string)=>{if(historyGuard.current){event.preventDefault();historyGuard.current(()=>navigate(to));}};
+  const openSettings=(tab: SettingsTab) => {setSettingsTab(tab);setSettingsOpen(true);};
+  const guardSettings=(action:()=>void)=>{if(modelGuard.current)modelGuard.current(action);else action();};
+  const navigation=(event:React.MouseEvent<HTMLAnchorElement>,to:string)=>{if(to==='/preferences'){event.preventDefault();openSettings('personalization');}};
   const phase=speech.snapshot.phase;
   const overlayPhase=dictationPhase(dictation,phase,speech.snapshot);
   const overlayStart=()=>{if(dictationPorts.dictation)void dictationPorts.dictation.start().then(speechStore.accept).catch(e=>setSpeechFailure(speechMessages[speechError(e).code]));else startSpeech();};
   const overlayControl=(action:'finish'|'cancel')=>{if(dictationPorts.dictation){if(dictation.taskId)void dictationPorts.dictation.control(dictation.taskId,action).catch(e=>{if(e&&typeof e==='object'&&'code'in e&&e.code==='staleSession')return;setSpeechFailure(inputMessage(e&&typeof e==='object'&&'code'in e?String(e.code):null));});}else controlSpeech(action);};
   if (store.port.surface==='overlay') return <MotionScope enabled={snapshot.windows.overlay}><VoiceSurface configure={dictation.admission==='rejected'&&dictation.taskId&&dictation.presentationId?()=>{void dictationPorts.dictation?.settings(dictation.taskId!,dictation.presentationId!).catch(report);}:undefined} key={dictation.presentationId??'idle'} presentation={voiceDemo?undefined:dictation.source==='external'?dictation.presentation:undefined} dismiss={dictationPorts.dictation&&dictation.taskId&&dictation.presentationId?()=>{void dictationPorts.dictation!.dismiss(dictation.taskId!,dictation.presentationId!).catch(e=>{if(e&&typeof e==='object'&&'code'in e&&e.code==='staleSession')return;report(e);});}:undefined} mode={voiceDemo?'demo':'speech'} cancelLabel={!voiceDemo&&dictation.source==='external'&&speech.snapshot.taskId===dictation.taskId&&speech.snapshot.phase==='completed'?'停止填入':undefined} retry={voiceDemo?false:speech.snapshot.retry} error={voiceDemo?undefined:(dictation.admission==='rejected'&&dictation.error?componentMessage(dictation.error):undefined)||speechFailure||(speech.snapshot.error?speechMessages[speech.snapshot.error]:undefined)} meterSource={voiceDemo?undefined:speechStore.liveMeter} motionEnabled={snapshot.windows.overlay} phase={voiceDemo?snapshot.session.phase:overlayPhase} start={voiceDemo?()=>demo('start'):overlayStart} cancel={voiceDemo?()=>demo('cancel'):()=>overlayControl('cancel')} finish={voiceDemo?()=>demo('finish'):()=>overlayControl('finish')} text={dictation.source==='external'?(speech.snapshot.taskId===dictation.taskId?speech.snapshot.text:dictation.text):undefined} delivery={dictation.delivery} copy={dictationPorts.dictation?()=>dictation.taskId?dictation.presentationId?dictationPorts.dictation!.copy(dictation.taskId,dictation.presentationId):Promise.reject({code:'staleSession'}):Promise.reject({code:'staleSession'}):undefined}/></MotionScope>;
+  const home=<Home shortcut={shortcut?.active?shortcutLabel(shortcut.active.binding):undefined} readyModel={ready.model} readyDevice={ready.device} motionEnabled={snapshot.windows.main && !settingsVisible} onShortcuts={()=>openSettings('device')} onModels={()=>openSettings('models')} retryCurrent={trialCurrent&&!occupied?()=>trialAction('retry'):undefined} startDisabled={occupied||trialPending} failure={trialFailure} speech={trial.snapshot} meterSource={speechStore.trialMeter} usage={usage} simulation={ports.speech.mode==='simulation'} copy={text=>ports.speech.copy(text)} phase={trialPhase} start={startTrial} cancel={()=>trialAction('cancel')} finish={()=>trialAction('finish')}/>;
   return <MotionScope enabled={snapshot.windows.main}><div className={s.window}>
     <aside className={s.sidebar}><div className={s.brand} data-tauri-drag-region><img src={brand} alt="" width={24} height={24}/><span>{zh.brand}</span></div>
       <nav className={s.navigation} aria-label={zh.navigation.home}><NavItem to="/" onClick={event=>navigation(event,'/')} icon="house">{zh.navigation.home}</NavItem><NavItem to="/history" onClick={event=>navigation(event,'/history')} icon="clock">{zh.navigation.history}</NavItem><NavItem to="/dictionary" onClick={event=>navigation(event,'/dictionary')} icon="book-open">{zh.navigation.dictionary}</NavItem><NavItem to="/preferences" onClick={event=>navigation(event,'/preferences')} icon="sliders-horizontal">{zh.navigation.preferences}</NavItem></nav>
@@ -138,13 +142,13 @@ function RuntimeApp() {
     </aside>
     <div className={s.body}><header className={s.titlebar} data-tauri-drag-region><IconButton label={zh.window.minimize} onClick={()=>windowAction('main','minimize')}><Icon name="minus" size={16}/></IconButton><IconButton label={zh.window.maximize} onClick={()=>windowAction('main','toggleMaximize')}><Icon name="square" size={16}/></IconButton><IconButton label={zh.window.close} onClick={()=>windowAction('main','hide')}><Icon name="x" size={16}/></IconButton></header>
       <main className={`${s.content} ${location.pathname==='/history'?s.historyContent:''}`}>{archiveFailure&&<div role="status"><InlineMessage status="error">有一条口述未完整保存，已输入的文字不受影响。</InlineMessage><Button onClick={speechStore.dismissArchiveFailure}>关闭</Button></div>}{speechFailure&&!speech.snapshot.error&&<InlineMessage status="error">{speechFailure}</InlineMessage>}{error && <div className={s.error}><InlineMessage status="error">{zh.error[error]}</InlineMessage><Button onClick={()=>{setError(null);setConnection(x=>x+1);}}>{zh.error.retry}</Button></div>}
-        <MotionScope enabled={!settingsOpen}><Routes><Route path="/" element={<Home shortcut={shortcut?.active?shortcutLabel(shortcut.active.binding):undefined} readyModel={ready.model} readyDevice={ready.device} motionEnabled={snapshot.windows.main && !settingsOpen} onShortcuts={()=>openSettings('device')} onModels={()=>openSettings('models')} retryCurrent={trialCurrent&&!occupied?()=>trialAction('retry'):undefined} startDisabled={occupied||trialPending} failure={trialFailure} speech={trial.snapshot} meterSource={speechStore.trialMeter} usage={usage} simulation={ports.speech.mode==='simulation'} copy={text=>ports.speech.copy(text)} phase={trialPhase} start={startTrial} cancel={()=>trialAction('cancel')} finish={()=>trialAction('finish')}/>}/><Route path="/history" element={<History contentRevision={dataRevision} deliveryRevision={dictation.delivery?[dictation.taskId,dictation.delivery.state,dictation.delivery.error].join(':'):''} reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} onGuardChange={updateHistoryGuard} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/><Route path="/dictionary" element={<Dictionary port={dictionary}/>}/><Route path="/preferences" element={<Preferences/>}/><Route path="/onboarding" element={<Onboarding/>}/>{DevCatalogue && <Route path="/dev/components" element={<Suspense><DevCatalogue snapshot={snapshot} demo={demo} windowAction={windowAction} resync={()=>store.resync().catch(report)}/></Suspense>}/>}<Route path="*" element={<History contentRevision={dataRevision} deliveryRevision={dictation.delivery?[dictation.taskId,dictation.delivery.state,dictation.delivery.error].join(':'):''} reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} onGuardChange={updateHistoryGuard} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/></Routes></MotionScope>
+        <MotionScope enabled={!settingsVisible}><Routes><Route path="/" element={home}/><Route path="/history" element={<History contentRevision={dataRevision} deliveryRevision={dictation.delivery?[dictation.taskId,dictation.delivery.state,dictation.delivery.error].join(':'):''} reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} recordingSettings={settings.recording} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/><Route path="/dictionary" element={<Dictionary port={dictionary} automaticTerms={settings.automaticTerms}/>}/><Route path="/preferences" element={home}/><Route path="/onboarding" element={<Onboarding/>}/>{DevCatalogue && <Route path="/dev/components" element={<Suspense><DevCatalogue snapshot={snapshot} demo={demo} windowAction={windowAction} resync={()=>store.resync().catch(report)}/></Suspense>}/>}<Route path="*" element={<History contentRevision={dataRevision} deliveryRevision={dictation.delivery?[dictation.taskId,dictation.delivery.state,dictation.delivery.error].join(':'):''} reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} recordingSettings={settings.recording} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/></Routes></MotionScope>
       </main>
     </div>
-    <SettingsShell shortcutPort={dictationPorts.shortcuts} textServicePort={dictationPorts.textService} onShortcutGuardChange={updateShortcutGuard} speechPort={ports.speech} open={settingsOpen} tab={settingsTab}
-      onTabChange={tab=>guardSettings(()=>setSettingsTab(tab))}
-      onOpenChange={open=>{if(!open)guardSettings(()=>setSettingsOpen(false));else setSettingsOpen(true);}}
-      modelContent={settingsOpen&&settingsTab==='models'?<ModelPanel extraGuard={guardProcessing} extraContent={<ProcessingSettings port={processing} revision={dataRevision} onGuardChange={updateProcessingGuard}/>} onChanged={dataChanged} onHelp={openModelHelp} onSpeech={()=>{setSettingsOpen(false);navigate('/');}} port={models} onGuardChange={updateModelGuard}/>:undefined}/>
+    <SettingsShell shortcutPort={dictationPorts.shortcuts} textServicePort={dictationPorts.textService} settings={settings} speechPort={ports.speech} open={settingsVisible} tab={activeSettingsTab}
+      onTabChange={tab=>guardSettings(()=>{if(preferenceRoute){setSettingsOpen(true);navigate('/',{replace:true});}setSettingsTab(tab);})}
+      onOpenChange={open=>{if(!open)guardSettings(()=>{setSettingsOpen(false);if(preferenceRoute)navigate('/',{replace:true});});else setSettingsOpen(true);}}
+      modelContent={settingsVisible&&activeSettingsTab==='models'?<ModelPanel extraContent={<ProcessingSettings port={processing} store={settings.polish} revision={dataRevision}/>} onChanged={dataChanged} onHelp={openModelHelp} onSpeech={()=>{setSettingsOpen(false);navigate('/');}} port={models} onGuardChange={updateModelGuard}/>:undefined}/>
   </div></MotionScope>;
 }
 export function App() { return <ErrorBoundary><HashRouter><RuntimeApp/></HashRouter></ErrorBoundary>; }

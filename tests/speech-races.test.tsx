@@ -1,3 +1,4 @@
+import {recordingSettings} from './settings-fixtures';
 import {it,expect,vi,beforeAll,afterAll} from 'vitest';
 import userEvent from '@testing-library/user-event';
 import {render,renderHook,screen,act} from '@testing-library/react';
@@ -28,9 +29,9 @@ it('a late device refresh cannot overwrite a committed selection',async()=>{
  const old:RecordingPreferences={deviceId:null,historyEnabled:true,audioEnabled:true,retentionDays:30,revision:1};
  const refresh=deferred<RecordingPreferences>(),save=deferred<RecordingPreferences>();
  const port={mode:'native',devices:vi.fn().mockResolvedValue([{id:'mic',name:'Mic',isDefault:false}]),preferences:vi.fn().mockResolvedValueOnce(old).mockReturnValueOnce(refresh.promise),savePreferences:vi.fn().mockReturnValue(save.promise)} as unknown as SpeechPort;
- const user=userEvent.setup();render(<DeviceSettings port={port}/>);const select=await screen.findByRole('combobox');
+ const user=userEvent.setup();render(<DeviceSettings port={port} settings={recordingSettings(port)}/>);const select=await screen.findByRole('combobox');
  await user.click(screen.getByRole('button',{name:'刷新设备'}));select.focus();await user.keyboard('[ArrowDown][End][Enter]');
- expect(screen.getByRole('button',{name:'刷新设备'})).toBeDisabled();
+ expect(screen.getByRole('button',{name:'刷新设备'})).toBeEnabled();
  await act(async()=>{save.resolve({...old,deviceId:'mic',revision:2});});expect(select).toHaveTextContent('Mic');
  await act(async()=>{refresh.resolve(old);});expect(select).toHaveTextContent('Mic');
  expect(port.savePreferences).toHaveBeenCalledWith({...old,deviceId:'mic'});

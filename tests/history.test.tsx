@@ -1,3 +1,4 @@
+import {recordingSettings} from './settings-fixtures';
 import {act,fireEvent,render,screen,waitFor,within} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import {it,expect,vi} from 'vitest';
@@ -7,7 +8,7 @@ import {BrowserHistory,BrowserSpeech} from '../src/adapters/speech-browser';
 import {BrowserModels} from '../src/adapters/models-browser';
 import {parseFeed,parseRecord,summarizeHistory,type HistoryRecord} from '../src/contracts/history';
 import {initialSpeech} from '../src/contracts/speech';
-import {SaveSettings,type DepartureGuard} from '../src/features/history/SaveSettings';
+import {SaveSettings} from '../src/features/history/SaveSettings';
 function record(n=1,text='完整的识别文字'):HistoryRecord {const id=`record-${n}`,a=`attempt-${n}`;return {id,createdAt:1000+n,endedAt:2000+n,durationMs:1000,status:'success',currentAttempt:a,revision:1,audio:null,attempts:[{id:a,recordId:id,kind:'live',configId:'fixture',configName:'模型',configRevision:1,modelId:'fixture',serviceHost:'example.invalid',createdAt:1000+n,endedAt:2000+n,status:'success',text,errorCode:null,elapsedMs:1}]};}
 function fixture(records:HistoryRecord[]){const speech=new BrowserSpeech();speech.records.push(...records);return {speech,port:new BrowserHistory(speech),models:new BrowserModels()};}
 function deferred<T>(){let resolve!:(value:T)=>void;const promise=new Promise<T>(r=>resolve=r);return {promise,resolve};}
@@ -16,7 +17,7 @@ it('copies and searches the full processed version independently of raw text',as
  r.processing=[{id:'processed-1',attemptId:r.currentAttempt!,configName:'文字模型',modelId:'fixture',state:'success',text:full,revision:1,errorCode:null,units:[]}];
  expect(parseRecord(r).processing?.[0]?.text).toBe(full);
  const f=fixture([r]),copy=vi.spyOn(f.speech,'copy').mockResolvedValue();
- render(<MemoryRouter><History {...f} snapshot={initialSpeech()}/></MemoryRouter>);
+ render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
  const row=await screen.findByRole('listitem');fireEvent.click(within(row).getByRole('button',{name:'复制'}));
  await waitFor(()=>expect(copy).toHaveBeenCalledWith(full));
  fireEvent.change(screen.getByRole('textbox',{name:'搜索识别文字'}),{target:{value:'识别原文'}});
@@ -31,10 +32,10 @@ it('rejects processing records with unrelated source identity or invalid receipt
 it('refreshes late delivery confirmation without changing the recognition record',async()=>{
  const r=record(),f=fixture([r]);let state='delivering';
  const port=Object.assign(Object.create(f.port) as import('../src/contracts/history').HistoryPort,{delivery:vi.fn(async()=>[{attemptId:r.currentAttempt!,state,error:null,updatedAt:1}])});
- const view=render(<MemoryRouter><History port={port} speech={f.speech} models={f.models} snapshot={initialSpeech()} deliveryRevision="working"/></MemoryRouter>);
+ const view=render(<MemoryRouter><History port={port} recordingSettings={recordingSettings(f.speech)} speech={f.speech} models={f.models} snapshot={initialSpeech()} deliveryRevision="working"/></MemoryRouter>);
  await screen.findByText('完整的识别文字');const user=userEvent.setup();screen.getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('menuitem',{name:'识别版本'}));
  await screen.findByText('填入未完成');state='confirmed';
- view.rerender(<MemoryRouter><History port={port} speech={f.speech} models={f.models} snapshot={initialSpeech()} deliveryRevision="confirmed"/></MemoryRouter>);
+ view.rerender(<MemoryRouter><History port={port} recordingSettings={recordingSettings(f.speech)} speech={f.speech} models={f.models} snapshot={initialSpeech()} deliveryRevision="confirmed"/></MemoryRouter>);
  expect(await screen.findByText('已填入')).toBeVisible();
 });
 it('keeps 20-item reading boundaries across deletion, new records and cache eviction',async()=>{
@@ -83,7 +84,7 @@ it('validates bounded summaries and distinguishes a failed retry without losing 
 it('copies the full matched old version and opens versions inline with keyboard access',async()=>{
  const r=record(1,'当前成功');const full='旧文字😀'.repeat(90);r.attempts.push({...r.attempts[0]!,id:'old',createdAt:1,text:full});
  const f=fixture([r]),copy=vi.spyOn(f.speech,'copy').mockResolvedValue();
- render(<MemoryRouter><History {...f} snapshot={initialSpeech()}/></MemoryRouter>);
+ render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
  await screen.findByText('当前成功');fireEvent.change(screen.getByRole('textbox',{name:'搜索识别文字'}),{target:{value:'旧文字'}});
  await screen.findByText('匹配旧版本');const row=screen.getByRole('listitem');fireEvent.click(within(row).getByRole('button',{name:'复制'}));
  await waitFor(()=>expect(copy).toHaveBeenCalledWith(full));expect(within(row).getByRole('button',{name:'已复制'})).toBeVisible();
@@ -93,7 +94,7 @@ it('copies the full matched old version and opens versions inline with keyboard 
 });
 it('keeps a successful body beside a failed retry and deletes only after inline confirmation',async()=>{
  const r=record();r.attempts.unshift({...r.attempts[0]!,id:'retry',kind:'retry',createdAt:9000,status:'failed',text:'',errorCode:'timeout'});const f=fixture([r]);
- render(<MemoryRouter><History {...f} snapshot={initialSpeech()}/></MemoryRouter>);await screen.findByText('完整的识别文字');expect(screen.getByText(/本次重识别未完成/)).toBeVisible();
+ render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);await screen.findByText('完整的识别文字');expect(screen.getByText(/本次重识别未完成/)).toBeVisible();
  const user=userEvent.setup();screen.getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('menuitem',{name:'删除记录'}));
  const confirm=await screen.findByRole('group',{name:'删除历史确认'});expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
  await user.click(within(confirm).getByRole('button',{name:'取消'}));expect(f.speech.records).toHaveLength(1);
@@ -104,26 +105,22 @@ it('keeps a successful body beside a failed retry and deletes only after inline 
 });
 it('a delayed full-text read cannot replace a newer copy or write after leaving',async()=>{
  const f=fixture([record(1,'较早文字'),record(2,'较新文字')]),copy=vi.spyOn(f.speech,'copy').mockResolvedValue();
- const view=render(<MemoryRouter><History {...f} snapshot={initialSpeech()}/></MemoryRouter>);await screen.findByText('较新文字');
+ const view=render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);await screen.findByText('较新文字');
  const delayed=deferred<HistoryRecord>();vi.spyOn(f.port,'detail').mockReturnValueOnce(delayed.promise);
  const rows=screen.getAllByRole('listitem');fireEvent.click(within(rows[1]!).getByRole('button',{name:'复制'}));fireEvent.click(within(rows[0]!).getByRole('button',{name:'复制'}));await waitFor(()=>expect(copy).toHaveBeenCalledWith('较新文字'));
  await act(async()=>delayed.resolve(record(1,'较早文字')));expect(copy).toHaveBeenCalledTimes(1);expect(within(rows[1]!).getByRole('button',{name:'复制'})).toBeVisible();
  const leaving=deferred<HistoryRecord>();vi.spyOn(f.port,'detail').mockReturnValueOnce(leaving.promise);fireEvent.click(within(rows[1]!).getByRole('button',{name:'复制'}));view.unmount();await act(async()=>leaving.resolve(record(1,'较早文字')));expect(copy).toHaveBeenCalledTimes(1);
 });
-it('protects unsaved retention and preserves a concurrent microphone selection on save',async()=>{
- const speech=new BrowserSpeech();let guard:DepartureGuard|null=null;render(<SaveSettings speech={speech} onGuardChange={v=>{guard=v;}}/>);
- const select=await screen.findByRole('combobox',{name:'录音保留时间'});const user=userEvent.setup();select.focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('option',{name:'7 天'}));
- const leave=vi.fn();act(()=>guard!(leave));expect(leave).not.toHaveBeenCalled();fireEvent.click(screen.getByRole('button',{name:'继续填写'}));expect(select).toHaveTextContent('7 天');
- const dirtyGuard=guard;speech.settings={...speech.settings,deviceId:'new-device',revision:2};fireEvent.click(screen.getByRole('button',{name:'保存设置'}));
- await screen.findByText('已保存，下一次录音生效。');expect(speech.settings).toMatchObject({deviceId:'new-device',retentionDays:7,revision:3});
- // onGuardChange is an effect contract; observe its rebind before invoking it.
- await waitFor(()=>{expect(guard).not.toBeNull();expect(guard).not.toBe(dirtyGuard);});
- act(()=>guard!(leave));expect(leave).toHaveBeenCalledOnce();
+it('saves retention immediately and retains a concurrently queued microphone change',async()=>{
+ const speech=new BrowserSpeech(),settings=recordingSettings(speech);render(<SaveSettings settings={settings}/>);
+ const select=await screen.findByRole('combobox',{name:'录音保留时间'});await waitFor(()=>expect(select).toBeEnabled());const user=userEvent.setup();
+ act(()=>settings.update({deviceId:'new-device'}));select.focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('option',{name:'7 天'}));
+ await waitFor(()=>expect(speech.settings).toMatchObject({deviceId:'new-device',retentionDays:7}));expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();expect(screen.queryByRole('button',{name:'保存设置'})).not.toBeInTheDocument();
 });
 it('can retry unavailable save settings without leaving the history page',async()=>{
  const speech=new BrowserSpeech();vi.spyOn(speech,'preferences').mockRejectedValueOnce({code:'unavailable'});
- render(<SaveSettings speech={speech}/>);fireEvent.click(await screen.findByRole('button',{name:'重试读取设置'}));
- expect(await screen.findByRole('combobox',{name:'录音保留时间'})).toHaveTextContent('30 天');
+ render(<SaveSettings settings={recordingSettings(speech)}/>);fireEvent.click(await screen.findByRole('button',{name:'重新读取'}));
+ await waitFor(()=>expect(screen.getByRole('combobox',{name:'录音保留时间'})).toHaveTextContent('30 天'));
 });
 
 it('coalesces a background notification received during navigation and handles empty stores',async()=>{

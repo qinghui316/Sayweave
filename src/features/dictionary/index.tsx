@@ -3,9 +3,12 @@ import { dictionaryError, validateDictionaryInput, type DictionaryPort, type Dic
 import { Button, Dialog, EmptyState, Field, InlineMessage, Tabs, TextInput,SingleChoice } from '../../ui';
 import { zh } from '../../locales/zh-CN';
 import s from './dictionary.module.css';
+import {ToggleSetting} from '../../settings/ToggleSetting';
+import type {SettingStore} from '../../settings/store';
+import type {ProcessingSettings} from '../../contracts/processing';
 const t=zh.dictionary;
 type Editor={record:DictionaryRecord|null; original:string; category:string; replacement:string};
-export function Dictionary({port}:{port:DictionaryPort}) {
+export function Dictionary({port,automaticTerms}:{port:DictionaryPort;automaticTerms:SettingStore<ProcessingSettings>}) {
   const [kind,setKind]=useState<DictionaryKind>('term');
   const [source,setSource]=useState<'all'|'manual'|'automatic'>('all');
   const [search,setSearch]=useState(''); const [page,setPage]=useState(1); const [refresh,setRefresh]=useState(0);
@@ -58,6 +61,7 @@ export function Dictionary({port}:{port:DictionaryPort}) {
   }
   return <section className={s.page}>
     <header className={s.heading}><h1>{t.title}</h1>{port.persistence==='memory'&&<p className={s.meta}>{t.memory}</p>}</header>
+    <ToggleSetting store={automaticTerms} label="自动入词" description="从你对口述文字的纠正中学习正确词形。使用所选文字模型判断，关闭后已有词条仍可使用。"/>
     <Tabs value={kind} label={t.tabs} onValueChange={v=>{setKind(v as DictionaryKind);setPage(1);setSearch('');setLoading(true);setFeedback('');}} options={[{value:'term',label:t.terms},{value:'correction',label:t.corrections}]}>
       <div className={s.panel}><div className={s.toolbar}><TextInput aria-label={t.search} placeholder={t.search} value={search} maxLength={256} onChange={e=>{setSearch(e.target.value);setPage(1);setLoading(true);}}/><span className={s.meta}>{t.total(result.total)}</span><Button variant="primary" onClick={()=>open(null)} disabled={!!error||loading}>{kind==='term'?t.addTerm:t.addCorrection}</Button></div>
         {kind==='term'&&<div className={s.sourceFilter}><SingleChoice value={source} label="词条来源" onValueChange={value=>{setSource(value as typeof source);setPage(1);setLoading(true);}} options={[{value:'all',label:'全部'},{value:'manual',label:'手动'},{value:'automatic',label:'自动'}]}/></div>}

@@ -67,15 +67,13 @@ describe('task-based model settings',()=>{
   const confirm=screen.getByRole('alertdialog');expect(confirm).toHaveTextContent('文字处理将清空');
   fireEvent.click(within(confirm).getByRole('button',{name:'确认删除'}));await screen.findByText('已删除。');expect((await p.overview()).configs).toHaveLength(0);
  });
- it('preserves input on failure and uses a focused visible discard dialog',async()=>{
-  const p=new BrowserModels();vi.spyOn(p,'save').mockRejectedValue(new ModelError('credentialUnavailable'));
+ it('offers only save or cancel on departure and preserves the editor after failure',async()=>{
+  const p=new BrowserModels(),save=vi.spyOn(p,'save').mockRejectedValue(new ModelError('credentialUnavailable'));
   let guard:((action:()=>void)=>void)|null=null;await panel(p,value=>{guard=value;});fillText();
-  fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByRole('alert');
-  expect(screen.getByLabelText('API 密钥')).toHaveValue('dummy-personal-key');
-  const close=vi.fn();act(()=>guard!(close));expect(close).not.toHaveBeenCalled();
-  await waitFor(()=>expect(within(screen.getByRole('alertdialog')).getByRole('button',{name:'继续填写'})).toHaveFocus());
-  fireEvent.click(screen.getByRole('button',{name:'继续填写'}));expect(screen.getByLabelText('名称')).toHaveValue('个人配置');
-  act(()=>guard!(close));fireEvent.click(screen.getByRole('button',{name:'放弃修改'}));expect(close).toHaveBeenCalledOnce();expect(screen.queryByLabelText('API 密钥')).not.toBeInTheDocument();
+  const close=vi.fn();act(()=>guard!(close));const dialog=screen.getByRole('alertdialog');expect(within(dialog).getAllByRole('button').map(b=>b.textContent)).toEqual(['保存','取消']);
+  fireEvent.click(within(dialog).getByRole('button',{name:'取消'}));expect(screen.getByLabelText('API 密钥')).toHaveValue('dummy-personal-key');expect(close).not.toHaveBeenCalled();
+  act(()=>guard!(close));fireEvent.click(within(screen.getByRole('alertdialog')).getByRole('button',{name:'保存'}));await screen.findByRole('alert');expect(close).not.toHaveBeenCalled();expect(screen.getByLabelText('API 密钥')).toHaveValue('dummy-personal-key');expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+  save.mockRestore();act(()=>guard!(close));fireEvent.click(within(screen.getByRole('alertdialog')).getByRole('button',{name:'保存'}));await waitFor(()=>expect(close).toHaveBeenCalledOnce());expect((await p.overview()).configs).toHaveLength(1);
  });
  it('invalidates delayed tests on draft edits and cancels on unmount',async()=>{
   const p=new BrowserModels();let resolve!:(result:ModelTestResult)=>void;
@@ -98,7 +96,7 @@ describe('task-based model settings',()=>{
  });
  it('guards category switching and keeps both defaults independent',async()=>{
   const p=new BrowserModels();await panel(p);fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'speech-key'}});
-  textTab();expect(screen.getByRole('alertdialog')).toBeInTheDocument();fireEvent.click(screen.getByRole('button',{name:'继续填写'}));expect(screen.getByRole('tab',{name:'语音识别'})).toHaveAttribute('aria-selected','true');
+  textTab();expect(screen.getByRole('alertdialog')).toBeInTheDocument();fireEvent.click(screen.getByRole('button',{name:'取消'}));expect(screen.getByRole('tab',{name:'语音识别'})).toHaveAttribute('aria-selected','true');
   fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
   textTab();fireEvent.change(screen.getByLabelText('API 密钥'),{target:{value:'text-key'}});manualModel();fireEvent.change(screen.getByLabelText('模型'),{target:{value:'text-model'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
   const view=await p.overview();expect(view.configs).toHaveLength(2);expect(view.defaults[0]!.configId).not.toBe(view.defaults[1]!.configId);

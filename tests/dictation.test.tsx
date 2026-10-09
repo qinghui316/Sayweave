@@ -1,3 +1,4 @@
+import {shortcutSettings} from './settings-fixtures';
 import {act,render,screen,waitFor,fireEvent} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import {describe,it,expect,vi} from 'vitest';
@@ -23,70 +24,59 @@ describe('dictation contracts',()=>{
  });
 });
 describe('shortcut settings',()=>{
+ it('saves a completed capture RPC even when the subscription has not attached',async()=>{
+  const base=new BrowserShortcuts(),save=vi.spyOn(base,'save');let attach!:()=>void;
+  const port:ShortcutConfigPort={mode:'simulation',status:()=>base.status(),save:value=>base.save(value),subscribe:()=>new Promise(resolve=>{attach=()=>resolve(()=>{});}),capture:async(begin,token)=>{const value=await base.capture(begin,token);return begin?{...value,capturing:false,capturedBinding:'Control+KeyD',sequence:value.sequence+1}:value;}};
+  const user=userEvent.setup(),view=render(<ShortcutSettings port={port} settings={shortcutSettings(port)}/>);await screen.findByText('已启用：右 Alt');await user.click(screen.getByRole('button',{name:'更改快捷键'}));
+  await waitFor(()=>expect(save).toHaveBeenCalledWith({binding:'Control+KeyD',mode:'toggle',revision:1}));view.unmount();await act(async()=>attach());
+ });
  it('keeps the current capture owned when an unrelated initial read arrives before capture starts',async()=>{
   const base=new BrowserShortcuts();let resolveRead!:(value:ShortcutStatus)=>void,startCapture!:(()=>Promise<void>);
   const port:ShortcutConfigPort={mode:'simulation',subscribe:cb=>base.subscribe(cb),save:v=>base.save(v),status:()=>new Promise(resolve=>{resolveRead=resolve;}),capture:(begin,token)=>begin?new Promise(resolve=>{startCapture=async()=>{resolve(await base.capture(true,token));};}):base.capture(false)};
-  const user=userEvent.setup();render(<ShortcutSettings port={port}/>);
+  const user=userEvent.setup();render(<ShortcutSettings settings={shortcutSettings(port)} port={port}/>);
   await act(async()=>{await base.capture(false);});await screen.findByText('已启用：右 Alt');
   // A newer initial read is sampled before this editor's capture command reaches the backend.
   const unrelated={...await base.status(),captureToken:crypto.randomUUID(),capturedBinding:'Control+KeyX'};
   await user.click(screen.getByRole('button',{name:'更改快捷键'}));
   await act(async()=>{resolveRead(unrelated);});
-  expect(screen.getByRole('button',{name:'更改快捷键'})).not.toHaveTextContent('Ctrl + X');expect(screen.getByRole('button',{name:'保存快捷键'})).toBeDisabled();
+  expect(screen.getByRole('button',{name:'更改快捷键'})).not.toHaveTextContent('Ctrl + X');expect(screen.queryByRole('button',{name:'保存快捷键'})).not.toBeInTheDocument();
   await act(async()=>{await startCapture();});fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});
-  await waitFor(()=>expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('Ctrl + D'));expect(screen.getByRole('button',{name:'保存快捷键'})).toBeEnabled();
+  await waitFor(()=>expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('Ctrl + D'));expect(screen.queryByRole('button',{name:'保存快捷键'})).not.toBeInTheDocument();
  });
- it('keeps a discarded captured key out of a reopened editor and can record the same key again',async()=>{
-  const port=new BrowserShortcuts(),user=userEvent.setup();let guard:((action:()=>void)=>void)|null=null;const closed=vi.fn();
-  const view=render(<ShortcutSettings port={port} onGuardChange={g=>{guard=g;}}/>);
+ it('keeps an automatically saved captured key after reopening',async()=>{
+  const port=new BrowserShortcuts(),settings=shortcutSettings(port),user=userEvent.setup();const view=render(<ShortcutSettings settings={settings} port={port}/>);
   await screen.findByText('已启用：右 Alt');await user.click(screen.getByRole('button',{name:'更改快捷键'}));
-  fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});await waitFor(()=>expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('Ctrl + D'));
-  act(()=>guard!(closed));await screen.findByRole('alertdialog',{name:'快捷键尚未保存'});
-  await user.click(screen.getByRole('button',{name:'放弃修改'}));expect(closed).toHaveBeenCalledOnce();view.unmount();
-  render(<ShortcutSettings port={port}/>);await screen.findByText('已启用：右 Alt');
-  expect(screen.getByRole('button',{name:'更改快捷键'})).not.toHaveTextContent('Ctrl + D');expect(screen.getByRole('button',{name:'保存快捷键'})).toBeDisabled();
-  await user.click(screen.getByRole('button',{name:'更改快捷键'}));fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});
-  await waitFor(()=>expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('Ctrl + D'));expect(screen.getByRole('button',{name:'保存快捷键'})).toBeEnabled();
+  fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});await screen.findByText('已启用：Ctrl + D');view.unmount();
+  render(<ShortcutSettings settings={settings} port={port}/>);await screen.findByText('已启用：Ctrl + D');expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
  });
  it('ignores a capture response and initial read that arrive after newer completion events',async()=>{
   const base=new BrowserShortcuts();let resolveRead!:(value:ShortcutStatus)=>void,resolveCapture!:(value:ShortcutStatus)=>void;
   const initial=await base.status();let captured:ShortcutStatus|undefined;
   const port:ShortcutConfigPort={mode:'simulation',subscribe:cb=>base.subscribe(cb),save:v=>base.save(v),status:()=>new Promise(resolve=>{resolveRead=resolve;}),capture:async (begin,token)=>{const v=await base.capture(begin,token);if(!begin)return v;captured=v;return new Promise(resolve=>{resolveCapture=resolve;});}};
-  const user=userEvent.setup();render(<ShortcutSettings port={port}/>);
+  const user=userEvent.setup();render(<ShortcutSettings settings={shortcutSettings(port)} port={port}/>);
   act(()=>{void base.capture(false);});await screen.findByText('已启用：右 Alt');
   await user.click(screen.getByRole('button',{name:'更改快捷键'}));await waitFor(()=>expect(captured).toBeDefined());
   fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});await waitFor(()=>expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('Ctrl + D'));
   await act(async()=>{resolveCapture(captured!);resolveRead(initial);});
-  expect(screen.getByRole('button',{name:'更改快捷键'})).toBeVisible();expect(screen.getByRole('button',{name:'保存快捷键'})).toBeEnabled();
+  expect(screen.getByRole('button',{name:'更改快捷键'})).toBeVisible();expect(screen.queryByRole('button',{name:'保存快捷键'})).not.toBeInTheDocument();
   expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('Ctrl + D');
  });
  it('records a key, saves its mode, and releases capture on unmount',async()=>{
   const port=new BrowserShortcuts(),capture=vi.spyOn(port,'capture');
-  const user=userEvent.setup();const view=render(<ShortcutSettings port={port}/>);
+  const user=userEvent.setup();const view=render(<ShortcutSettings settings={shortcutSettings(port)} port={port}/>);
   await screen.findByText('已启用：右 Alt');
   await user.click(screen.getByRole('button',{name:'更改快捷键'}));
   fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});
   await waitFor(()=>expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('Ctrl + D'));
   await user.click(screen.getByRole('radio',{name:'按住'}));
-  await user.click(screen.getByRole('button',{name:'保存快捷键'}));
   await screen.findByText('已启用：Ctrl + D');
-  expect((await port.status()).saved).toEqual({binding:'Control+KeyD',mode:'hold',revision:2});
-  view.unmount();expect(capture).toHaveBeenLastCalledWith(false);
+  await waitFor(async()=>expect((await port.status()).saved).toMatchObject({binding:'Control+KeyD',mode:'hold'}));
+  await user.click(screen.getByRole('button',{name:'更改快捷键'}));view.unmount();expect(capture).toHaveBeenLastCalledWith(false,expect.any(String));
  });
- it('keeps a failed draft and protects closing until discard',async()=>{
+ it('shows save failure without a leave prompt or an uncommitted mode',async()=>{
   const base=new BrowserShortcuts();const port:ShortcutConfigPort={mode:'simulation',status:()=>base.status(),subscribe:cb=>base.subscribe(cb),capture:(b,t)=>base.capture(b,t),save:vi.fn().mockRejectedValue({code:'shortcutConflict'})};
-  let guard:((action:()=>void)=>void)|null=null;const closed=vi.fn(),user=userEvent.setup();
-  render(<ShortcutSettings port={port} onGuardChange={g=>{guard=g;}}/>);
-  await screen.findByText('已启用：右 Alt');
-  await user.click(screen.getByRole('radio',{name:'按住'}));
-  await user.click(screen.getByRole('button',{name:'保存快捷键'}));
-  await screen.findByText('此快捷键已被占用，请换一个。');
-  expect(screen.getByRole('radio',{name:'按住'})).toBeChecked();
-  fireEvent.click(screen.getByRole('button',{name:'更改快捷键'}));
-  await waitFor(()=>expect(guard).not.toBeNull());
-  guard!(closed);await screen.findByRole('alertdialog',{name:'快捷键尚未保存'});
-  expect(closed).not.toHaveBeenCalled();
-  await user.click(screen.getByRole('button',{name:'放弃修改'}));expect(closed).toHaveBeenCalledOnce();
+  const user=userEvent.setup();render(<ShortcutSettings settings={shortcutSettings(port)} port={port}/>);await screen.findByText('已启用：右 Alt');await user.click(screen.getByRole('radio',{name:'按住'}));
+  await screen.findByText('此快捷键已被占用，请换一个。');expect(screen.getByRole('radio',{name:'点按'})).toBeChecked();expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
  });
 });
 it('keeps external completion pending only for the matching nonempty successful task',()=>{
@@ -156,11 +146,11 @@ it('dismissed preparation failures and clipboard notices remain closed when the 
 });
 
 it('records from the key field and cancels capture on outside interaction or window blur',async()=>{
- const port=new BrowserShortcuts(),user=userEvent.setup();render(<><ShortcutSettings port={port}/><button>其他设置</button></>);
+ const port=new BrowserShortcuts(),user=userEvent.setup();render(<><ShortcutSettings settings={shortcutSettings(port)} port={port}/><button>其他设置</button></>);
  await screen.findByText('已启用：右 Alt');const field=screen.getByRole('button',{name:'更改快捷键'});
  field.focus();await user.keyboard('{Enter}');await screen.findByText('按下快捷键…');
  await user.click(screen.getByRole('button',{name:'其他设置'}));await waitFor(()=>expect(field).toHaveAttribute('aria-pressed','false'));
- expect(field).toHaveTextContent('右 Alt');expect(screen.getByRole('button',{name:'保存快捷键'})).toBeDisabled();
+ expect(field).toHaveTextContent('右 Alt');expect(screen.queryByRole('button',{name:'保存快捷键'})).not.toBeInTheDocument();
  await user.click(field);await screen.findByText('按下快捷键…');fireEvent(window,new Event('blur'));
  await waitFor(()=>expect(field).toHaveAttribute('aria-pressed','false'));
  expect(field).toHaveTextContent('右 Alt');
@@ -169,11 +159,11 @@ it('records from the key field and cancels capture on outside interaction or win
 it('cancels a delayed capture start when the settings window loses focus',async()=>{
  const base=new BrowserShortcuts();let start!:()=>Promise<void>;
  const port:ShortcutConfigPort={mode:'simulation',status:()=>base.status(),subscribe:cb=>base.subscribe(cb),save:v=>base.save(v),capture:(begin,token)=>begin?new Promise(resolve=>{start=async()=>resolve(await base.capture(true,token));}):base.capture(false)};
- const user=userEvent.setup();render(<ShortcutSettings port={port}/>);await screen.findByText('已启用：右 Alt');
+ const user=userEvent.setup();render(<ShortcutSettings settings={shortcutSettings(port)} port={port}/>);await screen.findByText('已启用：右 Alt');
  await user.click(screen.getByRole('button',{name:'更改快捷键'}));fireEvent(window,new Event('blur'));
  await act(start);await waitFor(async()=>expect((await base.status()).capturing).toBe(false));
  fireEvent.keyDown(window,{key:'d',code:'KeyD',ctrlKey:true});expect(screen.getByRole('button',{name:'更改快捷键'})).toHaveTextContent('右 Alt');
- expect(screen.getByRole('button',{name:'保存快捷键'})).toBeDisabled();
+ expect(screen.queryByRole('button',{name:'保存快捷键'})).not.toBeInTheDocument();
 });
 
 it('reports rejected live admission without a copy card and exposes settings',async()=>{

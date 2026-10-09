@@ -567,6 +567,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             processing_commands::processing_status,
+            processing_commands::processing_settings,
             processing_commands::processing_save,
             shortcut_status,
             shortcut_save,

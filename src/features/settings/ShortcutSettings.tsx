@@ -1,24 +1,47 @@
 import {useEffect,useRef,useState} from 'react';
-import {Button,InlineMessage,Dialog,Keycap,SingleChoice} from '../../ui';
+import {Button,InlineMessage,Keycap,SingleChoice} from '../../ui';
 import {inputMessage,shortcutLabel,type ShortcutConfigPort,type ShortcutConfig,type ShortcutStatus} from '../../contracts/dictation';
+import type {SettingStore} from '../../settings/store';
+import {useSetting} from '../../settings/use-setting';
 import s from './settings.module.css';
-type Guard=(action:()=>void)=>void;
-export function ShortcutSettings({port,onGuardChange}:{port:ShortcutConfigPort;onGuardChange?:(guard:Guard|null)=>void}){
- const [status,setStatus]=useState<ShortcutStatus|null>(null),[draft,setDraft]=useState<ShortcutConfig|null>(null),[busy,setBusy]=useState(false),[captureStarting,setCaptureStarting]=useState(false),[error,setError]=useState(''),[confirm,setConfirm]=useState(false);
- const saved=useRef<ShortcutConfig|null>(null),changed=useRef(false),pending=useRef<(()=>void)|null>(null),mounted=useRef(true),captureToken=useRef<string|null>(null),recorder=useRef<HTMLDivElement>(null);
+export function ShortcutSettings({port,settings}:{port:ShortcutConfigPort;settings:SettingStore<ShortcutConfig>}){
+ const state=useSetting(settings),draft=state.value;
+ const [status,setStatus]=useState<ShortcutStatus|null>(null),[starting,setStarting]=useState(false),[error,setError]=useState('');
+ const captureToken=useRef<string|null>(null),mounted=useRef(false),recorder=useRef<HTMLDivElement>(null);
  const acceptStatus=useRef<(value:ShortcutStatus)=>void>(()=>{});
- useEffect(()=>{mounted.current=true;captureToken.current=null;let release:(()=>void)|undefined;let alive=true,sequence=-1;const accept=(v:ShortcutStatus)=>{if(!alive||v.sequence<=sequence)return;sequence=v.sequence;setStatus(v);if(!saved.current||v.saved.revision>saved.current.revision){saved.current=v.saved;if(!changed.current)setDraft(v.saved);}if(captureToken.current&&v.captureToken===captureToken.current&&!v.capturing){if(v.capturedBinding)setDraft(d=>d?{...d,binding:v.capturedBinding!}:d);captureToken.current=null;}};acceptStatus.current=accept;void port.subscribe(accept).then(r=>{if(alive)release=r;else r();}).catch(()=>{if(alive)setError('快捷键暂不可用，请重新打开设置。');});void port.status().then(accept).catch(()=>{if(alive)setError('快捷键暂不可用，请重新打开设置。');});return()=>{alive=false;mounted.current=false;captureToken.current=null;release?.();void port.capture(false).catch(()=>{});};},[port]);
- const dirty=!!draft&&!!status&&(draft.binding!==status.saved.binding||draft.mode!==status.saved.mode);
- useEffect(()=>{changed.current=dirty;},[dirty]);
- useEffect(()=>{if(!status?.capturing&&!captureStarting)return;const stop=()=>{captureToken.current=null;void port.capture(false).catch(()=>{});};const outside=(event:PointerEvent)=>{if(event.target instanceof Node&&!recorder.current?.contains(event.target))stop();};window.addEventListener('blur',stop);window.addEventListener('pointerdown',outside,true);return()=>{window.removeEventListener('blur',stop);window.removeEventListener('pointerdown',outside,true);};},[status?.capturing,captureStarting,port]);
- useEffect(()=>{onGuardChange?.(action=>{captureToken.current=null;void port.capture(false).catch(()=>{});if(changed.current){pending.current=action;setConfirm(true);}else{action();}});return()=>onGuardChange?.(null);},[onGuardChange,port]);
- async function capture(){const begin=!status?.capturing,token=begin?crypto.randomUUID():null,accept=acceptStatus.current;captureToken.current=token;setCaptureStarting(true);setError('');try{const value=await port.capture(begin,token??undefined);if(begin&&captureToken.current!==token&&value.capturing&&value.captureToken===token){accept(await port.capture(false));}else accept(value);}catch{if(mounted.current){if(captureToken.current===token)captureToken.current=null;setError('暂时无法录入，请重试。');}}finally{if(mounted.current)setCaptureStarting(false);}}
- async function save(){if(!draft||busy)return;setBusy(true);setError('');try{const v=await port.save(draft);if(mounted.current){acceptStatus.current(v);if(!saved.current||v.saved.revision>=saved.current.revision){saved.current=v.saved;setDraft(v.saved);changed.current=false;}}}catch(e){if(mounted.current)setError(inputMessage(typeof e==='object'&&e&&'code'in e?String(e.code):null));}finally{if(mounted.current)setBusy(false);}}
- return <section className={s.shortcutSection}><div className={s.shortcutRow}><div><h3>口述快捷键</h3><p>{port.mode==='simulation'?'浏览器仅模拟键位设置。':'点击右侧键位框，按下想使用的快捷键。'}</p></div><div className={s.recorderWrap} ref={recorder}><Button variant="quiet" className={s.shortcutRecorder} aria-label="更改快捷键" aria-pressed={status?.capturing??false} disabled={busy||!status||captureStarting} onClick={()=>{if(!status?.capturing)void capture();}}>{status?.capturing?<span role="status">按下快捷键…</span>:draft?shortcutLabel(draft.binding).split(' + ').map((key,index)=><span className={s.recordedKey} key={`${index}-${key}`}>{index>0&&<span className={s.keyJoin}> + </span>}<Keycap>{key}</Keycap></span>):<span>正在读取</span>}</Button>{status?.capturing&&<Button variant="quiet" onClick={()=>void capture()}>取消录入</Button>}</div></div>
+ useEffect(()=>{
+  mounted.current=true;let alive=true,sequence=-1,release:(()=>void)|undefined;
+  const accept=(value:ShortcutStatus)=>{
+   if(!alive||value.sequence<=sequence)return;sequence=value.sequence;setStatus(value);settings.accept(value.saved);
+   if(captureToken.current&&value.captureToken===captureToken.current&&!value.capturing){captureToken.current=null;if(value.capturedBinding)settings.update({binding:value.capturedBinding});}
+  };
+  acceptStatus.current=accept;
+  void port.subscribe(accept).then(stop=>{if(alive)release=stop;else stop();}).catch(()=>setError('快捷键暂不可用，请重试。'));
+  void port.status().then(accept).catch(()=>{if(alive)setError('快捷键暂不可用，请重试。');});
+  return()=>{alive=false;mounted.current=false;const token=captureToken.current;captureToken.current=null;release?.();if(token)void port.capture(false,token).catch(()=>{});};
+ },[port,settings]);
+ useEffect(()=>{
+  if(!status?.capturing)return;
+  const cancel=(event:PointerEvent)=>{if(!recorder.current?.contains(event.target as Node)){const token=captureToken.current;captureToken.current=null;void port.capture(false,token??undefined).catch(()=>{});}};
+  document.addEventListener('pointerdown',cancel);return()=>document.removeEventListener('pointerdown',cancel);
+ },[port,status?.capturing]);
+ useEffect(()=>{
+  const stop=()=>{const token=captureToken.current;captureToken.current=null;if(token)void port.capture(false,token).catch(()=>{});};
+  const visibility=()=>{if(document.hidden)stop();};
+  window.addEventListener('blur',stop);document.addEventListener('visibilitychange',visibility);
+  return()=>{window.removeEventListener('blur',stop);document.removeEventListener('visibilitychange',visibility);};
+ },[port]);
+ async function capture(){
+  if(starting)return;
+  if(status?.capturing){const token=captureToken.current;captureToken.current=null;void port.capture(false,token??undefined).catch(()=>{});return;}
+  const token=crypto.randomUUID();captureToken.current=token;setStarting(true);setError('');
+  try{const value=await port.capture(true,token);if(!mounted.current||captureToken.current!==token){if(value.capturing&&value.captureToken===token)await port.capture(false,token);}else acceptStatus.current(value);}
+  catch{if(mounted.current)setError('暂时无法录入，请重试。');if(captureToken.current===token)captureToken.current=null;}
+  finally{if(mounted.current)setStarting(false);}
+ }
+ return <section className={s.shortcutSection}><div className={s.shortcutRow}><div><h3>口述快捷键</h3><p>点击右侧键位框，按下想使用的快捷键。</p></div><div className={s.recorderWrap} ref={recorder}><Button variant="quiet" className={s.shortcutRecorder} aria-label="更改快捷键" aria-pressed={status?.capturing??false} disabled={!state.ready||starting} onClick={()=>void capture()}>{status?.capturing?<span role="status">按下快捷键…</span>:draft?shortcutLabel(draft.binding).split(' + ').map((key,index)=><span className={s.recordedKey} key={key+index}>{index>0&&<span className={s.keyJoin}> + </span>}<Keycap>{key}</Keycap></span>):<span>正在读取</span>}</Button>{status?.capturing&&<Button variant="quiet" onClick={()=>void capture()}>取消录入</Button>}</div></div>
  {status?.capturing&&<p className={s.captureHelp}>按下单键或组合键；Esc 或点击其他位置取消。</p>}
- {draft&&<div className={s.recordingMode}><span className={s.settingLabel}>录音方式</span><SingleChoice label="录音方式" value={draft.mode} disabled={busy||status?.capturing} options={[{value:'toggle',label:'点按'},{value:'hold',label:'按住'}]} onValueChange={mode=>setDraft({...draft,mode:mode as ShortcutConfig['mode']})}/><p>{draft.mode==='toggle'?'按一下开始，再按一下结束。':'按下开始，松开结束。'}</p></div>}
- {status?.pending&&<p role="status">已保存，本次口述结束后生效。</p>}{status?.error&&<InlineMessage status="error">{inputMessage(status.error)}</InlineMessage>}{status?.active&&!status.pending&&<p role="status">已启用：{shortcutLabel(status.active.binding)}</p>}{error&&<InlineMessage status="error">{error}</InlineMessage>}
- <Button disabled={busy||!dirty||status?.capturing} onClick={()=>void save()}>{busy?'正在保存':'保存快捷键'}</Button>
- <Dialog confirmation open={confirm} onOpenChange={setConfirm} title="快捷键尚未保存" description="选择继续填写或放弃这次修改。"><Button autoFocus onClick={()=>{setConfirm(false);pending.current=null;}}>继续填写</Button><Button onClick={()=>{setDraft(status?.saved??null);changed.current=false;setConfirm(false);void port.capture(false).catch(()=>{});const action=pending.current;pending.current=null;action?.();}}>放弃修改</Button></Dialog>
+ <div className={s.recordingMode}><span className={s.settingLabel}>录音方式</span><SingleChoice label="录音方式" value={draft?.mode??'toggle'} disabled={!state.ready||status?.capturing} options={[{value:'toggle',label:'点按'},{value:'hold',label:'按住'}]} onValueChange={mode=>settings.update({mode:mode as ShortcutConfig['mode']})}/><p>{draft?.mode==='hold'?'按下开始，松开结束。':'按一下开始，再按一下结束。'}</p></div>
+ {status?.pending&&<p role="status">已保存，本次口述结束后生效。</p>}{status?.error&&<InlineMessage status="error">{inputMessage(status.error)}</InlineMessage>}{status?.active&&!status.pending&&<p role="status">已启用：{shortcutLabel(status.active.binding)}</p>}{(error||state.error)&&<InlineMessage status="error">{error||state.error}</InlineMessage>}{state.error&&<Button variant="quiet" onClick={()=>void settings.load()}>重新读取</Button>}
  </section>;
 }
