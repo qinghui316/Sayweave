@@ -184,7 +184,7 @@ struct EventEvidence {
 }
 fn event_decision(event: u32, top: usize, focus: usize, e: &EventEvidence) -> EventDecision {
     if event == EVENT_SYSTEM_FOREGROUND {
-        if e.window != top && !e.own_event {
+        if e.window != top && e.root != top && !e.own_event {
             return EventDecision::Changed("externalForeground");
         }
         if e.foreground != top && !e.own_foreground {
@@ -245,13 +245,44 @@ pub(super) fn observe(event: u32, window: usize, object: i32, event_tick: u32) {
             CHANGES.fetch_add(1, Ordering::AcqRel);
         }
         if decision != EventDecision::Unrelated {
-            log::info!(target:"sayweave", "operation=input_target_event task_id={} event={event} object={object} event_tick={event_tick} received_tick={received_tick} own_overlay={} foreground_original={} foreground_overlay={} decision={decision:?} generation={}",watch.task.as_deref().unwrap_or("pending"),evidence.own_event,foreground==watch.anchor.window,evidence.own_foreground,CHANGES.load(Ordering::Acquire));
+            let (mut event_process, mut root_process) = (0, 0);
+            unsafe {
+                GetWindowThreadProcessId(hwnd(window), Some(&mut event_process));
+                GetWindowThreadProcessId(hwnd(evidence.root), Some(&mut root_process));
+            }
+            log::info!(target:"sayweave", "operation=input_target_event task_id={} event={event} object={object} event_tick={event_tick} received_tick={received_tick} event_window={window} event_root={} event_process={event_process} root_process={root_process} target_window={} target_process={} current_foreground={foreground} root_original={} own_overlay={} foreground_original={} foreground_overlay={} decision={decision:?} generation={}",watch.task.as_deref().unwrap_or("pending"),evidence.root,watch.anchor.window,watch.anchor.process,evidence.root==watch.anchor.window,evidence.own_event,foreground==watch.anchor.window,evidence.own_foreground,CHANGES.load(Ordering::Acquire));
         }
     }
 }
 #[cfg(test)]
 mod event_tests {
     use super::*;
+    #[test]
+    fn foreground_notification_from_original_child_is_not_an_external_switch() {
+        let mut evidence = EventEvidence {
+            window: 12,
+            object: OBJID_WINDOW.0,
+            root: 10,
+            foreground: 10,
+            own_event: false,
+            own_foreground: false,
+        };
+        assert_eq!(
+            event_decision(EVENT_SYSTEM_FOREGROUND, 10, 12, &evidence),
+            EventDecision::Original
+        );
+        // Same current foreground cannot erase a genuine earlier other-root event.
+        evidence.root = 15;
+        assert_eq!(
+            event_decision(EVENT_SYSTEM_FOREGROUND, 10, 12, &evidence),
+            EventDecision::Changed("externalForeground")
+        );
+        evidence.root = 0;
+        assert_eq!(
+            event_decision(EVENT_SYSTEM_FOREGROUND, 10, 12, &evidence),
+            EventDecision::Changed("externalForeground")
+        );
+    }
     #[test]
     fn caret_geometry_is_advisory_but_text_and_selection_invalidate() {
         let e = EventEvidence {
