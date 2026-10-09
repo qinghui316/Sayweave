@@ -4284,7 +4284,7 @@ dependencies = [
 
 [[package]]
 name = "sayweave"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cpal 0.18.2",
  "flate2",
@@ -4322,7 +4322,7 @@ dependencies = [
 
 [[package]]
 name = "sayweave-text-service"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
