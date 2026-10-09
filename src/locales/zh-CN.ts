@@ -2,7 +2,7 @@ export const zh = {
   dictionary: {
     title:'词典', description:'管理专有名词和常见纠错，内容保存在本机。', memory:'浏览器预览：仅保存在内存，刷新后重置。',
     terms:'专有名词', corrections:'常见纠错', tabs:'词典类型', search:'搜索词条', addTerm:'新增词条', addCorrection:'新增纠错', edit:'编辑', remove:'删除',
-    original:'词条', heard:'听成', replacement:'改为', category:'分类（可选）', categoryColumn:'分类', actions:'操作',
+    original:'词语', heard:'听成', replacement:'改为', category:'分类（可选）', categoryColumn:'分类', actions:'操作',
     save:'保存', cancel:'取消', retry:'重新加载', empty:'还没有词条', emptyDescription:'添加常用名称、专业术语或正确写法。', noMatches:'没有匹配的词条',
     editTitle:'编辑词条', newTitle:'新增词条', formDescription:'填写后保存到词典。', removeTitle:'删除词条', removeDescription:'删除当前词典中的记录；升级备份可能仍保留副本。',
     saved:'已保存', deleted:'已删除', loading:'正在加载词典', viewExisting:'查看已有词条', reloadConflict:'重新读取当前记录',

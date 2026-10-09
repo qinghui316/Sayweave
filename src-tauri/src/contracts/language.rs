@@ -278,8 +278,45 @@ pub struct AnalysisStamp {
     pub template_version: String,
     pub strategy_version: String,
 }
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSummary {
+    pub scope: String,
+    pub name: String,
+    pub version: i64,
+    pub preference_count: i64,
+    pub observation_count: i64,
+    pub updated_at: i64,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileOverview {
+    pub preference_count: i64,
+    pub application_count: i64,
+    pub observation_count: i64,
+    pub shared: ProfileSummary,
+    pub applications: Vec<ProfileSummary>,
+    pub next: Option<String>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayPreference {
+    pub rule: String,
+    pub language: WritingLanguage,
+    pub context: Option<String>,
+}
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileDetails {
+    pub scope: String,
+    pub version: i64,
+    pub updated_at: i64,
+    pub preferences: Vec<DisplayPreference>,
+}
 #[derive(Clone, Debug)]
 pub enum DbOperation {
+    Overview(Option<String>),
+    Profile(String),
     Settings,
     SaveSettings(LanguageSettingsPatch),
     Snapshot(ApplicationContext),
@@ -313,6 +350,8 @@ pub enum DbOperation {
 }
 #[derive(Debug)]
 pub enum DbOutput {
+    Overview(ProfileOverview),
+    Profile(ProfileDetails),
     Settings(LanguageSettings),
     Snapshot(Snapshot),
     Batch(Option<ProfileBatch>),

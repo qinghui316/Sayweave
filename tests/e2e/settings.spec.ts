@@ -8,8 +8,8 @@ test('personalization and automatic terms are findable at both desktop sizes',as
   expect(await dialog.evaluate(node=>{const box=node.getBoundingClientRect();return box.left>=0&&box.top>=0&&box.right<=innerWidth&&box.bottom<=innerHeight;})).toBe(true);
   await page.screenshot({path:'.local/settings-personalization-'+width+'.png'});await dialog.getByRole('button',{name:'关闭',exact:true}).click();
   await page.getByRole('link',{name:'词典',exact:true}).click();await expect(page.getByRole('switch',{name:'自动入词'})).toBeEnabled();
-  await page.getByRole('tab',{name:'常见纠错'}).click();await expect(page.getByRole('switch',{name:'自动入词'})).toBeVisible();
-  await expect(page.getByRole('tab',{name:'常见纠错'})).toHaveCSS('color','rgb(246, 246, 246)');
+  await page.getByRole('button',{name:'词典更多操作'}).click();await page.getByRole('menuitem',{name:'纠错映射'}).click();await expect(page.getByRole('switch',{name:'自动入词'})).toBeVisible();
+  await expect(page.getByRole('heading',{name:'纠错映射'})).toBeVisible();
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);await page.screenshot({path:'.local/settings-dictionary-'+width+'.png'});
  }
 });

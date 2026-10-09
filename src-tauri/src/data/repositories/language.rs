@@ -7,6 +7,8 @@ use crate::{
     data::repository::{Repository, db_error, now},
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+#[path = "language_dashboard.rs"]
+mod dashboard;
 #[cfg(test)]
 #[path = "language_tests.rs"]
 mod tests;
@@ -137,6 +139,12 @@ fn changed_terms(before: &str, after: &str, original: &str, term: &str) -> bool 
 impl Repository {
     pub fn language_operation(&mut self, operation: DbOperation) -> Result<DbOutput, DataError> {
         match operation {
+            DbOperation::Overview(after) => {
+                dashboard::overview(&mut self.connection, after).map(DbOutput::Overview)
+            }
+            DbOperation::Profile(scope) => {
+                dashboard::profile(&self.connection, scope).map(DbOutput::Profile)
+            }
             DbOperation::ProfileAttempt {
                 scope: requested,
                 settings_revision,

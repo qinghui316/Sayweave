@@ -581,6 +581,8 @@ pub fn run() {
             dictation_dismiss,
             dictation_settings,
             language_learning::language_settings,
+            language_learning::language_overview,
+            language_learning::language_profile,
             language_learning::language_save,
             runtime_snapshot,
             runtime_demo,

@@ -126,7 +126,7 @@ impl LanguageLearning {
                         let interrupted_edit=match &job {Job::Edit(e)=>Some(e.clone()),_=>None};
                         let result=match job {
                             Job::Edit(e)=>classify(&app,e,&active,&mut stopped,&generation,ticket).await,
-                            Job::Speech(o)=>operation(&app.state::<DataWorker>(),DbOperation::Observe(o)).await.map(|_|()).map_err(ModelError::from),
+                            Job::Speech(o)=>operation(&app.state::<DataWorker>(),DbOperation::Observe(o)).await.map(|_|{let _=app.emit_to("main","language:changed",());}).map_err(ModelError::from),
                             Job::Pending(_)=>unreachable!(),
                         };
                         if let Err(error)=result {
@@ -417,6 +417,7 @@ async fn classify(
     }
     result?;
     let _ = app.emit_to("main", "dictionary:changed", ());
+    let _ = app.emit_to("main", "language:changed", ());
     Ok(())
 }
 async fn classify_frozen<F, Fut>(
@@ -566,6 +567,7 @@ async fn consolidate(
     let text = text?;
     let proposal = profile_proposal(batch, &allowed, &text.text, text.analysis)?;
     operation(&data, DbOperation::Publish(proposal)).await?;
+    let _ = app.emit_to("main", "language:changed", ());
     Ok(true)
 }
 pub(crate) fn profile_messages(
@@ -675,6 +677,30 @@ pub(crate) fn profile_proposal(
         reason: result.reason,
         analysis,
     })
+}
+#[tauri::command]
+pub async fn language_overview(
+    window: tauri::WebviewWindow,
+    data: tauri::State<'_, DataWorker>,
+    after: Option<String>,
+) -> Result<ProfileOverview, DataError> {
+    crate::contracts::dictionary::authorize(window.label())?;
+    match operation(&data, DbOperation::Overview(after)).await? {
+        DbOutput::Overview(value) => Ok(value),
+        _ => Err(DataError::new("unavailable")),
+    }
+}
+#[tauri::command]
+pub async fn language_profile(
+    window: tauri::WebviewWindow,
+    data: tauri::State<'_, DataWorker>,
+    scope: String,
+) -> Result<ProfileDetails, DataError> {
+    crate::contracts::dictionary::authorize(window.label())?;
+    match operation(&data, DbOperation::Profile(scope)).await? {
+        DbOutput::Profile(value) => Ok(value),
+        _ => Err(DataError::new("unavailable")),
+    }
 }
 #[tauri::command]
 pub async fn language_settings(

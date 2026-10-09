@@ -57,7 +57,8 @@ function RuntimeApp() {
   const [dictionary] = useState(createDictionary);
   const [models] = useState(createModels);
   const [processing]=useState(()=>createProcessing(models));
-  const [settings]=useState(()=>createSettingsStores(processing,createLanguageSettings(),ports.speech,dictationPorts.shortcuts));
+  const [language]=useState(createLanguageSettings);
+  const [settings]=useState(()=>createSettingsStores(processing,language,ports.speech,dictationPorts.shortcuts));
   const [dataRevision,setDataRevision]=useState(0);
   const dataChanged=useCallback(()=>setDataRevision(value=>value+1),[]);
   useEffect(()=>{if(!processing.onArchived)return;let stopped=false;let release:(()=>void)|undefined;void processing.onArchived(dataChanged).then(value=>{if(stopped)value();else release=value;});return()=>{stopped=true;release?.();};},[processing,dataChanged]);
@@ -145,7 +146,7 @@ function RuntimeApp() {
         <MotionScope enabled={!settingsVisible}><Routes><Route path="/" element={home}/><Route path="/history" element={<History contentRevision={dataRevision} deliveryRevision={dictation.delivery?[dictation.taskId,dictation.delivery.state,dictation.delivery.error].join(':'):''} reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} recordingSettings={settings.recording} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/><Route path="/dictionary" element={<Dictionary port={dictionary} automaticTerms={settings.automaticTerms}/>}/><Route path="/preferences" element={home}/><Route path="/onboarding" element={<Onboarding/>}/>{DevCatalogue && <Route path="/dev/components" element={<Suspense><DevCatalogue snapshot={snapshot} demo={demo} windowAction={windowAction} resync={()=>store.resync().catch(report)}/></Suspense>}/>}<Route path="*" element={<History contentRevision={dataRevision} deliveryRevision={dictation.delivery?[dictation.taskId,dictation.delivery.state,dictation.delivery.error].join(':'):''} reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} recordingSettings={settings.recording} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/></Routes></MotionScope>
       </main>
     </div>
-    <SettingsShell shortcutPort={dictationPorts.shortcuts} textServicePort={dictationPorts.textService} settings={settings} speechPort={ports.speech} open={settingsVisible} tab={activeSettingsTab}
+    <SettingsShell languagePort={language} visible={snapshot.windows.main} shortcutPort={dictationPorts.shortcuts} textServicePort={dictationPorts.textService} settings={settings} speechPort={ports.speech} open={settingsVisible} tab={activeSettingsTab}
       onTabChange={tab=>guardSettings(()=>{if(preferenceRoute){setSettingsOpen(true);navigate('/',{replace:true});}setSettingsTab(tab);})}
       onOpenChange={open=>{if(!open)guardSettings(()=>{setSettingsOpen(false);if(preferenceRoute)navigate('/',{replace:true});});else setSettingsOpen(true);}}
       modelContent={settingsVisible&&activeSettingsTab==='models'?<ModelPanel extraContent={<ProcessingSettings port={processing} store={settings.polish} revision={dataRevision}/>} onChanged={dataChanged} onHelp={openModelHelp} onSpeech={()=>{setSettingsOpen(false);navigate('/');}} port={models} onGuardChange={updateModelGuard}/>:undefined}/>
