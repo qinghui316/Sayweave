@@ -439,7 +439,7 @@ async fn generated_sse_and_json_complete_actual_tls_without_publishing_partial()
         .unwrap();
     assert_eq!(output.text, "中文🙂。");
     assert_eq!(output.usage.total, Some(15));
-    let requests = fixture.seen.lock().unwrap();
+    let requests = fixture.seen.lock().unwrap().clone();
     assert_eq!(requests.len(), 2);
     let request: Value =
         serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -465,7 +465,7 @@ async fn generation_fallback_only_explicit_unsupported_parameter_and_incomplete_
             .text,
         "结果。"
     );
-    let requests = fixture.seen.lock().unwrap();
+    let requests = fixture.seen.lock().unwrap().clone();
     assert_eq!(requests.len(), 2);
     let retry: Value = serde_json::from_str(requests[1].split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert_eq!(retry["max_completion_tokens"], 2048);

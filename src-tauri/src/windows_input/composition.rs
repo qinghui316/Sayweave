@@ -996,6 +996,42 @@ fn reply_error(code: &str) -> &'static str {
         "compositionRejected"
     }
 }
+fn edit_expiry(now_tick: u64, changed_tick: u64, wall: i64) -> Option<i64> {
+    if changed_tick == 0 || changed_tick > now_tick {
+        return None;
+    }
+    let elapsed = now_tick - changed_tick;
+    (elapsed < 600000).then(|| wall + 600000 - elapsed as i64)
+}
+fn target_ready(task: &str, anchor: &Anchor, gate: &DeliveryGate) -> Result<(), Error> {
+    let began = Instant::now();
+    loop {
+        if gate.cancelled() {
+            return Err(Error::new("cancelled"));
+        }
+        if crate::input_state::activity() != anchor.activity {
+            return Err(Error::new("editing"));
+        }
+        if super::native::composition_target(task, anchor)? {
+            return Ok(());
+        }
+        if began.elapsed() >= Duration::from_millis(500) {
+            return Err(Error::new("targetChanged"));
+        }
+        pump();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+fn pump() {
+    unsafe {
+        let mut message = MSG::default();
+        while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,40 +1124,5 @@ mod tests {
         assert!(edit_expiry(700000, 100000, 1000000).is_none());
         assert!(edit_expiry(100, 101, 1000000).is_none());
         assert!(edit_expiry(100, 0, 1000000).is_none());
-    }
-}
-fn edit_expiry(now_tick: u64, changed_tick: u64, wall: i64) -> Option<i64> {
-    if changed_tick == 0 || changed_tick > now_tick {
-        return None;
-    }
-    let elapsed = now_tick - changed_tick;
-    (elapsed < 600000).then(|| wall + 600000 - elapsed as i64)
-}
-fn target_ready(task: &str, anchor: &Anchor, gate: &DeliveryGate) -> Result<(), Error> {
-    let began = Instant::now();
-    loop {
-        if gate.cancelled() {
-            return Err(Error::new("cancelled"));
-        }
-        if crate::input_state::activity() != anchor.activity {
-            return Err(Error::new("editing"));
-        }
-        if super::native::composition_target(task, anchor)? {
-            return Ok(());
-        }
-        if began.elapsed() >= Duration::from_millis(500) {
-            return Err(Error::new("targetChanged"));
-        }
-        pump();
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-fn pump() {
-    unsafe {
-        let mut message = MSG::default();
-        while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
     }
 }

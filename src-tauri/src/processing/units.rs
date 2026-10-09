@@ -297,7 +297,7 @@ mod tests {
     fn invalid_source_ranges_are_rejected_without_panicking_or_aliasing() {
         let segments = vec![seg(1, "中文🙂", true)];
         let original = next(1, &segments, 0, false).unwrap().unwrap();
-        for range in [2..1, 0..usize::MAX, 0..2] {
+        for range in [std::ops::Range { start: 2, end: 1 }, 0..usize::MAX, 0..2] {
             let mut unit = original.clone();
             unit.source[0].chars = range;
             assert!(!unit.matches(1, &segments));
