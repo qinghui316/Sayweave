@@ -7,7 +7,7 @@ const tag=process.env.SAYWEAVE_RELEASE_TAG??`v${pkg.version}`;
 const output=resolve(root,process.env.SAYWEAVE_RELEASE_DIR??'release/sayweave');
 const nsis=resolve(root,'src-tauri/target/release/bundle/nsis');
 const files=await (await import('node:fs/promises')).readdir(nsis);
-const installer=files.find(name=>/setup.*\.exe$/i.test(name));
+const installer=files.find(name=>name.includes(`_${pkg.version}_`)&&/setup.*\.exe$/i.test(name));
 if(!installer)throw new Error('NSIS installer not found');
 const signature=`${installer}.sig`;
 if(!files.includes(signature))throw new Error('NSIS updater signature not found');
