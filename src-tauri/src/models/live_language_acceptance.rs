@@ -324,3 +324,185 @@ fn stamp(id: &str, revision: i64, input: &ConfigInput, template: &str) -> Analys
         strategy_version: "application-learning-v1".into(),
     }
 }
+
+#[tokio::test]
+#[ignore = "Authorized registered synthetic edit to selected-model learning and next-session evaluation"]
+async fn selected_observed_edit_evaluation() {
+    assert_eq!(
+        std::env::var("SAYWEAVE_LIVE_LANGUAGE_ACCEPTANCE").as_deref(),
+        Ok("selected-default-synthetic")
+    );
+    assert!(std::env::var_os("SAYWEAVE_DATA_ACCEPTANCE_ID").is_none());
+    let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("../.local");
+    let native: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(folder.join("language-registered-observation.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(native["passed"], true);
+    assert_eq!(native["registered"], true);
+    assert_eq!(native["cleanup"], true);
+    let mut evidence: EditEvidence = serde_json::from_value(
+        native["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["target"] == "area")
+            .unwrap()["evidence"][0]
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(evidence.application.key, "web");
+    assert!(
+        evidence.expires_at > crate::data::repository::now(),
+        "Need fresh native edit evidence"
+    );
+    assert_eq!(
+        (&*evidence.before, &*evidence.after),
+        ("项目名是起蓝。", "项目名是绮蓝。")
+    );
+    let db = rusqlite::Connection::open_with_flags(
+        Path::new(&std::env::var("APPDATA").unwrap())
+            .join("local.sayweave.skeleton/data/dictionary.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let counts = || {
+        ["speech_records", "model_configs", "model_defaults"].map(|table| {
+            db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        })
+    };
+    let before_counts = counts();
+    assert!(before_counts[0] > 0);
+    let (id,revision,input,reference)=db.query_row("SELECT c.id,c.revision,c.name,c.protocol,c.base_url,c.model_id,c.credential_ref FROM model_defaults d JOIN model_configs c ON c.id=d.config_id WHERE d.usage='text' AND c.text=1",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,ConfigInput{name:r.get(2)?,protocol:r.get(3)?,base_url:r.get(4)?,model_id:r.get(5)?,usages:vec![Usage::Text]},r.get::<_,String>(6)?))).unwrap();
+    let input = input.validate().unwrap();
+    let key = WindowsCredentials::new("local.sayweave.skeleton.release".into())
+        .get(&reference)
+        .unwrap();
+    let provider = Provider::new(Arc::new(crate::network::RequestCoordinator::default())).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let data = DataWorker::start(root.path().to_path_buf()).unwrap();
+    let frozen = language_learning::snapshot(&data, evidence.application.clone())
+        .await
+        .unwrap();
+    // Rebase only the isolated database setting epoch; the native task/turn/op,
+    // actual before/after, application and expiry remain the captured receipt.
+    evidence.settings_revision = frozen.settings.revision;
+    language_learning::operation(&data, DbOperation::SaveEdit(evidence.clone()))
+        .await
+        .unwrap();
+    let messages =
+        language_learning::edit_messages(&evidence, &json!({"terms":[],"ambiguous_candidates":[]}))
+            .unwrap();
+    let generated = provider
+        .generate_unit(
+            &input,
+            &key,
+            &uuid::Uuid::new_v4().to_string(),
+            &messages,
+            tokio::time::Instant::now() + Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+    let body = generated
+        .text
+        .trim()
+        .strip_prefix("```json")
+        .and_then(|b| b.strip_suffix("```"))
+        .unwrap_or(generated.text.trim())
+        .trim();
+    let decision: LexicalDecision = serde_json::from_str(body).unwrap();
+    assert_eq!(decision.class, EditClass::Lexical);
+    assert_eq!(decision.term.as_deref(), Some("绮蓝"));
+    language_learning::operation(
+        &data,
+        DbOperation::ClassifyEdit {
+            id: evidence.id.clone(),
+            settings_revision: frozen.settings.revision,
+            decision: decision.clone(),
+            analysis: stamp(&id, revision, &input, "lexical-v1"),
+        },
+    )
+    .await
+    .unwrap();
+    let Output::Page(terms) = data
+        .request(
+            "main",
+            Operation::List(crate::contracts::dictionary::Query {
+                kind: Kind::Term,
+                search: "".into(),
+                page: 1,
+                source: Some(Source::Automatic),
+            }),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("term page")
+    };
+    assert_eq!(terms.records.len(), 1);
+    assert_eq!(terms.records[0].original, "绮蓝");
+    let next = language_learning::snapshot(&data, evidence.application.clone())
+        .await
+        .unwrap();
+    let dictionary = DictionaryIndex::new(terms.records.clone());
+    let request = prompt::build_with_context(
+        &evidence.raw,
+        "",
+        &dictionary,
+        Some(&next.application),
+        &next.preferences,
+    )
+    .unwrap();
+    let result = provider
+        .generate_unit(
+            &input,
+            &key,
+            &uuid::Uuid::new_v4().to_string(),
+            &request.messages,
+            tokio::time::Instant::now() + Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+    assert!(
+        result.text.contains("绮蓝"),
+        "Next-session term was not used: {}",
+        result.text
+    );
+    // Feed one identical existing synthetic recording with the newly learned
+    // term. Prior no-hint comparison is retained, not rerun here.
+    let (speech_id,speech_revision,speech_input,speech_ref)=db.query_row("SELECT c.id,c.revision,c.name,c.protocol,c.base_url,c.model_id,c.credential_ref FROM model_configs c JOIN model_defaults d ON d.config_id=c.id WHERE d.usage='speech'",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,ConfigInput{name:r.get(2)?,protocol:r.get(3)?,base_url:r.get(4)?,model_id:r.get(5)?,usages:vec![Usage::Speech]},r.get::<_,String>(6)?))).unwrap();
+    let cfg = crate::models::ExecutableConfiguration {
+        id: speech_id,
+        revision: speech_revision,
+        input: speech_input.validate().unwrap(),
+        key: WindowsCredentials::new("local.sayweave.skeleton.release".into())
+            .get(&speech_ref)
+            .unwrap(),
+    };
+    let words = terms
+        .records
+        .iter()
+        .map(|t| t.original.clone())
+        .collect::<Vec<_>>();
+    let actual = crate::speech::learned_term_followup(
+        &cfg,
+        &folder.join("language-hotwords-chinese.wav"),
+        &words,
+    )
+    .await;
+    assert!(
+        actual.contains("绮蓝"),
+        "Learned ASR hotword was not observed: {actual}"
+    );
+    assert_eq!(before_counts, counts());
+    let report = json!({"passed":true,"registeredSyntheticEdit":true,"readOnlyDailyProfile":true,"settingsEpochRebasedForIsolatedDatabase":true,"evidence":evidence,"classification":decision,"modelId":input.model_id,"classifyElapsedMs":generated.elapsed_ms,"automaticTerms":words,"nextSessionOutput":result.text,"nextSessionElapsedMs":result.elapsed_ms,"nextSpeechOutput":actual,"countsBefore":before_counts,"countsAfter":counts()});
+    std::fs::write(
+        folder.join("language-observed-learning.json"),
+        serde_json::to_vec_pretty(&report).unwrap(),
+    )
+    .unwrap();
+    data.shutdown().await;
+}

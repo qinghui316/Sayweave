@@ -9,6 +9,8 @@ mod live_continuation;
 mod live_hotwords;
 pub mod qwen;
 mod recognition;
+#[cfg(all(test, windows))]
+pub(crate) use live_hotwords::learned_term_followup;
 #[cfg(test)]
 mod tests;
 mod transport;

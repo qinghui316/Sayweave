@@ -6,6 +6,40 @@ use crate::models::{
 };
 use serde_json::json;
 use std::{path::PathBuf, time::Duration};
+/// Integration-fixture helper: the speech owner keeps the supplier connection
+/// and decoding private. This is compiled only in the existing test module.
+pub(crate) async fn learned_term_followup(
+    cfg: &ExecutableConfiguration,
+    path: &std::path::Path,
+    words: &[String],
+) -> String {
+    let mut wav = hound::WavReader::open(path).unwrap();
+    assert_eq!(
+        (
+            wav.spec().sample_rate,
+            wav.spec().channels,
+            wav.spec().bits_per_sample
+        ),
+        (16000, 1, 16)
+    );
+    let pcm = wav.samples::<i16>().collect::<Result<Vec<_>, _>>().unwrap();
+    assert!(pcm.len() < 16000 * 30);
+    let mut speech =
+        RecognitionSession::open_with_hotwords(cfg, &uuid::Uuid::new_v4().to_string(), words)
+            .await
+            .unwrap();
+    let mut position = 0;
+    let mut finished = false;
+    let mut actual = String::new();
+    let mut timer = tokio::time::interval(Duration::from_millis(60));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tokio::time::timeout(Duration::from_secs(45),async {loop{tokio::select!{
+        _=timer.tick(),if !finished=>{if position<pcm.len(){let end=(position+960).min(pcm.len());speech.send_pcm(&pcm[position..end]).await.unwrap();position=end;}else{speech.finish().await.unwrap();finished=true;}},
+        event=speech.next_event()=>match event.unwrap(){Event::Update(v)=>actual=v.text(false),Event::Finished=>break,Event::Heartbeat=>(),}
+    }}}).await.unwrap();
+    drop(speech);
+    actual
+}
 #[tokio::test]
 #[ignore = "Explicit authorized ASR hotword comparison, synthetic audio only"]
 async fn selected_hotword_comparison() {
