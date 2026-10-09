@@ -110,7 +110,13 @@ pub fn endpoint(base: &str) -> Result<String, Error> {
     u.set_path("/api-ws/v1/inference");
     Ok(u.to_string())
 }
-pub async fn connect(base: &str, key: &str, model: &str, task: &str) -> Result<Socket, Error> {
+pub async fn connect(
+    base: &str,
+    key: &str,
+    model: &str,
+    task: &str,
+    hotwords: &[String],
+) -> Result<Socket, Error> {
     let mut request = endpoint(base)?
         .into_client_request()
         .map_err(|_| Error::new("invalid"))?;
@@ -122,13 +128,21 @@ pub async fn connect(base: &str, key: &str, model: &str, task: &str) -> Result<S
     );
     let mut socket = super::transport::connect(base, request).await?;
     socket
-        .send(Message::Text(start_request(model, task).to_string().into()))
+        .send(Message::Text(
+            start_request(model, task, hotwords).to_string().into(),
+        ))
         .await
         .map_err(|_| Error::new("network"))?;
     Ok(socket)
 }
-fn start_request(model: &str, task: &str) -> Value {
-    json!({"header":{"action":"run-task","task_id":task,"streaming":"duplex"},"payload":{"task_group":"audio","task":"asr","function":"recognition","model":model,"parameters":{"format":"pcm","sample_rate":16000,"heartbeat":true,"semantic_punctuation_enabled":false,"max_sentence_silence":800},"input":{}}})
+fn start_request(model: &str, task: &str, hotwords: &[String]) -> Value {
+    let mut value = json!({"header":{"action":"run-task","task_id":task,"streaming":"duplex"},"payload":{"task_group":"audio","task":"asr","function":"recognition","model":model,"parameters":{"format":"pcm","sample_rate":16000,"heartbeat":true,"semantic_punctuation_enabled":false,"max_sentence_silence":800},"input":{}}});
+    let words = super::hotwords::select(hotwords, 100);
+    if !words.is_empty() {
+        value["payload"]["parameters"]["vocabulary"] =
+            Value::Object(words.into_iter().map(|word| (word, json!(4))).collect());
+    }
+    value
 }
 
 pub async fn receive(socket: &mut Socket) -> Result<Value, Error> {
@@ -151,12 +165,32 @@ pub async fn receive(socket: &mut Socket) -> Result<Value, Error> {
 mod boundary_tests {
     use super::*;
     #[test]
+    fn hotwords_use_vocabulary_weights_and_keep_recording_parameters() {
+        let words = (0..120).map(|i| format!("词条{i}")).collect::<Vec<_>>();
+        let request = start_request("qwen-audio-3.1-asr-flash-streaming", "task", &words);
+        let vocabulary = request["payload"]["parameters"]["vocabulary"]
+            .as_object()
+            .unwrap();
+        assert_eq!(vocabulary.len(), 100);
+        assert!(vocabulary.values().all(|v| *v == json!(4)));
+        assert_eq!(
+            request["payload"]["parameters"]["max_sentence_silence"],
+            800
+        );
+        assert_eq!(request["header"]["action"], "run-task");
+        assert!(
+            start_request("model", "task", &[])["payload"]["parameters"]
+                .get("vocabulary")
+                .is_none()
+        );
+    }
+    #[test]
     fn both_models_use_sentence_vad_without_ending_the_connection() {
         for model in [
             "qwen-audio-3.0-asr-flash-streaming",
             "qwen-audio-3.1-asr-flash-streaming",
         ] {
-            let request = start_request(model, "task");
+            let request = start_request(model, "task", &[]);
             assert_eq!(request["header"]["action"], "run-task");
             assert_eq!(
                 request["payload"]["parameters"]["max_sentence_silence"],

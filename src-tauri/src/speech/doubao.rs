@@ -51,8 +51,13 @@ fn encode(kind: u8, flags: u8, json: bool, payload: &[u8]) -> Result<Vec<u8>, Er
 pub fn audio_frame(bytes: &[u8], last: bool) -> Result<Vec<u8>, Error> {
     encode(0x20, if last { 2 } else { 0 }, false, bytes)
 }
-fn initial_frame() -> Result<Vec<u8>, Error> {
-    encode(0x10, 0, true, json!({"user":{"uid":"sayweave"},"audio":{"format":"pcm","codec":"raw","rate":16000,"bits":16,"channel":1},"request":{"model_name":"bigmodel","enable_itn":true,"enable_punc":true,"show_utterances":true,"result_type":"full","end_window_size":800}}).to_string().as_bytes())
+fn initial_frame(hotwords: &[String]) -> Result<Vec<u8>, Error> {
+    let mut value = json!({"user":{"uid":"sayweave"},"audio":{"format":"pcm","codec":"raw","rate":16000,"bits":16,"channel":1},"request":{"model_name":"bigmodel","enable_itn":true,"enable_punc":true,"show_utterances":true,"result_type":"full","end_window_size":800}});
+    let words = super::hotwords::select(hotwords, 100);
+    if !words.is_empty() {
+        value["request"]["corpus"] = json!({"context":json!({"hotwords":words.into_iter().map(|word|json!({"word":word})).collect::<Vec<_>>()}).to_string()});
+    }
+    encode(0x10, 0, true, value.to_string().as_bytes())
 }
 struct Response {
     value: Value,
@@ -343,12 +348,13 @@ pub async fn prepare(
     base: &str,
     key: &str,
     task: &str,
+    hotwords: &[String],
 ) -> Result<(transport::Socket, Transcript), Error> {
     for (index, resource) in RESOURCES.iter().enumerate() {
         let attempt = async {
             let mut socket = connect(base, key, task, resource).await?;
             socket
-                .send(Message::Binary(initial_frame()?.into()))
+                .send(Message::Binary(initial_frame(hotwords)?.into()))
                 .await
                 .map_err(|_| Error::new("network"))?;
             loop {
@@ -388,8 +394,24 @@ pub async fn prepare(
 mod tests {
     use super::*;
     #[test]
+    fn hotwords_are_serialized_under_corpus_not_the_flat_request() {
+        let frame = initial_frame(&["Sayweave".into(), "绮蓝引擎".into()]).unwrap();
+        let mut text = String::new();
+        GzDecoder::new(&frame[8..])
+            .read_to_string(&mut text)
+            .unwrap();
+        let request: Value = serde_json::from_str(&text).unwrap();
+        assert!(request["request"].get("context").is_none());
+        let context: Value =
+            serde_json::from_str(request["request"]["corpus"]["context"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(context["hotwords"][0]["word"], "Sayweave");
+        assert_eq!(context["hotwords"][1]["word"], "绮蓝引擎");
+        assert_eq!(request["request"]["end_window_size"], 800);
+    }
+    #[test]
     fn sentence_confirmation_keeps_stream_open_and_same_body_update() {
-        let frame = initial_frame().unwrap();
+        let frame = initial_frame(&[]).unwrap();
         let mut decoder = GzDecoder::new(&frame[8..]);
         let mut payload = String::new();
         decoder.read_to_string(&mut payload).unwrap();

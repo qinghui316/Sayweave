@@ -586,12 +586,14 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
             }
             let task = uuid::Uuid::new_v4().to_string();
             let mut expected = String::new();
+            let observation = std::env::var_os("SAYWEAVE_TSF_OBSERVATION_ONLY").is_some();
             for (operation, revision, action, text) in [
                 (1, 0, Action::Begin, ""),
                 (2, 1, Action::Update, "Sayweave 原位"),
                 (3, 2, Action::Update, "Sayweave 原位验证，🙂"),
                 (4, 2, Action::Commit, ""),
             ] {
+                let operation = operation + u64::from(observation && operation > 1);
                 let request = Request {
                     protocol: sayweave_text_service::wire::PROTOCOL,
                     capability: capability.clone(),
@@ -619,6 +621,24 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                 if reply.operation != operation || !reply.applied {
                     return Err(format!("owned edit rejected: {}", reply.code).into());
                 }
+                if observation && action == Action::Begin {
+                    let watch = exchange(
+                        &pipe,
+                        &capability,
+                        &task,
+                        1,
+                        2,
+                        0,
+                        Action::ObserveStart,
+                        "",
+                        false,
+                    )?;
+                    if !watch.applied
+                        || watch.edit_observation.as_ref().map(|o| o.capability) != Some(2)
+                    {
+                        return Err("optional observation capability unavailable".into());
+                    }
+                }
                 if action == Action::Update {
                     expected = text.into();
                 }
@@ -642,6 +662,104 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                         "controlText"
                     }
                 );
+            }
+            if observation {
+                // Observer installation is deferred until the write callback returns.
+                pump(Duration::from_millis(120));
+                let foreign =
+                    manager
+                        .cast::<ITfClientId>()?
+                        .GetClientId(&windows::core::GUID::from_u128(
+                            0x9da150371765447aa05db6c9bb370a60,
+                        ))?;
+                if plain {
+                    SendMessageW(editor, 0x00B1, Some(WPARAM(11)), Some(LPARAM(13)));
+                    let keys = "更正"
+                        .encode_utf16()
+                        .flat_map(|unit| {
+                            [false, true].map(move |up| INPUT {
+                                r#type: INPUT_KEYBOARD,
+                                Anonymous: INPUT_0 {
+                                    ki: KEYBDINPUT {
+                                        wScan: unit,
+                                        dwFlags: KEYEVENTF_UNICODE
+                                            | if up {
+                                                KEYEVENTF_KEYUP
+                                            } else {
+                                                KEYBD_EVENT_FLAGS(0)
+                                            },
+                                        ..Default::default()
+                                    },
+                                },
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    if SendInput(&keys, std::mem::size_of::<INPUT>() as i32) != keys.len() as u32 {
+                        return Err("fixture edit input incomplete".into());
+                    }
+                } else {
+                    let edit: ITfEditSession = UserTextEdit {
+                        context: context.clone(),
+                        start: 11,
+                        length: 2,
+                        text: "更正".into(),
+                    }
+                    .into();
+                    context
+                        .RequestEditSession(foreign, &edit, TF_ES_SYNC | TF_ES_READWRITE)?
+                        .ok()?;
+                }
+                pump(Duration::from_millis(30));
+                if editor_text(editor)? != "Sayweave 原位更正，🙂" {
+                    return Err("observed edit target text assertion failed".into());
+                }
+                let read = exchange(
+                    &pipe,
+                    &capability,
+                    &task,
+                    1,
+                    6,
+                    2,
+                    Action::ObserveStop,
+                    "",
+                    false,
+                )?;
+                let records = read
+                    .edit_observation
+                    .ok_or("missing observation payload")?
+                    .records;
+                if records.len() != 1
+                    || records[0].before != "Sayweave 原位验证，🙂"
+                    || records[0].after != "Sayweave 原位更正，🙂"
+                    || !records[0].ended
+                    || records[0].operation != 5
+                {
+                    return Err(format!(
+                        "observed receipt mismatch count={} before_units={} after_units={}",
+                        records.len(),
+                        records
+                            .first()
+                            .map_or(0, |r| r.before.encode_utf16().count()),
+                        records
+                            .first()
+                            .map_or(0, |r| r.after.encode_utf16().count())
+                    )
+                    .into());
+                }
+                if read.mutation != Mutation::NotAttempted {
+                    return Err("observation attempted mutation".into());
+                }
+                println!("owned receipt observation before_after_actual_text=true read_only=true");
+                observation_ranges_fixture(
+                    editor,
+                    &context,
+                    &manager,
+                    &pipe,
+                    &capability,
+                    foreign,
+                    plain,
+                )?;
+                return Ok(());
             }
             prefix_fixture(editor, &manager, &pipe, &capability)?;
             prefix_fault_fixture(component, editor, &pipe, &capability)?;
@@ -1168,6 +1286,398 @@ fn load_processor(
 struct UserPropertyEdit {
     context: ITfContext,
     mode: u8,
+}
+#[cfg(feature = "acceptance")]
+#[windows::core::implement(ITfEditSession)]
+struct UserTextEdit {
+    context: ITfContext,
+    start: i32,
+    length: i32,
+    text: String,
+}
+#[cfg(feature = "acceptance")]
+fn observation_ranges_fixture(
+    editor: windows::Win32::Foundation::HWND,
+    context: &ITfContext,
+    manager: &ITfThreadMgr,
+    pipe: &Pipe,
+    capability: &str,
+    foreign: u32,
+    plain: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use windows::{
+        Win32::{Foundation::*, UI::Input::KeyboardAndMouse::*},
+        core::PCWSTR,
+    };
+    unsafe {
+        for (label, input, from, to, replacement, expected, valid) in [
+            (
+                "longer",
+                "术语🙂\n尾部",
+                0usize,
+                2usize,
+                "正确术语",
+                "正确术语🙂\n尾部",
+                true,
+            ),
+            (
+                "shorter",
+                "正确术语🙂\n尾部",
+                0,
+                4,
+                "词",
+                "词🙂\n尾部",
+                true,
+            ),
+            (
+                "surrogate",
+                "术语🙂\n尾部",
+                2,
+                4,
+                "😀",
+                "术语😀\n尾部",
+                true,
+            ),
+            ("outside", "同词", 0, 2, "新词", "新词", false),
+            ("right", "同词", 2, 2, "新词", "同词新词", false),
+            ("ime", "术语", 0, 2, "词典", "词典", true),
+            ("undo", "术语", 0, 2, "词典", "词典", true),
+            ("revert", "术语", 0, 2, "词典", "词典", true),
+            ("handoffExplicit", "术语", 0, 2, "词典", "词典", true),
+            ("readonly", "术语", 0, 2, "词典", "词典", true),
+            ("originalRestore", "术语", 0, 2, "甲词", "甲词", false),
+        ] {
+            if !plain && matches!(label, "ime" | "undo" | "readonly") {
+                continue;
+            }
+            // Legacy EDIT may expose an empty TSF original even with a native
+            // selection. Its real WM_UNDO is tested above; do not invent an
+            // original-text proof for an ordinary typed replacement.
+            if plain && label == "originalRestore" {
+                continue;
+            }
+            let prefix = if label == "outside" { "同词" } else { "" };
+            let initial_body = if label == "originalRestore" {
+                "甲词"
+            } else {
+                prefix
+            };
+            let initial = initial_body.encode_utf16().chain([0]).collect::<Vec<_>>();
+            SetWindowTextW(editor, PCWSTR(initial.as_ptr()))?;
+            SendMessageW(
+                editor,
+                0x00B1,
+                Some(WPARAM(prefix.encode_utf16().count())),
+                Some(LPARAM(if label == "originalRestore" {
+                    initial_body.encode_utf16().count() as isize
+                } else {
+                    prefix.encode_utf16().count() as isize
+                })),
+            );
+            pump(Duration::from_millis(60));
+            let task = uuid::Uuid::new_v4().to_string();
+            for (op, rev, action, text) in [
+                (1, 0, Action::Begin, ""),
+                (2, 0, Action::ObserveStart, ""),
+                (3, 1, Action::Update, input),
+                (4, 1, Action::Commit, ""),
+            ] {
+                let action = if label == "handoffExplicit" && action == Action::Commit {
+                    Action::Handoff
+                } else {
+                    action
+                };
+                let result = exchange(pipe, capability, &task, 1, op, rev, action, text, false)?;
+                if !result.applied {
+                    return Err(format!("receipt setup {label}: {}", result.code).into());
+                }
+            }
+            pump(Duration::from_millis(120));
+            let before = if label == "handoff" && plain {
+                composition_text(context)?
+            } else {
+                editor_text(editor)?
+            };
+            if !observation_text_equal(&before, &format!("{prefix}{input}")) {
+                return Err(format!("receipt initial text {label}").into());
+            }
+            if label == "undo" {
+                SendMessageW(editor, 0x00CD, None, None);
+            }
+            if label == "handoff" {
+                let dispatch = manager.cast::<ITfKeystrokeMgr>()?;
+                if !dispatch
+                    .TestKeyDown(WPARAM(VK_BACK.0 as usize), LPARAM(1))?
+                    .as_bool()
+                    || dispatch
+                        .KeyDown(WPARAM(VK_BACK.0 as usize), LPARAM(1))?
+                        .as_bool()
+                {
+                    return Err("handoff dispatcher did not forward original key".into());
+                }
+                let keys = [
+                    (VK_CONTROL, false),
+                    (VIRTUAL_KEY(0x41), false),
+                    (VIRTUAL_KEY(0x41), true),
+                    (VK_CONTROL, true),
+                ]
+                .map(|(key, up)| INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: key,
+                            dwFlags: if up {
+                                KEYEVENTF_KEYUP
+                            } else {
+                                KEYBD_EVENT_FLAGS(0)
+                            },
+                            ..Default::default()
+                        },
+                    },
+                });
+                if SendInput(&keys, std::mem::size_of::<INPUT>() as i32) != keys.len() as u32 {
+                    return Err("handoff keys incomplete".into());
+                }
+                pump(Duration::from_millis(60));
+                if editor_text(editor)? != input {
+                    return Err("handoff actual text was not committed before the key".into());
+                }
+            }
+            // Native EDIT uses CRLF coordinates. RichEdit exposes one CR per line.
+            // These changes stay before the first newline, so coordinates are exact.
+            if plain {
+                if label == "ime" {
+                    SendMessageW(editor, WM_IME_STARTCOMPOSITION, None, None);
+                }
+                SendMessageW(
+                    editor,
+                    0x00B1,
+                    Some(WPARAM(from)),
+                    Some(LPARAM(to as isize)),
+                );
+                let keys = replacement
+                    .encode_utf16()
+                    .flat_map(|unit| {
+                        [false, true].map(move |up| INPUT {
+                            r#type: INPUT_KEYBOARD,
+                            Anonymous: INPUT_0 {
+                                ki: KEYBDINPUT {
+                                    wScan: unit,
+                                    dwFlags: KEYEVENTF_UNICODE
+                                        | if up {
+                                            KEYEVENTF_KEYUP
+                                        } else {
+                                            KEYBD_EVENT_FLAGS(0)
+                                        },
+                                    ..Default::default()
+                                },
+                            },
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if label == "undo" {
+                    let text = replacement.encode_utf16().chain([0]).collect::<Vec<_>>();
+                    SendMessageW(
+                        editor,
+                        0x00C2,
+                        Some(WPARAM(1)),
+                        Some(LPARAM(text.as_ptr() as isize)),
+                    );
+                } else if SendInput(&keys, std::mem::size_of::<INPUT>() as i32) != keys.len() as u32
+                {
+                    return Err("receipt input incomplete".into());
+                }
+            } else {
+                let edit: ITfEditSession = UserTextEdit {
+                    context: context.clone(),
+                    start: from as i32,
+                    length: (to - from) as i32,
+                    text: replacement.into(),
+                }
+                .into();
+                context
+                    .RequestEditSession(foreign, &edit, TF_ES_SYNC | TF_ES_READWRITE)?
+                    .ok()?;
+            }
+            pump(Duration::from_millis(50));
+            let actual = editor_text(editor)?;
+            let expected_all = if label != "outside" {
+                expected.to_owned()
+            } else {
+                format!("{expected}{input}")
+            };
+            if !observation_text_equal(&actual, &expected_all) {
+                return Err(format!("receipt actual text {label}: {actual:?}").into());
+            }
+            if label == "ime" {
+                let reading = exchange(
+                    pipe,
+                    capability,
+                    &task,
+                    1,
+                    5,
+                    1,
+                    Action::ObservePoll,
+                    "",
+                    false,
+                )?;
+                if !reading
+                    .edit_observation
+                    .ok_or("missing IME receipt")?
+                    .records
+                    .is_empty()
+                {
+                    return Err("incomplete IME was exposed".into());
+                }
+                SendMessageW(editor, WM_IME_ENDCOMPOSITION, None, None);
+            }
+            if label == "undo" {
+                let keys = [
+                    (VK_CONTROL, false),
+                    (
+                        windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0x5a),
+                        false,
+                    ),
+                    (
+                        windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0x5a),
+                        true,
+                    ),
+                    (VK_CONTROL, true),
+                ]
+                .map(|(key, up)| INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: key,
+                            dwFlags: if up {
+                                KEYEVENTF_KEYUP
+                            } else {
+                                KEYBD_EVENT_FLAGS(0)
+                            },
+                            ..Default::default()
+                        },
+                    },
+                });
+                if SendInput(&keys, std::mem::size_of::<INPUT>() as i32) != keys.len() as u32 {
+                    return Err("undo keys incomplete".into());
+                }
+                pump(Duration::from_millis(30));
+                // Legacy EDIT keeps one undo group for the preceding IMM delivery;
+                // this actual Ctrl+Z clears that group. Observation must not learn it.
+                if !editor_text(editor)?.is_empty() {
+                    return Err(format!(
+                        "undo target did not restore original text: fixture_actual={:?}",
+                        editor_text(editor)?
+                    )
+                    .into());
+                }
+            }
+            if label == "revert" {
+                if plain {
+                    SendMessageW(
+                        editor,
+                        0x00B1,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(expected.encode_utf16().count() as isize)),
+                    );
+                    let text = input.encode_utf16().chain([0]).collect::<Vec<_>>();
+                    SendMessageW(
+                        editor,
+                        0x00C2,
+                        Some(WPARAM(1)),
+                        Some(LPARAM(text.as_ptr() as isize)),
+                    );
+                } else {
+                    let edit: ITfEditSession = UserTextEdit {
+                        context: context.clone(),
+                        start: 0,
+                        length: expected.encode_utf16().count() as i32,
+                        text: input.into(),
+                    }
+                    .into();
+                    context
+                        .RequestEditSession(foreign, &edit, TF_ES_SYNC | TF_ES_READWRITE)?
+                        .ok()?;
+                }
+                pump(Duration::from_millis(30));
+                if !observation_text_equal(&editor_text(editor)?, input) {
+                    return Err("revert did not restore actual output".into());
+                }
+            }
+            if label == "readonly" {
+                SendMessageW(editor, 0x00CF, Some(WPARAM(1)), None);
+            }
+            let result = exchange(
+                pipe,
+                capability,
+                &task,
+                1,
+                6,
+                1,
+                Action::ObserveStop,
+                "",
+                false,
+            )?;
+            let records = result
+                .edit_observation
+                .ok_or("receipt response missing")?
+                .records;
+            if label == "readonly" {
+                SendMessageW(editor, 0x00CF, Some(WPARAM(0)), None);
+            }
+            let valid = valid && !matches!(label, "undo" | "readonly" | "revert");
+            if result.mutation != Mutation::NotAttempted
+                || (valid
+                    && (records.len() != 1
+                        || !observation_text_equal(&records[0].before, input)
+                        || !observation_text_equal(&records[0].after, expected)))
+                || (!valid && !records.is_empty())
+            {
+                return Err(format!(
+                    "receipt scope assertion {label} records={} fixture_values={:?}",
+                    records.len(),
+                    records
+                        .iter()
+                        .map(|r| (&r.before, &r.after, r.composing, r.ended))
+                        .collect::<Vec<_>>()
+                )
+                .into());
+            }
+            println!("owned receipt scenario={label} actual_text=true scoped_edit=true");
+        }
+        Ok(())
+    }
+}
+#[cfg(feature = "acceptance")]
+fn observation_text_equal(actual: &str, expected: &str) -> bool {
+    actual.replace("\r\n", "\n").replace('\r', "\n")
+        == expected.replace("\r\n", "\n").replace('\r', "\n")
+}
+#[cfg(feature = "acceptance")]
+impl ITfEditSession_Impl for UserTextEdit_Impl {
+    fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        unsafe {
+            let range = self.context.GetStart(ec)?;
+            let mut shifted = 0;
+            range.ShiftStart(ec, self.start, &mut shifted, std::ptr::null())?;
+            if shifted != self.start {
+                return Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ));
+            }
+            range.ShiftEnd(ec, self.length, &mut shifted, std::ptr::null())?;
+            if shifted != self.length {
+                return Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_FAIL,
+                ));
+            }
+            range.SetText(
+                ec,
+                TF_ST_CORRECTION,
+                &self.text.encode_utf16().collect::<Vec<_>>(),
+            )
+        }
+    }
 }
 #[cfg(feature = "acceptance")]
 #[windows::core::implement(ITfEditSession)]

@@ -7,6 +7,7 @@ mod data;
 mod dictation;
 mod history;
 mod input_state;
+mod language_learning;
 mod models;
 mod network;
 mod processing;
@@ -376,6 +377,8 @@ fn tray_action(app: &tauri::AppHandle, id: &str) -> Result<(), RuntimeError> {
             app.state::<dictation::DictationCoordinator>().shutdown();
             app.state::<speech::SpeechService>().shutdown();
             app.state::<windows_input::WindowsInputService>().shutdown();
+            app.state::<language_learning::LanguageLearning>()
+                .shutdown();
             service.begin_shutdown();
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -388,6 +391,9 @@ fn tray_action(app: &tauri::AppHandle, id: &str) -> Result<(), RuntimeError> {
                         .drain()
                         .await;
                     crate::archive::drain().await;
+                    app.state::<language_learning::LanguageLearning>()
+                        .drain()
+                        .await;
                     service.finish_shutdown().await;
                 })
                 .await;
@@ -568,6 +574,8 @@ pub fn run() {
             dictation_copy,
             dictation_dismiss,
             dictation_settings,
+            language_learning::language_settings,
+            language_learning::language_save,
             runtime_snapshot,
             runtime_demo,
             runtime_window,
@@ -652,6 +660,9 @@ pub fn run() {
                     )));
                     app.manage(shortcuts::ShortcutService::new(worker.clone()));
                     app.manage(worker);
+                    app.manage(language_learning::LanguageLearning::new(
+                        app.handle().clone(),
+                    ));
                     let handle = app.handle().clone();
                     let mut transcripts = handle
                         .state::<speech::SpeechService>()

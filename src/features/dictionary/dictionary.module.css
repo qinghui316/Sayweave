@@ -12,5 +12,6 @@
 .pagination { display: flex; align-items: center; gap: var(--space-12); }.pagination>span { flex: 1; }
 .empty { padding: var(--space-32) 0; display: flex; flex-direction: column; gap: var(--space-16); }
 .modal { width: min(480px,calc(100vw - 48px)); height: auto; max-height: calc(100vh - 64px); overflow-y: auto; }
+.sourceFilter { margin-bottom:var(--space-16);display:flex;justify-content:flex-start; }
 .form { padding: var(--space-32); display: flex; flex-direction: column; gap: var(--space-20); }.form h2 { font-size: var(--text-section); font-weight: 500; padding-right: var(--space-32); }.form footer { margin-top: var(--space-8); }
 @media(max-width:1000px) { .toolbar input { max-width: 240px; }.panel { padding: var(--space-16); } }

@@ -9,6 +9,95 @@ use windows::{
 };
 
 struct Array(*mut SAFEARRAY);
+/// Identity-only focus evidence. No name, value, text, URL or title is read.
+#[derive(Clone)]
+pub(super) struct FocusIdentity {
+    window: HWND,
+    class: String,
+    object: Option<IUnknown>,
+}
+impl FocusIdentity {
+    pub(super) fn capture() -> Result<Self> {
+        unsafe {
+            let window = GetFocus();
+            let mut process = 0;
+            if window.0.is_null()
+                || GetWindowThreadProcessId(window, Some(&mut process)) != GetCurrentThreadId()
+                || process != GetCurrentProcessId()
+            {
+                return Err(E_ACCESSDENIED.into());
+            }
+            let mut class = [0u16; 256];
+            let count = GetClassNameW(window, &mut class);
+            if count <= 0 {
+                return Err(E_FAIL.into());
+            }
+            let class = String::from_utf16_lossy(&class[..count as usize]);
+            if class == "Edit" || class.to_ascii_lowercase().starts_with("richedit") {
+                return Ok(Self {
+                    window,
+                    class,
+                    object: None,
+                });
+            }
+            let mut accessible: Option<IAccessible> = None;
+            AccessibleObjectFromWindow(
+                window,
+                OBJID_CLIENT.0 as u32,
+                &IAccessible::IID,
+                (&mut accessible as *mut Option<IAccessible>).cast(),
+            )?;
+            let mut accessible =
+                accessible.ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?;
+            for _ in 0..16 {
+                let focus = accessible.accFocus()?;
+                match focus.vt() {
+                    VT_DISPATCH => {
+                        accessible = IDispatch::try_from(&focus)?.cast()?;
+                    }
+                    VT_I4 => {
+                        let child = i32::try_from(&focus)?;
+                        if child != 0 {
+                            accessible = accessible.get_accChild(&focus)?.cast()?;
+                            continue;
+                        }
+                        let child = VARIANT::from(0i32);
+                        let role = i32::try_from(&accessible.get_accRole(&child)?)?;
+                        let state = i32::try_from(&accessible.get_accState(&child)?)? as u32;
+                        // A generic window/document focus is not an editable field identity.
+                        if [
+                            ROLE_SYSTEM_WINDOW as i32,
+                            ROLE_SYSTEM_CLIENT as i32,
+                            ROLE_SYSTEM_DOCUMENT as i32,
+                        ]
+                        .contains(&role)
+                            || state & STATE_SYSTEM_FOCUSED == 0
+                            || state & (STATE_SYSTEM_PROTECTED | STATE_SYSTEM_READONLY) != 0
+                        {
+                            return Err(E_ACCESSDENIED.into());
+                        }
+                        return Ok(Self {
+                            window,
+                            class,
+                            object: Some(accessible.cast()?),
+                        });
+                    }
+                    _ => return Err(E_NOINTERFACE.into()),
+                }
+            }
+            Err(E_FAIL.into())
+        }
+    }
+    pub(super) fn matches(&self) -> Result<bool> {
+        if unsafe { GetFocus() } != self.window {
+            return Ok(false);
+        }
+        let current = Self::capture()?;
+        Ok(current.window == self.window
+            && current.class == self.class
+            && current.object == self.object)
+    }
+}
 impl Drop for Array {
     fn drop(&mut self) {
         unsafe {

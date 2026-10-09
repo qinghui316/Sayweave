@@ -46,6 +46,9 @@ pub enum Action {
     Commit,
     Handoff,
     Abort,
+    ObserveStart,
+    ObservePoll,
+    ObserveStop,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Reply {
@@ -60,6 +63,35 @@ pub struct Reply {
     pub range_epoch: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settlement: Option<Settlement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_observation: Option<EditObservation>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct EditObservation {
+    pub capability: u32,
+    pub records: Vec<ObservedEdit>,
+    #[serde(default)]
+    pub active: u32,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ObservedEdit {
+    pub task: String,
+    pub turn: u64,
+    pub operation: u64,
+    pub revision: u64,
+    pub sequence: u64,
+    pub changed_tick: u64,
+    pub before: String,
+    pub after: String,
+    pub ended: bool,
+    pub composing: bool,
+    pub region: OutputRegion,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum OutputRegion {
+    Prefix,
+    Tail,
 }
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 pub struct Settlement {
@@ -107,6 +139,9 @@ impl Request {
                         && prefix.expected_revision < self.revision
                 }
                 (Action::Settle, None) => false,
+                (Action::ObserveStart | Action::ObservePoll | Action::ObserveStop, prefix) => {
+                    self.text.is_empty() && prefix.is_none()
+                }
                 (_, prefix) => prefix.is_none(),
             }
     }
@@ -199,6 +234,7 @@ mod tests {
         r.protocol = 1;
         assert!(!r.valid());
         let mut reply = Reply {
+            edit_observation: None,
             range_epoch: 0,
             settlement: None,
             operation: 1,

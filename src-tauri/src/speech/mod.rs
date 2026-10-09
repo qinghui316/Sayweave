@@ -2,8 +2,11 @@ pub mod audio;
 pub mod commands;
 pub mod continuous;
 mod doubao;
+mod hotwords;
 #[cfg(all(test, windows))]
 mod live_continuation;
+#[cfg(all(test, windows))]
+mod live_hotwords;
 pub mod qwen;
 mod recognition;
 #[cfg(test)]
@@ -142,6 +145,7 @@ struct Task {
     preferences: Preferences,
     replay: Option<Vec<i16>>,
     continuous: Option<continuous::Control>,
+    hotwords: Vec<String>,
     archive: crate::archive::Archive,
     record_lease: Mutex<Option<Arc<crate::history::RecordLease>>>,
     audio_archive: Mutex<Option<(tokio::sync::oneshot::Receiver<bool>, u64)>>,
@@ -165,6 +169,7 @@ pub struct NativeStart {
     pub cancel: watch::Sender<u8>,
     pub terminal: tokio::sync::oneshot::Sender<NativeTerminal>,
     pub continuous: Option<continuous::Control>,
+    pub hotwords: Vec<String>,
 }
 /// Native cumulative recognition stream; separate from renderer and lifecycle projection.
 #[derive(Clone, Default)]
@@ -555,6 +560,22 @@ impl SpeechService {
             return Err(e);
         }
         let continuous = context.as_ref().and_then(|c| c.continuous.clone());
+        let hotwords = if let Some(context) = &context {
+            context.hotwords.clone()
+        } else {
+            match app
+                .state::<crate::data::DataWorker>()
+                .request_admitted(crate::data::Operation::Processing(
+                    crate::contracts::processing::DbOperation::DictionarySnapshot,
+                ))
+                .await
+            {
+                Ok(crate::data::Output::Processing(
+                    crate::contracts::processing::DbOutput::Dictionary(records),
+                )) => crate::processing::prompt::DictionaryIndex::new(records).hotwords(),
+                _ => vec![],
+            }
+        };
         let source = context.as_ref().map_or(
             if retry_id.is_some() {
                 Source::History
@@ -622,6 +643,7 @@ impl SpeechService {
             preferences,
             replay,
             continuous,
+            hotwords,
         };
         tauri::async_runtime::spawn(async move {
             let service = app.state::<SpeechService>();
@@ -750,6 +772,7 @@ impl SpeechService {
                 &task.id,
                 task.continuous.clone(),
                 app.state::<ModelService>().requests.clone(),
+                &task.hotwords,
             )
             .await?;
             if *cancel.borrow() >= 2 {

@@ -6,7 +6,7 @@ export class BrowserDictionary implements DictionaryPort {
   async list(query: DictionaryQuery) {
     if(!Number.isInteger(query.page)||query.page<0||[...query.search].length>128||/\p{Cc}/u.test(query.search)) throw new DictionaryError('invalid');
     const key=dictionaryKey(query.search);
-    const records=this.records.filter(r=>r.kind===query.kind && [r.original,r.category,r.replacement].some(s=>s!==null && dictionaryKey(s).includes(key))).sort((a,b)=>b.updatedAt-a.updatedAt || (a.id<b.id?-1:a.id>b.id?1:0));
+    const records=this.records.filter(r=>r.kind===query.kind && (!query.source || (r.source??'manual')===query.source) && [r.original,r.category,r.replacement].some(s=>s!==null && dictionaryKey(s).includes(key))).sort((a,b)=>b.updatedAt-a.updatedAt || (a.id<b.id?-1:a.id>b.id?1:0));
     const page=Math.min(Math.max(1,query.page),Math.max(1,Math.ceil(records.length/50)));
     return {records:records.slice((page-1)*50,page*50).map(r=>({...r})),total:records.length,page};
   }
@@ -15,7 +15,7 @@ export class BrowserDictionary implements DictionaryPort {
     const duplicate=this.records.find(r=>r.kind===clean.kind && r.id!==existing?.id && dictionaryKey(r.original)===dictionaryKey(clean.original));
     if(duplicate) throw new DictionaryError('duplicate',duplicate.id);
     const now=Date.now();
-    const record: DictionaryRecord={...clean,id:existing?.id??crypto.randomUUID(),revision:(existing?.revision??0)+1,createdAt:existing?.createdAt??now,updatedAt:now};
+    const record: DictionaryRecord={...clean,source:'manual',id:existing?.id??crypto.randomUUID(),revision:(existing?.revision??0)+1,createdAt:existing?.createdAt??now,updatedAt:now};
     this.records=this.records.filter(r=>r.id!==record.id).concat(record); return {...record};
   }
   async create(input: DictionaryInput) { return this.save(input); }

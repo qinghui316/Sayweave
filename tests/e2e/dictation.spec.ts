@@ -63,7 +63,10 @@ test('device and shortcut controls fit both window sizes with shared styles and 
   await expect(dialog.getByText(chosen==='按住'?'按下开始，松开结束。':'按一下开始，再按一下结束。')).toBeVisible();
   for(const control of [device,dialog.getByRole('button',{name:'更改快捷键'}),dialog.getByRole('radio',{name:'点按',exact:true}),dialog.getByRole('radio',{name:'按住',exact:true}),dialog.getByRole('button',{name:'保存快捷键'})]){
    const unclipped=await control.evaluate(node=>{const box=node.getBoundingClientRect();for(let parent=node.parentElement;parent;parent=parent.parentElement){const css=getComputedStyle(parent);if(['auto','scroll','hidden'].includes(css.overflowY)){const clip=parent.getBoundingClientRect();if(box.top<clip.top||box.bottom>clip.bottom)return false;}}return true;});expect(unclipped).toBe(true);
-   const rect=await control.boundingBox();expect(rect).not.toBeNull();expect(rect!.height).toBeGreaterThanOrEqual(36);expect(rect!.y).toBeGreaterThanOrEqual(0);expect(rect!.y+rect!.height).toBeLessThan(height);expect(rect!.x+rect!.width).toBeLessThan(width);
+   // Choice feedback deliberately scales the visual surface; layout allocation
+   // remains 36px. Keep viewport/clipping assertions on the transformed surface.
+   const layoutHeight=await control.evaluate(node=>(node as HTMLElement).offsetHeight);expect(layoutHeight).toBeGreaterThanOrEqual(36);
+   const rect=await control.boundingBox();expect(rect).not.toBeNull();expect(rect!.y).toBeGreaterThanOrEqual(0);expect(rect!.y+rect!.height).toBeLessThan(height);expect(rect!.x+rect!.width).toBeLessThan(width);
   }
   await expect(dialog.getByText('全局快捷键',{exact:true})).toHaveCount(0);await expect(dialog.getByText('未配置',{exact:true})).toHaveCount(0);
   await page.screenshot({path:`.local/dictation-settings-${width}.png`});

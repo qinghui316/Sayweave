@@ -22,6 +22,7 @@ pub struct Context {
     pub provider: Arc<crate::models::provider::Provider>,
     pub configuration: Arc<ExecutableConfiguration>,
     pub dictionary: Arc<prompt::DictionaryIndex>,
+    pub language: Option<crate::contracts::language::Snapshot>,
     pub settings: Settings,
     pub data: DataWorker,
     run: Arc<OnceLock<Option<RunBinding>>>,
@@ -43,6 +44,16 @@ pub async fn settings(
         _ => Err(crate::contracts::dictionary::DataError::new("unavailable")),
     }
 }
+pub async fn dictionary(
+    app: &tauri::AppHandle,
+) -> Result<Arc<prompt::DictionaryIndex>, ModelError> {
+    let DbOutput::Dictionary(records) =
+        settings(&app.state::<DataWorker>(), DbOperation::DictionarySnapshot).await?
+    else {
+        return Err(ModelError::new("unavailable"));
+    };
+    Ok(Arc::new(prompt::DictionaryIndex::new(records)))
+}
 impl Context {
     #[cfg(test)]
     pub(crate) fn fixture(
@@ -60,6 +71,7 @@ impl Context {
                 revision: 1,
             }),
             dictionary: Arc::new(prompt::DictionaryIndex::new(vec![])),
+            language: None,
             settings: Settings {
                 enabled: true,
                 revision: 1,
@@ -74,6 +86,8 @@ impl Context {
         app: &tauri::AppHandle,
         mut cancel: watch::Receiver<u8>,
         task_id: &str,
+        dictionary: Arc<prompt::DictionaryIndex>,
+        language: Option<crate::contracts::language::Snapshot>,
     ) -> Result<Option<Self>, ModelError> {
         let preparation = async {
             let data = app.state::<DataWorker>();
@@ -89,16 +103,12 @@ impl Context {
                 Err(error) if error.code == "notConfigured" => return Ok(None),
                 Err(error) => return Err(error),
             };
-            let DbOutput::Dictionary(dictionary) =
-                settings(&data, DbOperation::DictionarySnapshot).await?
-            else {
-                return Err(ModelError::new("unavailable"));
-            };
             Ok(Some(Self {
                 task_id: task_id.into(),
                 provider: models.provider.clone(),
                 configuration: Arc::new(configuration),
-                dictionary: Arc::new(prompt::DictionaryIndex::new(dictionary)),
+                dictionary,
+                language,
                 settings: config,
                 data: data.inner().clone(),
                 run: Arc::new(OnceLock::new()),
@@ -121,8 +131,20 @@ impl Context {
         context: &str,
         deadline: tokio::time::Instant,
     ) -> Result<GeneratedText, ModelError> {
-        let prompt = prompt::build(&unit.text, context, &self.dictionary)
-            .map_err(|e| ModelError::new(e.code))?;
+        let prompt = prompt::build_with_context(
+            &unit.text,
+            context,
+            &self.dictionary,
+            self.language
+                .as_ref()
+                .filter(|s| s.settings.enabled)
+                .map(|s| &s.application),
+            self.language
+                .as_ref()
+                .filter(|s| s.settings.enabled)
+                .map_or(&[], |s| s.preferences.as_slice()),
+        )
+        .map_err(|e| ModelError::new(e.code))?;
         log::info!(target:"sayweave","operation=processing_request task_id={} unit_id={} turn={} prompt_version={} settings_revision={} source_chars={} prompt_bytes={} context_chars={} dictionary_items={}",self.task_id,unit.id,unit.turn,prompt::VERSION,self.settings.revision,unit.text.chars().count(),prompt.serialized_bytes,prompt.context_chars,prompt.dictionary.terms.len()+prompt.dictionary.corrections.len());
         let mut record = self.unit_record(unit)?;
         self.persist(&record);

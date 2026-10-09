@@ -119,7 +119,7 @@ async fn completed_date_correction_reaches_native_application_with_latest_tail()
         ),
     );
     actor.schedule(&mut state).unwrap();
-    let Command::Settle(_, prefix, tail, _, reply) = command(&native).await else {
+    let Command::Settle(_, prefix, tail, _, _, reply) = command(&native).await else {
         panic!("corrected prefix expected")
     };
     assert_eq!(prefix, cleaned);
@@ -169,7 +169,7 @@ async fn next_generation_overlaps_unacknowledged_prefix_and_uses_latest_tail() {
     actor.start_generation(&mut state).unwrap();
     generated(&mut state).await;
     actor.schedule(&mut state).unwrap();
-    let Command::Settle(_, prefix, tail, _, reply) = command(&native).await else {
+    let Command::Settle(_, prefix, tail, _, _, reply) = command(&native).await else {
         panic!("prefix expected")
     };
     assert_eq!(prefix, a);
@@ -202,7 +202,7 @@ async fn next_generation_overlaps_unacknowledged_prefix_and_uses_latest_tail() {
     acknowledge(&actor, &mut state).await;
     assert!(state.latest.text.ends_with("最新尾部🙂"));
     actor.schedule(&mut state).unwrap();
-    let Command::Settle(_, prefix, tail, _, reply) = command(&native).await else {
+    let Command::Settle(_, prefix, tail, _, _, reply) = command(&native).await else {
         panic!("second prefix expected")
     };
     assert_eq!(prefix, b);
@@ -218,6 +218,85 @@ async fn next_generation_overlaps_unacknowledged_prefix_and_uses_latest_tail() {
     acknowledge(&actor, &mut state).await;
     assert_eq!(state.submitted, format!("{a}{b}"));
     assert_eq!(state.consumed, 516);
+    drop(state);
+    drop(actor);
+    data.shutdown().await;
+}
+#[tokio::test]
+async fn learning_receipts_keep_delayed_newlines_with_the_exact_prefix_and_final_tail() {
+    let a = format!("{}甲\n", "甲。".repeat(255));
+    let b = "第二段。\n";
+    let fixture = Fixture::start(vec![response(&a), response(b)]);
+    let root = tempfile::tempdir().unwrap();
+    let data = crate::data::DataWorker::start(root.path().to_path_buf()).unwrap();
+    let context = Context::fixture(fixture.provider.clone(), fixture.input(), data.clone());
+    let (actor, mut state, native) = actor(Some(context));
+    actor.observe(
+        &mut state,
+        snapshot(
+            1,
+            vec![
+                segment(1, &a, true),
+                segment(2, b, true),
+                segment(3, "尾部🙂", false),
+            ],
+        ),
+    );
+    state.merge_at = Some(Instant::now() - Duration::from_millis(151));
+    actor.start_generation(&mut state).unwrap();
+    generated(&mut state).await;
+    actor.schedule(&mut state).unwrap();
+    let Command::Settle(_, prefix, tail, source, _, reply) = command(&native).await else {
+        panic!()
+    };
+    assert_eq!(prefix, a.trim_end_matches('\n'));
+    assert_eq!(tail, format!("\n{b}尾部🙂"));
+    assert_eq!(
+        source,
+        Some((a.trim_end_matches('\n').into(), format!("\n{b}尾部🙂")))
+    );
+    reply
+        .send(PrefixOutcome {
+            prefix: Mutation::Changed,
+            tail_owned: true,
+            error: None,
+        })
+        .ok()
+        .unwrap();
+    acknowledge(&actor, &mut state).await;
+    state.merge_at = Some(Instant::now() - Duration::from_millis(151));
+    actor.start_generation(&mut state).unwrap();
+    generated(&mut state).await;
+    actor.schedule(&mut state).unwrap();
+    let Command::Settle(_, prefix, tail, source, _, reply) = command(&native).await else {
+        panic!()
+    };
+    assert_eq!(prefix, "\n第二段。");
+    assert_eq!(tail, "\n尾部🙂");
+    assert_eq!(source, Some(("\n第二段。".into(), "\n尾部🙂".into())));
+    reply
+        .send(PrefixOutcome {
+            prefix: Mutation::Changed,
+            tail_owned: true,
+            error: None,
+        })
+        .ok()
+        .unwrap();
+    acknowledge(&actor, &mut state).await;
+    let (finish, _) = oneshot::channel();
+    state.ending = Some(Ending {
+        mode: Finish::Commit,
+        reply: finish,
+        deadline: tokio::time::Instant::now() + Duration::from_secs(15),
+        expired: false,
+    });
+    actor.schedule_final(&mut state).unwrap();
+    let Command::Finish(_, tail, mode, source, _, _) = command(&native).await else {
+        panic!()
+    };
+    assert_eq!(mode, Finish::Commit);
+    assert_eq!(tail, "\n尾部🙂");
+    assert_eq!(source, Some("\n尾部🙂".into()));
     drop(state);
     drop(actor);
     data.shutdown().await;
@@ -239,7 +318,7 @@ async fn in_flight_source_revision_revokes_prefix_and_lookahead_without_replayin
     actor.start_generation(&mut state).unwrap();
     generated(&mut state).await;
     actor.schedule(&mut state).unwrap();
-    let Command::Settle(_, _, _, permit, reply) = command(&native).await else {
+    let Command::Settle(_, _, _, _, permit, reply) = command(&native).await else {
         panic!("prefix expected")
     };
     actor.start_generation(&mut state).unwrap();
@@ -283,7 +362,7 @@ async fn same_body_confirmation_keeps_source_revision_and_avoids_duplicate_nativ
         snapshot(1, vec![segment(1, "测试文字。", false)]),
     );
     actor.schedule(&mut state).unwrap();
-    let Command::Replace(_, text, reply) = command(&native).await else {
+    let Command::Replace(_, text, _, reply) = command(&native).await else {
         panic!("ASR expected")
     };
     assert_eq!(text, "测试文字。");

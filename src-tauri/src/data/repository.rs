@@ -33,6 +33,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "streaming_processing_v1",
         include_str!("migrations/007_streaming_processing.sql"),
     ),
+    (
+        "language_learning_v1",
+        include_str!("migrations/008_language_learning.sql"),
+    ),
 ];
 pub fn now() -> i64 {
     SystemTime::now()
@@ -226,6 +230,11 @@ impl Repository {
             revision: row.get(4)?,
             created_at: row.get(5)?,
             updated_at: row.get(6)?,
+            source: if row.get::<_, String>(7)? == "automatic" {
+                Source::Automatic
+            } else {
+                Source::Manual
+            },
         })
     }
     pub fn get(&self, kind: Kind, id: &str) -> Result<Record, DataError> {
@@ -256,6 +265,19 @@ impl Repository {
                 "(?1='' OR instr(normalized_heard,?1)>0 OR instr(corrected_key,?1)>0)"
             }
         };
+        let source = match query.source {
+            Some(Source::Automatic) => "automatic",
+            Some(Source::Manual) => "manual",
+            None => "",
+        };
+        let predicate = format!(
+            "{predicate} AND (?3='' OR {}=?3)",
+            if query.kind == Kind::Term {
+                "coalesce((SELECT source FROM language_term_sources WHERE term_id=dictionary_terms.id),'manual')"
+            } else {
+                "'manual'"
+            }
+        );
         let tx = self.connection.transaction().map_err(db_error)?;
         let total: u32 = tx
             .query_row(
@@ -263,7 +285,7 @@ impl Repository {
                     "SELECT count(*) FROM {} WHERE {predicate}",
                     query.kind.table()
                 ),
-                [&search],
+                params![search, 0, source],
                 |r| r.get(0),
             )
             .map_err(db_error)?;
@@ -271,7 +293,7 @@ impl Repository {
         let records = {
             let mut statement = tx.prepare(&format!("SELECT {} FROM {} WHERE {predicate} ORDER BY updated_at DESC,id ASC LIMIT 50 OFFSET ?2", query.kind.columns(), query.kind.table())).map_err(db_error)?;
             statement
-                .query_map(params![search, (page - 1) * 50], |r| {
+                .query_map(params![search, (page - 1) * 50, source], |r| {
                     Self::row(query.kind.clone(), r)
                 })
                 .map_err(db_error)?
@@ -295,6 +317,17 @@ impl Repository {
             .as_ref()
             .map(|e| e.0.clone())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let previous_key: Option<String> = if input.kind == Kind::Term && edit.is_some() {
+            tx.query_row(
+                "SELECT normalized_term FROM dictionary_terms WHERE id=?1",
+                [&id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?
+        } else {
+            None
+        };
         if let Some((_, revision)) = &edit {
             let current: Option<i64> = tx
                 .query_row(
@@ -362,6 +395,17 @@ impl Repository {
                 tx.execute("UPDATE correction_rules SET heard=?2,corrected=?3,normalized_heard=?4,corrected_key=?5,revision=revision+1,updated_at=?6 WHERE id=?1 AND revision=?7", params![id, input.original, input.replacement, key(&input.original), input.replacement.as_deref().map(key), time, rev]).map_err(db_error)?;
             }
         }
+        if input.kind == Kind::Term {
+            if let Some(previous) = previous_key.filter(|old| old != &key(&input.original)) {
+                tx.execute("INSERT INTO language_suppression(term_key,updated_at) VALUES(?1,?2) ON CONFLICT(term_key) DO UPDATE SET updated_at=excluded.updated_at",params![previous,time]).map_err(db_error)?;
+            }
+            tx.execute(
+                "DELETE FROM language_suppression WHERE term_key=?1",
+                [key(&input.original)],
+            )
+            .map_err(db_error)?;
+            tx.execute("INSERT INTO language_term_sources(term_id,source,settings_revision,created_at) VALUES(?1,'manual',0,?2) ON CONFLICT(term_id) DO UPDATE SET source='manual',evidence_id=NULL",params![id,time]).map_err(db_error)?;
+        }
         tx.commit().map_err(db_error)?;
         self.get(input.kind, &id)
     }
@@ -382,6 +426,9 @@ impl Repository {
             None => return Err(DataError::new("notFound")),
             Some(v) if v != revision => return Err(DataError::new("conflict")),
             _ => (),
+        }
+        if kind == Kind::Term {
+            tx.execute("INSERT INTO language_suppression(term_key,updated_at) SELECT normalized_term,?2 FROM dictionary_terms WHERE id=?1 ON CONFLICT(term_key) DO UPDATE SET updated_at=excluded.updated_at",params![id,now()]).map_err(db_error)?;
         }
         tx.execute(
             &format!("DELETE FROM {} WHERE id=?1 AND revision=?2", kind.table()),

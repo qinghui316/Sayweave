@@ -26,6 +26,15 @@ pub struct Record {
     pub revision: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub source: Source,
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Source {
+    #[default]
+    Manual,
+    Automatic,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -33,6 +42,8 @@ pub struct Query {
     pub kind: Kind,
     pub search: String,
     pub page: u32,
+    #[serde(default)]
+    pub source: Option<Source>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

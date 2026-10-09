@@ -1,4 +1,6 @@
 //! All TSF state stays on the target apartment. IPC never carries COM pointers.
+#[path = "edit_observation.rs"]
+mod edit_observation;
 #[path = "initial_selection.rs"]
 mod initial_selection;
 use crate::{
@@ -67,6 +69,13 @@ struct Pending {
 }
 #[derive(Default)]
 struct State {
+    observation_task: Option<(String, u64)>,
+    observations: Vec<edit_observation::Watch>,
+    observation_epoch: u64,
+    observation_native: Option<NativeEditPosition>,
+    observation_cursor: u32,
+    observation_pending: Vec<ObservationCandidate>,
+    observation_field: Option<initial_selection::FocusIdentity>,
     #[cfg(feature = "acceptance")]
     selection_probe: Option<(String, u64, u64, String)>,
     manager: Option<ITfThreadMgr>,
@@ -82,6 +91,8 @@ struct State {
     pending: Option<Pending>,
     epoch: u64,
     own_change: Option<OwnChange>,
+    observation_tail: Option<ObservationTail>,
+    observation_original: Option<Rc<str>>,
     ownership_loss: Option<&'static str>,
     ownership_detail: Option<String>,
     cleanup: bool,
@@ -108,6 +119,47 @@ struct State {
     key_failure: bool,
 }
 #[derive(Clone)]
+struct ObservationCandidate {
+    request: Request,
+    connection: u64,
+    epoch: u64,
+    context: ITfContext,
+    range: ITfRange,
+    boundary: Option<ITfRange>,
+    expected: String,
+    native: Option<(usize, u32)>,
+    ready: bool,
+    completed: bool,
+    completed_tick: u64,
+    field: initial_selection::FocusIdentity,
+    original: Option<Rc<str>>,
+}
+#[derive(Clone, Copy)]
+struct ObservationAdmission {
+    connection: u64,
+    epoch: u64,
+    generation: u64,
+    operation: u64,
+    revision: u64,
+    native: Option<NativeEditPosition>,
+}
+impl ObservationAdmission {
+    fn matches(&self, state: &State, r: &Request) -> bool {
+        state.active
+            && state.connected
+            && state.pending.is_none()
+            && state.connection == self.connection
+            && state.observation_epoch == self.epoch
+            && state.generation == self.generation
+            && state.version.owned
+            && state.version.task == r.task
+            && state.version.turn == r.turn
+            && state.version.operation == self.operation
+            && state.version.revision == self.revision
+            && state.capability.as_ref() == Some(&r.capability)
+    }
+}
+#[derive(Clone)]
 struct PreparedSelection {
     range: ITfRange,
     position: RangePosition,
@@ -124,6 +176,35 @@ struct OwnChange {
     verified: bool,
     position: Option<RangePosition>,
     context_end: Option<i32>,
+}
+#[derive(Clone)]
+struct ObservationTail {
+    context: ITfContext,
+    range: ITfRange,
+    request: Request,
+    generation: u64,
+    epoch: u64,
+}
+fn remember_observation_tail(
+    shared: &Shared,
+    context: &ITfContext,
+    range: &ITfRange,
+    request: &Request,
+    generation: u64,
+    epoch: u64,
+) {
+    let next = (!request.text.is_empty()).then(|| ObservationTail {
+        context: context.clone(),
+        range: range.clone(),
+        request: request.clone(),
+        generation,
+        epoch,
+    });
+    let old = {
+        let mut state = shared.borrow_mut();
+        std::mem::replace(&mut state.observation_tail, next)
+    };
+    drop(old);
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RangePosition {
@@ -415,6 +496,7 @@ impl ITfTextInputProcessor_Impl for Service_Impl {
     fn Deactivate(&self) -> windows::core::Result<()> {
         unsafe {
             end_owned(&self.state);
+            stop_observations(&self.state);
             let (manager, client, key_sink, window) = {
                 let mut s = self.state.borrow_mut();
                 s.active = false;
@@ -458,6 +540,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, w: WPARAM, l: LP
     }
 }
 fn disconnect(shared: &Shared) {
+    stop_observations(shared);
     {
         let mut s = shared.borrow_mut();
         s.generation = next_generation();
@@ -518,6 +601,7 @@ fn read_request(shared: &Shared) -> Result<Option<(Request, u64)>, ()> {
     }
 }
 fn poll(shared: &Shared) {
+    activate_observations(shared);
     let (r, connection) = match read_request(shared) {
         Ok(Some(r)) => r,
         Ok(None) => return,
@@ -529,6 +613,75 @@ fn poll(shared: &Shared) {
     dispatch(shared, r, connection);
 }
 fn dispatch(shared: &Shared, r: Request, connection: u64) {
+    if matches!(
+        r.action,
+        Action::ObserveStart | Action::ObservePoll | Action::ObserveStop
+    ) {
+        let mut valid = {
+            let s = shared.borrow();
+            s.pending.is_none()
+                && r.text.is_empty()
+                && r.live(unsafe { GetTickCount64() })
+                && if r.action == Action::ObserveStart {
+                    s.version.owned && s.version.task == r.task && s.version.turn == r.turn
+                } else {
+                    s.observation_task
+                        .as_ref()
+                        .is_some_and(|(task, turn)| task == &r.task && *turn == r.turn)
+                }
+        };
+        let admission = {
+            let state = shared.borrow();
+            ObservationAdmission {
+                connection,
+                epoch: state.observation_epoch,
+                generation: state.generation,
+                operation: state.version.operation,
+                revision: state.version.revision,
+                native: state.native_position,
+            }
+        };
+        let field = if valid && r.action == Action::ObserveStart {
+            initial_selection::FocusIdentity::capture().ok()
+        } else {
+            None
+        };
+        if r.action == Action::ObserveStart && field.is_none() {
+            valid = false;
+        }
+        if valid && r.action == Action::ObserveStart {
+            valid = admission.matches(&shared.borrow(), &r);
+            if valid {
+                stop_observations(shared);
+                let retired = ObservationAdmission {
+                    epoch: admission.epoch + 1,
+                    ..admission
+                };
+                valid = field.as_ref().is_some_and(|f| f.matches().unwrap_or(false));
+                let mut state = shared.borrow_mut();
+                valid &= retired.matches(&state, &r);
+                if valid {
+                    state.observation_task = Some((r.task.clone(), r.turn));
+                    state.observation_native = admission.native;
+                    state.observation_cursor = admission.native.map_or(0, |p| p.offset);
+                    state.observation_field = field;
+                }
+            }
+        }
+        reply(
+            shared,
+            &r,
+            connection,
+            valid,
+            if valid {
+                "observation"
+            } else {
+                "observationUnavailable"
+            },
+            Mutation::NotAttempted,
+        );
+        return;
+    }
     if r.action == Action::Inspect {
         // Authenticated connection only; no context, selection or edit session is touched.
         let idle = {
@@ -720,6 +873,22 @@ fn send_reply(
     mutation: Mutation,
     settlement: Option<Settlement>,
 ) {
+    let edit_observation = if r.action == Action::Inspect {
+        Some(EditObservation {
+            capability: 2,
+            records: vec![],
+            active: 0,
+        })
+    } else if applied
+        && matches!(
+            r.action,
+            Action::ObserveStart | Action::ObservePoll | Action::ObserveStop
+        )
+    {
+        Some(observed_edits(shared, r))
+    } else {
+        None
+    };
     let s = shared.borrow();
     if !s.connected || s.connection != connection || s.capability.as_ref() != Some(&r.capability) {
         return;
@@ -758,6 +927,7 @@ fn send_reply(
                 0
             },
             settlement,
+            edit_observation,
             runtime: (r.action == Action::Inspect).then(|| Runtime {
                 protocol: PROTOCOL,
                 process: std::process::id(),
@@ -767,6 +937,285 @@ fn send_reply(
         if let Ok(data) = serde_json::to_vec(&reply) {
             let _ = pipe.send(&data);
         }
+    }
+}
+fn settle_observation(
+    shared: &Shared,
+    r: &Request,
+    connection: u64,
+    applied: bool,
+    settlement: Option<Settlement>,
+) {
+    let mut state = shared.borrow_mut();
+    let native = state.observation_native.is_some();
+    let mut advance = 0;
+    for candidate in &mut state.observation_pending {
+        if !candidate.completed
+            && candidate.connection == connection
+            && candidate.request.operation == r.operation
+            && candidate.request.task == r.task
+            && candidate.request.turn == r.turn
+            && candidate.request.action == r.action
+            && candidate.request.revision == r.revision
+            && candidate.request.capability == r.capability
+        {
+            candidate.completed = true;
+            candidate.completed_tick = unsafe { GetTickCount64() };
+            candidate.ready = applied || settlement.is_some_and(|s| s.prefix == Mutation::Changed);
+            if candidate.ready && native && r.action == Action::Settle {
+                advance = candidate
+                    .expected
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n")
+                    .replace('\n', "\r\n")
+                    .encode_utf16()
+                    .count() as u32;
+            }
+        }
+    }
+    state.observation_cursor = state.observation_cursor.saturating_add(advance);
+}
+fn observed_edits(shared: &Shared, request: &Request) -> EditObservation {
+    let (watches, manager, epoch, connection) = {
+        let mut state = shared.borrow_mut();
+        (
+            std::mem::take(&mut state.observations),
+            state.manager.clone(),
+            state.observation_epoch,
+            state.connection,
+        )
+    };
+    let mut records = Vec::new();
+    let mut keep = Vec::new();
+    for watch in watches {
+        let snapshot =
+            unsafe { watch.snapshot(manager.as_ref(), request.action == Action::ObserveStop) };
+        if let Some(value) =
+            snapshot.filter(|value| value.task == request.task && value.turn == request.turn)
+        {
+            // Budget serialized escaping as well as text. Reserve space for Reply metadata.
+            records.push(value);
+            if serde_json::to_vec(&records).map_or(true, |bytes| bytes.len() > MAX_FRAME - 4096) {
+                records.pop();
+            }
+        }
+        if !watch.ended() {
+            keep.push(watch);
+        }
+    }
+    let mut state = shared.borrow_mut();
+    if state.observation_epoch == epoch && state.connection == connection {
+        state.observations.append(&mut keep);
+        if request.action == Action::ObserveStop {
+            state.observation_task = None;
+            state.observation_epoch += 1;
+        }
+    }
+    let active = (state.observations.len() + state.observation_pending.len()) as u32;
+    drop(state);
+    EditObservation {
+        capability: 2,
+        records,
+        active,
+    }
+}
+fn stop_observations(shared: &Shared) {
+    let retired = {
+        let mut state = shared.borrow_mut();
+        state.observation_epoch += 1;
+        state.observation_task = None;
+        state.observation_native = None;
+        (
+            std::mem::take(&mut state.observations),
+            std::mem::take(&mut state.observation_pending),
+            state.observation_field.take(),
+        )
+    };
+    // Unadvise/removing a subclass can reenter the host. Never hold State here.
+    drop(retired);
+}
+fn prepare_observation(
+    shared: &Shared,
+    context: &ITfContext,
+    range: &ITfRange,
+    boundary: Option<&ITfRange>,
+    request: &Request,
+) {
+    let mut state = shared.borrow_mut();
+    if !state
+        .observation_task
+        .as_ref()
+        .is_some_and(|(task, turn)| task == &request.task && *turn == request.turn)
+        || state.observations.len() + state.observation_pending.len() >= 16
+    {
+        return;
+    }
+    let expected = request
+        .prefix
+        .as_ref()
+        .map(|p| p.text.clone())
+        .or_else(|| state.text.as_ref().map(|t| t.semantic.clone()))
+        .unwrap_or_default();
+    if expected.is_empty() {
+        return;
+    }
+    let Some(field) = state.observation_field.clone() else {
+        return;
+    };
+    // Retain existing objects only. No range traversal, sink installation or COM
+    // edit request is inserted into the composition's write transaction.
+    let candidate = ObservationCandidate {
+        request: request.clone(),
+        connection: state.connection,
+        epoch: state.observation_epoch,
+        context: context.clone(),
+        range: range.clone(),
+        boundary: boundary.cloned(),
+        expected,
+        native: state
+            .observation_native
+            .map(|p| (p.window, state.observation_cursor)),
+        ready: false,
+        completed: false,
+        completed_tick: 0,
+        field,
+        original: state.observation_original.clone(),
+    };
+    state.observation_pending.push(candidate);
+}
+fn observation_current(shared: &Shared, candidate: &ObservationCandidate) -> bool {
+    if !candidate.field.matches().unwrap_or(false) {
+        return false;
+    }
+    if candidate.completed
+        && unsafe { GetTickCount64() }.saturating_sub(candidate.completed_tick) > 1000
+    {
+        return false;
+    }
+    let manager = shared.borrow().manager.clone();
+    let focused = unsafe {
+        manager
+            .and_then(|m| m.GetFocus().ok())
+            .and_then(|m| m.GetTop().ok())
+    };
+    let state = shared.borrow();
+    focused.as_ref() == Some(&candidate.context)
+        && state.active
+        && state.connected
+        && state.connection == candidate.connection
+        && state.observation_epoch == candidate.epoch
+        && state.observation_task.as_ref()
+            == Some(&(candidate.request.task.clone(), candidate.request.turn))
+}
+fn publish_observation(
+    shared: &Shared,
+    candidate: &ObservationCandidate,
+    watch: edit_observation::Watch,
+) {
+    if observation_current(shared, candidate) {
+        let mut state = shared.borrow_mut();
+        if state.observations.len() < 16 {
+            state.observations.push(watch);
+            return;
+        }
+    }
+    drop(watch);
+}
+fn activate_observations(shared: &Shared) {
+    activate_observations_with_flags(shared, TF_ES_ASYNCDONTCARE);
+}
+fn activate_observations_with_flags(shared: &Shared, flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS) {
+    let candidates = { std::mem::take(&mut shared.borrow_mut().observation_pending) };
+    for candidate in candidates {
+        if !observation_current(shared, &candidate) {
+            continue;
+        }
+        if !candidate.completed {
+            shared.borrow_mut().observation_pending.push(candidate);
+            continue;
+        }
+        if !candidate.ready {
+            continue;
+        }
+        let client = shared.borrow().client;
+        unsafe {
+            if let Some((window, start)) = candidate.native {
+                if let Ok(watch) = edit_observation::Watch::native(
+                    &candidate.context,
+                    (window, start),
+                    client,
+                    &candidate.request,
+                    &candidate.expected,
+                    candidate.completed_tick,
+                    candidate.field.clone(),
+                    candidate.original.clone(),
+                ) {
+                    publish_observation(shared, &candidate, watch);
+                }
+            } else {
+                let context = candidate.context.clone();
+                let edit: ITfEditSession = ObserveAttach {
+                    state: Rc::downgrade(shared),
+                    candidate,
+                    client,
+                    _lease: Lease::new(),
+                }
+                .into();
+                let _ = context.RequestEditSession(client, &edit, flags | TF_ES_READ);
+            }
+        }
+    }
+}
+#[implement(ITfEditSession)]
+struct ObserveAttach {
+    state: std::rc::Weak<RefCell<State>>,
+    candidate: ObservationCandidate,
+    client: u32,
+    _lease: Lease,
+}
+impl ITfEditSession_Impl for ObserveAttach_Impl {
+    fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        let Some(shared) = self.state.upgrade() else {
+            return Ok(());
+        };
+        let candidate = &self.candidate;
+        let result = (|| -> windows::core::Result<edit_observation::Watch> {
+            unsafe {
+                if !observation_current(&shared, candidate) {
+                    return Err(failure(TF_E_DISCONNECTED));
+                }
+                let range = candidate.range.Clone()?;
+                if let Some(boundary) = &candidate.boundary {
+                    range.ShiftEndToRange(ec, boundary, TF_ANCHOR_START)?;
+                }
+                if candidate.context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0
+                    || password(&candidate.context, &range, ec)?
+                {
+                    return Err(failure(E_ACCESSDENIED));
+                }
+                let actual = range_text(&range, ec)?;
+                if !equivalent_native_text(&actual, &candidate.expected)
+                    || !observation_current(&shared, candidate)
+                {
+                    return Err(failure(TF_E_DISCONNECTED));
+                }
+                edit_observation::Watch::attach(
+                    &candidate.context,
+                    &range,
+                    self.client,
+                    &candidate.request,
+                    ec,
+                    candidate.completed_tick,
+                    candidate.field.clone(),
+                    candidate.original.clone(),
+                )
+            }
+        })();
+        if let Ok(watch) = result {
+            publish_observation(&shared, candidate, watch);
+        }
+        // Optional learning probes never report failure to a host edit session.
+        Ok(())
     }
 }
 fn lease(
@@ -970,6 +1419,8 @@ fn release_composition_with_failure(
                         .is_some_and(|progress| progress.prefix_operation == p.operation)
                 })
                 .cloned(),
+            s.observation_tail.take(),
+            s.observation_original.take(),
         )
     };
     // Settle must terminate when editing retires its gap, even if its queued
@@ -1276,6 +1727,17 @@ impl KeySink {
         let shared = self.state.upgrade()?;
         let owns = {
             let s = shared.borrow();
+            #[cfg(feature = "acceptance")]
+            if std::env::var_os("SAYWEAVE_TSF_OBSERVATION_ONLY").is_some() {
+                eprintln!(
+                    "observe_key key={} active={} owned={} cleanup={} context_match={}",
+                    key.0,
+                    s.active,
+                    s.version.owned,
+                    s.cleanup,
+                    s.context.as_ref() == context.as_ref()
+                );
+            }
             s.active && s.version.owned && !s.cleanup && s.context.as_ref() == context.as_ref()
         };
         owns.then_some(shared)
@@ -1300,8 +1762,16 @@ impl ITfKeyEventSink_Impl for KeySink_Impl {
         _: LPARAM,
     ) -> windows::core::Result<BOOL> {
         if let Some(shared) = self.owns_key(context, key) {
+            let observation = prepare_key_observation(&shared);
             let ended = end_owned_with_flags(&shared, TF_ES_SYNC);
             shared.borrow_mut().key_handoff = ended;
+            if let Some(request) = observation {
+                let connection = shared.borrow().connection;
+                settle_observation(&shared, &request, connection, ended, None);
+                if ended {
+                    activate_observations_with_flags(&shared, TF_ES_SYNC);
+                }
+            }
         }
         Ok(false.into())
     }
@@ -1314,6 +1784,38 @@ impl ITfKeyEventSink_Impl for KeySink_Impl {
     fn OnPreservedKey(&self, _: Ref<ITfContext>, _: *const GUID) -> windows::core::Result<BOOL> {
         Ok(false.into())
     }
+}
+fn prepare_key_observation(shared: &Shared) -> Option<Request> {
+    let (receipt, request) = {
+        let state = shared.borrow();
+        state.observation_task.as_ref()?;
+        if state.pending.is_some() || !state.version.owned || state.text.is_none() {
+            return None;
+        }
+        let receipt = state.observation_tail.as_ref()?;
+        if receipt.epoch != state.epoch
+            || receipt.generation != state.generation
+            || receipt.request.task != state.version.task
+            || receipt.request.turn != state.version.turn
+            || receipt.request.operation != state.version.operation
+            || receipt.request.revision != state.version.revision
+            || state.context.as_ref() != Some(&receipt.context)
+        {
+            return None;
+        }
+        let request = Request {
+            action: Action::Handoff,
+            prefix: None,
+            text: String::new(),
+            deadline_tick: unsafe { GetTickCount64() } + 2000,
+            ..receipt.request.clone()
+        };
+        (receipt.clone(), request)
+    };
+    // Only retain the exact tail already verified by the write. No new COM
+    // range discovery precedes the user's mandatory synchronous handoff.
+    prepare_observation(shared, &receipt.context, &receipt.range, None, &request);
+    Some(request)
 }
 #[implement(ITfEditSession)]
 struct EndOwned {
@@ -1865,6 +2367,7 @@ fn complete(
     if current {
         let settlement =
             settlement.or_else(|| shared.borrow().pending.as_ref().and_then(|p| p.settlement));
+        settle_observation(shared, r, connection, applied, settlement);
         reply_outcome(shared, r, connection, applied, code, mutation, settlement);
     }
 }
@@ -2002,11 +2505,16 @@ fn settle_prefix(
             return Err(failure(TF_E_DISCONNECTED));
         }
         boundary.Collapse(ec, TF_ANCHOR_START)?;
+        prepare_observation(shared, context, &written, Some(&boundary), r);
         edit_identity(shared, r, generation, epoch)?;
         *phase = "settlePrefix";
         // From this point prefix submission may be irreversible. Reentrant
         // Abort must never restore the original selection into the remaining tail.
-        let retired_backup = { shared.borrow_mut().backup.take() };
+        let retired_backup = {
+            let mut state = shared.borrow_mut();
+            state.observation_original = None;
+            state.backup.take()
+        };
         drop(retired_backup);
         edit_identity(shared, r, generation, epoch)?;
         outcome.prefix_operation = r.operation;
@@ -2034,6 +2542,24 @@ fn settle_prefix(
         if !tail.matches_marked(&actual_tail) {
             return Err(failure(TF_E_DISCONNECTED));
         }
+        let receipt = (!r.text.is_empty()).then(|| ObservationTail {
+            context: context.clone(),
+            range: remaining.clone(),
+            request: r.clone(),
+            generation,
+            epoch,
+        });
+        let next_offset = shared
+            .borrow()
+            .native_position
+            .as_ref()
+            .map(|p| {
+                p.offset
+                    .checked_add(committed.replace('\n', "\r\n").encode_utf16().count() as u32)
+                    .ok_or_else(|| failure(E_INVALIDARG))
+            })
+            .transpose()?;
+        edit_identity(shared, r, generation, epoch)?;
         // Install verified range truth before more COM calls can fail/reenter.
         // Cleanup must never compare this shrunken range to the old ASR buffer.
         let retired = {
@@ -2042,19 +2568,18 @@ fn settle_prefix(
             state.text = (!r.text.is_empty()).then_some(tail);
             state.backup = Some(Rollback::GeneratedTail);
             state.selection = None;
-            if let Some(position) = &mut state.native_position {
-                position.offset = position
-                    .offset
-                    .checked_add(committed.replace('\n', "\r\n").encode_utf16().count() as u32)
-                    .ok_or_else(|| failure(E_INVALIDARG))?;
+            let old_receipt = std::mem::replace(&mut state.observation_tail, receipt);
+            if let (Some(position), Some(offset)) = (&mut state.native_position, next_offset) {
+                position.offset = offset;
             }
-            if r.text.is_empty() {
+            let old_composition = if r.text.is_empty() {
                 state.empty_range = Some(remaining.clone());
                 state.materialize_allowed = false;
                 state.composition.take()
             } else {
                 None
-            }
+            };
+            (old_composition, old_receipt)
         };
         drop(retired);
         edit_identity(shared, r, generation, epoch)?;
@@ -2308,6 +2833,7 @@ fn write_composing(
             s.selection = None;
         }
         *phase = "updateCaret";
+        remember_observation_tail(shared, context, range, r, generation, epoch);
         let caret = range.Clone()?;
         caret.Collapse(ec, TF_ANCHOR_END)?;
         {
@@ -2761,6 +3287,11 @@ fn apply(
             }
             let mut s = shared.borrow_mut();
             s.epoch = epoch;
+            s.observation_original = original_semantic
+                .as_ref()
+                .map(|o| o.semantic.clone())
+                .or_else(|| (!expected.is_empty()).then(|| expected.clone()))
+                .map(Rc::<str>::from);
             s.composition = composition;
             s.prepared = prepared;
             s.preserved_attributes.clear();
@@ -2982,10 +3513,15 @@ fn apply(
                 )?;
                 edit_identity(shared, r, generation, epoch)?;
                 shared.borrow_mut().version.applied(r);
+                prepare_observation(shared, context, &range, None, r);
                 composition.EndComposition(ec)?;
                 release_composition(shared, epoch, Some(&composition));
             }
-            Action::Begin | Action::Inspect => unreachable!(),
+            Action::Begin
+            | Action::Inspect
+            | Action::ObserveStart
+            | Action::ObservePoll
+            | Action::ObserveStop => unreachable!(),
         }
         Ok(())
     }

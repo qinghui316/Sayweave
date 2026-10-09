@@ -212,13 +212,21 @@ impl Stream {
         task: &str,
         control: Option<Control>,
         requests: Arc<RequestCoordinator>,
+        hotwords: &[String],
     ) -> Result<Self, Error> {
-        let first = RecognitionSession::open(cfg, task).await?;
+        let first = RecognitionSession::open_with_hotwords(cfg, task, hotwords).await?;
         Ok(if let Some(control) = control {
             let _ = control.task.set(task.into());
             let route = *control.requested.borrow();
             control.enabled(route);
-            Self::Continuous(Continuous::spawn(first, cfg, control, route, requests))
+            Self::Continuous(Continuous::spawn(
+                first,
+                cfg,
+                control,
+                route,
+                requests,
+                hotwords.to_vec(),
+            ))
         } else {
             Self::Single(first)
         })
@@ -337,6 +345,7 @@ impl Continuous {
         control: Control,
         route: Route,
         requests: Arc<RequestCoordinator>,
+        hotwords: Vec<String>,
     ) -> Self {
         let cfg = Arc::new(SpeechConfiguration {
             id: cfg.id.clone(),
@@ -347,10 +356,11 @@ impl Continuous {
         Self::run(first, control, route, move |turn| {
             let cfg = cfg.clone();
             let requests = requests.clone();
+            let hotwords = hotwords.clone();
             async move {
                 let id = uuid::Uuid::new_v4().to_string();
                 let slot = requests.register(&id).map_err(|e| Error::new(&e.code))?;
-                let session = RecognitionSession::open(&cfg, &id).await?;
+                let session = RecognitionSession::open_with_hotwords(&cfg, &id, &hotwords).await?;
                 Ok(Connection {
                     turn,
                     session,

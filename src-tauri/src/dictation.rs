@@ -381,6 +381,8 @@ impl DictationCoordinator {
             });
         }
         app.state::<ShortcutService>().active_task(Some(id.clone()));
+        app.state::<crate::language_learning::LanguageLearning>()
+            .interrupt(app);
         let sequence = self.snapshot()?.sequence + 1;
         *self
             .snapshot
@@ -434,9 +436,30 @@ impl DictationCoordinator {
         self.update(&app, &id, |_| {});
         let input = app.state::<WindowsInputService>();
         let mut anchor = anchor;
+        let dictionary = processing_context::dictionary(&app).await.unwrap_or_else(|error| {
+            log::info!(target:"sayweave", "operation=dictionary_prepare task_id={} result=unavailable error={}", id,error.code);
+            Arc::new(crate::processing::prompt::DictionaryIndex::new(vec![]))
+        });
+        let hotwords = dictionary.hotwords();
+        let application = crate::windows_input::application_context(anchor.clone()).await;
+        let language = if source == "external" {
+            crate::language_learning::snapshot(&app.state::<crate::data::DataWorker>(), application)
+                .await
+                .ok()
+        } else {
+            None
+        };
         #[cfg(windows)]
         let processing = if source == "external" {
-            match processing_context::Context::prepare(&app, tx.subscribe(), &id).await {
+            match processing_context::Context::prepare(
+                &app,
+                tx.subscribe(),
+                &id,
+                dictionary,
+                language.clone(),
+            )
+            .await
+            {
                 Ok(value) => value,
                 Err(error) if error.code == "cancelled" => {
                     let error = Error::new("cancelled");
@@ -493,6 +516,30 @@ impl DictationCoordinator {
         } else {
             None
         };
+        #[cfg(windows)]
+        if let (Some(native), Some(language)) =
+            (&raw_draft, language.as_ref().filter(|s| s.settings.enabled))
+        {
+            let handle = app.clone();
+            let _ = native
+                .observe(Arc::new(
+                    crate::windows_input::composition::ObservationSink {
+                        snapshot: language.clone(),
+                        permit: app
+                            .state::<crate::language_learning::LanguageLearning>()
+                            .observation_permit(),
+                        current_revision: app
+                            .state::<crate::language_learning::LanguageLearning>()
+                            .observation_revision(),
+                        emit: Arc::new(move |e| {
+                            handle
+                                .state::<crate::language_learning::LanguageLearning>()
+                                .edit(e)
+                        }),
+                    },
+                ))
+                .await;
+        }
         let continuous = (source == "external" && anchor.is_some()).then(|| {
             let flow =
                 crate::speech::continuous::Control::new(crate::input_state::activity_evidence());
@@ -532,6 +579,7 @@ impl DictationCoordinator {
                     cancel: tx,
                     terminal: terminal_tx,
                     continuous: continuous.clone(),
+                    hotwords,
                 },
             )
             .await;
@@ -834,6 +882,7 @@ impl DictationCoordinator {
             };
             let archive_app = app.clone();
             let archive_id = id.clone();
+            let language_source = recognized_snapshot.clone();
             crate::archive::spawn(async move {
                 let app = archive_app;
                 let id = archive_id;
@@ -905,6 +954,27 @@ impl DictationCoordinator {
                     } else {
                         draft.release_record();
                     }
+                }
+                if saved
+                    && !archive_error
+                    && let (Some(language), Some(recognition)) = (&language, &language_source)
+                    && language.settings.enabled
+                    && recognition.phase == Phase::Completed
+                    && let Some(attempt) = &recognition.attempt_id
+                {
+                    app.state::<crate::language_learning::LanguageLearning>()
+                        .speech(crate::contracts::language::StyleObservation {
+                            id: format!("speech:{id}"),
+                            task: id.clone(),
+                            application: language.application.clone(),
+                            settings_revision: language.settings.revision,
+                            language: crate::contracts::language::WritingLanguage::of(
+                                &recognition.text,
+                            ),
+                            kind: "speech".into(),
+                            summary: String::new(),
+                            source_ref: Some(attempt.clone()),
+                        });
                 }
                 app.state::<SpeechService>()
                     .archive_settled(crate::speech::ArchiveSettlement {

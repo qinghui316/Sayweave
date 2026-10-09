@@ -94,7 +94,15 @@ pub struct RecognitionSession {
     worker: tokio::task::JoinHandle<()>,
 }
 impl RecognitionSession {
+    #[cfg(test)]
     pub async fn open(cfg: &SpeechConfiguration, task: &str) -> Result<Self, Error> {
+        Self::open_with_hotwords(cfg, task, &[]).await
+    }
+    pub async fn open_with_hotwords(
+        cfg: &SpeechConfiguration,
+        task: &str,
+        hotwords: &[String],
+    ) -> Result<Self, Error> {
         if !crate::models::types::capabilities(&cfg.input.protocol).is_some_and(|c| c.live_text) {
             return Err(Error::new("unsupported"));
         }
@@ -102,9 +110,14 @@ impl RecognitionSession {
         let prepared = tokio::time::timeout(Duration::from_secs(15), async {
             match cfg.input.protocol.as_str() {
                 "qwen-audio-streaming" => {
-                    let mut socket =
-                        qwen::connect(&cfg.input.base_url, &cfg.key, &cfg.input.model_id, task)
-                            .await?;
+                    let mut socket = qwen::connect(
+                        &cfg.input.base_url,
+                        &cfg.key,
+                        &cfg.input.model_id,
+                        task,
+                        hotwords,
+                    )
+                    .await?;
                     let mut transcript = qwen::Transcript::default();
                     loop {
                         let value = qwen::receive(&mut socket).await?;
@@ -118,7 +131,7 @@ impl RecognitionSession {
                 }
                 "doubao-asr-streaming" => {
                     let (socket, transcript) =
-                        doubao::prepare(&cfg.input.base_url, &cfg.key, task).await?;
+                        doubao::prepare(&cfg.input.base_url, &cfg.key, task, hotwords).await?;
                     Ok((socket, Parser::Doubao(transcript)))
                 }
                 _ => Err(Error::new("unsupported")),

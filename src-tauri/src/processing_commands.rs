@@ -19,6 +19,7 @@ pub struct SettingsView {
     pub available: bool,
     pub model: Option<String>,
     pub error: Option<String>,
+    pub personalization: Option<crate::contracts::language::Settings>,
 }
 fn authorize(label: &str) -> Result<(), DataError> {
     crate::contracts::dictionary::authorize(label)
@@ -34,6 +35,15 @@ async fn config(data: &DataWorker, operation: DbOperation) -> Result<Settings, D
 }
 async fn view(data: &DataWorker, models: &ModelService) -> Result<SettingsView, DataError> {
     let settings = config(data, DbOperation::Settings).await?;
+    let personalization = match crate::language_learning::operation(
+        data,
+        crate::contracts::language::DbOperation::Settings,
+    )
+    .await
+    {
+        Ok(crate::contracts::language::DbOutput::Settings(value)) => Some(value),
+        _ => None,
+    };
     let result = async {
         models.status("main", false).await?;
         models.overview("main").await
@@ -50,6 +60,7 @@ async fn view(data: &DataWorker, models: &ModelService) -> Result<SettingsView, 
                 .iter()
                 .find(|c| Some(c.id.as_str()) == selected && executable(&c.input, &Usage::Text));
             Ok(SettingsView {
+                personalization,
                 settings,
                 available: model.is_some_and(|c| c.credential_status == "present"),
                 model: model.map(|c| c.input.name.clone()),
@@ -59,6 +70,7 @@ async fn view(data: &DataWorker, models: &ModelService) -> Result<SettingsView, 
             })
         }
         Err(error) => Ok(SettingsView {
+            personalization,
             settings,
             available: false,
             model: None,

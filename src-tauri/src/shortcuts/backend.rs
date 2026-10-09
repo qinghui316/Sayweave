@@ -263,6 +263,16 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             let released = [WM_KEYUP, WM_SYSKEYUP].contains(&(w.0 as u32));
             let value = key.vkCode as u16;
             let (repeated, consumed_release) = track_key(b, value, pressed, released);
+            if pressed
+                && crate::input_state::reversal_key(
+                    value,
+                    down(&b.pressed, "Control"),
+                    down(&b.pressed, "Alt"),
+                    b.altgr,
+                )
+            {
+                crate::input_state::reversed();
+            }
             if pressed && edits_target(b, value) {
                 crate::input_state::edit_key_pressed(value);
                 if let Some(task) = &b.task_active {

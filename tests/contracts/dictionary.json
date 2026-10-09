@@ -1,5 +1,5 @@
 {
-  "record": {"id":"6dcb1d53-88a0-421e-9c46-0375cddc9d00","kind":"term","original":"Figma","category":"设计工具","replacement":null,"revision":1,"createdAt":1791030000000,"updatedAt":1791030000000},
+  "record": {"id":"6dcb1d53-88a0-421e-9c46-0375cddc9d00","kind":"term","original":"Figma","category":"设计工具","replacement":null,"revision":1,"createdAt":1791030000000,"updatedAt":1791030000000,"source":"manual"},
   "status":{"state":"ready","error":null,"schemaVersion":1,"normalizationVersion":1},
   "keys":[{"input":" Figma ","key":"figma"},{"input":"é","key":"é"},{"input":"Ａ","key":"ａ"},{"input":"ΣΟΣ","key":"σος"},{"input":"İ","key":"i̇"}]
 }

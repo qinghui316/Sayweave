@@ -10,9 +10,24 @@ use tokio::sync::oneshot;
 #[cfg(feature = "desktop-acceptance")]
 mod acceptance;
 #[cfg(windows)]
+mod application;
+#[cfg(windows)]
 pub(crate) mod composition;
 #[cfg(windows)]
 mod native;
+pub async fn application_context(
+    anchor: Option<Anchor>,
+) -> crate::contracts::language::ApplicationContext {
+    #[cfg(windows)]
+    if let Some(anchor) = anchor {
+        return tokio::task::spawn_blocking(move || application::resolve(&anchor))
+            .await
+            .unwrap_or_default();
+    }
+    #[cfg(not(windows))]
+    let _ = anchor;
+    Default::default()
+}
 #[cfg(windows)]
 pub(crate) use native::{composition_target, reanchor_turn};
 #[cfg(feature = "desktop-acceptance")]
@@ -275,6 +290,10 @@ impl WindowsInputService {
         let _ = self.send(Request::Forget(id));
     }
     pub fn shutdown(&self) {
+        #[cfg(windows)]
+        tauri::async_runtime::spawn(async {
+            let _ = composition::stop_observer().await;
+        });
         let _guard = self.admission.lock().ok();
         self.stopping.store(true, Ordering::Release);
         self.pending.fetch_add(1, Ordering::AcqRel);

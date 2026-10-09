@@ -5,11 +5,12 @@ use sayweave_text_service::{
     client::ProfileLease,
     registration,
     transport::Pipe,
-    wire::{Action, Mutation, Prefix, Reply, Request},
+    wire::{Action, Mutation, OutputRegion, Prefix, Reply, Request},
 };
 use std::{
+    collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -23,17 +24,62 @@ use windows::Win32::{
 };
 
 pub(crate) enum Command {
+    Observe(Arc<ObservationSink>, oneshot::Sender<bool>),
     Begin(u64, Anchor, oneshot::Sender<Result<(), Error>>),
-    Finish(u64, String, Finish, bool, oneshot::Sender<FinishOutcome>),
+    Finish(
+        u64,
+        String,
+        Finish,
+        Option<String>,
+        bool,
+        oneshot::Sender<FinishOutcome>,
+    ),
     Close(oneshot::Sender<Result<(), Error>>),
-    Replace(u64, String, oneshot::Sender<Result<(), Error>>),
+    Replace(
+        u64,
+        String,
+        Option<String>,
+        oneshot::Sender<Result<(), Error>>,
+    ),
     Settle(
         u64,
         String,
         String,
+        Option<(String, String)>,
         Arc<AtomicBool>,
         oneshot::Sender<PrefixOutcome>,
     ),
+}
+pub(crate) struct ObservationSink {
+    pub snapshot: crate::contracts::language::Snapshot,
+    pub permit: Arc<AtomicBool>,
+    pub current_revision: Arc<AtomicU64>,
+    pub emit: Arc<dyn Fn(crate::contracts::language::EditEvidence) + Send + Sync>,
+}
+impl ObservationSink {
+    fn allowed(&self) -> bool {
+        self.permit.load(Ordering::Acquire)
+            && self.current_revision.load(Ordering::Acquire)
+                == self.snapshot.settings.revision as u64
+    }
+}
+struct SourceReceipt {
+    operation: u64,
+    revision: u64,
+    raw: String,
+}
+static RETAINED: Mutex<Option<Arc<Connection>>> = Mutex::new(None);
+pub(crate) async fn stop_observer() -> Result<(), Error> {
+    let old = RETAINED
+        .lock()
+        .map_err(|_| Error::new("compositionWorker"))?
+        .take();
+    if let Some(old) = old
+        && let Err(error) = old.close().await
+    {
+        log::info!(target:"sayweave","operation=observation_retire result=failed error={}",error.code);
+    }
+    Ok(())
 }
 pub(crate) struct PrefixOutcome {
     pub prefix: Mutation,
@@ -130,7 +176,12 @@ impl Draft {
         anchor: Anchor,
         gate: Arc<DeliveryGate>,
     ) -> Result<Arc<Self>, Error> {
+        // Retire the previous read-only lease before acquiring the exclusive
+        // activation. An old observer can never deactivate the next session.
+        stop_observer().await?;
         let (sender, commands) = mpsc::sync_channel(4);
+        let connection = Arc::new(Connection { sender });
+        let weak_connection = Arc::downgrade(&connection);
         let (ready, result) = oneshot::channel();
         std::thread::Builder::new()
             .name("sayweave-composition-sta".into())
@@ -152,27 +203,41 @@ impl Draft {
                 loop {
                     pump();
                     match commands.recv_timeout(Duration::from_millis(5)) {
-                        Ok(Command::Replace(turn,text,reply))=>{
+                        Ok(Command::Observe(sink,reply))=>{let ready=host.observe(sink);let _=reply.send(ready);},
+                        Ok(Command::Replace(turn,text,raw,reply))=>{
                             let result=if turn==host.turn {host.update(&text)}else{Err(Error::new("staleSession"))};
+                            if result.is_ok(){host.remember_tail(raw);}
                             let _=reply.send(result);
                         },
-                        Ok(Command::Settle(turn,prefix,tail,permit,reply))=>{
+                        Ok(Command::Settle(turn,prefix,tail,source,permit,reply))=>{
                             let outcome=if turn!=host.turn {PrefixOutcome {prefix:Mutation::NotAttempted,tail_owned:false,error:Some("staleSession".into())}}
                             else if !permit.load(Ordering::Acquire) {PrefixOutcome {prefix:Mutation::NotAttempted,tail_owned:false,error:Some("staleSnapshot".into())}}
                             else {host.settle(&prefix,&tail,&permit)};
+                            if outcome.prefix==Mutation::Changed&&let Some((prefix_source,tail_source))=source {host.remember_receipt(OutputRegion::Prefix,prefix_source);host.remember_tail(Some(tail_source));}
                             let _=reply.send(outcome);
                         },
                         Ok(Command::Begin(turn,anchor,reply))=>{let _=reply.send(host.begin_turn(turn,anchor));},
                         Ok(Command::Close(reply))=>{let result=host.close();drop(host);let _=reply.send(result);return;},
-                        Ok(Command::Finish(turn,text,mode,keep,reply))=>{
+                        Ok(Command::Finish(turn,text,mode,raw,keep,reply))=>{
                             if turn!=host.turn {let _=reply.send(FinishOutcome::rejected("staleSession"));continue;}
                             let mut delivery=host.finish(&text,mode);
+                            if delivery.committed || delivery.handed_off {host.remember_receipt(OutputRegion::Tail,raw.or_else(||host.raw_tail.as_ref().map(|v|v.raw.clone())).unwrap_or_default());}
                             if keep {let _=reply.send(delivery);continue;}
+                            if host.sink.is_some() && let Some(connection)=weak_connection.upgrade() {
+                                host.retained_at=Some(Instant::now());
+                                if let Ok(mut retained)=RETAINED.lock(){*retained=Some(connection);}
+                                let _=reply.send(delivery);continue;
+                            }
                             delivery.record_cleanup(host.close().is_err());
                             drop(host);let _=reply.send(delivery);return;
                         },
                         Err(mpsc::RecvTimeoutError::Disconnected)=>return,
-                        Err(mpsc::RecvTimeoutError::Timeout)=>{},
+                        Err(mpsc::RecvTimeoutError::Timeout)=>{
+                            if let Some(at)=host.retained_at {
+                                let alive=host.poll_observer();
+                                if !alive || at.elapsed()>=Duration::from_secs(60){let _=host.close();if let Ok(mut retained)=RETAINED.lock()&&retained.as_ref().is_some_and(|c|std::sync::Weak::ptr_eq(&weak_connection,&Arc::downgrade(c))){retained.take();}return;}
+                            }
+                        },
                     }
                 }
             })
@@ -181,7 +246,7 @@ impl Draft {
             .await
             .map_err(|_| Error::new("compositionWorker"))??;
         Ok(Arc::new(Self {
-            connection: Arc::new(Connection { sender }),
+            connection,
             turn,
             closed: AtomicBool::new(false),
             source_sequence: AtomicU64::new(0),
@@ -190,7 +255,28 @@ impl Draft {
     pub(crate) fn connection(&self) -> Arc<Connection> {
         self.connection.clone()
     }
+    #[cfg(feature = "desktop-acceptance")]
     pub async fn replace(&self, sequence: u64, text: String) -> Result<(), Error> {
+        self.replace_with_source(sequence, text, None).await
+    }
+    pub async fn observe(&self, sink: Arc<ObservationSink>) -> bool {
+        let (reply, result) = oneshot::channel();
+        if self
+            .connection
+            .sender
+            .try_send(Command::Observe(sink, reply))
+            .is_err()
+        {
+            return false;
+        }
+        result.await.unwrap_or(false)
+    }
+    pub async fn replace_with_source(
+        &self,
+        sequence: u64,
+        text: String,
+        raw: Option<String>,
+    ) -> Result<(), Error> {
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::new("staleSession"));
         }
@@ -200,15 +286,27 @@ impl Draft {
         let (reply, result) = oneshot::channel();
         self.connection
             .sender
-            .try_send(Command::Replace(self.turn, text, reply))
+            .try_send(Command::Replace(self.turn, text, raw, reply))
             .map_err(|_| Error::new("compositionWorker"))?;
         result.await.map_err(|_| Error::new("compositionWorker"))?
     }
+    #[cfg(feature = "desktop-acceptance")]
     pub async fn settle(
         &self,
         sequence: u64,
         prefix: String,
         tail: String,
+        permit: Arc<AtomicBool>,
+    ) -> PrefixOutcome {
+        self.settle_with_source(sequence, prefix, tail, None, permit)
+            .await
+    }
+    pub async fn settle_with_source(
+        &self,
+        sequence: u64,
+        prefix: String,
+        tail: String,
+        source: Option<(String, String)>,
         permit: Arc<AtomicBool>,
     ) -> PrefixOutcome {
         let fail = |code: &str| PrefixOutcome {
@@ -226,7 +324,9 @@ impl Draft {
         if self
             .connection
             .sender
-            .try_send(Command::Settle(self.turn, prefix, tail, permit, reply))
+            .try_send(Command::Settle(
+                self.turn, prefix, tail, source, permit, reply,
+            ))
             .is_err()
         {
             return fail("compositionWorker");
@@ -240,8 +340,17 @@ impl Draft {
     pub async fn finish(&self, text: String, mode: Finish) -> Delivery {
         self.finish_range(text, mode, false).await.delivery
     }
+    #[cfg(feature = "desktop-acceptance")]
     pub async fn finish_receipt(&self, text: String, mode: Finish) -> FinishOutcome {
         self.finish_range(text, mode, false).await
+    }
+    pub async fn finish_receipt_with_source(
+        &self,
+        text: String,
+        mode: Finish,
+        raw: String,
+    ) -> FinishOutcome {
+        self.finish_range_source(text, mode, Some(raw), false).await
     }
 
     pub async fn handoff_receipt(&self) -> FinishOutcome {
@@ -249,6 +358,15 @@ impl Draft {
             .await
     }
     async fn finish_range(&self, text: String, mode: Finish, keep: bool) -> FinishOutcome {
+        self.finish_range_source(text, mode, None, keep).await
+    }
+    async fn finish_range_source(
+        &self,
+        text: String,
+        mode: Finish,
+        raw: Option<String>,
+        keep: bool,
+    ) -> FinishOutcome {
         if self.closed.swap(true, Ordering::AcqRel) {
             return FinishOutcome::rejected("staleSession");
         }
@@ -256,7 +374,7 @@ impl Draft {
         if self
             .connection
             .sender
-            .try_send(Command::Finish(self.turn, text, mode, keep, reply))
+            .try_send(Command::Finish(self.turn, text, mode, raw, keep, reply))
             .is_err()
         {
             let mut outcome = Delivery::not_submitted("compositionWorker");
@@ -293,6 +411,13 @@ impl Drop for Apartment {
     }
 }
 struct Host {
+    supports_observation: bool,
+    observer_reversal: u64,
+    sink: Option<Arc<ObservationSink>>,
+    raw_tail: Option<SourceReceipt>,
+    receipts: HashMap<(u64, u64, OutputRegion), SourceReceipt>,
+    retained_at: Option<Instant>,
+    poll_at: Instant,
     task: String,
     turn: u64,
     anchor: Anchor,
@@ -315,6 +440,141 @@ struct Host {
     _apartment: Apartment,
 }
 impl Host {
+    fn remember_tail(&mut self, raw: Option<String>) {
+        self.raw_tail = raw.map(|raw| SourceReceipt {
+            operation: self.operation,
+            revision: self.revision,
+            raw,
+        });
+    }
+    fn remember_receipt(&mut self, region: OutputRegion, raw: String) {
+        if raw.is_empty() || self.receipts.len() >= 16 {
+            return;
+        }
+        self.receipts.insert(
+            (self.turn, self.operation, region),
+            SourceReceipt {
+                operation: self.operation,
+                revision: self.revision,
+                raw,
+            },
+        );
+    }
+    fn observe(&mut self, sink: Arc<ObservationSink>) -> bool {
+        if !sink.allowed() {
+            return false;
+        }
+        self.observer_reversal = crate::input_state::reversal_epoch();
+        if !self.supports_observation
+            || !sink.snapshot.settings.enabled
+            || sink.snapshot.application.key == "unknown"
+        {
+            return false;
+        }
+        if self.exchange(Action::ObserveStart, "", true).is_ok() {
+            self.sink = Some(sink);
+            true
+        } else {
+            false
+        }
+    }
+    fn observation_records(&mut self, reply: Reply) {
+        let Some(observation) = reply.edit_observation else {
+            return;
+        };
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        if !sink.allowed() || self.observer_reversal != crate::input_state::reversal_epoch() {
+            return;
+        }
+        for value in observation.records {
+            if !value.ended
+                || value.composing
+                || value.task != self.task
+                || value.before == value.after
+            {
+                continue;
+            }
+            let source = self
+                .receipts
+                .get(&(value.turn, value.operation, value.region))
+                .or_else(|| {
+                    self.raw_tail.as_ref().filter(|r| {
+                        value.region == OutputRegion::Tail
+                            && value.turn == self.turn
+                            && r.operation == value.operation
+                    })
+                });
+            let Some(source) = source.filter(|r| r.revision == value.revision) else {
+                continue;
+            };
+            let Some(expires_at) = edit_expiry(
+                unsafe { GetTickCount64() },
+                value.changed_tick,
+                crate::data::repository::now(),
+            ) else {
+                continue;
+            };
+            (sink.emit)(crate::contracts::language::EditEvidence {
+                id: format!(
+                    "{}:{}:{}:{:?}:{}",
+                    value.task, value.turn, value.operation, value.region, value.sequence
+                ),
+                task: value.task,
+                turn: value.turn,
+                operation: value.operation,
+                sequence: value.sequence,
+                region: if value.region == OutputRegion::Prefix {
+                    "prefix"
+                } else {
+                    "tail"
+                }
+                .into(),
+                expires_at,
+                application: sink.snapshot.application.clone(),
+                settings_revision: sink.snapshot.settings.revision,
+                raw: source.raw.clone(),
+                before: value.before,
+                after: value.after,
+            });
+            self.receipts
+                .remove(&(value.turn, value.operation, value.region));
+        }
+    }
+    fn stop_observation(&mut self) {
+        if self.sink.is_some()
+            && let Ok(reply) = self.exchange_reply(Action::ObserveStop, "", None, true, None)
+        {
+            self.observation_records(reply);
+        }
+    }
+    fn poll_observer(&mut self) -> bool {
+        if self.sink.as_ref().is_some_and(|s| !s.allowed())
+            || self.observer_reversal != crate::input_state::reversal_epoch()
+        {
+            self.stop_observation();
+            self.sink = None;
+            return false;
+        }
+        if self.poll_at.elapsed() < Duration::from_millis(250) {
+            return true;
+        }
+        self.poll_at = Instant::now();
+        if let Ok(reply) = self.exchange_reply(Action::ObservePoll, "", None, true, None) {
+            let active = reply
+                .edit_observation
+                .as_ref()
+                .is_some_and(|v| v.active > 0);
+            self.observation_records(reply);
+            active
+                || self
+                    .retained_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
+        } else {
+            false
+        }
+    }
     fn open(
         task: String,
         turn: u64,
@@ -357,6 +617,13 @@ impl Host {
             std::thread::sleep(Duration::from_millis(5));
         };
         let mut host = Self {
+            supports_observation: false,
+            observer_reversal: crate::input_state::reversal_epoch(),
+            sink: None,
+            raw_tail: None,
+            receipts: HashMap::new(),
+            retained_at: None,
+            poll_at: Instant::now(),
             task,
             turn,
             anchor,
@@ -406,12 +673,15 @@ impl Host {
         {
             return Err(Error::new("staleSession"));
         }
+        self.stop_observation();
         self.anchor = anchor;
         self.turn = turn;
         self.revision = 0;
         self.settled_empty_revision = None;
         self.text.clear();
         self.attempted = false;
+        self.raw_tail = None;
+        self.receipts.clear();
         self.visible = false;
         self.exchange(Action::Begin, "", false)?;
         self.range_open = true;
@@ -421,6 +691,9 @@ impl Host {
             self.exchange(Action::Handoff, "", true)?;
             self.range_open = false;
             return Err(error);
+        }
+        if let Some(sink) = self.sink.clone() {
+            let _ = self.observe(sink);
         }
         Ok(())
     }
@@ -496,6 +769,7 @@ impl Host {
                     return Err(Error::new("compositionProtocol"));
                 }
                 if action == Action::Inspect {
+                    self.supports_observation=reply.edit_observation.as_ref().is_some_and(|v|v.capability==2);
                     let mut pid = 0;
                     let thread = unsafe { GetWindowThreadProcessId(HWND(self.anchor.window as *mut _), Some(&mut pid)) };
                     if pid != self.anchor.process || !reply.compatible_runtime(pid, thread) {
@@ -681,6 +955,8 @@ impl Host {
         }
     }
     fn close(&mut self) -> Result<(), Error> {
+        self.stop_observation();
+        self.sink = None;
         self.profile
             .close()
             .map_err(|_| Error::new("compositionCleanup"))
@@ -722,7 +998,7 @@ fn reply_error(code: &str) -> &'static str {
 }
 #[cfg(test)]
 mod tests {
-    use super::reply_error;
+    use super::*;
     #[test]
     fn empty_tail_completion_requires_the_exact_settlement_and_no_remaining_text() {
         assert!(super::completed_prefix(Some(9), 9, "", ""));
@@ -769,6 +1045,57 @@ mod tests {
             "compositionRejected"
         );
     }
+    #[test]
+    fn observation_off_on_does_not_reactivate_a_frozen_settings_revision() {
+        use crate::contracts::language::*;
+        let enabled = Arc::new(AtomicBool::new(true));
+        let revision = Arc::new(AtomicU64::new(1));
+        let mut snapshot = Snapshot {
+            settings: Settings {
+                enabled: true,
+                revision: 1,
+            },
+            application: ApplicationContext::default(),
+            profile_version: 0,
+            shared_version: 0,
+            preferences: vec![],
+        };
+        let old = ObservationSink {
+            snapshot: snapshot.clone(),
+            permit: enabled.clone(),
+            current_revision: revision.clone(),
+            emit: Arc::new(|_| {}),
+        };
+        assert!(old.allowed());
+        revision.store(2, Ordering::Release);
+        enabled.store(false, Ordering::Release);
+        assert!(!old.allowed());
+        revision.store(3, Ordering::Release);
+        enabled.store(true, Ordering::Release);
+        assert!(!old.allowed());
+        snapshot.settings.revision = 3;
+        let new = ObservationSink {
+            snapshot,
+            permit: enabled,
+            current_revision: revision,
+            emit: Arc::new(|_| {}),
+        };
+        assert!(new.allowed());
+    }
+    #[test]
+    fn edit_expiry_uses_native_change_time_instead_of_late_poll_time() {
+        assert_eq!(edit_expiry(120000, 100000, 1000000), Some(1580000));
+        assert!(edit_expiry(700000, 100000, 1000000).is_none());
+        assert!(edit_expiry(100, 101, 1000000).is_none());
+        assert!(edit_expiry(100, 0, 1000000).is_none());
+    }
+}
+fn edit_expiry(now_tick: u64, changed_tick: u64, wall: i64) -> Option<i64> {
+    if changed_tick == 0 || changed_tick > now_tick {
+        return None;
+    }
+    let elapsed = now_tick - changed_tick;
+    (elapsed < 600000).then(|| wall + 600000 - elapsed as i64)
 }
 fn target_ready(task: &str, anchor: &Anchor, gate: &DeliveryGate) -> Result<(), Error> {
     let began = Instant::now();

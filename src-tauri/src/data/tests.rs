@@ -25,6 +25,7 @@ fn query(kind: Kind, search: &str, page: u32) -> Query {
         kind,
         search: search.into(),
         page,
+        source: None,
     }
 }
 #[test]

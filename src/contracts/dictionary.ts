@@ -4,8 +4,9 @@ export class DictionaryError extends Error {
   constructor(readonly code: DictionaryErrorCode, readonly existingId?: string) { super(code); }
 }
 export interface DictionaryInput { kind: DictionaryKind; original: string; replacement: string|null; category: string|null }
-export interface DictionaryRecord extends DictionaryInput { id: string; revision: number; createdAt: number; updatedAt: number }
-export interface DictionaryQuery { kind: DictionaryKind; search: string; page: number }
+export type DictionarySource='manual'|'automatic';
+export interface DictionaryRecord extends DictionaryInput { id: string; revision: number; createdAt: number; updatedAt: number; source?:DictionarySource }
+export interface DictionaryQuery { kind: DictionaryKind; search: string; page: number; source?:DictionarySource|null }
 export interface DictionaryPage { records: DictionaryRecord[]; total: number; page: number }
 export interface DictionaryStatus { state: 'preparing'|'ready'|'unavailable'; error: {code: DictionaryErrorCode}|null; schemaVersion: number; normalizationVersion: number }
 export interface DictionaryPort {
@@ -16,6 +17,7 @@ export interface DictionaryPort {
   create(input: DictionaryInput): Promise<DictionaryRecord>;
   update(input: DictionaryInput, id: string, revision: number): Promise<DictionaryRecord>;
   delete(kind: DictionaryKind, id: string, revision: number): Promise<void>;
+  onChanged?(callback:()=>void):Promise<()=>void>;
 }
 export function trimText(value: string) { return value.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, ''); }
 export function dictionaryKey(value: string) { return trimText(value).normalize('NFC').toLowerCase().normalize('NFC'); }
@@ -42,7 +44,8 @@ function integer(value: unknown, min=0): value is number { return typeof value==
 export function parseDictionaryRecord(value: unknown): DictionaryRecord {
   const v=object(value);
   if((v.kind!=='term'&&v.kind!=='correction')||typeof v.id!=='string'||typeof v.original!=='string'||!(v.category===null||typeof v.category==='string')||!(v.replacement===null||typeof v.replacement==='string')||!integer(v.revision,1)||!integer(v.createdAt)||!integer(v.updatedAt)) throw new DictionaryError('unavailable');
-  return {id:v.id,kind:v.kind,original:v.original,category:v.category,replacement:v.replacement,revision:v.revision,createdAt:v.createdAt,updatedAt:v.updatedAt};
+  if(v.source!==undefined&&v.source!=='manual'&&v.source!=='automatic')throw new DictionaryError('unavailable');
+  return {id:v.id,kind:v.kind,original:v.original,category:v.category,replacement:v.replacement,revision:v.revision,createdAt:v.createdAt,updatedAt:v.updatedAt,source:v.source??'manual'};
 }
 export function parseDictionaryPage(value: unknown): DictionaryPage {
   const v=object(value); if(!Array.isArray(v.records)||v.records.length>50||!integer(v.total)||!integer(v.page,1)) throw new DictionaryError('unavailable');

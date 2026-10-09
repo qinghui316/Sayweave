@@ -760,8 +760,21 @@ impl SessionDraft {
         let draft = s.draft.as_ref().unwrap().clone();
         let sequence = s.latest.sequence;
         let prefix = boundary.committed.clone();
+        let source_end = unit.chars.end - suffix.chars().count();
+        let prefix_source = units::slice(&s.latest.text, s.committed_source..source_end);
+        let tail_source = units::slice(&s.latest.text, source_end..s.latest.text.chars().count());
         let job = tokio::spawn(async move {
-            NativeValue::Settled(draft.settle(sequence, prefix, tail, permission).await)
+            NativeValue::Settled(
+                draft
+                    .settle_with_source(
+                        sequence,
+                        prefix,
+                        tail,
+                        Some((prefix_source, tail_source)),
+                        permission,
+                    )
+                    .await,
+            )
         });
         s.native = Some(NativeJob {
             kind: NativeKind::Settle {
@@ -852,10 +865,17 @@ impl SessionDraft {
             let tail = Self::tail(s);
             let draft = s.draft.as_ref().unwrap().clone();
             let sequence = s.latest.sequence;
-            let job =
-                tokio::spawn(
-                    async move { NativeValue::Replaced(draft.replace(sequence, tail).await) },
-                );
+            let source = units::slice(
+                &s.latest.text,
+                s.committed_source..s.latest.text.chars().count(),
+            );
+            let job = tokio::spawn(async move {
+                NativeValue::Replaced(
+                    draft
+                        .replace_with_source(sequence, tail, Some(source))
+                        .await,
+                )
+            });
             s.native = Some(NativeJob {
                 kind: NativeKind::Replace {
                     sequence,
@@ -903,8 +923,16 @@ impl SessionDraft {
                 format!("{}{tail}", s.submitted)
             };
             let action = mode.clone();
+            let tail_source = units::slice(
+                &raw,
+                s.committed_source..raw.chars().count().max(s.committed_source),
+            );
             let job = tokio::spawn(async move {
-                NativeValue::Finalized(draft.finish_receipt(tail, action).await)
+                NativeValue::Finalized(
+                    draft
+                        .finish_receipt_with_source(tail, action, tail_source)
+                        .await,
+                )
             });
             s.native = Some(NativeJob {
                 kind: NativeKind::Final { mode, raw, text },
