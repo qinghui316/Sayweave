@@ -172,6 +172,7 @@ enum EventDecision {
     Unrelated,
     Original,
     OwnOverlay,
+    NonActivatingNotice,
     Changed(&'static str),
 }
 struct EventEvidence {
@@ -181,9 +182,13 @@ struct EventEvidence {
     foreground: usize,
     own_event: bool,
     own_foreground: bool,
+    nonactivating_notice: bool,
 }
 fn event_decision(event: u32, top: usize, focus: usize, e: &EventEvidence) -> EventDecision {
     if event == EVENT_SYSTEM_FOREGROUND {
+        if e.nonactivating_notice && e.foreground == top {
+            return EventDecision::NonActivatingNotice;
+        }
         if e.window != top && e.root != top && !e.own_event {
             return EventDecision::Changed("externalForeground");
         }
@@ -222,10 +227,19 @@ pub(super) fn observe(event: u32, window: usize, object: i32, event_tick: u32) {
     {
         let received_tick = unsafe { GetTickCount() };
         let foreground = unsafe { GetForegroundWindow().0 as usize };
+        let event_root = unsafe { GetAncestor(hwnd(window), GA_ROOT).0 as usize };
+        let nonactivating_notice = event == EVENT_SYSTEM_FOREGROUND
+            && foreground == watch.anchor.window
+            && event_root != 0
+            && event_root != watch.anchor.window
+            && unsafe { IsWindow(Some(hwnd(event_root))) }.as_bool()
+            && unsafe { GetWindowLongPtrW(hwnd(event_root), GWL_EXSTYLE) } as u32
+                & (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0)
+                == (WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0);
         let evidence = EventEvidence {
             window,
             object,
-            root: unsafe { GetAncestor(hwnd(window), GA_ROOT).0 as usize },
+            root: event_root,
             foreground,
             own_event: watch
                 .overlay
@@ -235,6 +249,7 @@ pub(super) fn observe(event: u32, window: usize, object: i32, event_tick: u32) {
                 .overlay
                 .as_ref()
                 .is_some_and(|o| crate::voice_window::contains(o, foreground, received_tick)),
+            nonactivating_notice,
         };
         let decision = event_decision(event, watch.anchor.window, watch.anchor.focus, &evidence);
         watch.identity_changed |= matches!(
@@ -258,6 +273,35 @@ pub(super) fn observe(event: u32, window: usize, object: i32, event_tick: u32) {
 mod event_tests {
     use super::*;
     #[test]
+    fn nonactivating_notice_does_not_invalidate_original_foreground() {
+        let mut evidence = EventEvidence {
+            window: 15,
+            object: OBJID_WINDOW.0,
+            root: 15,
+            foreground: 10,
+            own_event: false,
+            own_foreground: false,
+            nonactivating_notice: true,
+        };
+        assert_eq!(
+            event_decision(EVENT_SYSTEM_FOREGROUND, 10, 12, &evidence),
+            EventDecision::NonActivatingNotice
+        );
+        // Style does not grant permission when the helper really owns foreground.
+        evidence.foreground = 15;
+        assert!(matches!(
+            event_decision(EVENT_SYSTEM_FOREGROUND, 10, 12, &evidence),
+            EventDecision::Changed(_)
+        ));
+        // An ordinary external window's delayed event remains invalidating.
+        evidence.foreground = 10;
+        evidence.nonactivating_notice = false;
+        assert_eq!(
+            event_decision(EVENT_SYSTEM_FOREGROUND, 10, 12, &evidence),
+            EventDecision::Changed("externalForeground")
+        );
+    }
+    #[test]
     fn foreground_notification_from_original_child_is_not_an_external_switch() {
         let mut evidence = EventEvidence {
             window: 12,
@@ -266,6 +310,7 @@ mod event_tests {
             foreground: 10,
             own_event: false,
             own_foreground: false,
+            nonactivating_notice: false,
         };
         assert_eq!(
             event_decision(EVENT_SYSTEM_FOREGROUND, 10, 12, &evidence),
@@ -292,6 +337,7 @@ mod event_tests {
             foreground: 10,
             own_event: false,
             own_foreground: false,
+            nonactivating_notice: false,
         };
         assert_eq!(
             event_decision(EVENT_OBJECT_LOCATIONCHANGE, 10, 12, &e),
@@ -317,6 +363,7 @@ mod event_tests {
             foreground: 10,
             own_event: false,
             own_foreground: false,
+            nonactivating_notice: false,
         };
         assert_eq!(
             event_decision(EVENT_OBJECT_DESTROY, 10, 12, &e),
@@ -342,6 +389,7 @@ mod event_tests {
             foreground: 10,
             own_event: true,
             own_foreground: false,
+            nonactivating_notice: false,
         };
         assert_eq!(
             event_decision(EVENT_SYSTEM_FOREGROUND, 10, 12, &e),

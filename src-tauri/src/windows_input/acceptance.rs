@@ -7,6 +7,38 @@ use std::{
     time::{Duration, Instant},
 };
 use windows::Win32::{Foundation::*, System::DataExchange::*, UI::WindowsAndMessaging::*};
+static TRACKED_AUXILIARY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static AUXILIARY_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+struct AuxiliaryEvents(usize);
+impl AuxiliaryEvents {
+    fn track(window: usize) -> Self {
+        TRACKED_AUXILIARY.store(window, std::sync::atomic::Ordering::Release);
+        Self(window)
+    }
+    fn count(&self) -> u64 {
+        AUXILIARY_EVENTS.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn wait_after(&self, previous: u64) -> Result<(), String> {
+        let until = Instant::now() + Duration::from_secs(2);
+        while self.count() <= previous {
+            if Instant::now() >= until {
+                return Err("owned auxiliary foreground event was not received".into());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+}
+impl Drop for AuxiliaryEvents {
+    fn drop(&mut self) {
+        let _ = TRACKED_AUXILIARY.compare_exchange(
+            self.0,
+            0,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+}
 struct Fixture {
     child: Child,
     window: usize,
@@ -27,6 +59,11 @@ unsafe extern "system" fn evidence_event(
     time: u32,
 ) {
     super::native::observe(event, window.0 as usize, object, time);
+    if event == EVENT_SYSTEM_FOREGROUND
+        && window.0 as usize == TRACKED_AUXILIARY.load(std::sync::atomic::Ordering::Acquire)
+    {
+        AUXILIARY_EVENTS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 impl EvidenceLease {
     fn new() -> Result<Self, String> {
@@ -368,7 +405,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         let (cancel, _) = tokio::sync::watch::channel(0);
         let manager = SessionDraft::new(
             id.clone(),
-            anchor,
+            anchor.clone(),
             draft,
             flow.clone(),
             cancel.clone(),
@@ -420,8 +457,39 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             let mut edited_prefix = String::new();
             manager.update(&latest);
             wait_text(&mut fixture, "a第1轮你好bc")?;
+            let auxiliary = fixture.command(serde_json::json!({"action":"auxiliary-info"}))?;
+            if auxiliary["foreground"] != true
+                || auxiliary["auxiliary"]["error"] != serde_json::Value::Null
+                || auxiliary["auxiliary"]["noActivate"] != true
+                || auxiliary["auxiliary"]["toolWindow"] != true
+                || auxiliary["auxiliary"]["foreground"] != false
+                || auxiliary["auxiliary"]["text"] != "owned helper sentinel"
+            {
+                return Err(format!("nonactivating helper initialization {auxiliary}"));
+            }
+            let auxiliary_window = auxiliary["auxiliary"]["window"]
+                .as_u64()
+                .filter(|window| *window != 0 && *window as usize != fixture.window)
+                .ok_or("nonactivating helper window missing")?
+                as usize;
+            let notices = AuxiliaryEvents::track(auxiliary_window);
             for round in 1..=6 {
                 active()?;
+                let previous = notices.count();
+                let notice = fixture.command(serde_json::json!({"action":"auxiliary-notice"}))?;
+                if notice["foreground"] != true
+                    || notice["auxiliary"]["error"] != serde_json::Value::Null
+                    || notice["auxiliary"]["foreground"] != false
+                    || notice["auxiliary"]["text"] != "owned helper sentinel"
+                {
+                    return Err(format!(
+                        "synthetic auxiliary notification changed target {notice}"
+                    ));
+                }
+                notices.wait_after(previous)?;
+                if !composition_target(&id, &anchor).map_err(|e| e.code)? {
+                    return Err("synthetic auxiliary notification blocked original target".into());
+                }
                 let before = fixture.command(serde_json::json!({"action":"read"}))?;
                 let expected_caret =
                     1 + edited_prefix.encode_utf16().count() + latest.text.encode_utf16().count();
@@ -508,7 +576,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
                 wait_text(&mut fixture, &format!("a{edited_prefix}{}bc", latest.text))?;
                 active()?;
                 println!(
-                    "SAYWEAVE_COMPOSITION_EDIT_ROUND_PASS round={round} turn={} same_session=true controlled_edit=true actual_text=true cancel=0 stopping=false",
+                    "SAYWEAVE_COMPOSITION_EDIT_ROUND_PASS round={round} turn={} same_session=true controlled_edit=true synthetic_accessibility_notice=true actual_text=true cancel=0 stopping=false",
                     latest.turn
                 );
             }
@@ -533,6 +601,10 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
                     latest.turn, delivery.error, report.error
                 ));
             }
+            let helper = fixture.command(serde_json::json!({"action":"auxiliary-read"}))?;
+            if helper["auxiliary"]["text"] != "owned helper sentinel" {
+                return Err(format!("six-edit workflow wrote the helper {helper}"));
+            }
             Ok(())
         })();
         if result.is_err() && !actor.is_finished() {
@@ -555,6 +627,59 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         result?;
         println!(
             "SAYWEAVE_COMPOSITION_TURNS_PASS rounds=6 final_turn=7 controlled_edit=true actual_handoff=true resumed_range=true old_turn_ignored=true final_single_copy=true"
+        );
+    }
+    // The same styled helper is still a real external window if explicitly
+    // activated. This uses actual foreground, not a synthetic notice, and must
+    // remain invalidating after the original window regains foreground.
+    {
+        fixture
+            .command(serde_json::json!({"action":"focus","text":"target ","start":7,"end":7}))?;
+        thread::sleep(Duration::from_millis(60));
+        let id = uuid::Uuid::new_v4().to_string();
+        let anchor = WindowsInputService::anchor().ok_or("auxiliary negative target missing")?;
+        bind_watch(&id, &anchor, None).map_err(|e| e.code)?;
+        let draft = runtime
+            .block_on(Draft::begin(
+                id.clone(),
+                1,
+                anchor,
+                Arc::new(DeliveryGate::default()),
+            ))
+            .map_err(|e| e.code)?;
+        runtime
+            .block_on(draft.replace(1, "原范围".into()))
+            .map_err(|e| e.code)?;
+        let helper = fixture.command(serde_json::json!({"action":"auxiliary-info"}))?;
+        let window = helper["auxiliary"]["window"]
+            .as_u64()
+            .ok_or("helper missing")? as usize;
+        let notices = AuxiliaryEvents::track(window);
+        let previous = notices.count();
+        let activated = fixture.command(serde_json::json!({"action":"auxiliary-activate"}))?;
+        if activated["auxiliary"]["error"] != serde_json::Value::Null
+            || activated["foreground"] != false
+            || activated["auxiliary"]["foreground"] != true
+        {
+            return Err(format!("helper was not actual foreground {activated}"));
+        }
+        notices.wait_after(previous)?;
+        fixture.command(serde_json::json!({"action":"focus"}))?;
+        thread::sleep(Duration::from_millis(60));
+        let result = runtime.block_on(draft.finish("禁止追加".into(), Finish::Commit));
+        let actual = fixture.command(serde_json::json!({"action":"auxiliary-read"}))?;
+        release_watch(&id);
+        if result.error.as_deref() != Some("targetChanged")
+            || actual["text"] != "target 原范围"
+            || actual["auxiliary"]["text"] != "owned helper sentinel"
+        {
+            return Err(format!(
+                "explicitly activated helper bypassed protection: {:?} {actual}",
+                result.error
+            ));
+        }
+        println!(
+            "SAYWEAVE_NONACTIVATING_HELPER_PASS synthetic_notice_preserved_target=true actual_activation_sticky=true helper_untouched=true ime_identity_proven=false"
         );
     }
     // Actual foreground notifications must remain sticky after switching back. This is

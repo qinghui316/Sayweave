@@ -361,10 +361,15 @@ fn main() {
         io::stdout().flush().unwrap();
         let mut msg = MSG::default();
         let mut injected_keys = Vec::new();
+        let mut auxiliary = HWND::default();
+        let mut auxiliary_editor = HWND::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.message == WM_APP + 7 {
                 let value = r.recv().unwrap();
                 if value["action"] == "exit" {
+                    if !auxiliary.0.is_null() {
+                        let _ = DestroyWindow(auxiliary);
+                    }
                     let _ = DestroyWindow(top);
                     PostQuitMessage(0);
                     let _ = ok.send(());
@@ -412,6 +417,81 @@ fn main() {
                     io::stdout().flush().unwrap();
                     let _ = ok.send(());
                     continue;
+                }
+                let mut auxiliary_result = None;
+                if matches!(
+                    value["action"].as_str(),
+                    Some("auxiliary-info" | "auxiliary-notice" | "auxiliary-activate")
+                ) {
+                    let result = (|| -> windows::core::Result<()> {
+                        if GetForegroundWindow() != top || GetFocus() != editor {
+                            return Err(E_ACCESSDENIED.into());
+                        }
+                        if !IsWindow(Some(auxiliary)).as_bool() {
+                            auxiliary = CreateWindowExW(
+                                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                                w!("SayweaveInputFixture"),
+                                w!("Owned auxiliary fixture"),
+                                WS_POPUP,
+                                530,
+                                30,
+                                200,
+                                80,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )?;
+                            auxiliary_editor = CreateWindowExW(
+                                WINDOW_EX_STYLE(0),
+                                w!("EDIT"),
+                                w!("owned helper sentinel"),
+                                WS_CHILD | WS_VISIBLE,
+                                4,
+                                4,
+                                190,
+                                60,
+                                Some(auxiliary),
+                                None,
+                                None,
+                                None,
+                            )?;
+                            let _ = ShowWindow(auxiliary, SW_SHOWNOACTIVATE);
+                        }
+                        if value["action"] == "auxiliary-notice" {
+                            use windows::Win32::UI::Accessibility::NotifyWinEvent;
+                            // An explicit synthetic accessibility notification,
+                            // not an assertion that this window became foreground.
+                            NotifyWinEvent(EVENT_SYSTEM_FOREGROUND, auxiliary, OBJID_WINDOW.0, 0);
+                        } else if value["action"] == "auxiliary-activate" {
+                            let _ = SetForegroundWindow(auxiliary);
+                            let _ = SetFocus(Some(auxiliary_editor));
+                            if GetForegroundWindow() != auxiliary {
+                                return Err(E_FAIL.into());
+                            }
+                        }
+                        Ok(())
+                    })();
+                    let mut text = [0u16; 256];
+                    let size = GetWindowTextW(auxiliary_editor, &mut text) as usize;
+                    let style = GetWindowLongPtrW(auxiliary, GWL_EXSTYLE) as u32;
+                    auxiliary_result = Some(serde_json::json!({
+                        "window": auxiliary.0 as usize,
+                        "text": String::from_utf16_lossy(&text[..size]),
+                        "noActivate": style & WS_EX_NOACTIVATE.0 != 0,
+                        "toolWindow": style & WS_EX_TOOLWINDOW.0 != 0,
+                        "foreground": GetForegroundWindow() == auxiliary,
+                        "error": result.err().map(|error| format!("{:08x}", error.code().0 as u32))
+                    }));
+                }
+                if value["action"] == "auxiliary-read" {
+                    let mut text = [0u16; 256];
+                    let size = GetWindowTextW(auxiliary_editor, &mut text) as usize;
+                    auxiliary_result = Some(serde_json::json!({
+                        "window": auxiliary.0 as usize,
+                        "text": String::from_utf16_lossy(&text[..size]),
+                        "foreground": GetForegroundWindow() == auxiliary
+                    }));
                 }
                 if value["action"] != "type"
                     && let Some(text) = value["text"].as_str()
@@ -652,7 +732,7 @@ fn main() {
                 let selection = message(editor, 0x00B0, WPARAM(0), LPARAM(0)).0 as usize;
                 println!(
                     "{}",
-                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window,"controlledEdit":controlled_edit,"controlledEditSteps":controlled_edit_steps})
+                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window,"controlledEdit":controlled_edit,"controlledEditSteps":controlled_edit_steps,"auxiliary":auxiliary_result})
                 );
                 io::stdout().flush().unwrap();
                 let _ = ok.send(());
