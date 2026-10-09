@@ -335,6 +335,15 @@ unsafe extern "system" fn procedure(
         }
         let after_length = length(window);
         let delta = after_length as i64 - before_length as i64;
+        if after_length == 0
+            && !hook.incomplete.get()
+            && message != WM_UNDO
+            && message != 0x00C7
+            && capable(window)
+            && reading.borrow_mut().freeze_before_clear()
+        {
+            return result;
+        }
         if message == WM_UNDO || message == 0x00C7 || message == WM_SETTEXT || !capable(window) {
             reading.borrow_mut().valid = false;
             return result;

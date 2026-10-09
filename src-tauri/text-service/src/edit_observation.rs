@@ -25,6 +25,56 @@ struct Reading {
     original: Option<Rc<str>>,
     end_reason: &'static str,
 }
+impl Reading {
+    // A host may clear its field after submitting. Keep only the latest
+    // completed, already-verified edit; emptying itself grants no evidence.
+    fn freeze_before_clear(&mut self) -> bool {
+        if !self.valid
+            || self.value.composing
+            || self.value.sequence == 0
+            || self.value.after.is_empty()
+            || self.value.before == self.value.after
+            || self.original.as_deref().is_some_and(|original| {
+                crate::composition_text::equivalent_native_text(original, &self.value.after)
+            })
+        {
+            return false;
+        }
+        self.value.ended = true;
+        self.continuation = false;
+        self.end_reason = "fieldCleared";
+        true
+    }
+}
+unsafe fn field_is_empty(context: &ITfContext, ec: u32) -> windows::core::Result<bool> {
+    unsafe {
+        if context
+            .GetStart(ec)?
+            .CompareStart(ec, &context.GetEnd(ec)?, TF_ANCHOR_START)?
+            == 0
+        {
+            return Ok(true);
+        }
+        // RichEdit can retain a structural terminal after its visible text is
+        // empty. Its own native length is an independent metadata proof. A
+        // browser/top-level window's zero caption length is never a field proof.
+        use windows::Win32::{
+            System::Threading::GetCurrentProcessId,
+            UI::WindowsAndMessaging::{
+                GetClassNameW, GetWindowTextLengthW, GetWindowThreadProcessId,
+            },
+        };
+        let window = context.GetActiveView()?.GetWnd()?;
+        let mut process = 0;
+        GetWindowThreadProcessId(window, Some(&mut process));
+        let mut buffer = [0u16; 64];
+        let count = GetClassNameW(window, &mut buffer);
+        let name = String::from_utf16_lossy(&buffer[..count.max(0) as usize]).to_ascii_uppercase();
+        Ok(process == GetCurrentProcessId()
+            && (name == "EDIT" || name.starts_with("RICHEDIT"))
+            && GetWindowTextLengthW(window) == 0)
+    }
+}
 pub(super) struct Watch {
     field: super::initial_selection::FocusIdentity,
     context: ITfContext,
@@ -343,7 +393,7 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                     return Ok(());
                 }
             }
-            let result = (|| -> windows::core::Result<(String, bool, bool)> {
+            let result = (|| -> windows::core::Result<(String, bool, bool, bool)> {
                 if context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0
                     || super::password(context, &self.range, ec)?
                 {
@@ -359,6 +409,10 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                 let mut count = 0;
                 let mut changed_text = false;
                 let mut exhausted = false;
+                // Some hosts clear while ending composition and notify only a
+                // property change. The field's own empty metadata remains the
+                // proof; notification kind alone must not revive interim text.
+                let cleared = field_is_empty(context, ec)?;
                 for _ in 0..64 {
                     ranges[0] = None;
                     changes.Next(&mut ranges, &mut count)?;
@@ -367,6 +421,12 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                         break;
                     }
                     changed_text = true;
+                    // Check whole-document structure, not just an empty receipt.
+                    // This reads no unrelated text and does not infer a send key.
+                    if cleared {
+                        exhausted = true;
+                        break;
+                    }
                     let changed = ranges[0]
                         .as_ref()
                         .ok_or_else(|| windows::core::Error::from_hresult(E_POINTER))?;
@@ -410,7 +470,11 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                     ));
                 }
                 // Native ranges track edits inside the receipt; unrelated text stays outside.
-                let after = range_text(&self.range, ec)?;
+                let after = if cleared {
+                    String::new()
+                } else {
+                    range_text(&self.range, ec)?
+                };
                 #[cfg(feature = "acceptance")]
                 eprintln!(
                     "owned observer callback own=false epoch={epoch} changed_text={changed_text} after_units={}",
@@ -431,7 +495,7 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                 owner
                     .EnumCompositions()?
                     .Next(&mut compositions, &mut fetched)?;
-                Ok((after, fetched != 0, continuation))
+                Ok((after, fetched != 0, continuation, cleared))
             })();
             let field = self.field.matches();
             let mut data = self.data.borrow_mut();
@@ -452,8 +516,13 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                 }
             }
             match result {
-                Ok((after, composing, continuation)) => {
+                Ok((after, composing, continuation, cleared)) => {
                     data.continuation = continuation;
+                    // Both the previous captured edit and this clearing session
+                    // must be complete; ending IME cannot promote an interim edit.
+                    if cleared && !composing && data.freeze_before_clear() {
+                        return Ok(());
+                    }
                     data.value.composing = composing;
                     if after != data.value.after {
                         data.value.after = after;

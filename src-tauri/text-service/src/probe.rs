@@ -1348,6 +1348,13 @@ fn observation_ranges_fixture(
             ("undo", "术语", 0, 2, "词典", "词典", true),
             ("revert", "术语", 0, 2, "词典", "词典", true),
             ("handoffExplicit", "术语", 0, 2, "词典", "词典", true),
+            ("clearAfterEdit", "术语", 0, 2, "词典", "词典", true),
+            ("settleClearAfterEdit", "术语", 0, 2, "词典", "词典", true),
+            ("clearWithoutEdit", "术语", 0, 2, "术语", "术语", false),
+            ("clearRestored", "术语", 0, 2, "词典", "词典", false),
+            ("rangeClear", "术语", 0, 2, "", "", true),
+            ("clearComposing", "术语", 0, 2, "词典", "词典", false),
+            ("clearComposingEnded", "术语", 0, 2, "词典", "词典", false),
             ("readonly", "术语", 0, 2, "词典", "词典", true),
             ("password", "术语", 0, 2, "词典", "词典", true),
             ("originalRestore", "术语", 0, 2, "甲词", "甲词", false),
@@ -1359,7 +1366,12 @@ fn observation_ranges_fixture(
             ("settleReentry", "术语", 0, 2, "词典", "词典", true),
             ("settleReactivate", "术语", 0, 2, "词典", "词典", false),
         ] {
-            if !plain && matches!(label, "ime" | "undo" | "readonly" | "password") {
+            if !plain
+                && matches!(
+                    label,
+                    "ime" | "clearComposing" | "undo" | "readonly" | "password"
+                )
+            {
                 continue;
             }
             // Legacy EDIT may expose an empty TSF original even with a native
@@ -1371,7 +1383,25 @@ fn observation_ranges_fixture(
             if plain && label.starts_with("settle") {
                 continue;
             }
-            let prefix = if label == "outside" { "同词" } else { "" };
+            if plain && label == "clearComposingEnded" {
+                continue;
+            }
+            let user_composition = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let prefix = if label == "outside" {
+                "同词"
+            } else if label == "rangeClear" {
+                "正文"
+            } else {
+                ""
+            };
+            let (from, to) = if label == "rangeClear" {
+                (
+                    from + prefix.encode_utf16().count(),
+                    to + prefix.encode_utf16().count(),
+                )
+            } else {
+                (from, to)
+            };
             let initial_body = if label == "originalRestore" {
                 "甲词"
             } else {
@@ -1565,7 +1595,7 @@ fn observation_ranges_fixture(
             // Native EDIT uses CRLF coordinates. RichEdit exposes one CR per line.
             // These changes stay before the first newline, so coordinates are exact.
             if plain {
-                if label == "ime" {
+                if matches!(label, "ime" | "clearComposing") {
                     SendMessageW(editor, WM_IME_STARTCOMPOSITION, None, None);
                 }
                 SendMessageW(
@@ -1574,6 +1604,9 @@ fn observation_ranges_fixture(
                     Some(WPARAM(from)),
                     Some(LPARAM(to as isize)),
                 );
+                if replacement.is_empty() {
+                    SendMessageW(editor, WM_CHAR, Some(WPARAM(8)), None);
+                }
                 let keys = replacement
                     .encode_utf16()
                     .flat_map(|unit| {
@@ -1615,13 +1648,22 @@ fn observation_ranges_fixture(
                     let inject: unsafe extern "system" fn(usize) = std::mem::transmute(entry);
                     inject(if label == "settleReactivate" { 10 } else { 8 });
                 }
-                let edit: ITfEditSession = UserTextEdit {
-                    context: context.clone(),
-                    start: from as i32,
-                    length: (to - from) as i32,
-                    text: replacement.into(),
-                }
-                .into();
+                let edit: ITfEditSession = if label == "clearComposingEnded" {
+                    ComposingChange {
+                        context: context.clone(),
+                        composition: user_composition.clone(),
+                        start: true,
+                    }
+                    .into()
+                } else {
+                    UserTextEdit {
+                        context: context.clone(),
+                        start: from as i32,
+                        length: (to - from) as i32,
+                        text: replacement.into(),
+                    }
+                    .into()
+                };
                 context
                     .RequestEditSession(foreign, &edit, TF_ES_SYNC | TF_ES_READWRITE)?
                     .ok()?;
@@ -1630,6 +1672,8 @@ fn observation_ranges_fixture(
             let actual = editor_text(editor)?;
             let expected_all = if label == "settleReentry" {
                 format!("{expected}{input}")
+            } else if label == "rangeClear" {
+                format!("{prefix}{expected}")
             } else if label != "outside" {
                 expected.to_owned()
             } else {
@@ -1655,6 +1699,51 @@ fn observation_ranges_fixture(
                     "owned receipt scenario=settleReactivate actual_text=true old_resources_retired=true new_activation_retained=true"
                 );
                 continue;
+            }
+            if matches!(
+                label,
+                "clearAfterEdit" | "settleClearAfterEdit" | "clearWithoutEdit" | "clearComposing"
+            ) {
+                // Simulate a host submitting and clearing its field immediately
+                // after a verified correction, before the first observation poll.
+                SetWindowTextW(editor, windows::core::w!(""))?;
+                pump(Duration::from_millis(30));
+                if !editor_text(editor)?.is_empty() {
+                    return Err("submitted fixture field was not cleared".into());
+                }
+            }
+            if label == "clearComposingEnded" {
+                let interim = exchange(
+                    pipe,
+                    capability,
+                    &task,
+                    1,
+                    5,
+                    1,
+                    Action::ObservePoll,
+                    "",
+                    false,
+                )?
+                .edit_observation
+                .ok_or("missing composing snapshot")?;
+                if interim.active == 0 || !interim.records.is_empty() {
+                    return Err(
+                        "active uncommitted composition was exposed or observation lost".into(),
+                    );
+                }
+                let edit: ITfEditSession = ComposingChange {
+                    context: context.clone(),
+                    composition: user_composition.clone(),
+                    start: false,
+                }
+                .into();
+                context
+                    .RequestEditSession(foreign, &edit, TF_ES_SYNC | TF_ES_READWRITE)?
+                    .ok()?;
+                pump(Duration::from_millis(30));
+                if !editor_text(editor)?.is_empty() {
+                    return Err("IME end/clear did not empty actual field".into());
+                }
             }
             if label == "ime" {
                 let reading = exchange(
@@ -1719,7 +1808,7 @@ fn observation_ranges_fixture(
                     .into());
                 }
             }
-            if label == "revert" {
+            if matches!(label, "revert" | "clearRestored") {
                 if plain {
                     SendMessageW(
                         editor,
@@ -1749,6 +1838,13 @@ fn observation_ranges_fixture(
                 pump(Duration::from_millis(30));
                 if !observation_text_equal(&editor_text(editor)?, input) {
                     return Err("revert did not restore actual output".into());
+                }
+                if label == "clearRestored" {
+                    SetWindowTextW(editor, windows::core::w!(""))?;
+                    pump(Duration::from_millis(30));
+                    if !editor_text(editor)?.is_empty() {
+                        return Err("restored fixture was not cleared".into());
+                    }
                 }
             }
             let read_count = |operation| -> Result<u64, Box<dyn std::error::Error>> {
@@ -1828,12 +1924,17 @@ fn observation_ranges_fixture(
                 SetWindowLongPtrW(editor, GWL_STYLE, original_style);
             }
             let valid = valid && !matches!(label, "undo" | "readonly" | "password" | "revert");
+            let cleared_negative = matches!(
+                label,
+                "clearWithoutEdit" | "clearRestored" | "clearComposingEnded"
+            );
             if result.mutation != Mutation::NotAttempted
                 || (valid
                     && (records.len() != 1
                         || !observation_text_equal(&records[0].before, input)
                         || !observation_text_equal(&records[0].after, expected)))
-                || (!valid && !records.is_empty())
+                || (!valid && !cleared_negative && !records.is_empty())
+                || (cleared_negative && records.iter().any(|record| !record.after.is_empty()))
             {
                 return Err(format!(
                     "receipt scope assertion {label} records={} diagnostic={} fixture_values={:?}",
@@ -1879,6 +1980,73 @@ impl ITfEditSession_Impl for UserTextEdit_Impl {
                 TF_ST_CORRECTION,
                 &self.text.encode_utf16().collect::<Vec<_>>(),
             )
+        }
+    }
+}
+#[cfg(feature = "acceptance")]
+#[windows::core::implement(ITfCompositionSink)]
+struct UserCompositionSink;
+#[cfg(feature = "acceptance")]
+impl ITfCompositionSink_Impl for UserCompositionSink_Impl {
+    fn OnCompositionTerminated(
+        &self,
+        _: u32,
+        _: windows::core::Ref<ITfComposition>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+#[cfg(feature = "acceptance")]
+#[windows::core::implement(ITfEditSession)]
+struct ComposingChange {
+    context: ITfContext,
+    composition: std::rc::Rc<std::cell::RefCell<Option<ITfComposition>>>,
+    start: bool,
+}
+#[cfg(feature = "acceptance")]
+impl ITfEditSession_Impl for ComposingChange_Impl {
+    fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        unsafe {
+            let range = self.context.GetStart(ec)?;
+            if self.start {
+                let mut moved = 0;
+                range.ShiftEnd(ec, 2, &mut moved, std::ptr::null())?;
+                if moved != 2 {
+                    return Err(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_FAIL,
+                    ));
+                }
+                let sink: ITfCompositionSink = UserCompositionSink.into();
+                let owner: ITfContextComposition = self.context.cast()?;
+                *self.composition.borrow_mut() = Some(owner.StartComposition(ec, &range, &sink)?);
+                range.SetText(
+                    ec,
+                    TF_ST_CORRECTION,
+                    &"词典".encode_utf16().collect::<Vec<_>>(),
+                )
+            } else {
+                let composition = self.composition.borrow_mut().take().ok_or_else(|| {
+                    windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL)
+                })?;
+                composition.EndComposition(ec)?;
+                let owner: ITfContextComposition = self.context.cast()?;
+                let mut compositions = [None];
+                let mut count = 0;
+                owner
+                    .EnumCompositions()?
+                    .Next(&mut compositions, &mut count)?;
+                if count != 0 {
+                    return Err(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_FAIL,
+                    ));
+                }
+                // Clear through the actual host in the same foreign edit
+                // session. Range SetText can leave RichEdit's terminal CR.
+                SetWindowTextW(
+                    self.context.GetActiveView()?.GetWnd()?,
+                    windows::core::w!(""),
+                )
+            }
         }
     }
 }
