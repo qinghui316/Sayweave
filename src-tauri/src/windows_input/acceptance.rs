@@ -377,66 +377,184 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         );
         manager.activate();
         let ongoing = manager.clone();
-        let actor = runtime.spawn(async move {
+        let mut actor = runtime.spawn(async move {
             ongoing.maintain(|_| {}).await;
         });
-        manager.update(&NativeTranscript {
+        let mut latest = NativeTranscript {
             task_id: id.clone(),
             turn: 1,
             sequence: 1,
-            text: "你好".into(),
-            ..NativeTranscript::default()
-        });
-        let until = std::time::Instant::now() + Duration::from_secs(3);
-        while fixture.command(serde_json::json!({"action":"read"}))?["text"] != "a你好bc" {
-            if std::time::Instant::now() >= until {
-                return Err("turn1 actual text missing".into());
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        crate::input_state::edited();
-        fixture.command(serde_json::json!({"action":"type","text":"X"}))?;
-        let until = std::time::Instant::now() + Duration::from_secs(4);
-        while manager.presentation() != Presentation::Resuming {
-            if *cancel.borrow() > 0 || std::time::Instant::now() >= until {
-                actor.abort();
-                return Err("production turn manager did not resume".into());
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        manager.update(&NativeTranscript {
-            task_id: id.clone(),
-            turn: 1,
-            sequence: 2,
-            text: "旧轮禁止覆盖".into(),
-            ..NativeTranscript::default()
-        });
-        let latest = NativeTranscript {
-            task_id: id.clone(),
-            turn: 2,
-            sequence: 3,
-            text: "新🙂".into(),
+            text: "第1轮你好".into(),
             ..NativeTranscript::default()
         };
-        manager.update(&latest);
-        flow.request_finish();
-        cancel.send_replace(1);
-        let delivery = runtime.block_on(manager.finish(&latest, Finish::Commit));
-        runtime.block_on(actor).map_err(|e| e.to_string())?;
-        let actual = fixture.command(serde_json::json!({"action":"read"}))?;
-        if delivery.verification != Verification::Unavailable
-            || delivery.submission != Submission::Submitted
-            || delivery.error.as_deref() != Some("inputUnconfirmed")
-            || actual["text"] != "a你好X新🙂bc"
-        {
-            return Err(format!(
-                "handoff owned-fixture assertion failed delivery={:?} actual={}",
-                delivery.error, actual["text"]
-            ));
+        let result = (|| -> Result<(), String> {
+            let active = || -> Result<(), String> {
+                if *cancel.borrow() != 0 || flow.stopping() {
+                    return Err(format!(
+                        "six-edit Session stopped: cancel={} stopping={}",
+                        *cancel.borrow(),
+                        flow.stopping()
+                    ));
+                }
+                Ok(())
+            };
+            let wait_text = |fixture: &mut Fixture, expected: &str| -> Result<(), String> {
+                let until = Instant::now() + Duration::from_secs(4);
+                loop {
+                    active()?;
+                    let actual = fixture.command(serde_json::json!({"action":"read"}))?;
+                    if actual["foreground"] != true {
+                        return Err("six-edit owned target lost foreground".into());
+                    }
+                    if actual["text"] == expected {
+                        return Ok(());
+                    }
+                    if Instant::now() >= until {
+                        return Err(format!(
+                            "six-edit complete text mismatch expected={expected:?} actual={actual}"
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            };
+            let mut edited_prefix = String::new();
+            manager.update(&latest);
+            wait_text(&mut fixture, "a第1轮你好bc")?;
+            for round in 1..=6 {
+                active()?;
+                let before = fixture.command(serde_json::json!({"action":"read"}))?;
+                let expected_caret =
+                    1 + edited_prefix.encode_utf16().count() + latest.text.encode_utf16().count();
+                if before["text"] != format!("a{edited_prefix}{}bc", latest.text)
+                    || before["start"].as_u64() != Some(expected_caret as u64)
+                    || before["end"].as_u64() != Some(expected_caret as u64)
+                {
+                    return Err(format!("six-edit round {round} initial position {before}"));
+                }
+                // Two BMP characters, a fixed X and explicit editing evidence.
+                // The helper dispatches TSF keys before Win32 edit messages; no physical
+                // keyboard or main-program low-level hook coverage is claimed.
+                let before_edit_prefix = edited_prefix.clone();
+                edited_prefix.push_str(latest.text.strip_suffix("你好").ok_or("BMP tail")?);
+                edited_prefix.push('X');
+                crate::input_state::edited();
+                let edited = fixture.command(serde_json::json!({"action":"controlled-edit"}))?;
+                let expected = format!("a{edited_prefix}bc");
+                if edited["controlledEdit"] != "completed"
+                    || edited["text"] != expected
+                    || edited["foreground"] != true
+                {
+                    return Err(format!("six-edit round {round} actual deletion {edited}"));
+                }
+                let steps = edited["controlledEditSteps"]
+                    .as_array()
+                    .ok_or("delete steps missing")?;
+                let expected_steps = [
+                    format!(
+                        "a{before_edit_prefix}{}bc",
+                        latest.text.strip_suffix('好').ok_or("first BMP tail")?
+                    ),
+                    format!(
+                        "a{before_edit_prefix}{}bc",
+                        latest.text.strip_suffix("你好").ok_or("second BMP tail")?
+                    ),
+                ];
+                if steps.len() != expected_steps.len() {
+                    return Err(format!(
+                        "six-edit round {round} did not read both deletions"
+                    ));
+                }
+                for (index, (step, expected)) in steps.iter().zip(&expected_steps).enumerate() {
+                    let caret = (expected_caret - index - 1) as u64;
+                    if step["text"] != *expected
+                        || step["start"].as_u64() != Some(caret)
+                        || step["end"].as_u64() != Some(caret)
+                        || step["foreground"] != true
+                    {
+                        return Err(format!(
+                            "six-edit round {round} deletion {} mismatch {step}",
+                            index + 1
+                        ));
+                    }
+                }
+                let until = Instant::now() + Duration::from_secs(4);
+                while manager.presentation() != Presentation::Editing {
+                    active()?;
+                    if Instant::now() >= until {
+                        return Err(format!("six-edit round {round} handoff was not observed"));
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                while manager.presentation() != Presentation::Resuming {
+                    active()?;
+                    if Instant::now() >= until {
+                        return Err(format!("six-edit round {round} new turn was not acquired"));
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+                manager.update(&NativeTranscript {
+                    task_id: id.clone(),
+                    turn: latest.turn,
+                    sequence: latest.sequence + 1,
+                    text: "旧轮禁止覆盖".into(),
+                    ..NativeTranscript::default()
+                });
+                thread::sleep(Duration::from_millis(60));
+                wait_text(&mut fixture, &expected)?;
+                latest.turn += 1;
+                latest.sequence += 2;
+                latest.text = format!("第{}轮你好", round + 1);
+                manager.update(&latest);
+                wait_text(&mut fixture, &format!("a{edited_prefix}{}bc", latest.text))?;
+                active()?;
+                println!(
+                    "SAYWEAVE_COMPOSITION_EDIT_ROUND_PASS round={round} turn={} same_session=true controlled_edit=true actual_text=true cancel=0 stopping=false",
+                    latest.turn
+                );
+            }
+            flow.request_finish();
+            cancel.send_replace(1);
+            let delivery = runtime.block_on(manager.finish(&latest, Finish::Commit));
+            runtime
+                .block_on(async { tokio::time::timeout(Duration::from_secs(5), &mut actor).await })
+                .map_err(|_| "six-edit actor did not finish")?
+                .map_err(|e| e.to_string())?;
+            let actual = fixture.command(serde_json::json!({"action":"read"}))?;
+            let report = manager.report().ok_or("six-edit final report missing")?;
+            if latest.turn != 7
+                || report.error.is_some()
+                || delivery.verification != Verification::Unavailable
+                || delivery.submission != Submission::Submitted
+                || delivery.error.as_deref() != Some("inputUnconfirmed")
+                || actual["text"] != format!("a{edited_prefix}{}bc", latest.text)
+            {
+                return Err(format!(
+                    "six-edit final assertion turn={} delivery={:?} report_error={:?} actual={actual}",
+                    latest.turn, delivery.error, report.error
+                ));
+            }
+            Ok(())
+        })();
+        if result.is_err() && !actor.is_finished() {
+            flow.request_finish();
+            cancel.send_replace(2);
+            let _ = runtime.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    manager.finish(&latest, Finish::Abort),
+                )
+                .await
+            });
+            if !actor.is_finished() {
+                actor.abort();
+            }
+            let _ = runtime
+                .block_on(async { tokio::time::timeout(Duration::from_secs(1), &mut actor).await });
         }
         release_watch(&id);
+        result?;
         println!(
-            "SAYWEAVE_COMPOSITION_TURNS_PASS controlled_edit=true actual_handoff=true resumed_range=true old_turn_ignored=true final_single_copy=true"
+            "SAYWEAVE_COMPOSITION_TURNS_PASS rounds=6 final_turn=7 controlled_edit=true actual_handoff=true resumed_range=true old_turn_ignored=true final_single_copy=true"
         );
     }
     // Actual foreground notifications must remain sticky after switching back. This is

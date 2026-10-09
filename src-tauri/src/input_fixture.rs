@@ -455,6 +455,63 @@ fn main() {
                         message(editor, WM_CHAR, WPARAM(unit as usize), LPARAM(0));
                     }
                 }
+                let mut controlled_edit = None;
+                let mut controlled_edit_steps = Vec::new();
+                if value["action"] == "controlled-edit" {
+                    // Fixed, owned-target edit for the SessionDraft acceptance test.
+                    // Dispatch TSF before RichEdit's two Backspace key messages;
+                    // only the fixed X is delivered with WM_CHAR.
+                    // this is neither physical input nor a main-program hook test.
+                    let result = (|| -> windows::core::Result<()> {
+                        use windows::{Win32::UI::TextServices::*, core::Interface};
+                        if GetForegroundWindow() != top || GetFocus() != editor {
+                            return Err(E_ACCESSDENIED.into());
+                        }
+                        let manager = tsf_manager.as_ref().ok_or(E_FAIL)?;
+                        let keys: ITfKeystrokeMgr = manager.cast()?;
+                        for step in 1..=2 {
+                            if GetForegroundWindow() != top || GetFocus() != editor {
+                                return Err(E_ACCESSDENIED.into());
+                            }
+                            if keys
+                                .TestKeyDown(WPARAM(VK_BACK.0 as usize), LPARAM(1))?
+                                .as_bool()
+                                && keys
+                                    .KeyDown(WPARAM(VK_BACK.0 as usize), LPARAM(1))?
+                                    .as_bool()
+                            {
+                                return Err(E_FAIL.into());
+                            }
+                            message(editor, WM_KEYDOWN, WPARAM(VK_BACK.0 as usize), LPARAM(1));
+                            if keys
+                                .TestKeyUp(WPARAM(VK_BACK.0 as usize), LPARAM(1))?
+                                .as_bool()
+                            {
+                                let _ = keys.KeyUp(WPARAM(VK_BACK.0 as usize), LPARAM(1))?;
+                            }
+                            message(editor, WM_KEYUP, WPARAM(VK_BACK.0 as usize), LPARAM(1));
+                            let mut text = [0u16; 4096];
+                            let size = GetWindowTextW(editor, &mut text) as usize;
+                            let selected = message(editor, 0x00B0, WPARAM(0), LPARAM(0)).0 as usize;
+                            controlled_edit_steps.push(serde_json::json!({
+                                "step": step,
+                                "text": String::from_utf16_lossy(&text[..size]),
+                                "start": selected & 65535,
+                                "end": (selected >> 16) & 65535,
+                                "foreground": GetForegroundWindow() == top
+                            }));
+                        }
+                        if GetForegroundWindow() != top || GetFocus() != editor {
+                            return Err(E_ACCESSDENIED.into());
+                        }
+                        message(editor, WM_CHAR, WPARAM('X' as usize), LPARAM(0));
+                        Ok(())
+                    })();
+                    controlled_edit = Some(match result {
+                        Ok(()) => "completed".to_string(),
+                        Err(error) => format!("failed:{:08x}", error.code().0 as u32),
+                    });
+                }
                 if value["action"] == "fixture-key" {
                     let mut pid = 0;
                     GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
@@ -595,7 +652,7 @@ fn main() {
                 let selection = message(editor, 0x00B0, WPARAM(0), LPARAM(0)).0 as usize;
                 println!(
                     "{}",
-                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window})
+                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window,"controlledEdit":controlled_edit,"controlledEditSteps":controlled_edit_steps})
                 );
                 io::stdout().flush().unwrap();
                 let _ = ok.send(());
