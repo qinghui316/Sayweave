@@ -9,7 +9,7 @@ const roots = new Set(['.gitattributes', '.gitignore', 'README.md', 'LICENSE',
   'tsconfig.json', 'vite.config.ts']);
 const docs = new Set(['architecture.md', 'development.md', 'design.md', 'testing.md', 'local-data.md', 'motion.md', 'models.md', 'speech.md', 'history.md', 'dictation.md', 'personalization.md']);
 const scripts = new Set(['check-boundaries.mjs', 'check-native-boundaries.mjs', 'check-text.mjs', 'check-distribution.mjs',
-  'test-desktop.ps1', 'test-dictionary-desktop.mjs', 'test-models-desktop.mjs', 'test-speech-desktop.mjs', 'test-prefix-input.mjs', 'test-input.ps1', 'desktop.mjs']);
+  'test-desktop.ps1', 'test-dictionary-desktop.mjs', 'test-models-desktop.mjs', 'test-speech-desktop.mjs', 'test-prefix-input.mjs', 'test-input.ps1', 'desktop.mjs', 'test-language-actor.mjs', 'test-language-dashboard-live.mjs']);
 const testRoots = new Set(['contracts', 'e2e']);
 const testFixtures = new Set(['voice-recovery.html', 'voice-recovery.tsx', 'input-target.ts', 'faithful-v1.txt']);
 const generated = /(?:^|\/)(?:node_modules|target|gen|dist|coverage|test-results|playwright-report|\.local|\.git)(?:\/|$)|^tests\/visual\//i;
