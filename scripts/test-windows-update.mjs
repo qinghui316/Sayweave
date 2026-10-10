@@ -231,6 +231,13 @@ try{
  const preparedUser=preparedIdentity.HKEY_CURRENT_USER;
  if(!preparedUser.com||preparedUser.owner!=='SayweaveStageA-v1'||typeof preparedUser.module!=='string'||moduleKey(preparedUser.module)!==moduleKey(tools.component)||preparedIdentity.HKEY_LOCAL_MACHINE.com)throw Error('Prepared TIP module identity differs from the verified production DLL');
  temporaryRegistration.prepared=preparedIdentity;
+ stage('short production DLL metadata proof');
+ const metadataOutput=await command('powershell',['-NoProfile','-ExecutionPolicy','Bypass','-File','scripts/windows-update-metadata.ps1','-ExpectedCommit',commit,'-ProductCommit',commit,'-ExpectedModulePath',preparedUser.module,'-ExpectedComponentSha256',temporaryRegistration.sha256],root,process.env,undefined,30000);
+ const metadataEnd=metadataOutput.stdout.indexOf('Read-only metadata receipt:');
+ if(metadataEnd<0)throw Error('Metadata receipt output missing');
+ report.componentMetadata=JSON.parse(metadataOutput.stdout.slice(0,metadataEnd).trim());checkpoint();
+ expect(report.componentMetadata.characterization.readComplete).toBe(true);
+ expect(report.componentMetadata.metadataExpected).toBe(true);
  stage('short production DLL actual text');
  const smoke=await command(tools.probe,['installed-fixture',tools.component],root,process.env,undefined,60000);
  for(const marker of proofMarkers)expect(smoke.stdout).toContain(marker);
