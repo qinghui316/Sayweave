@@ -129,6 +129,7 @@ jobs:
         if: always()
         with:
           name: stable-install-acceptance
+          include-hidden-files: true
           path: |
             .local/windows-update-acceptance.json
             .local/windows-update/*/acceptance.json
