@@ -94,16 +94,18 @@ function componentIdentity(){
  return {module,sha256:createHash('sha256').update(readFileSync(module)).digest('hex')};
 }
 function quote(value){return "'"+value.replaceAll("'","''")+"'";}
-async function registrationInventory(){
- const script="$ErrorActionPreference='Stop';$items=@{};foreach($scope in @('HKEY_CURRENT_USER','HKEY_LOCAL_MACHINE')){$base='Registry::'+$scope;$com=$base+'\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$tip=$base+'\\Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$item=@{com=(Test-Path -LiteralPath $com);tip=(Test-Path -LiteralPath $tip);module=$null;owner=$null};if(Test-Path -LiteralPath ($com+'\\InprocServer32')){$key=Get-Item -LiteralPath ($com+'\\InprocServer32');$item.module=$key.GetValue('');$item.owner=$key.GetValue('SayweaveOwner')};$items[$scope]=$item};ConvertTo-Json -InputObject $items -Compress";
- return JSON.parse((await command('powershell',['-NoProfile','-Command',script],root,process.env,undefined,30000)).stdout);
+async function registrationInventory(timeoutMs=30000){
+ const script="$ErrorActionPreference='Stop';$items=@{};foreach($scope in @('HKEY_CURRENT_USER','HKEY_LOCAL_MACHINE')){$base='Registry::'+$scope;$com=$base+'\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$tip=$base+'\\Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$item=@{com=(Test-Path -LiteralPath $com);tip=(Test-Path -LiteralPath $tip);module=$null;owner=$null;tipEntries=@()};if(Test-Path -LiteralPath ($com+'\\InprocServer32')){$key=Get-Item -LiteralPath ($com+'\\InprocServer32');$item.module=$key.GetValue('');$item.owner=$key.GetValue('SayweaveOwner')};if($item.tip){$queue=@($tip);for($n=0;$n -lt $queue.Count;$n++){if($queue.Count -gt 64){throw 'Owned TIP registry inventory exceeded bound'};$key=Get-Item -LiteralPath $queue[$n];$values=@{};$names=@($key.GetValueNames());if($names.Count -gt 32){throw 'Owned TIP value inventory exceeded bound'};foreach($name in $names){$value=$key.GetValue($name);if(($value -isnot [string] -and $value -isnot [int]) -or ([string]$value).Length -gt 1024){throw 'Owned TIP value exceeded bound'};$values[$name]=@{kind=([string]$key.GetValueKind($name));value=$value}};$item.tipEntries+=@{path=$queue[$n].Substring($tip.Length);values=$values};foreach($child in @($key.GetSubKeyNames())){$queue+=($queue[$n]+'\\'+$child)}}};$items[$scope]=$item};ConvertTo-Json -InputObject $items -Compress -Depth 9";
+ return JSON.parse((await command('powershell',['-NoProfile','-Command',script],root,process.env,undefined,timeoutMs)).stdout);
 }
 const registrationEmpty=info=>Object.values(info).every(item=>!item.com&&!item.tip);
 async function awaitRegistrationState(probe,registered){
  const deadline=Date.now()+10000;let state,stable=0;
  do{
   state=JSON.parse((await command(probe,['registration-state'],root,process.env,undefined,Math.max(1,deadline-Date.now()))).stdout.trim());
-  const matches=registered?state.profiles>0&&state.categories>0&&state.speechCategory:state.profiles===0&&state.categories===0&&!state.speechCategory;
+  let emptyRoots=true;
+  if(!registered){const inventory=await registrationInventory(Math.max(1,deadline-Date.now()));report.toolRegistrationLastCleanup={inventory,profiles:state};checkpoint();emptyRoots=registrationEmpty(inventory);}
+  const matches=registered?state.profiles>0&&state.categories>0&&state.speechCategory:state.profiles===0&&state.categories===0&&!state.speechCategory&&emptyRoots;
   stable=matches?stable+1:0;if(stable===2&&Date.now()<=deadline)return state;
   await delay(Math.max(0,Math.min(250,deadline-Date.now())));
  }while(Date.now()<deadline);
@@ -117,7 +119,8 @@ async function clearTemporaryRegistration(){
   if(!user.com||user.owner!=='SayweaveStageA-v1'||typeof user.module!=='string'||moduleKey(user.module)!==moduleKey(temporaryRegistration.component)||machine.com)throw Error('Temporary TIP identity is unavailable or changed; no blind removal');
   await command(temporaryRegistration.probe,['remove'],root,process.env,undefined,30000);
  }
- const after=await registrationInventory(),profiles=await awaitRegistrationState(temporaryRegistration.probe,false);
+ const profiles=await awaitRegistrationState(temporaryRegistration.probe,false),after=await registrationInventory();
+ report.toolRegistration={before,after,profiles,removed:registrationEmpty(after)};checkpoint();
  if(!registrationEmpty(after))throw Error('Temporary TIP registration was not fully removed');
  report.toolRegistration={before,after,profiles,removed:true};temporaryRegistration=null;
 }
@@ -185,6 +188,7 @@ try{
  const capability=await command(tools.probe,['capabilities']);const capabilities=JSON.parse(capability.stdout.trim());expect(capabilities).toEqual({acceptance:true,installedFixture:true,protocol:8});
  stage('temporary production TIP preparation');
  const initialRegistration=await registrationInventory(),initialProfiles=await command(tools.probe,['registration-state'],root,process.env,undefined,30000);
+ report.toolRegistrationInitial=initialRegistration;checkpoint();
  expect(JSON.parse(initialProfiles.stdout.trim())).toEqual({profiles:0,categories:0,speechCategory:false});
  if(!registrationEmpty(initialRegistration))throw Error('Short tooling requires an empty owned TIP registration');
  temporaryRegistration={probe:tools.probe,component:tools.component};
