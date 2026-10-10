@@ -127,6 +127,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Removed owned machine speech component.");
             }
             #[cfg(feature = "acceptance")]
+            Some("disable-registered-profile") => {
+                let owned: Vec<_> = input_profiles()?
+                    .into_iter()
+                    .filter(|profile| profile.clsid == registration::CLASS)
+                    .collect();
+                if owned.len() != 1 || owned[0].guidProfile != registration::PROFILE {
+                    return Err("fixed fixture profile identity differs".into());
+                }
+                registration::profiles()?.EnableLanguageProfile(
+                    &registration::CLASS,
+                    owned[0].langid,
+                    &registration::PROFILE,
+                    false,
+                )?;
+                println!("Disabled exact fixture profile; registration retained.");
+            }
+            #[cfg(feature = "acceptance")]
             Some("repair-machine-metadata") => {
                 registration::acceptance_replace_machine(
                     args.get(2).ok_or("replacement path required")?,
