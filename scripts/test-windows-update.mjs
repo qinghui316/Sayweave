@@ -26,7 +26,11 @@ async function command(file,args,cwd=root,env=process.env,expectedFailure){
 }
 function stage(value){report.stage=value;checkpoint();console.log(`Windows update acceptance: ${value}`);}
 let server,browser,app,thumbprint,ownedProcess,lastEndpoint,serverMode='valid',packageBytes,signature,deniedDirectory,originalAcl,installerProcess;
+let installerDescendants=[];
 let credentialRequests=0;
+async function cleanup(label,action){
+ try{await action();return true;}catch(error){report.passed=false;process.exitCode=1;(report.cleanupErrors??=[]).push({stage:label,error:String(error?.message??error?.code??error).slice(0,1024)});return false;}
+}
 const debugPort=9291,identifier=`local.sayweave.acceptance.${id}`,product=`Sayweave 验收 ${id}`,testData=path.join(process.env.APPDATA,identifier,'data'),testExe=path.join(process.env.LOCALAPPDATA,product,'sayweave.exe');
 const invoke=(page,command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
 function processes(exe){
@@ -151,7 +155,7 @@ try{
  await expect.poll(()=>{installerProcess=processes(cache)[0];return Boolean(installerProcess);},{timeout:15000,intervals:[100]}).toBe(true);
  await expect.poll(()=>processes(testExe).some(p=>p.CreationDate===originalProcess.CreationDate),{timeout:15000,intervals:[100]}).toBe(false);
  const launched=processes(cache).find(p=>p.ProcessId===installerProcess.ProcessId&&p.CreationDate===installerProcess.CreationDate);if(!launched)throw Error('Owned launched installer identity changed before interruption');
- const descendants=processTree(launched);
+ const descendants=installerDescendants=processTree(launched);
  execFileSync('taskkill',['/PID',String(launched.ProcessId),'/T','/F'],{stdio:'ignore'});
  await expect.poll(()=>descendants.some(p=>processes(p.ExecutablePath).some(current=>current.ProcessId===p.ProcessId&&current.CreationDate===p.CreationDate)),{timeout:10000}).toBe(false);installerProcess=null;
  await installing;await browser.close().catch(()=>{});browser=null;ownedProcess=null;
@@ -167,6 +171,18 @@ try{
  const stablePath=path.join(stableData,'dictionary.sqlite'),stable=new DatabaseSync(stablePath),seed=new DatabaseSync(seedDatabase,{readOnly:true});report.legacySeed=seedLegacyRows(stable,seed,saved.configs[0].id);seed.close();stable.close();
  page=await connect(stableExe,true,true);const legacyBefore=await legacyData(page,saved.configs[0]);expect(legacyBefore.dictionary.total).toBe(1);expect(legacyBefore.history.count).toBe(10);expect(legacyBefore.detail.preferences[0].rule).toBe('保留完整理由和步骤');await close(page,false);const oldDb=new DatabaseSync(stablePath,{readOnly:true});report.legacyBefore=databaseInventory(oldDb);oldDb.close();
  const stableArgument=process.argv.indexOf('--stable-installer'),manual=stableArgument>=0?path.resolve(process.argv[stableArgument+1]):await build('0.1.7','internal');if(stableArgument>=0)report.installers.push(installerIdentity(manual,'0.1.7','stable'));await command(manual,['/S']);page=await connect(stableExe);const snapshot=await invoke(page,'update_snapshot');expect(snapshot.build.version).toBe('0.1.7');expect(snapshot.build.updatesEnabled).toBe(stableArgument>=0);if(stableArgument>=0){expect(snapshot.build.channel).toBe('stable');expect(snapshot.build.commit).toBe(commit);}expect(await legacyData(page,saved.configs[0])).toEqual(legacyBefore);await page.screenshot({path:path.join(directory,'native-manual-overlay.png')});await close(page,false);const newDb=new DatabaseSync(stablePath,{readOnly:true});report.legacyAfter=databaseInventory(newDb);newDb.close();expect(report.legacyAfter).toEqual(report.legacyBefore);report.componentAfter=componentIdentity();expect(report.componentAfter).toEqual(installedComponent);await command(probe,['fixture',installedComponent.module,'plain']);report.checks.push('actual public0.1.6 database retained in place; old/native-created model and term plus bounded synthetic rows read before/after0.1.7 overlay, exact table hashes/real credential value/installed TSF preserved');report.passed=true;
-}catch(error){report.error=error.message;throw error;}finally{
- if(browser)await browser.close().catch(()=>{});if(ownedProcess){const remaining=processes(ownedProcess.ExecutablePath).find(p=>p.CreationDate===ownedProcess.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}if(installerProcess){const remaining=processes(installerProcess.ExecutablePath).find(p=>p.ProcessId===installerProcess.ProcessId&&p.CreationDate===installerProcess.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}restoreInstallAcl();if(app&&app.exitCode===null)app.kill();if(server){server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}if(thumbprint)await command('certutil',['-user','-delstore','Root',thumbprint]).catch(()=>{});rmSync(keyPath,{force:true});checkpoint();console.log(JSON.stringify({passed:report.passed,commit,checks:report.checks.length,receipt:path.join(directory,'acceptance.json')}));
+}catch(error){report.passed=false;report.error=String(error?.message??error?.code??error);throw error;}finally{
+ await cleanup('browser',async()=>{if(browser)await browser.close();});
+ await cleanup('application',()=>{if(ownedProcess){const remaining=processes(ownedProcess.ExecutablePath).find(p=>p.ProcessId===ownedProcess.ProcessId&&p.CreationDate===ownedProcess.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}if(app&&app.exitCode===null)app.kill();});
+ const installersStopped=await cleanup('interrupted installer tree',async()=>{
+  const identities=[...installerDescendants,...(installerProcess?[installerProcess]:[])];
+  for(const owned of identities){const remaining=processes(owned.ExecutablePath).find(p=>p.ProcessId===owned.ProcessId&&p.CreationDate===owned.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}
+  await expect.poll(()=>identities.some(owned=>processes(owned.ExecutablePath).some(p=>p.ProcessId===owned.ProcessId&&p.CreationDate===owned.CreationDate)),{timeout:10000}).toBe(false);
+ });
+ if(installersStopped)await cleanup('original installation ACL',restoreInstallAcl);
+ else if(deniedDirectory)(report.cleanupErrors??=[]).push({stage:'original installation ACL',error:'Not restored while owned installer termination is unconfirmed'});
+ await cleanup('HTTPS server',async()=>{if(server){server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}});
+ await cleanup('temporary root certificate',async()=>{if(thumbprint)await command('certutil',['-user','-delstore','Root',thumbprint]);});
+ await cleanup('temporary signing key',()=>rmSync(keyPath,{force:true}));
+ checkpoint();console.log(JSON.stringify({passed:report.passed,commit,checks:report.checks.length,receipt:path.join(directory,'acceptance.json')}));
 }
