@@ -294,6 +294,7 @@ impl WindowsInputService {
         let _ = self.send(Request::Forget(id));
     }
     pub fn shutdown(&self) {
+        // The application exit owner retires observation before calling shutdown.
         #[cfg(windows)]
         tauri::async_runtime::spawn(async {
             let _ = composition::stop_observer().await;
@@ -313,6 +314,9 @@ impl WindowsInputService {
         {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+    pub fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire) || self.pending.load(Ordering::Acquire) > 0
     }
 }
 impl Default for WindowsInputService {

@@ -1,11 +1,20 @@
 import {automaticSettings} from './settings-fixtures';
-import {act,render,screen,waitFor} from '@testing-library/react';
+import {act,render,screen,waitFor,within} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import {describe,expect,it,vi} from 'vitest';
 import {Dictionary} from '../src/features/dictionary';
 import {BrowserDictionary} from '../src/adapters/dictionary-browser';
 import {DictionaryError,type DictionaryPage} from '../src/contracts/dictionary';
 describe('manual dictionary',()=>{
+  it('update Save/Cancel preserves the word and continues only after a confirmed save',async()=>{
+    const port=new BrowserDictionary(),install=vi.fn();let guard:((action:()=>void)=>void)|null=null;
+    const create=vi.spyOn(port,'create').mockRejectedValueOnce(new DictionaryError('busy'));
+    render(<Dictionary automaticTerms={automaticSettings()} port={port} onGuardChange={value=>{guard=value;}}/>);
+    const user=userEvent.setup();await user.click(await screen.findByRole('button',{name:'添加词语'}));await user.type(screen.getByLabelText('词语'),'绮蓝');
+    act(()=>guard?.(install));await user.click(within(screen.getByRole('alertdialog')).getByRole('button',{name:'取消'}));expect(install).not.toHaveBeenCalled();expect(screen.getByLabelText('词语')).toHaveValue('绮蓝');
+    act(()=>guard?.(install));await user.click(within(screen.getByRole('alertdialog')).getByRole('button',{name:'保存'}));expect(await screen.findByRole('alert')).toHaveTextContent('正在忙');expect(screen.getByLabelText('词语')).toHaveValue('绮蓝');expect(install).not.toHaveBeenCalled();
+    act(()=>guard?.(install));await user.click(within(screen.getByRole('alertdialog')).getByRole('button',{name:'保存'}));await waitFor(()=>expect(install).toHaveBeenCalledOnce());expect((await port.list({kind:'term',search:'',page:1})).total).toBe(1);expect(create).toHaveBeenCalledTimes(2);
+  });
   it('preserves input on failure, saves only after confirmation and restores focus',async()=>{
     const port=new BrowserDictionary();const create=vi.spyOn(port,'create').mockRejectedValueOnce(new DictionaryError('busy'));
     render(<Dictionary automaticTerms={automaticSettings()} port={port}/>);const user=userEvent.setup();const add=await screen.findByRole('button',{name:'添加词语'});await waitFor(()=>expect(add).toBeEnabled());await user.click(add);

@@ -342,6 +342,13 @@ impl DictationCoordinator {
         event: Option<&TaskStamp>,
         anchor: Option<&Anchor>,
     ) -> Result<Reservation, Error> {
+        let _admission = app
+            .state::<crate::lifecycle::Lifecycle>()
+            .enter()
+            .map_err(Error::new)?;
+        if let Some(updates) = app.try_state::<crate::update::UpdateService>() {
+            updates.foreground(app);
+        }
         SpeechSource::try_from(source)?;
         // Application admission includes the DEV demonstration session; the
         // speech service itself owns no rendering Runtime or window state.
@@ -1016,6 +1023,7 @@ impl DictationCoordinator {
                         saved: saved && !archive_error,
                         save_error: archive_error,
                     });
+                !archive_error
             });
             app.state::<WindowsInputService>().forget(id.clone());
             coordinator.release(&app, &id).await;

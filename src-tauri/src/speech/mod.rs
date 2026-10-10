@@ -394,6 +394,10 @@ impl SpeechService {
         context: Option<NativeStart>,
     ) -> Result<Snapshot, Error> {
         let _gate = self.gate.try_lock().map_err(|_| Error::new("busy"))?;
+        let _admission = app
+            .state::<crate::lifecycle::Lifecycle>()
+            .enter()
+            .map_err(Error::new)?;
         let _operation = self.admit()?;
         if expected_task.is_some() && self.snapshot()?.task_id != expected_task {
             return Err(Error::new("staleSession"));
@@ -1150,11 +1154,11 @@ impl SpeechService {
                 crate::task_stop::request(tx, crate::contracts::speech::StopReason::Interrupted);
         }
     }
-    pub async fn drain(&self) {
+    pub async fn drain(&self) -> Result<(), Error> {
         while self.is_active() || self.operations.load(Ordering::Acquire) > 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let _ = self.playback.control("stop", None).await;
+        self.playback.control("stop", None).await.map(|_| ())
     }
     pub async fn play(&self, id: &str) -> Result<crate::history::playback::PlaybackState, Error> {
         let _operation = self.admit()?;

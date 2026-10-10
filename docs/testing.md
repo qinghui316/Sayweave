@@ -17,6 +17,8 @@
 
 E2E前运行 `npx playwright install chromium`。截图、报告、运行数据不跟踪到Git。浏览器内存词典不证明磁盘持久化。
 
+发布更新验收使用 `node scripts/test-windows-update.mjs`，仅允许一次性 Windows runner／账户。它构建同一候选的两个隔离版本，执行真实 HTTPS、临时签名、NSIS 覆盖安装与自动重启，核对凭据、历史、词典、偏好和组件状态，并检查中断、错误签名、版本冒充、保存屏障超时、停止超时及安装器启动失败。正式发布工作流另外回下载并实际安装正式草稿。具体约束与收尾顺序见 [release.md](release.md)；浏览器模拟不能替代真实安装记录。
+
 ## Windows 桌面检查
 
 ```powershell

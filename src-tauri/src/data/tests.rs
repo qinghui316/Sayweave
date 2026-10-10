@@ -12,6 +12,34 @@ fn term(value: &str) -> Input {
         replacement: None,
     }
 }
+
+#[tokio::test]
+async fn final_database_barrier_rejects_even_admitted_late_producers() {
+    let root = tempfile::tempdir().unwrap();
+    let worker = super::DataWorker::start(root.path().to_path_buf()).unwrap();
+    worker.begin_shutdown();
+    worker
+        .request_admitted(super::Operation::Create(term("已接收词语")))
+        .await
+        .unwrap();
+    worker.seal_and_drain().await.unwrap();
+    assert_eq!(
+        worker
+            .request_admitted(super::Operation::Create(term("迟到词语")))
+            .await
+            .unwrap_err()
+            .code,
+        "unavailable"
+    );
+    let connection = rusqlite::Connection::open(root.path().join("dictionary.sqlite")).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM dictionary_terms", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
 fn correction(value: &str, target: &str) -> Input {
     Input {
         kind: Kind::Correction,
@@ -375,6 +403,7 @@ fn worker_authorization_recovery_and_bounded_queue() {
             sender,
             status: worker.status.clone(),
             stopping: Arc::new(AtomicBool::new(false)),
+            sealed: Arc::new(AtomicBool::new(false)),
             dispatch: Arc::new(Mutex::new(())),
             root: worker.root.clone(),
             journal_io: worker.journal_io.clone(),

@@ -89,6 +89,7 @@ pub async fn processing_save(
     window: WebviewWindow,
     settings: Settings,
 ) -> Result<Settings, DataError> {
+    let _admission = crate::lifecycle::mutation(&window)?;
     authorize(window.label())?;
     config(&data, DbOperation::SaveSettings(settings)).await
 }

@@ -122,6 +122,7 @@ pub async fn text_service_action(
     coordinator: State<'_, crate::dictation::DictationCoordinator>,
     action: Action,
 ) -> Result<Status, Error> {
+    let _admission = crate::lifecycle::mutation(&window)?;
     crate::data::model::authorize(window.label())?;
     let maintenance = coordinator.component_maintenance()?;
     tauri::async_runtime::spawn_blocking(move || apartment(|| operate(action, maintenance)))

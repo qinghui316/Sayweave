@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useId, type FormEvent } from 'react';
+import { useCallback,useEffect, useRef, useState, useId, type FormEvent } from 'react';
 import { dictionaryError, validateDictionaryInput, type DictionaryPort, type DictionaryKind, type DictionaryRecord, type DictionaryPage, type DictionaryError } from '../../contracts/dictionary';
 import { Button, Dialog, EmptyState, Field, InlineMessage, TextInput,SingleChoice,ActionMenu,ActionIcon,IconButton } from '../../ui';
 import { zh } from '../../locales/zh-CN';
@@ -8,7 +8,7 @@ import type {SettingStore} from '../../settings/store';
 import type {ProcessingSettings} from '../../contracts/processing';
 const t=zh.dictionary;
 type Editor={kind:DictionaryKind;record:DictionaryRecord|null; original:string; category:string; replacement:string};
-export function Dictionary({port,automaticTerms}:{port:DictionaryPort;automaticTerms:SettingStore<ProcessingSettings>}) {
+export function Dictionary({port,automaticTerms,onGuardChange}:{port:DictionaryPort;automaticTerms:SettingStore<ProcessingSettings>;onGuardChange?:(guard:((action:()=>void)=>void)|null)=>void}) {
   const [kind,setKind]=useState<DictionaryKind>('term');
   const [source,setSource]=useState<'all'|'manual'|'automatic'>('all');
   const [searchOpen,setSearchOpen]=useState(false);const searchId=useId(),searchBox=useRef<HTMLDivElement|null>(null),searchField=useRef<HTMLInputElement|null>(null);
@@ -21,6 +21,9 @@ export function Dictionary({port,automaticTerms}:{port:DictionaryPort;automaticT
   const pageElement=useRef<HTMLElement|null>(null),focusBack=useRef<HTMLElement|null>(null),rows=useRef(new Map<string,HTMLLIElement>());
   const restoreFocus=()=>focusBack.current?.isConnected?focusBack.current:pageElement.current?.querySelector<HTMLElement>('[data-dictionary-add]')??null;
   const generation=useRef(0); const mutation=useRef(0); const inFlight=useRef(false);
+  const [leaving,setLeaving]=useState(false);const nextAction=useRef<(()=>void)|null>(null);
+  const guard=useCallback((action:()=>void)=>{if(inFlight.current)return;if(editor){nextAction.current=action;setLeaving(true);}else action();},[editor]);
+  useEffect(()=>{onGuardChange?.(guard);return()=>onGuardChange?.(null);},[guard,onGuardChange]);
   useEffect(()=>()=>{mutation.current++;},[]);
   useEffect(()=>{let disposed=false;let release:(()=>void)|undefined;void port.onChanged?.(()=>setRefresh(v=>v+1)).then(stop=>{if(disposed)stop();else release=stop;}).catch(()=>{});return()=>{disposed=true;release?.();};},[port]);
   useEffect(()=>{
@@ -40,14 +43,15 @@ export function Dictionary({port,automaticTerms}:{port:DictionaryPort;automaticT
   const reload=()=>{setPage(1);setRefresh(v=>v+1);};
   function open(record:DictionaryRecord|null,target?:HTMLElement) {if(!editor)focusBack.current=target??(record?rows.current.get(record.id)?.querySelector<HTMLElement>('[aria-haspopup="menu"]')??null:pageElement.current?.querySelector('[data-dictionary-add]')??null);setSupplement(false);setFormError(null);setEditor({kind:record?.kind??kind,record,original:record?.original??'',category:record?.category??'',replacement:record?.replacement??''});}
   function close() {if(!inFlight.current){mutation.current++;setEditor(null);setDeleting(null);setFormError(null);}}
-  async function save(event:FormEvent) {
-    event.preventDefault(); if(!editor||inFlight.current) return;
+  async function save(event?:FormEvent) {
+    event?.preventDefault(); if(!editor||inFlight.current) return false;
     const token=++mutation.current;inFlight.current=true;setBusy(true);setFormError(null);
     try {
       const input=validateDictionaryInput({kind:editor.kind,original:editor.original,category:editor.kind==='term'?editor.category||null:null,replacement:editor.kind==='correction'?editor.replacement:null});
       if(editor.record) await port.update(input,editor.record.id,editor.record.revision); else await port.create(input);
-      if(token===mutation.current){setEditor(null);reload();}
-    } catch(e) {if(token===mutation.current)setFormError(dictionaryError(e));}
+      if(token===mutation.current){setEditor(null);reload();return true;}
+      return false;
+    } catch(e) {if(token===mutation.current){setFormError(dictionaryError(e));requestAnimationFrame(()=>pageElement.current?.querySelector<HTMLInputElement>('input')?.focus());}return false;}
     finally {inFlight.current=false;if(token===mutation.current)setBusy(false);}
   }
   async function remove() {
@@ -65,6 +69,7 @@ export function Dictionary({port,automaticTerms}:{port:DictionaryPort;automaticT
     finally{inFlight.current=false;if(token===mutation.current)setBusy(false);}
   }
   return <section ref={pageElement} className={s.page}>
+    <Dialog confirmation open={leaving} onOpenChange={open=>{if(!open){setLeaving(false);nextAction.current=null;}}} title="更新前保存词语" description="保存后继续更新，或取消并返回编辑。"><div className={s.actions}><Button variant="primary" disabled={busy} onClick={()=>{const action=nextAction.current;nextAction.current=null;setLeaving(false);void save().then(saved=>{if(saved)action?.();});}}>保存</Button><Button disabled={busy} onClick={()=>{setLeaving(false);nextAction.current=null;}}>取消</Button></div></Dialog>
     <header className={s.heading}><div><h1>{kind==='term'?'词典':'纠错映射'}</h1>{port.persistence==='memory'&&<p className={s.meta}>{t.memory}</p>}</div><div className={s.headerActions}><ToggleSetting compact store={automaticTerms} label="自动入词" description="从真实文字纠正中学习正确词形，关闭后已有词语仍可使用。"/><ActionMenu label="词典更多操作" items={[{label:kind==='term'?'纠错映射':'返回词典',onSelect:()=>{setKind(kind==='term'?'correction':'term');setPage(1);setSearch('');setSearchOpen(false);setLoading(true);}}]}/><Button data-dictionary-add aria-label={kind==='term'?'添加词语':'添加纠错'} variant="primary" className={s.add} onClick={()=>open(null)} disabled={!!error||loading}>{kind==='term'?'新词':'新纠错'}</Button></div></header>
     <div className={s.filters}><div className={s.filterGroup}>{kind==='term'?<SingleChoice value={source} label="词条来源" onValueChange={value=>{setSource(value as typeof source);setPage(1);setLoading(true);}} options={[{value:'all',label:'所有'},{value:'automatic',label:'自动添加'},{value:'manual',label:'手动添加'}]}/>:<span className={s.meta}>纠正特定的识别写法</span>}{result.total>0&&<span className={s.meta}>{t.total(result.total)}</span>}</div><div ref={searchBox} className={s.searchSlot}>{!searchOpen?<IconButton label="搜索词语" aria-expanded={false} aria-controls={searchId} className={s.searchTrigger} onClick={()=>setSearchOpen(true)}><ActionIcon name="search" size={16}/></IconButton>:<div id={searchId} className={s.searchBox}><div className={s.searchContents}><ActionIcon name="search" size={16}/><TextInput ref={searchField} autoFocus aria-label={t.search} placeholder="搜索" value={search} maxLength={256} onKeyDown={event=>{if(event.key==='Escape'){event.preventDefault();event.stopPropagation();setSearch('');setPage(1);setSearchOpen(false);requestAnimationFrame(()=>searchBox.current?.querySelector('button')?.focus());}}} onChange={e=>{setSearch(e.target.value);setPage(1);setLoading(true);}}/></div></div>}</div></div>
     {loading?<p role="status" className={s.empty}>{t.loading}</p>:error?<div className={s.empty}><InlineMessage status="error">{t.errors[error.code]}</InlineMessage><Button onClick={reload}>{t.retry}</Button></div>:result.records.length===0?<EmptyState title={search?t.noMatches:t.empty} description={search?undefined:t.emptyDescription}/>:<ul className={s.words} aria-label="词语列表">{result.records.map(r=><li key={r.id} ref={node=>{if(node)rows.current.set(r.id,node);else rows.current.delete(r.id);}}><button type="button" className={s.wordButton} aria-label={'编辑词语 '+r.original} onClick={event=>open(r,event.currentTarget)}><span className={r.source==='automatic'?s.automatic:s.manual} role="img" aria-label={r.source==='automatic'?'自动添加':'手动添加'}><ActionIcon name={r.source==='automatic'?'automatic':'manual'} size={14}/></span><span className={s.word} title={r.original}>{r.original}{r.kind==='correction'&&<span className={s.meta}> → {r.replacement}</span>}</span></button><ActionMenu label={'更多操作 '+r.original} items={[{label:'编辑',onSelect:()=>open(r)},{label:'删除',onSelect:()=>{focusBack.current=rows.current.get(r.id)?.querySelector<HTMLElement>('[aria-haspopup="menu"]')??null;setFormError(null);setDeleting(r);}}]}/></li>)}</ul>}

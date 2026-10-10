@@ -1,0 +1,58 @@
+name: Sayweave Windows validation
+on:
+  push:
+    branches: [main, 'codex/sayweave-release-update-repair-v01']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: windows-validation-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ci:
+    name: CI
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install chromium
+      - run: npm run check
+      - run: npm run test:e2e
+      - run: npm run test:desktop
+      - run: npm run check:distribution
+  windows-update:
+    name: Windows update acceptance
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: node scripts/test-windows-update.mjs
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: windows-update-receipt
+          path: |
+            .local/windows-update-acceptance.json
+            .local/windows-update/*/acceptance.json
+            .local/windows-update/*/native-*.png
+          if-no-files-found: error

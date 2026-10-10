@@ -375,7 +375,6 @@ impl ModelService {
             })
     }
     pub fn begin_shutdown(&self) {
-        self.data.begin_shutdown();
         self.stopping.store(true, Ordering::Release);
         self.requests.shutdown();
     }
@@ -413,9 +412,9 @@ impl ModelService {
             key,
         })
     }
-    pub async fn finish_shutdown(&self) {
+    pub async fn finish_shutdown(&self) -> Result<(), crate::data::model::DataError> {
         let _guard = self.gate.lock().await;
-        self.data.shutdown().await;
+        Ok(())
     }
 }
 pub struct ExecutableConfiguration {

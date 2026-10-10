@@ -60,6 +60,7 @@ pub async fn speech_preferences(
     service: State<'_, SpeechService>,
     preferences: Option<Preferences>,
 ) -> Result<Preferences, Error> {
+    let _admission = crate::lifecycle::mutation(&window)?;
     main(&window)?;
     let _operation = service.admit()?;
     match preferences {
@@ -157,6 +158,7 @@ pub async fn history_remove(
     id: String,
     revision: i64,
 ) -> Result<(), Error> {
+    let _admission = crate::lifecycle::mutation(&window)?;
     main(&window)?;
     let _operation = service.admit()?;
     if window
@@ -201,6 +203,7 @@ pub async fn history_play(
     action: String,
     position_ms: Option<u64>,
 ) -> Result<PlaybackState, Error> {
+    let _admission = crate::lifecycle::mutation(&window)?;
     main(&window)?;
     let _operation = service.admit()?;
     if action == "play" {

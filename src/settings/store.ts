@@ -7,6 +7,7 @@ export class SettingStore<T extends {revision:number}> {
  private flight:SettingPatch<T>|null=null;
  private uncertain:T|null=null;
  private running=false;
+ private paused=false;
  private reading:Promise<void>|null=null;
  private writeEpoch=0;
  private error:string|null=null;
@@ -16,7 +17,7 @@ export class SettingStore<T extends {revision:number}> {
  subscribe=(listener:()=>void)=>{this.listeners.add(listener);return()=>{this.listeners.delete(listener);};};
  getSnapshot=()=>this.state;
  private emit(){
-  this.state={value:this.uncertain?{...this.uncertain,...this.pending}:(this.confirmed?{...this.confirmed,...this.flight,...this.pending}:null),ready:!!this.confirmed&&!this.uncertain,busy:this.running,error:this.error};
+  this.state={value:this.uncertain?{...this.uncertain,...this.pending}:(this.confirmed?{...this.confirmed,...this.flight,...this.pending}:null),ready:!!this.confirmed&&!this.uncertain&&!this.paused,busy:this.running,error:this.error};
   for(const listener of this.listeners)listener();
  }
  accept(value:T){if(!this.confirmed||value.revision>=this.confirmed.revision){this.confirmed=value;this.emit();}}
@@ -30,10 +31,20 @@ export class SettingStore<T extends {revision:number}> {
   return this.reading;
  };
  update=(patch:SettingPatch<T>)=>{
+  if(this.paused)return;
   if(!this.confirmed||this.uncertain)return;
   this.pending={...this.pending,...patch};this.error=null;
   void this.drain();
  };
+ pause(){this.paused=true;this.emit();}
+ resume(){this.paused=false;this.emit();}
+ async flush(){
+  if(this.reading)await this.reading;
+  if(!this.confirmed)await this.load();
+  while(this.running)await new Promise(resolve=>setTimeout(resolve,10));
+  if(this.uncertain)await this.load();
+  if(!this.confirmed||this.uncertain||this.error||Object.keys(this.pending).length)throw new Error(this.error??'设置尚未完成保存。');
+ }
  private matches(value:T,patch:SettingPatch<T>){return (Object.keys(patch) as (keyof SettingPatch<T>)[]).every(key=>Object.is(value[key],patch[key]));}
  private async drain(){
   if(this.running){this.emit();return;}

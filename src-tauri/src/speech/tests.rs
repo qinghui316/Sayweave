@@ -192,6 +192,7 @@ async fn stopping_rejects_fresh_operations_but_drains_existing_admission() {
     drop(admitted);
     tokio::time::timeout(std::time::Duration::from_secs(1), service.drain())
         .await
+        .unwrap()
         .unwrap();
 }
 
@@ -258,6 +259,7 @@ async fn shutdown_waits_for_admitted_background_cleanup() {
     cleanup.await.unwrap().unwrap();
     tokio::time::timeout(Duration::from_secs(1), service.drain())
         .await
+        .unwrap()
         .unwrap();
 }
 

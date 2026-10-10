@@ -14,6 +14,7 @@ const BYTE_CAPACITY: usize = 2 * 1024 * 1024;
 static QUEUES: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(16)));
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
+static FAILURES: AtomicUsize = AtomicUsize::new(0);
 struct Pending {
     writes: VecDeque<(String, Operation, usize)>,
     bytes: usize,
@@ -132,6 +133,9 @@ impl Archive {
             }
             log::info!(target:"sayweave", "operation=archive_settled task_id={} failed={}", task, state.failed.load(Ordering::Acquire));
             done.send_replace(true);
+            if state.failed.load(Ordering::Acquire) {
+                FAILURES.fetch_add(1, Ordering::AcqRel);
+            }
         });
         Self {
             producer: Arc::new(Producer(shared)),
@@ -192,22 +196,36 @@ impl Archive {
     }
 }
 /// Tracks application archive finalizers through the existing bounded shutdown.
-pub(crate) fn spawn(work: impl std::future::Future<Output = ()> + Send + 'static) {
+pub(crate) fn spawn(work: impl std::future::Future<Output = bool> + Send + 'static) {
     WORKERS.fetch_add(1, Ordering::AcqRel);
     tokio::spawn(async move {
-        struct Finalizer;
+        struct Finalizer(bool);
         impl Drop for Finalizer {
             fn drop(&mut self) {
+                if !self.0 {
+                    FAILURES.fetch_add(1, Ordering::AcqRel);
+                }
                 WORKERS.fetch_sub(1, Ordering::AcqRel);
             }
         }
-        let _finalizer = Finalizer;
-        work.await;
+        let mut finalizer = Finalizer(false);
+        finalizer.0 = work.await;
     });
 }
 pub(crate) async fn drain() {
     while WORKERS.load(Ordering::Acquire) != 0 {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+pub(crate) fn watermark() -> usize {
+    FAILURES.load(Ordering::Acquire)
+}
+pub(crate) async fn drain_since(watermark: usize) -> Result<(), &'static str> {
+    drain().await;
+    if FAILURES.load(Ordering::Acquire) != watermark {
+        Err("archiveFailed")
+    } else {
+        Ok(())
     }
 }
 

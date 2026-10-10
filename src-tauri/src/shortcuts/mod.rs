@@ -396,10 +396,18 @@ impl ShortcutService {
             b.stop();
         }
     }
-    pub async fn drain(&self, app: &tauri::AppHandle) {
+    #[cfg(feature = "desktop-acceptance")]
+    pub async fn acceptance_hold_drain(&self, ready: tokio::sync::oneshot::Sender<()>) {
+        let _guard = self.gate.lock().await;
+        let _ = ready.send(());
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    }
+    pub async fn drain(&self, app: &tauri::AppHandle) -> Result<(), Error> {
         let _gate = self.gate.lock().await;
         // Plugin registration dispatches to the UI thread; never wait for this lock in a UI callback.
         let _registration = self.registration.lock().ok();
-        let _ = app.global_shortcut().unregister_all();
+        app.global_shortcut()
+            .unregister_all()
+            .map_err(|_| Error::new("shortcutRegistration"))
     }
 }

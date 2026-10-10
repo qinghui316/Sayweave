@@ -639,6 +639,7 @@ mod tests {
             sender,
             status: worker.status.clone(),
             stopping: Arc::new(AtomicBool::new(false)),
+            sealed: Arc::new(AtomicBool::new(false)),
             dispatch: Arc::new(Mutex::new(())),
             root: worker.root.clone(),
             journal_io: worker.journal_io.clone(),
