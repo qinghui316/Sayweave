@@ -46,6 +46,14 @@ async function closeCurrent(page){
  for(let n=0;n<20;n++){if(!installedState(exe).applications.some(app=>app.CreationDate===owned.CreationDate))break;await new Promise(resolve=>setTimeout(resolve,250));}
  if(installedState(exe).applications.some(app=>app.CreationDate===owned.CreationDate))throw Error('Native application exit did not complete.');
 }
+async function cleanupComponent(){
+ const registered=execFileSync('powershell',['-NoProfile','-Command',"$key=Get-Item -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}\\InprocServer32' -ErrorAction Stop;@{module=$key.GetValue('');owner=$key.GetValue('SayweaveOwner')}|ConvertTo-Json -Compress"],{encoding:'utf8'});
+ const identity=JSON.parse(registered),expected=path.join(process.env.ProgramFiles,'Sayweave','TextService',tools.manifest.artifacts.component.sha256,'sayweave_text_service.dll');
+ if(identity.owner!=='SayweaveStageA-v1'||path.normalize(identity.module.replace(/^\\\\\?\\/,'')).toLowerCase()!==path.normalize(expected).toLowerCase()||createHash('sha256').update(readFileSync(identity.module)).digest('hex')!==tools.manifest.artifacts.component.sha256)throw Error('Refusing cleanup of changed component identity');
+ await command(exe,['--sayweave-text-service=remove',`--initiator=${componentPreparation.sid}`]);
+ await command('powershell',['-NoProfile','-Command',"$ErrorActionPreference='Stop';foreach($root in @('HKCU:','HKLM:')){foreach($key in @('Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}','Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}')){if(Test-Path -LiteralPath ($root+'\\'+$key)){throw 'Prepared component cleanup incomplete'}}};'empty'"]);
+ componentPreparation.removed=true;
+}
 async function command(file,args){
  const entry={tool:path.basename(file),args,stage:report.stage,startedAt:new Date().toISOString()};report.commands.push(entry);persist();
  let stdout=Buffer.alloc(0),stderr=Buffer.alloc(0),error;
@@ -126,14 +134,7 @@ finally{
  if(browser)await browser.close().catch(()=>{});
  if(owned){try{const current=installedState(exe).applications.find(app=>app.ProcessId===owned.ProcessId&&app.CreationDate===owned.CreationDate);if(current){report.cleanupKill={ProcessId:current.ProcessId,CreationDate:current.CreationDate};await command('taskkill',['/PID',String(current.ProcessId),'/T','/F']);}}catch(error){report.cleanupError=String(error.message).slice(0,1024);report.passed=false;process.exitCode=1;}}
  else if(child&&child.exitCode===null){report.unverifiedProcessCleanup=true;report.passed=false;process.exitCode=1;}
- if(componentPreparation){try{
-  const registered=execFileSync('powershell',['-NoProfile','-Command',"$key=Get-Item -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}\\InprocServer32' -ErrorAction Stop;@{module=$key.GetValue('');owner=$key.GetValue('SayweaveOwner')}|ConvertTo-Json -Compress"],{encoding:'utf8'});
-  const identity=JSON.parse(registered),expected=path.join(process.env.ProgramFiles,'Sayweave','TextService',tools.manifest.artifacts.component.sha256,'sayweave_text_service.dll');
-  if(identity.owner!=='SayweaveStageA-v1'||path.normalize(identity.module.replace(/^\\\\\?\\/,'' )).toLowerCase()!==path.normalize(expected).toLowerCase()||createHash('sha256').update(readFileSync(identity.module)).digest('hex')!==tools.manifest.artifacts.component.sha256)throw Error('Refusing cleanup of changed component identity');
-  await command(exe,['--sayweave-text-service=remove',`--initiator=${componentPreparation.sid}`]);
-  await command('powershell',['-NoProfile','-Command',"$ErrorActionPreference='Stop';foreach($root in @('HKCU:','HKLM:')){foreach($key in @('Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}','Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}')){if(Test-Path -LiteralPath ($root+'\\'+$key)){throw 'Prepared component cleanup incomplete'}}};'empty'"]);
-  componentPreparation.removed=true;
- }catch(error){report.componentCleanupError=safeStartupText(error.message).slice(0,1024);report.passed=false;process.exitCode=1;}}
+ if(componentPreparation)await cleanupComponent().catch(error=>{report.componentCleanupError=safeStartupText(error.message).slice(0,1024);report.passed=false;process.exitCode=1;});
  if(debugPolicy){try{debugPolicy.remove();}catch(error){report.policyCleanupError=safeStartupText(error.message).slice(0,1024);report.passed=false;process.exitCode=1;}}
  persist();console.log(JSON.stringify({kind:report.kind,candidateCommit:candidate,acceptanceCommit:harness,passed:report.passed,error:report.error,receipt:path.join(directory,'receipt.json')}));
 }
