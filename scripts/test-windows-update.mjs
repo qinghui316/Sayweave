@@ -24,6 +24,7 @@ function checkpoint(){
 async function command(file,args,cwd=root,env=process.env,expectedFailure,timeoutMs=30*60_000){
  const started=Date.now(),entry={stage:report.stage,tool:path.basename(file),startedAt:new Date(started).toISOString()};report.commands.push(entry);checkpoint();
  let tail='',stdout='',stderr='';const safe=path.basename(file)==='tsf-probe.exe'||file==='cargo'&&args[0]==='build'&&args.some(arg=>arg.includes('text-service'));
+ if(safe)entry.args=args;
  const diagnostics=path.join(directory,'diagnostics');if(safe)mkdirSync(diagnostics,{recursive:true});
  const child=spawn(file,args,{cwd,env,windowsHide:true,timeout:timeoutMs,stdio:['ignore','pipe','pipe']});
  for(const [label,stream] of [['stdout',child.stdout],['stderr',child.stderr]])stream.on('data',bytes=>{writeFileSync(log,bytes,{flag:'a'});tail=(tail+bytes.toString('utf8')).slice(-16384);if(label==='stdout')stdout=(stdout+bytes.toString('utf8')).slice(-131072);else stderr=(stderr+bytes.toString('utf8')).slice(-131072);});
@@ -98,6 +99,16 @@ async function registrationInventory(){
  return JSON.parse((await command('powershell',['-NoProfile','-Command',script],root,process.env,undefined,30000)).stdout);
 }
 const registrationEmpty=info=>Object.values(info).every(item=>!item.com&&!item.tip);
+async function awaitRegistrationState(probe,registered){
+ const deadline=Date.now()+10000;let state,stable=0;
+ do{
+  state=JSON.parse((await command(probe,['registration-state'],root,process.env,undefined,30000)).stdout.trim());
+  const matches=registered?state.profiles>0&&state.categories>0&&state.speechCategory:state.profiles===0&&state.categories===0&&!state.speechCategory;
+  stable=matches?stable+1:0;if(stable===2)return state;
+  await delay(250);
+ }while(Date.now()<deadline);
+ throw Error(`TIP registration state did not settle (${registered?'registered':'removed'}): ${JSON.stringify(state)}`);
+}
 function moduleKey(value){return (value.startsWith('\\\\?\\')?value.slice(4):value).toLowerCase();}
 async function clearTemporaryRegistration(){
  if(!temporaryRegistration)return;
@@ -106,8 +117,7 @@ async function clearTemporaryRegistration(){
   if(!user.com||user.owner!=='SayweaveStageA-v1'||typeof user.module!=='string'||moduleKey(user.module)!==moduleKey(temporaryRegistration.component)||machine.com)throw Error('Temporary TIP identity is unavailable or changed; no blind removal');
   await command(temporaryRegistration.probe,['remove'],root,process.env,undefined,30000);
  }
- const after=await registrationInventory(),state=await command(temporaryRegistration.probe,['registration-state'],root,process.env,undefined,30000);
- const profiles=JSON.parse(state.stdout.trim());expect(profiles).toEqual({profiles:0,categories:0,speechCategory:false});
+ const after=await registrationInventory(),profiles=await awaitRegistrationState(temporaryRegistration.probe,false);
  if(!registrationEmpty(after))throw Error('Temporary TIP registration was not fully removed');
  report.toolRegistration={before,after,profiles,removed:true};temporaryRegistration=null;
 }
@@ -179,8 +189,7 @@ try{
  if(!registrationEmpty(initialRegistration))throw Error('Short tooling requires an empty owned TIP registration');
  temporaryRegistration={probe:tools.probe,component:tools.component};
  await command(tools.probe,['register',tools.component],root,process.env,undefined,30000);
- const prepared=JSON.parse((await command(tools.probe,['registration-state'],root,process.env,undefined,30000)).stdout.trim());
- expect(prepared.profiles).toBeGreaterThan(0);expect(prepared.speechCategory).toBe(true);report.toolRegistrationPrepared=prepared;
+ const prepared=await awaitRegistrationState(tools.probe,true);report.toolRegistrationPrepared=prepared;
  stage('short production DLL actual text');
  const smoke=await command(tools.probe,['installed-fixture',tools.component],root,process.env,undefined,60000);
  for(const marker of proofMarkers)expect(smoke.stdout).toContain(marker);
