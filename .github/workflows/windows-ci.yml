@@ -53,6 +53,7 @@ jobs:
         if: always()
         with:
           name: windows-update-receipt
+          include-hidden-files: true
           path: |
             .local/windows-update-acceptance.json
             .local/windows-update/*/acceptance.json

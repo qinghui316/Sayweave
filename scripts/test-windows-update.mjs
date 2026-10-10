@@ -2,22 +2,28 @@
 import {spawn,execFileSync} from 'node:child_process';
 import {randomUUID,createHash} from 'node:crypto';
 import {createServer} from 'node:https';
-import {mkdirSync,readFileSync,writeFileSync,existsSync,symlinkSync,rmSync} from 'node:fs';
+import {mkdirSync,readFileSync,writeFileSync,existsSync,symlinkSync,rmSync,renameSync} from 'node:fs';
 import path from 'node:path';
 import {chromium,expect} from '@playwright/test';
 import {DatabaseSync,backup} from 'node:sqlite';
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'&&process.env.SAYWEAVE_DISPOSABLE_WINDOWS!=='1')throw Error('Use a disposable Windows runner; never an owner profile.');
 const root=process.cwd(),id=randomUUID(),directory=path.join(root,'.local','windows-update',id),source=path.join(directory,'source');mkdirSync(source,{recursive:true});
-const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),report={schemaVersion:1,commit,environment:process.env.RUNNER_NAME??'explicit disposable Windows',id,checks:[],installers:[],passed:false};
+const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),report={schemaVersion:1,commit,environment:process.env.RUNNER_NAME??'explicit disposable Windows',id,checks:[],installers:[],commands:[],passed:false};
 const log=path.join(directory,'build.log'),keyPath=path.join(directory,'fixture-signing.key'),cli=path.join(root,'node_modules','@tauri-apps','cli','tauri.js');
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function checkpoint(){
+ report.updatedAt=new Date().toISOString();
+ for(const file of [path.join(directory,'acceptance.json'),path.join(root,'.local','windows-update-acceptance.json')]){writeFileSync(file+'.tmp',JSON.stringify(report,null,2)+'\n');renameSync(file+'.tmp',file);}
+}
 async function command(file,args,cwd=root,env=process.env,expectedFailure){
+ const started=Date.now(),entry={stage:report.stage,tool:path.basename(file),startedAt:new Date(started).toISOString()};report.commands.push(entry);checkpoint();
  let tail='';const child=spawn(file,args,{cwd,env,windowsHide:true,stdio:['ignore','pipe','pipe']});for(const stream of [child.stdout,child.stderr])stream.on('data',bytes=>{writeFileSync(log,bytes,{flag:'a'});tail=(tail+bytes.toString('utf8')).slice(-16384);});
- const code=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('exit',resolve);});
+ const heartbeat=setInterval(()=>{entry.elapsedMs=Date.now()-started;checkpoint();console.log(`Windows update acceptance: ${entry.stage} (${Math.round(entry.elapsedMs/1000)}s)`);},60000);
+ let code;try{code=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('exit',resolve);});}finally{clearInterval(heartbeat);entry.elapsedMs=Date.now()-started;entry.exitCode=code??null;checkpoint();}
  if(expectedFailure){if(code!==0&&tail.includes(expectedFailure))return;throw Error('Expected build-isolation rejection was not observed');}
  if(code!==0)throw Error(`Command failed: ${file} ${args.slice(0,3).join(' ')} (${code}); private fixture log retained`);
 }
-function stage(value){report.stage=value;console.log(`Windows update acceptance: ${value}`);}
+function stage(value){report.stage=value;checkpoint();console.log(`Windows update acceptance: ${value}`);}
 let server,browser,app,thumbprint,ownedProcess,lastEndpoint,serverMode='valid',packageBytes,signature;
 const debugPort=9291,identifier=`local.sayweave.acceptance.${id}`,product=`Sayweave 验收 ${id}`,testData=path.join(process.env.APPDATA,identifier,'data'),testExe=path.join(process.env.LOCALAPPDATA,product,'sayweave.exe');
 const invoke=(page,command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
@@ -69,8 +75,9 @@ async function build(version,channel='test'){
 try{
  stage('source and build isolation');
  execFileSync('git',['archive','HEAD','--format=tar','-o',path.join(directory,'source.tar')]);execFileSync('tar',['-xf',path.join(directory,'source.tar'),'-C',source]);symlinkSync(path.join(root,'node_modules'),path.join(source,'node_modules'),'junction');
- await command('cargo',['check','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance'],root,{...process.env,SAYWEAVE_BUILD_CHANNEL:'stable'},'acceptance feature in stable build');report.checks.push('actual stable build rejects the desktop-acceptance feature');
- await command('cargo',['build','--manifest-path','src-tauri/text-service/Cargo.toml','--release','--lib']);await command('cargo',['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_fixture','--','--ignored'],root,{...process.env,SAYWEAVE_DATA_ACCEPTANCE_ID:id});
+ stage('stable feature isolation');await command('cargo',['check','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance'],root,{...process.env,SAYWEAVE_BUILD_CHANNEL:'stable'},'acceptance feature in stable build');report.checks.push('actual stable build rejects the desktop-acceptance feature');
+ stage('native component build');await command('cargo',['build','--manifest-path','src-tauri/text-service/Cargo.toml','--release','--lib']);
+ stage('HTTPS certificate fixture');await command('cargo',['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_fixture','--','--ignored'],root,{...process.env,SAYWEAVE_DATA_ACCEPTANCE_ID:id});
  const certRoot=path.join(root,'.local','data-acceptance',id,'data');await command('certutil',['-user','-addstore','Root',path.join(certRoot,'fixture-ca.der')]);
  thumbprint=execFileSync('powershell',['-NoProfile','-Command',`(New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('${path.join(certRoot,'fixture-ca.der').replaceAll("'","''")}')).Thumbprint`],{encoding:'utf8'}).trim();await command(process.execPath,[cli,'signer','generate','--ci','--write-keys',keyPath]);
  server=createServer({cert:readFileSync(path.join(certRoot,'fixture-ca.pem')),key:readFileSync(path.join(certRoot,'fixture-key.pem'))},async(req,res)=>{
@@ -97,5 +104,5 @@ try{
  const stablePath=path.join(stableData,'dictionary.sqlite'),stable=new DatabaseSync(stablePath),models=stable.prepare('SELECT * FROM model_configs').all(),defaults=stable.prepare('SELECT * FROM model_defaults').all();stable.exec('PRAGMA wal_checkpoint(TRUNCATE)');await backup(stable,path.join(directory,'legacy.sqlite'));stable.close();for(const suffix of ['-wal','-shm'])rmSync(stablePath+suffix,{force:true});writeFileSync(stablePath,readFileSync(seedDatabase));const transplanted=new DatabaseSync(stablePath);transplanted.exec('PRAGMA foreign_keys=OFF; DELETE FROM model_defaults; DELETE FROM model_configs;');for(const [table,rows] of [['model_configs',models],['model_defaults',defaults]])for(const row of rows){const keys=Object.keys(row);transplanted.prepare(`INSERT INTO ${table}(${keys.join(',')}) VALUES(${keys.map(()=>'?').join(',')})`).run(...keys.map(key=>row[key]));}transplanted.close();
  const stableArgument=process.argv.indexOf('--stable-installer'),manual=stableArgument>=0?path.resolve(process.argv[stableArgument+1]):await build('0.1.7','internal');await command(manual,['/S']);page=await connect(stableExe);const snapshot=await invoke(page,'update_snapshot');expect(snapshot.build.version).toBe('0.1.7');expect(snapshot.build.updatesEnabled).toBe(stableArgument>=0);if(stableArgument>=0){expect(snapshot.build.channel).toBe('stable');expect(snapshot.build.commit).toBe(commit);}const preserved=await invoke(page,'model_overview');expect(preserved.configs[0].id).toBe(saved.configs[0].id);expect(preserved.configs[0].credentialStatus).toBe('present');expect((await invoke(page,'dictionary_list',{query:{kind:'term',search:'',page:1}})).total).toBe(1);expect((await invoke(page,'history_usage')).count).toBe(10);expect((await invoke(page,'language_overview',{after:null})).preferenceCount).toBe(1);await page.screenshot({path:path.join(directory,'native-manual-overlay.png')});await close(page,false);report.checks.push('actual public0.1.6 replaced by same-code0.1.7 candidate; native rendering and original credential reference/synthetic data preserved');report.passed=true;
 }catch(error){report.error=error.message;throw error;}finally{
- if(browser)await browser.close().catch(()=>{});if(ownedProcess){const remaining=processes(ownedProcess.ExecutablePath).find(p=>p.CreationDate===ownedProcess.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}if(app&&app.exitCode===null)app.kill();if(server){server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}if(thumbprint)await command('certutil',['-user','-delstore','Root',thumbprint]).catch(()=>{});writeFileSync(path.join(directory,'acceptance.json'),JSON.stringify(report,null,2)+'\n');writeFileSync(path.join(root,'.local','windows-update-acceptance.json'),JSON.stringify(report,null,2)+'\n');console.log(JSON.stringify({passed:report.passed,commit,checks:report.checks.length,receipt:path.join(directory,'acceptance.json')}));
+ if(browser)await browser.close().catch(()=>{});if(ownedProcess){const remaining=processes(ownedProcess.ExecutablePath).find(p=>p.CreationDate===ownedProcess.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}if(app&&app.exitCode===null)app.kill();if(server){server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}if(thumbprint)await command('certutil',['-user','-delstore','Root',thumbprint]).catch(()=>{});rmSync(keyPath,{force:true});checkpoint();console.log(JSON.stringify({passed:report.passed,commit,checks:report.checks.length,receipt:path.join(directory,'acceptance.json')}));
 }
