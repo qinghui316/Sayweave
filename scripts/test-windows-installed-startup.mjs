@@ -20,6 +20,8 @@ if(execFileSync('git',['status','--porcelain','--untracked-files=no'],{encoding:
 const packages=readPackages('.local/prior-update-packages',candidate);
 const recovery=process.argv.includes('--restart-recovery');
 const metadata=process.argv.includes('--metadata');
+const aclDiagnostic=process.argv.includes('--acl');
+const aclPrelude=String.raw`$ErrorActionPreference='Stop';[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop;`;
 const tools=metadata?readTools('.local/prior-update-tools',candidate):null;
 if(recovery&&!packages.next)throw Error('Recovery diagnosis requires both frozen signed packages.');
 const directory=path.join(root,'.local','installed-startup',randomUUID());mkdirSync(directory,{recursive:true});
@@ -115,6 +117,27 @@ try{
  let page=await connect();
  await page.screenshot({path:path.join(directory,'native-startup.png')});
  await closeCurrent(page);
+ if(aclDiagnostic){
+  stage('PowerShell ACL module comparison');
+  const literal="'"+path.dirname(exe).replaceAll("'","''")+"'";
+  const inspect=String.raw`[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);$r=@{version=$PSVersionTable.PSVersion.ToString();edition=$PSVersionTable.PSEdition;pshome=$PSHOME;modulePath=@($env:PSModulePath -split ';');available=@(Get-Module -ListAvailable Microsoft.PowerShell.Security|ForEach-Object{@{version=$_.Version.ToString();path=$_.Path}});loaded=@();read=false};try{Import-Module Microsoft.PowerShell.Security -ErrorAction Stop;$null=Get-Acl -LiteralPath `+literal+String.raw` -ErrorAction Stop;$r.read=$true}catch{$r.error=$_.Exception.ToString();$r.errorId=$_.FullyQualifiedErrorId};$r.loaded=@(Get-Module Microsoft.PowerShell.Security|ForEach-Object{@{version=$_.Version.ToString();path=$_.Path}});ConvertTo-Json -InputObject $r -Compress -Depth 5`;
+  report.aclModuleDefault=JSON.parse(await command('powershell',['-NoProfile','-Command',inspect]));persist();
+  report.aclModuleExplicit=JSON.parse(await command('powershell',['-NoProfile','-Command',aclPrelude+inspect]));persist();
+  expect(report.aclModuleExplicit.read).toBe(true);
+  stage('owned scratch ACL denial and exact restoration');
+  const scratch=path.join(directory,'acl-fixture');mkdirSync(scratch);const quoted="'"+scratch.replaceAll("'","''")+"'";
+  const original=(await command('powershell',['-NoProfile','-Command',aclPrelude+`(Get-Acl -LiteralPath ${quoted}).Sddl`])).trim();if(!original)throw Error('Owned scratch ACL is empty');
+  report.aclRoundtrip={directory:scratch,original,denied:false,restored:false};persist();
+  const user=execFileSync('whoami',[],{encoding:'utf8'}).trim();
+  try{
+   await command('icacls',[scratch,'/deny',`${user}:(OI)(CI)(W,D)`]);
+   try{writeFileSync(path.join(scratch,'must-not-create.tmp'),'forbidden');}catch{report.aclRoundtrip.denied=true;}persist();expect(report.aclRoundtrip.denied).toBe(true);
+  }finally{
+   const restored=(await command('powershell',['-NoProfile','-Command',aclPrelude+`$acl=Get-Acl -LiteralPath ${quoted};$acl.SetSecurityDescriptorSddlForm('${original.replaceAll("'","''")}');Set-Acl -LiteralPath ${quoted} -AclObject $acl;(Get-Acl -LiteralPath ${quoted}).Sddl`])).trim();
+   report.aclRoundtrip.restored=restored===original;persist();expect(report.aclRoundtrip.restored).toBe(true);
+  }
+  report.aclCompatibilityPassed=true;persist();
+ }
  if(recovery){
   stage('signed cache fixture for restart boundary only');
   if(!report.payload.manifestConsistent)throw Error('Recovery fixture requires consistent signed payload identity');

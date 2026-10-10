@@ -12,6 +12,7 @@ import {temporaryPreferenceCleanup} from './windows-update-registration.mjs';
 import {installedStartup,restartAndReconnect} from './windows-update-startup.mjs';
 import {readPackages,writePackages,nsisExecutableIdentity} from './windows-update-packages.mjs';
 import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
+const aclPrelude=String.raw`$ErrorActionPreference='Stop';[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop;`;
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'&&process.env.SAYWEAVE_DISPOSABLE_WINDOWS!=='1')throw Error('Use an elevated disposable Windows VM; never an owner machine.');
 const root=process.cwd(),id=randomUUID(),directory=path.join(root,'.local','windows-update',id),source=path.join(directory,'source');mkdirSync(source,{recursive:true});
 const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),report={schemaVersion:1,commit,environment:process.env.RUNNER_NAME??'explicit disposable Windows',id,checks:[],installers:[],commands:[],passed:false};
@@ -29,7 +30,7 @@ function checkpoint(){
 }
 async function command(file,args,cwd=root,env=process.env,expectedFailure,timeoutMs=30*60_000){
  const started=Date.now(),entry={stage:report.stage,tool:path.basename(file),startedAt:new Date(started).toISOString()};report.commands.push(entry);checkpoint();
- let tail='',stdout='',stderr='';const safe=path.basename(file)==='tsf-probe.exe'||file==='powershell'&&(toolsOnly||args.includes('scripts/windows-update-metadata.ps1'))||file==='cargo'&&(args.includes('verify-update-signature')||args[0]==='build'&&args.some(arg=>arg.includes('text-service')));
+ let tail='',stdout='',stderr='';const safe=path.basename(file)==='tsf-probe.exe'||file==='powershell'&&(toolsOnly||args.includes('scripts/windows-update-metadata.ps1')||args.at(-1)?.startsWith(aclPrelude))||file==='cargo'&&(args.includes('verify-update-signature')||args[0]==='build'&&args.some(arg=>arg.includes('text-service')));
  if(safe)entry.args=args;
  const diagnostics=path.join(directory,'diagnostics');if(safe)mkdirSync(diagnostics,{recursive:true});
  const child=spawn(file,args,{cwd,env,windowsHide:true,timeout:timeoutMs,stdio:['ignore','pipe','pipe']});
@@ -47,6 +48,7 @@ function stage(value){report.stage=value;checkpoint();console.log(`Windows updat
 let server,browser,app,thumbprint,ownedProcess,lastEndpoint,serverMode='valid',packageBytes,signature,deniedDirectory,originalAcl,installerProcess;
 let installerDescendants=[];
 let installerTreeConfirmed=false;
+let installerLaunchAttempted=false;
 let credentialRequests=0;
 let tools,legacySeed,temporaryRegistration,temporaryMachineRegistration,temporaryMachineFiles,unknownPreference,debugPolicy;
 async function cleanup(label,action){
@@ -214,11 +216,11 @@ async function clearTemporaryRegistration(){
  if(!registrationEmpty(after))throw Error('Temporary TIP registration was not fully removed');
  report.toolRegistration={before,after,profiles,removed:true};temporaryRegistration=null;
 }
-function restoreInstallAcl(){
+async function restoreInstallAcl(){
  if(!deniedDirectory)return;
- const script=`$acl=Get-Acl -LiteralPath ${quote(deniedDirectory)};$acl.SetSecurityDescriptorSddlForm(${quote(originalAcl)});Set-Acl -LiteralPath ${quote(deniedDirectory)} -AclObject $acl`;
- execFileSync('powershell',['-NoProfile','-Command',script],{stdio:'ignore'});
- expect(execFileSync('powershell',['-NoProfile','-Command',`(Get-Acl -LiteralPath ${quote(deniedDirectory)}).Sddl`],{encoding:'utf8'}).trim()).toBe(originalAcl);deniedDirectory=null;
+ const script=aclPrelude+`$acl=Get-Acl -LiteralPath ${quote(deniedDirectory)};$acl.SetSecurityDescriptorSddlForm(${quote(originalAcl)});Set-Acl -LiteralPath ${quote(deniedDirectory)} -AclObject $acl;(Get-Acl -LiteralPath ${quote(deniedDirectory)}).Sddl`;
+ const result=await command('powershell',['-NoProfile','-Command',script],root,process.env,undefined,30000);
+ expect(result.stdout.trim()).toBe(originalAcl);deniedDirectory=null;
 }
 async function legacyData(page,config){
  await expect.poll(async()=>(await invoke(page,'model_status',{retry:false})).state).toBe('ready');
@@ -397,9 +399,11 @@ try{
  const cache=path.join(testData,'update-cache','candidate.exe'),user=execFileSync('whoami',[],{encoding:'utf8'}).trim();await command('icacls',[cache,'/deny',`${user}:(X)`]);await invoke(page,'update_install',{taskId:candidate.taskId,revision:candidate.revision});await state(page,'recovery');await command('icacls',[cache,'/remove:d',user]);report.checks.push('real Windows execute denial produces launch recovery before process exit');
  stage('real launched installer interruption');page=await restartCurrent(page);candidate=await state(page,'readyToInstall');
  const oldExecutableHash=createHash('sha256').update(readFileSync(testExe)).digest('hex');
- deniedDirectory=path.dirname(testExe);originalAcl=execFileSync('powershell',['-NoProfile','-Command',`(Get-Acl -LiteralPath ${quote(deniedDirectory)}).Sddl`],{encoding:'utf8'}).trim();
+ const installDirectory=path.dirname(testExe),acl=await command('powershell',['-NoProfile','-Command',aclPrelude+`(Get-Acl -LiteralPath ${quote(installDirectory)}).Sddl`],root,process.env,undefined,30000);
+ originalAcl=acl.stdout.trim();if(!originalAcl)throw Error('Original installation ACL is empty');deniedDirectory=installDirectory;
  await command('icacls',[deniedDirectory,'/deny',`${user}:(OI)(CI)(W,D)`]);
  let denied=false;try{writeFileSync(path.join(deniedDirectory,'must-not-create.tmp'),'forbidden');}catch{denied=true;}expect(denied).toBe(true);
+ installerLaunchAttempted=true;
  const originalProcess=ownedProcess,installing=invoke(page,'update_install',{taskId:candidate.taskId,revision:candidate.revision}).catch(()=>{});
  await expect.poll(()=>{installerProcess=processes(cache)[0];if(installerProcess)captureInstallerTree(true);return Boolean(installerProcess);},{timeout:15000,intervals:[100]}).toBe(true);
  await expect.poll(()=>{captureInstallerTree();return processes(testExe).some(p=>p.CreationDate===originalProcess.CreationDate);},{timeout:15000,intervals:[100]}).toBe(false);
@@ -409,7 +413,7 @@ try{
  await installing;await browser.close().catch(()=>{});browser=null;ownedProcess=null;
  expect(createHash('sha256').update(readFileSync(testExe)).digest('hex')).toBe(oldExecutableHash);
  const journal=JSON.parse(readFileSync(path.join(testData,'update-cache','transaction.json'),'utf8'));expect(['launching','launched']).toContain(journal.stage);
- restoreInstallAcl();page=await connect(testExe);candidate=await state(page,'readyToInstall');expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.700');expect(candidate.error).toContain('上次更新未完成');expect(await data(page)).toEqual(seeded);
+ await restoreInstallAcl();page=await connect(testExe);candidate=await state(page,'readyToInstall');expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.700');expect(candidate.error).toContain('上次更新未完成');expect(await data(page)).toEqual(seeded);
  for(let n=0;n<21;n++){expect(processes(cache)).toHaveLength(0);await delay(1000);}expect((await invoke(page,'update_snapshot')).state).toBe('readyToInstall');
  report.interruptedInstaller={...installerIdentity(cache,'0.1.701','test'),process:launched,descendants,stage:journal.stage,oldExecutableHash,interruption:'owned NSIS tree deliberately terminated after successful launch and app exit',aclRestored:true,noAutomaticRetrySeconds:21};report.checks.push('genuine launched NSIS installation deliberately interrupted; old binary/data retained, incomplete update shown without automatic retry');
  stage('native UI and real automatic upgrade');await page.getByRole('button',{name:'关于',exact:true}).click();await page.getByRole('button',{name:'重启并更新',exact:true}).click();await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);
@@ -434,7 +438,7 @@ try{
  await cleanup('browser',async()=>{if(browser)await browser.close();});
  await cleanup('application',()=>{if(ownedProcess){const remaining=processes(ownedProcess.ExecutablePath).find(p=>p.ProcessId===ownedProcess.ProcessId&&p.CreationDate===ownedProcess.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}if(app&&app.exitCode===null)app.kill();});
  const installersStopped=await cleanup('interrupted installer tree',async()=>{
-  if(deniedDirectory&&!installerTreeConfirmed)throw Error('Installer ownership snapshot unconfirmed; retain directory denial');
+  if(deniedDirectory&&installerLaunchAttempted&&!installerTreeConfirmed)throw Error('Installer ownership snapshot unconfirmed; retain directory denial');
   if(installerTreeConfirmed&&deniedDirectory)captureInstallerTree();
   const identities=[...installerDescendants,...(installerProcess?[installerProcess]:[])];
   for(const owned of identities){const remaining=processes(owned.ExecutablePath).find(p=>p.ProcessId===owned.ProcessId&&p.CreationDate===owned.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}
