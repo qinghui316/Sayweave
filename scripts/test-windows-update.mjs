@@ -16,11 +16,12 @@ function checkpoint(){
  report.updatedAt=new Date().toISOString();
  for(const file of [path.join(directory,'acceptance.json'),path.join(root,'.local','windows-update-acceptance.json')]){writeFileSync(file+'.tmp',JSON.stringify(report,null,2)+'\n');renameSync(file+'.tmp',file);}
 }
-async function command(file,args,cwd=root,env=process.env,expectedFailure){
+async function command(file,args,cwd=root,env=process.env,expectedFailure,timeoutMs=30*60_000){
  const started=Date.now(),entry={stage:report.stage,tool:path.basename(file),startedAt:new Date(started).toISOString()};report.commands.push(entry);checkpoint();
- let tail='';const child=spawn(file,args,{cwd,env,windowsHide:true,stdio:['ignore','pipe','pipe']});for(const stream of [child.stdout,child.stderr])stream.on('data',bytes=>{writeFileSync(log,bytes,{flag:'a'});tail=(tail+bytes.toString('utf8')).slice(-16384);});
+ let tail='';const child=spawn(file,args,{cwd,env,windowsHide:true,timeout:timeoutMs,stdio:['ignore','pipe','pipe']});for(const stream of [child.stdout,child.stderr])stream.on('data',bytes=>{writeFileSync(log,bytes,{flag:'a'});tail=(tail+bytes.toString('utf8')).slice(-16384);});
  const heartbeat=setInterval(()=>{entry.elapsedMs=Date.now()-started;checkpoint();console.log(`Windows update acceptance: ${entry.stage} (${Math.round(entry.elapsedMs/1000)}s)`);},60000);
  let code;try{code=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('exit',resolve);});}finally{clearInterval(heartbeat);entry.elapsedMs=Date.now()-started;entry.exitCode=code??null;checkpoint();}
+ if(child.killed)throw Error(`Command exceeded ${timeoutMs}ms: ${path.basename(file)}`);
  if(expectedFailure){if(code!==0&&tail.includes(expectedFailure))return;throw Error('Expected build-isolation rejection was not observed');}
  if(code!==0)throw Error(`Command failed: ${file} ${args.slice(0,3).join(' ')} (${code}); private fixture log retained`);
 }
@@ -128,8 +129,12 @@ try{
  stage('stable feature isolation');await command('cargo',['check','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance'],root,{...process.env,SAYWEAVE_BUILD_CHANNEL:'stable'},'acceptance feature in stable build');report.checks.push('actual stable build rejects the desktop-acceptance feature');
  stage('native component build');await command('cargo',['build','--manifest-path','src-tauri/text-service/Cargo.toml','--release','--lib','--bin','tsf-probe']);
  stage('HTTPS certificate fixture');await command('cargo',['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_fixture','--','--ignored'],root,{...process.env,SAYWEAVE_DATA_ACCEPTANCE_ID:id});
- const certRoot=path.join(root,'.local','data-acceptance',id,'data');await command('certutil',['-user','-addstore','Root',path.join(certRoot,'fixture-ca.der')]);
- thumbprint=execFileSync('powershell',['-NoProfile','-Command',`(New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('${path.join(certRoot,'fixture-ca.der').replaceAll("'","''")}')).Thumbprint`],{encoding:'utf8'}).trim();await command(process.execPath,[cli,'signer','generate','--ci','--write-keys',keyPath]);
+ const certRoot=path.join(root,'.local','data-acceptance',id,'data'),certificateFile=path.join(certRoot,'fixture-ca.der');
+ thumbprint=execFileSync('powershell',['-NoProfile','-Command',`(New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(${quote(certificateFile)})).Thumbprint`],{encoding:'utf8',timeout:30000}).trim();
+ stage('isolated HTTPS trust import');
+ await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$cert=New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(${quote(certificateFile)});$store=New-Object System.Security.Cryptography.X509Certificates.X509Store('Root','CurrentUser');try{$store.Open('ReadWrite');$store.Add($cert);if($store.Certificates.Find('FindByThumbprint',${quote(thumbprint)},$false).Count -ne 1){throw 'Isolated root import not confirmed'}}finally{$store.Close();$cert.Dispose()}`],root,process.env,undefined,60000);
+ report.checks.push('isolated CurrentUser root imported without interactive certutil; exact thumbprint confirmed');
+ stage('temporary signature key');await command(process.execPath,[cli,'signer','generate','--ci','--write-keys',keyPath],root,process.env,undefined,60000);
  server=createServer({cert:readFileSync(path.join(certRoot,'fixture-ca.pem')),key:readFileSync(path.join(certRoot,'fixture-key.pem'))},async(req,res)=>{
   if(req.url==='/v1/chat/completions'){
    let size=0;for await(const chunk of req){size+=chunk.length;if(size>8192){res.destroy();return;}}
