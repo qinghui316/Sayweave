@@ -28,7 +28,7 @@ function checkpoint(){
 }
 async function command(file,args,cwd=root,env=process.env,expectedFailure,timeoutMs=30*60_000){
  const started=Date.now(),entry={stage:report.stage,tool:path.basename(file),startedAt:new Date(started).toISOString()};report.commands.push(entry);checkpoint();
- let tail='',stdout='',stderr='';const safe=path.basename(file)==='tsf-probe.exe'||file==='cargo'&&args[0]==='build'&&args.some(arg=>arg.includes('text-service'));
+ let tail='',stdout='',stderr='';const safe=path.basename(file)==='tsf-probe.exe'||file==='cargo'&&(args.includes('verify-update-signature')||args[0]==='build'&&args.some(arg=>arg.includes('text-service')));
  if(safe)entry.args=args;
  const diagnostics=path.join(directory,'diagnostics');if(safe)mkdirSync(diagnostics,{recursive:true});
  const child=spawn(file,args,{cwd,env,windowsHide:true,timeout:timeoutMs,stdio:['ignore','pipe','pipe']});
