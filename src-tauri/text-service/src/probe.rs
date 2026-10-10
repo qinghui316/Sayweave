@@ -596,6 +596,7 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         if installed && std::env::args().nth(2).is_none() {
             return Err("installed fixture requires an explicit production DLL".into());
         }
+        let keyboard_before = if installed { Some(keyboard()?) } else { None };
         let plain = installed || std::env::args().nth(3).as_deref() == Some("plain");
         println!("owned fixture stage=library");
         let library = LoadLibraryExW(w!("Msftedit.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)?;
@@ -719,19 +720,26 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         // profile and keyboard unchanged.
         println!("owned fixture stage=activation");
         let (activation, language) = sayweave_text_service::client::speech_activation()?;
+        if installed && activation == sayweave_text_service::client::SpeechActivation::Other {
+            return Err("owned fixture found a conflicting speech profile".into());
+        }
         if activation == sayweave_text_service::client::SpeechActivation::Own {
             registration::deactivate(language, false)?;
             pump(Duration::from_millis(100));
         }
         println!("owned fixture stage=component");
-        let (component, processor) = load_processor(&module_path)?;
+        let (component, processor) = if installed {
+            (load_fixture_module(&module_path)?, None)
+        } else {
+            let (module, processor) = load_processor(&module_path)?;
+            (module, Some(processor))
+        };
         let capability = uuid::Uuid::new_v4().to_string();
         let host = registration::host_capability(std::process::id(), &capability)?;
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
             if installed {
-                // Only TSF owns a registered TIP's activation identity. The spare
-                // COM instance above validates this explicit module's factory,
-                // while TSF creates/activates the real service for this process.
+                // Only TSF owns a registered TIP's activation identity. Hold the
+                // exact module for export/unload checks; TSF creates the service.
                 println!("owned fixture stage=service process_scope=true");
                 let activated = registration::activate(false)
                     .map_err(|e| format!("owned process TIP activate: {e}"))?;
@@ -748,15 +756,22 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "owned process TIP activation identity confirmed=true language={language}"
                 );
+                if keyboard_before != Some(keyboard()?) {
+                    return Err("owned process TIP activation changed keyboard identity".into());
+                }
                 pump(Duration::from_millis(200));
             } else {
                 let service_client = manager
                     .cast::<ITfClientId>()?
                     .GetClientId(&registration::CLASS)?;
                 println!("owned fixture stage=service client={service_client} direct=true");
-                processor.Activate(&manager, service_client).map_err(|e| {
-                    format!("owned processor activate client={service_client}: {e}")
-                })?;
+                processor
+                    .as_ref()
+                    .ok_or("missing direct fixture processor")?
+                    .Activate(&manager, service_client)
+                    .map_err(|e| {
+                        format!("owned processor activate client={service_client}: {e}")
+                    })?;
             }
             if installed {
                 if GetProcAddress(component, windows::core::s!("SayweaveSettleFixtureFault"))
@@ -1369,7 +1384,10 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         let stopped = if installed {
             registration::deactivate(language, false)
         } else {
-            processor.Deactivate()
+            processor
+                .as_ref()
+                .ok_or("missing direct fixture processor")?
+                .Deactivate()
         };
         drop(processor);
         let manager_stopped = manager.Deactivate();
@@ -1388,6 +1406,9 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         result?;
         stopped.map_err(|e| format!("owned service deactivation: {e}"))?;
         manager_stopped.map_err(|e| format!("owned manager deactivation: {e}"))?;
+        if installed && keyboard_before != Some(keyboard()?) {
+            return Err("owned process TIP cleanup changed keyboard identity".into());
+        }
         Ok(())
     }
 }
@@ -1449,25 +1470,34 @@ impl ITfEditSession_Impl for ReadComposition_Impl {
     }
 }
 #[cfg(feature = "acceptance")]
+fn load_fixture_module(
+    path: &std::path::Path,
+) -> Result<windows::Win32::Foundation::HMODULE, Box<dyn std::error::Error>> {
+    use windows::{Win32::System::LibraryLoader::*, core::PCWSTR};
+    let path: Vec<_> = std::fs::canonicalize(path)?
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    Ok(unsafe {
+        LoadLibraryExW(
+            PCWSTR(path.as_ptr()),
+            None,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )?
+    })
+}
+#[cfg(feature = "acceptance")]
 fn load_processor(
     path: &std::path::Path,
 ) -> Result<(windows::Win32::Foundation::HMODULE, ITfTextInputProcessor), Box<dyn std::error::Error>>
 {
     use windows::{
         Win32::{Foundation::FreeLibrary, System::LibraryLoader::*},
-        core::{GUID, HRESULT, Interface, PCWSTR, s},
+        core::{GUID, HRESULT, Interface, s},
     };
     unsafe {
-        let path: Vec<_> = std::fs::canonicalize(path)?
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(Some(0))
-            .collect();
-        let module = LoadLibraryExW(
-            PCWSTR(path.as_ptr()),
-            None,
-            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
-        )?;
+        let module = load_fixture_module(path)?;
         let result = (|| -> Result<ITfTextInputProcessor, Box<dyn std::error::Error>> {
             let entry = GetProcAddress(module, s!("DllGetClassObject"))
                 .ok_or("missing COM factory export")?;

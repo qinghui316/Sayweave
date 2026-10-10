@@ -102,10 +102,10 @@ const registrationEmpty=info=>Object.values(info).every(item=>!item.com&&!item.t
 async function awaitRegistrationState(probe,registered){
  const deadline=Date.now()+10000;let state,stable=0;
  do{
-  state=JSON.parse((await command(probe,['registration-state'],root,process.env,undefined,30000)).stdout.trim());
+  state=JSON.parse((await command(probe,['registration-state'],root,process.env,undefined,Math.max(1,deadline-Date.now()))).stdout.trim());
   const matches=registered?state.profiles>0&&state.categories>0&&state.speechCategory:state.profiles===0&&state.categories===0&&!state.speechCategory;
-  stable=matches?stable+1:0;if(stable===2)return state;
-  await delay(250);
+  stable=matches?stable+1:0;if(stable===2&&Date.now()<=deadline)return state;
+  await delay(Math.max(0,Math.min(250,deadline-Date.now())));
  }while(Date.now()<deadline);
  throw Error(`TIP registration state did not settle (${registered?'registered':'removed'}): ${JSON.stringify(state)}`);
 }
@@ -190,6 +190,9 @@ try{
  temporaryRegistration={probe:tools.probe,component:tools.component};
  await command(tools.probe,['register',tools.component],root,process.env,undefined,30000);
  const prepared=await awaitRegistrationState(tools.probe,true);report.toolRegistrationPrepared=prepared;
+ const preparedIdentity=await registrationInventory();report.toolRegistrationIdentity=preparedIdentity;
+ const preparedUser=preparedIdentity.HKEY_CURRENT_USER;
+ if(!preparedUser.com||preparedUser.owner!=='SayweaveStageA-v1'||typeof preparedUser.module!=='string'||moduleKey(preparedUser.module)!==moduleKey(tools.component)||preparedIdentity.HKEY_LOCAL_MACHINE.com)throw Error('Prepared TIP module identity differs from the verified production DLL');
  stage('short production DLL actual text');
  const smoke=await command(tools.probe,['installed-fixture',tools.component],root,process.env,undefined,60000);
  for(const marker of proofMarkers)expect(smoke.stdout).toContain(marker);
