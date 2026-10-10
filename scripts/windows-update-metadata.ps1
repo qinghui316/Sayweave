@@ -19,13 +19,17 @@ $readerPath = Join-Path $PSScriptRoot 'windows-update-metadata.cs'
 if ('SayweaveMetadata.Characterization' -as [type]) { throw 'Use a fresh PowerShell process; a reader type is already loaded.' }
 Add-Type -Path $readerPath
 $result = [SayweaveMetadata.Characterization]::Read($ExpectedModulePath, $ExpectedComponentSha256)
+$readerHash = [Security.Cryptography.SHA256]::Create()
+try {
+    $helperSha256 = [BitConverter]::ToString($readerHash.ComputeHash([IO.File]::ReadAllBytes($readerPath))).Replace('-', '').ToLowerInvariant()
+} finally { $readerHash.Dispose() }
 $receipt = [ordered]@{
     productCommit = $ProductCommit
     acceptanceCommit = $ExpectedCommit
     environment = 'GitHub-hosted disposable elevated Windows x64'
     runnerName = $env:RUNNER_NAME
     observedAt = [DateTime]::UtcNow.ToString('o')
-    helperSha256 = (Get-FileHash -LiteralPath $readerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    helperSha256 = $helperSha256
     characterization = $result
     metadataExpected = ($result.allRawExpected -and $result.allApiExpected)
 }
