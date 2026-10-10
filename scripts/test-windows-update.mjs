@@ -11,6 +11,7 @@ import {readTools,writeTools,readMechanismEvidence,writeMechanismEvidence,proofM
 import {temporaryPreferenceCleanup} from './windows-update-registration.mjs';
 import {installedStartup} from './windows-update-startup.mjs';
 import {readPackages,writePackages} from './windows-update-packages.mjs';
+import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'&&process.env.SAYWEAVE_DISPOSABLE_WINDOWS!=='1')throw Error('Use an elevated disposable Windows VM; never an owner machine.');
 const root=process.cwd(),id=randomUUID(),directory=path.join(root,'.local','windows-update',id),source=path.join(directory,'source');mkdirSync(source,{recursive:true});
 const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),report={schemaVersion:1,commit,environment:process.env.RUNNER_NAME??'explicit disposable Windows',id,checks:[],installers:[],commands:[],passed:false};
@@ -47,7 +48,7 @@ let server,browser,app,thumbprint,ownedProcess,lastEndpoint,serverMode='valid',p
 let installerDescendants=[];
 let installerTreeConfirmed=false;
 let credentialRequests=0;
-let tools,legacySeed,temporaryRegistration;
+let tools,legacySeed,temporaryRegistration,debugPolicy;
 async function cleanup(label,action){
  try{await action();return true;}catch(error){report.passed=false;process.exitCode=1;(report.cleanupErrors??=[]).push({stage:label,error:String(error?.message??error?.code??error).slice(0,1024)});return false;}
 }
@@ -73,6 +74,7 @@ function captureInstallerTree(first=false){
  installerDescendants=tree;if(first)installerTreeConfirmed=true;return tree;
 }
 async function connect(exe,launch=true,allowBroken=false){
+ if(!debugPolicy){debugPolicy=prepareDisposableDebugPolicy(debugPort);report.debugPolicyLease=debugPolicy.receipt;checkpoint();debugPolicy.install();checkpoint();}
  const result=await installedStartup({exe,dataRoot:exe===testExe?testData:path.join(process.env.APPDATA,'local.sayweave.skeleton','data'),directory:path.join(directory,'diagnostics'),port:debugPort,launch,previous:ownedProcess,record:report.startups??(report.startups=[]),persist:checkpoint,onOwned:value=>{ownedProcess=value;},onSpawn:value=>{app=value;},allowMissingPageMarker:allowBroken});
  const endpoint=result.endpoint;if(!launch&&endpoint.webSocketDebuggerUrl===lastEndpoint)throw Error('Old debug endpoint cannot confirm restart');lastEndpoint=endpoint.webSocketDebuggerUrl;
  try{
@@ -325,6 +327,7 @@ try{
  });
  if(installersStopped)await cleanup('original installation ACL',restoreInstallAcl);
  else if(deniedDirectory)(report.cleanupErrors??=[]).push({stage:'original installation ACL',error:'Not restored while owned installer termination is unconfirmed'});
+ await cleanup('temporary WebView debug policy',()=>{if(debugPolicy)debugPolicy.remove();});
  await cleanup('HTTPS server',async()=>{if(server){server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}});
  await cleanup('temporary root certificate',async()=>{if(thumbprint)await command('certutil',['-delstore','Root',thumbprint],root,process.env,undefined,60000);});
  await cleanup('temporary signing key',()=>rmSync(keyPath,{force:true}));
