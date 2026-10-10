@@ -4,6 +4,21 @@ import path from 'node:path';
 
 const limit=128*1024*1024;
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
+// Tauri 2.12.1 patches the NSIS payload token, then restores the build output.
+// Bind the generated NSIS input, actual signed payload and restored source bytes.
+export function nsisExecutableIdentity(script,expectedSource,buildOutput,payload){
+ const matches=[...script.matchAll(/^!define MAINBINARYSRCPATH "([^"\r\n]+)"\r?$/gm)];
+ if(matches.length!==1)throw Error('NSIS main binary source is missing or ambiguous');
+ const source=matches[0][1].replaceAll('$$','$');
+ if(!path.win32.isAbsolute(source)||path.win32.normalize(source).toLowerCase()!==path.win32.normalize(expectedSource).toLowerCase())throw Error('NSIS main binary source differs from the frozen build output');
+ if(!Buffer.isBuffer(buildOutput)||!Buffer.isBuffer(payload)||buildOutput.length<1||payload.length!==buildOutput.length||payload.length>limit)throw Error('NSIS executable bytes exceed identity bounds');
+ const restored=Buffer.from(payload),token=Buffer.from('__TAURI_BUNDLE_TYPE_VAR_NSS'),original=Buffer.from('__TAURI_BUNDLE_TYPE_VAR_UNK');
+ const offset=restored.indexOf(token);
+ if(offset<0||restored.indexOf(token,offset+1)>=0||buildOutput.indexOf(original)!==offset||buildOutput.indexOf(original,offset+1)>=0)throw Error('NSIS bundle type identity is missing or ambiguous');
+ original.copy(restored,offset);
+ if(!restored.equals(buildOutput))throw Error('NSIS payload differs beyond the expected bundle type patch');
+ return {mainBinarySource:source,restoredBuildSha256:hash(buildOutput),executableSha256:hash(payload),executableSize:payload.length,bundleTypeOffset:offset};
+}
 const names={old:'test-0.1.700-setup.exe',next:'test-0.1.701-setup.exe'};
 function item(directory,name,max=limit){
  const root=lstatSync(directory);if(!root.isDirectory()||root.isSymbolicLink())throw Error('Package artifact directory must be real');
