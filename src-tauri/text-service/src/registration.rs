@@ -621,13 +621,15 @@ fn unregister_scope(root: HKEY) -> windows::core::Result<()> {
         category?;
         profile?;
         clear_user_preferences()?;
-        if exists(HKEY_LOCAL_MACHINE, TIP_ROOT)?
-            || !owned_languages(&profiles()?)?.is_empty()
-            || owned_category_count()? != 0
-        {
+        let machine_remaining = exists(HKEY_LOCAL_MACHINE, TIP_ROOT)?;
+        let profiles_remaining = owned_languages(&profiles()?)?.len();
+        let categories_remaining = owned_category_count()?;
+        if machine_remaining || profiles_remaining != 0 || categories_remaining != 0 {
             return Err(windows::core::Error::new(
                 E_FAIL,
-                "profileRemovalIncomplete",
+                format!(
+                    "profileRemovalIncomplete machine={machine_remaining} profiles={profiles_remaining} categories={categories_remaining}"
+                ),
             ));
         }
         let status = RegDeleteTreeW(root, PCWSTR(wide(COM_ROOT).as_ptr()));

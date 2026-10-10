@@ -29,7 +29,7 @@ function checkpoint(){
 }
 async function command(file,args,cwd=root,env=process.env,expectedFailure,timeoutMs=30*60_000){
  const started=Date.now(),entry={stage:report.stage,tool:path.basename(file),startedAt:new Date(started).toISOString()};report.commands.push(entry);checkpoint();
- let tail='',stdout='',stderr='';const safe=path.basename(file)==='tsf-probe.exe'||file==='powershell'&&args.includes('scripts/windows-update-metadata.ps1')||file==='cargo'&&(args.includes('verify-update-signature')||args[0]==='build'&&args.some(arg=>arg.includes('text-service')));
+ let tail='',stdout='',stderr='';const safe=path.basename(file)==='tsf-probe.exe'||file==='powershell'&&(toolsOnly||args.includes('scripts/windows-update-metadata.ps1'))||file==='cargo'&&(args.includes('verify-update-signature')||args[0]==='build'&&args.some(arg=>arg.includes('text-service')));
  if(safe)entry.args=args;
  const diagnostics=path.join(directory,'diagnostics');if(safe)mkdirSync(diagnostics,{recursive:true});
  const child=spawn(file,args,{cwd,env,windowsHide:true,timeout:timeoutMs,stdio:['ignore','pipe','pipe']});
@@ -140,7 +140,7 @@ async function clearMachineFiles(){
 async function clearUnknownPreference(){
  if(!unknownPreference)return;
  const {key,name}=unknownPreference;
- await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$key=Get-Item -LiteralPath ${quote(key)};if($key.GetValueNames() -contains ${quote(name)}){if($key.GetValueKind(${quote(name)}) -ne [Microsoft.Win32.RegistryValueKind]::DWord -or $key.GetValue(${quote(name)}) -ne 123){throw 'Fixture value changed'};$key.DeleteValue(${quote(name)},$true)}`]);
+ await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(${quote(key)},$true);if(-not $key){throw 'Fixture key missing'};try{if($key.GetValueNames() -contains ${quote(name)}){if($key.GetValueKind(${quote(name)}) -ne [Microsoft.Win32.RegistryValueKind]::DWord -or $key.GetValue(${quote(name)}) -ne 123){throw 'Fixture value changed'};$key.DeleteValue(${quote(name)},$true)}}finally{$key.Close()}`]);
  unknownPreference=null;
 }
 async function machineMetadataProof(){
@@ -157,8 +157,8 @@ async function machineMetadataProof(){
  const prepared=await registrationInventory();report.machineMetadata={syntheticPaths:true,prepared,initial:await characterizeComponent(paths[0],componentHash)};checkpoint();
  const leaf=prepared.HKEY_LOCAL_MACHINE.tipEntries.find(entry=>Object.hasOwn(entry.values,'Description'))?.path;
  if(!leaf)throw Error('Machine metadata profile missing');
- const key=`Registry::HKEY_LOCAL_MACHINE\\Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}${leaf}`;
- await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$key=Get-Item -LiteralPath ${quote(key)};$key.SetValue('Description','Sayweave Voice Files',[Microsoft.Win32.RegistryValueKind]::String)`]);
+ const key=`Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}${leaf}`;
+ await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$key=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(${quote(key)},$true);if(-not $key){throw 'Fixture key missing'};try{$key.SetValue('Description','Sayweave Voice Files',[Microsoft.Win32.RegistryValueKind]::String)}finally{$key.Close()}`]);
  const malformed=await registrationInventory();report.machineMetadata.malformed=malformed;checkpoint();
  await command(tools.probe,['repair-machine-metadata',paths[1],prepared.HKEY_LOCAL_MACHINE.module,'reject-confirmation'],root,process.env,'acceptanceReplacementFailure',30000);
  expect(await registrationInventory()).toEqual(malformed);report.machineMetadata.rollbackPreserved=true;checkpoint();
@@ -190,7 +190,13 @@ async function clearTemporaryRegistration(){
  if(user.com||machine.com){
   if(!user.com||user.owner!=='SayweaveStageA-v1'||typeof user.module!=='string'||moduleKey(user.module)!==moduleKey(temporaryRegistration.component)||machine.com)throw Error('Temporary TIP identity is unavailable or changed; no blind removal');
   temporaryRegistration.anchor=before;report.toolRegistrationRemoval={anchor:before,initial:temporaryRegistration.initial,componentSha256:temporaryRegistration.sha256};checkpoint();
-  await command(temporaryRegistration.probe,['remove'],root,process.env,undefined,30000);
+  try{await command(temporaryRegistration.probe,['remove'],root,process.env,undefined,30000);}
+  catch(error){
+   const failure=report.nativeRemovalFailure={error:String(error.message).slice(0,4096)};checkpoint();
+   try{failure.inventory=await registrationInventory();}catch(readError){failure.inventoryError=String(readError.message).slice(0,1024);}checkpoint();
+   try{failure.api=JSON.parse((await command(temporaryRegistration.probe,['registration-state'],root,process.env,undefined,30000)).stdout.trim());}catch(readError){failure.apiError=String(readError.message).slice(0,1024);}checkpoint();
+   throw error;
+  }
   temporaryRegistration.apiRemoved=true;
  }
  const metadata=await awaitRegistrationState(temporaryRegistration.probe,false,false),remaining=await registrationInventory();
@@ -291,9 +297,9 @@ try{
  stage('unknown user preference refuses native removal');
  const userLeaf=preparedUser.tipEntries.find(entry=>Object.hasOwn(entry.values,'Enable'))?.path;
  if(!userLeaf)throw Error('Prepared user preference missing');
- const userKey=`Registry::HKEY_CURRENT_USER\\Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}${userLeaf}`,unknownName=`Acceptance-${id}`;
+ const userKey=`Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}${userLeaf}`,unknownName=`Acceptance-${id}`;
  unknownPreference={key:userKey,name:unknownName};
- await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$key=Get-Item -LiteralPath ${quote(userKey)};if($key.GetValueNames() -contains ${quote(unknownName)}){throw 'Fixture value exists'};$key.SetValue(${quote(unknownName)},123,[Microsoft.Win32.RegistryValueKind]::DWord)`]);
+ await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(${quote(userKey)},$true);if(-not $key){throw 'Fixture key missing'};try{if($key.GetValueNames() -contains ${quote(unknownName)}){throw 'Fixture value exists'};$key.SetValue(${quote(unknownName)},123,[Microsoft.Win32.RegistryValueKind]::DWord)}finally{$key.Close()}`]);
  const unknown=await registrationInventory();await command(tools.probe,['remove'],root,process.env,'preferenceIdentityChanged',30000);expect(await registrationInventory()).toEqual(unknown);
  await clearUnknownPreference();
  report.checks.push('unknown preference rejects product removal with exact registry and COM anchor retained');
