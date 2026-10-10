@@ -8,7 +8,9 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: windows-validation-${{ github.ref }}
+  # Preserve installer diagnostics when a corrected candidate is pushed.
+  # Only duplicate runs of this exact ref/commit supersede one another.
+  group: windows-validation-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 jobs:
   ci:
