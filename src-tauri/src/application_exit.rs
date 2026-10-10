@@ -35,7 +35,8 @@ pub async fn stop(app: &tauri::AppHandle, archive_watermark: usize) -> Result<()
     app.state::<crate::models::ModelService>().begin_shutdown();
     app.state::<crate::language_learning::LanguageLearning>()
         .drain()
-        .await;
+        .await
+        .map_err(|e| e.code)?;
     app.state::<crate::models::ModelService>()
         .finish_shutdown()
         .await
