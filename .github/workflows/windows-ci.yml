@@ -5,8 +5,19 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      phase:
+        description: Startup proof or full upgrade acceptance (report startup first)
+        type: choice
+        options: [startup, full]
+        default: startup
+      reuse_run:
+        description: Same-commit run containing immutable tools/packages (optional)
+        type: string
+        default: ''
 permissions:
   contents: read
+  actions: read
 concurrency:
   # Preserve installer diagnostics when a corrected candidate is pushed.
   # Only duplicate runs of this exact ref/commit supersede one another.
@@ -16,7 +27,7 @@ jobs:
   ci:
     name: CI
     needs: windows-tooling
-    if: always()
+    if: always() && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || inputs.phase == 'full')
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -51,7 +62,22 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
-      - run: node scripts/test-windows-update.mjs --tools-only
+      - name: Reuse exact candidate tools
+        if: inputs.reuse_run != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN: ${{ inputs.reuse_run }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          if ($env:REUSE_RUN -notmatch '^\d+$') { throw 'Invalid reuse run.' }
+          $run = gh api "repos/qinghui316/Sayweave/actions/runs/$env:REUSE_RUN" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $env:EXPECTED_COMMIT -or $run.path -ne '.github/workflows/windows-ci.yml' -or $run.event -notin @('push','workflow_dispatch','pull_request')) { throw 'Reusable run identity differs.' }
+          gh run download $env:REUSE_RUN --name windows-update-tools --dir .local/prior-update-tools
+          if ($LASTEXITCODE -ne 0) { throw 'Reusable tools download failed.' }
+      - run: |
+          if (Test-Path .local/prior-update-tools) { node scripts/test-windows-update.mjs --tools-only --tools-dir .local/prior-update-tools }
+          else { node scripts/test-windows-update.mjs --tools-only }
+          if ($LASTEXITCODE -ne 0) { throw 'Short tooling validation failed.' }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: windows-update-tools
@@ -68,10 +94,10 @@ jobs:
             .local/windows-update/*/acceptance.json
             .local/windows-update/*/diagnostics/*.log
           if-no-files-found: error
-  windows-update:
-    name: Windows update acceptance
+  windows-startup:
+    name: Windows installed startup
     needs: windows-tooling
-    if: always()
+    if: always() && github.ref != 'refs/heads/main' && github.event_name != 'pull_request' && inputs.phase != 'full'
     runs-on: windows-latest
     timeout-minutes: 90
     env:
@@ -93,7 +119,80 @@ jobs:
         with:
           name: windows-update-tools
           path: .local/verified-update-tools
-      - run: node scripts/test-windows-update.mjs --tools-dir .local/verified-update-tools
+      - name: Reuse exact candidate package
+        if: inputs.reuse_run != ''
+        env:
+          REUSE_RUN: ${{ inputs.reuse_run }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          if ($env:REUSE_RUN -notmatch '^\d+$') { throw 'Invalid reuse run.' }
+          $run = gh api "repos/qinghui316/Sayweave/actions/runs/$env:REUSE_RUN" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $env:EXPECTED_COMMIT -or $run.path -ne '.github/workflows/windows-ci.yml' -or $run.event -notin @('push','workflow_dispatch','pull_request')) { throw 'Reusable run identity differs.' }
+          gh run download $env:REUSE_RUN --name windows-update-packages --dir .local/prior-update-packages
+          if ($LASTEXITCODE -ne 0) { throw 'Reusable package download failed.' }
+      - run: |
+          $arguments = @('--startup-only', '--tools-dir', '.local/verified-update-tools')
+          if (Test-Path .local/prior-update-packages) { $arguments += @('--packages-dir', '.local/prior-update-packages') }
+          node scripts/test-windows-update.mjs @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'Installed startup validation failed.' }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: windows-update-packages
+          include-hidden-files: true
+          path: .local/windows-update-packages/
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: windows-startup-receipt
+          include-hidden-files: true
+          path: |
+            .local/windows-update-acceptance.json
+            .local/windows-update/*/acceptance.json
+            .local/windows-update/*/diagnostics/*.log
+          if-no-files-found: error
+  windows-update:
+    name: Windows update acceptance
+    needs: windows-tooling
+    if: always() && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || inputs.phase == 'full')
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Require successful short tooling proof
+        if: needs.windows-tooling.result != 'success'
+        run: throw 'Short Windows tooling proof failed; package validation is blocked.'
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: windows-update-tools
+          path: .local/verified-update-tools
+      - name: Reuse exact startup package set
+        if: inputs.reuse_run != ''
+        env:
+          REUSE_RUN: ${{ inputs.reuse_run }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          if ($env:REUSE_RUN -notmatch '^\d+$') { throw 'Invalid reuse run.' }
+          $run = gh api "repos/qinghui316/Sayweave/actions/runs/$env:REUSE_RUN" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $env:EXPECTED_COMMIT -or $run.path -ne '.github/workflows/windows-ci.yml' -or $run.event -notin @('push','workflow_dispatch','pull_request')) { throw 'Reusable run identity differs.' }
+          gh run download $env:REUSE_RUN --name windows-update-packages --dir .local/prior-update-packages
+          if ($LASTEXITCODE -ne 0) { throw 'Reusable package set download failed.' }
+      - run: |
+          $arguments = @('--tools-dir', '.local/verified-update-tools')
+          if (Test-Path .local/prior-update-packages) { $arguments += @('--packages-dir', '.local/prior-update-packages') }
+          node scripts/test-windows-update.mjs @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'Full upgrade acceptance failed.' }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: windows-update-evidence
