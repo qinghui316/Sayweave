@@ -159,7 +159,7 @@ pub async fn acceptance_update_seed(
                 rule: "保留完整理由和步骤".into(),
                 language: WritingLanguage::Han,
                 context: None,
-                evidence,
+                evidence: evidence.into_iter().take(8).collect(),
             }],
             candidates: vec![],
             reason: "Synthetic installation acceptance fixture".into(),
