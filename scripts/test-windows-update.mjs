@@ -10,7 +10,7 @@ import {databaseInventory,seedLegacyRows,legacySeedRows} from './windows-update-
 import {readTools,writeTools,readMechanismEvidence,writeMechanismEvidence,proofMarkers} from './windows-update-artifacts.mjs';
 import {temporaryPreferenceCleanup} from './windows-update-registration.mjs';
 import {installedStartup} from './windows-update-startup.mjs';
-import {readPackages,writePackages} from './windows-update-packages.mjs';
+import {readPackages,writePackages,nsisExecutableIdentity} from './windows-update-packages.mjs';
 import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'&&process.env.SAYWEAVE_DISPOSABLE_WINDOWS!=='1')throw Error('Use an elevated disposable Windows VM; never an owner machine.');
 const root=process.cwd(),id=randomUUID(),directory=path.join(root,'.local','windows-update',id),source=path.join(directory,'source');mkdirSync(source,{recursive:true});
@@ -190,7 +190,13 @@ async function build(version,channel='test'){
  await command(process.execPath,[path.join(source,'scripts','desktop.mjs'),'package','--config',file,...(channel==='test'?['--features','desktop-acceptance']:[])],source,env);
  readTools(tools.directory,commit);
  const installer=path.join(env.CARGO_TARGET_DIR,'release','bundle','nsis',`${config.productName}_${version}_x64-setup.exe`),copy=path.join(directory,`${channel}-${version}-setup.exe`);writeFileSync(copy,readFileSync(installer));writeFileSync(`${copy}.sig`,readFileSync(`${installer}.sig`));
- report.installers.push({...installerIdentity(copy,version,channel),executableSha256:createHash('sha256').update(readFileSync(path.join(env.CARGO_TARGET_DIR,'release','sayweave.exe'))).digest('hex')});return copy;
+ await verifyPackage(copy,version,readFileSync(`${keyPath}.pub`,'utf8').trim());
+ stage(`signed NSIS payload identity ${version}`);
+ const extracted=path.join(directory,`payload-${channel}-${version}`),sevenZip=path.join(process.env.ProgramFiles,'7-Zip','7z.exe');
+ if(!existsSync(sevenZip))throw Error('Disposable runner lacks the static signed-payload extractor');
+ await command(sevenZip,['x',copy,`-o${extracted}`,'sayweave.exe','-y']);
+ const binary=nsisExecutableIdentity(readFileSync(path.join(env.CARGO_TARGET_DIR,'release','nsis','x64','installer.nsi'),'utf8'),path.join(env.CARGO_TARGET_DIR,'release','sayweave.exe'),readFileSync(path.join(env.CARGO_TARGET_DIR,'release','sayweave.exe')),readFileSync(path.join(extracted,'sayweave.exe')));
+ report.installers.push({...installerIdentity(copy,version,channel),...binary});checkpoint();return copy;
 }
 try{
  stage('source and build isolation');
