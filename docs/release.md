@@ -26,7 +26,7 @@ npm run desktop:release:verify
 
 ## GitHub 发布
 
-发布从已验证的 `main` 提交创建 `v<version>` tag。Actions 先执行完整检查，再在 `windows-signing` Environment 构建签名安装包并创建 Draft Release。Draft 资产会重新下载并校验，实际安装正式草稿包通过后，由 `windows-release` Environment 审核公开并标记 Latest。两个环境仅允许 `v*` 标签。
+发布从已验证的 `main` 提交创建 `v<version>` tag。Actions 核验同一完整 SHA 的成功主线 CI 和 Windows 更新机制证据，复用其中按哈希绑定的正式组件，在 `windows-signing` Environment 构建签名安装包并创建 Draft Release。Draft 资产会重新下载并校验，实际安装正式草稿包通过后，由 `windows-release` Environment 审核公开并标记 Latest。两个环境仅允许 `v*` 标签。
 
 资产恰好为安装器、`.sig`、`latest.json`、`release-receipt.json` 和 `SHA256SUMS.txt`。校验清单必须覆盖前四份资产，缺项、重复、额外文件、越界路径、错误提交和外部下载 URL 均拒绝。客户端与发布验证器共用完整 minisign 签名及受签名版本校验。发布说明由结构化文件生成可读 Markdown，与应用内说明一致。
 
@@ -48,10 +48,18 @@ npm run desktop:release:verify
 
 ## 真实 Windows 验收
 
+验收分为工具、更新机制和正式安装包三个独立阶段。先运行 `node scripts/test-windows-update.mjs --tools-only`：从精确提交归档分别在 `component-target` 和 `probe-target` 构建正式 DLL 与启用 `acceptance` 的探针，验证 `capabilities` 及 `installed-fixture`。后者加载明确指定的正式 DLL，检查实际 EDIT 文字、协议8、故障注入导出缺失及 COM 最终卸载；短检查失败时不会导入证书、签名或构建安装包。
+
+通过后使用 `--tools-dir <工具目录>` 运行机制验收，构建两份隔离版本。每次打包前后重新核对工具哈希，包内组件只来自正式 DLL 目录。所有清理成功后才生成可复用的 `windows-update-evidence`，绑定完整提交、工具哈希、成功机制记录和有界合成数据；不上传签名私钥、证书私钥或凭据值。
+
+正式验收使用 `--stable-installer <草稿回下载包> --mechanism-evidence <同SHA成功证据目录>`，不重建或重跑两份隔离版本。发布流程先严格验签和核对资产身份，再实际安装正式草稿包，覆盖实际旧版并核对原生界面、稳定渠道、完整提交、数据及组件身份。不同候选的工具或机制证据不能互用。
+
+每次执行保存阶段、失败阶段、退出码、信号、超时与工具身份。探针 stdout/stderr 和无密钥的组件／探针 Cargo 构建日志分别有界保存到 `diagnostics` 并上传；涉及签名、证书和模型的完整日志只留在一次性环境的私有 `build.log`，不进入公开验收资产。进程标准流关闭后才结算命令结果。
+
 `node scripts/test-windows-update.mjs` 仅允许已提权的一次性 Windows runner 或明确标记的一次性虚拟机，不能在日常机器仅新建账户后运行。脚本先核验管理员权限，不发起交互提权；合成 HTTPS 根证书有界导入该虚拟机的 LocalMachine/Root，以精确指纹核验并在收尾移除。它从同一候选构建两个隔离版本，经真实 HTTPS、临时签名、NSIS、自动重启核对凭据值与数据。安装启动后的中断由测试主动终止已确认身份的 NSIS 进程树注入，验证旧版重开、资料保持及不自动重试；这与安装器自行报错退出分别记录。测试恢复原安装目录 ACL 后，通过界面再次安装。
 
 旧公开版覆盖检查保留原 SQLite 文件、迁移账本及旧程序创建的模型、默认项、凭据引用和词条，仅按冻结结构追加有界的合成历史／偏好来源。旧程序先读取这些资料，覆盖后再核对内容哈希；已保存密钥通过真实 HTTPS 模型测试验证，报告只保存匹配结果。输入组件在一次性账户实际安装，以注册路径、DLL 哈希和原生输入探针核对保持。所有实际安装包，包括下载的旧版和外部传入的正式草稿包，都记录哈希。正式发行再次回下载并实际安装正式草稿包。不要在日常账户设置一次性标志。
 
-记录绑定具体提交、安装器哈希、环境与实际检查项；模拟 UI、原生窗口和真实安装分别留证。数据库009、TSF8及已有资料保持；本轮不重装输入组件。
+记录绑定具体提交、安装器哈希、环境与实际检查项；模拟 UI、原生窗口和真实安装分别留证。数据库009、TSF8及已有资料保持；日常机器不执行此安装验收。
 
 首发不配置 Windows Authenticode，因此 Windows 可能显示未知发布者；updater 产物签名仍然是强制的信任边界。

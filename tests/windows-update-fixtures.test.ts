@@ -1,7 +1,7 @@
 import {DatabaseSync} from 'node:sqlite';
 import {describe,expect,it} from 'vitest';
 // @ts-expect-error Fixture JavaScript has no declaration file.
-import {databaseInventory,seedLegacyRows} from '../scripts/windows-update-fixtures.mjs';
+import {databaseInventory,seedLegacyRows,legacySeedRows} from '../scripts/windows-update-fixtures.mjs';
 
 function fixture(){
  const old=new DatabaseSync(':memory:'),seed=new DatabaseSync(':memory:');
@@ -28,6 +28,23 @@ function fixture(){
  return {old,seed};
 }
 describe('old-install synthetic data fixture',()=>{
+ it('accepts serialized same-candidate synthetic rows and retains native identities',()=>{
+  const {old,seed}=fixture();try{
+   const before=databaseInventory(old,['schema_migrations','model_configs','model_defaults','dictionary_terms']);
+   seedLegacyRows(old,JSON.parse(JSON.stringify(legacySeedRows(seed))),'old-model');
+   expect(databaseInventory(old,Object.keys(before))).toEqual(before);
+   expect(old.prepare('SELECT config_id FROM speech_attempts').get()).toEqual({config_id:'old-model'});
+  }finally{old.close();seed.close();}
+ });
+ it('rejects extra tables, excessive rows and malformed serialized schemas without mutation',()=>{
+  const {old,seed}=fixture();try{
+   const before=databaseInventory(old),rows=legacySeedRows(seed);
+   expect(()=>seedLegacyRows(old,{...rows,model_configs:[]},'old-model')).toThrow('inventory');
+   expect(()=>seedLegacyRows(old,{...rows,speech_records:Array(21).fill({id:'bad'})},'old-model')).toThrow('bound');
+   expect(()=>seedLegacyRows(old,{...rows,language_profiles:[{wrong:'bad'}]},'old-model')).toThrow('schema');
+   expect(databaseInventory(old)).toEqual(before);
+  }finally{old.close();seed.close();}
+ });
  it('keeps the old ledger, native model/default/credential and dictionary while appending source-bound rows',()=>{
   const {old,seed}=fixture();try{
    const before=databaseInventory(old,['schema_migrations','model_configs','model_defaults','dictionary_terms']);
