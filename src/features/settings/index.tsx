@@ -23,7 +23,7 @@ export function SettingsShell({ open, tab, onTabChange, onOpenChange, modelConte
       <div className={s.content}><header><h2>{headings[tab]}</h2></header>{tab === 'models' && modelContent ? <div className={s.panelSlot}>{modelContent}</div> : <div className={s.scroll} key={tab} tabIndex={0}>
         {tab === 'device' ? <>{speechPort?<DeviceSettings port={speechPort} settings={settings.recording}/>:<section><h3>{t.microphone}</h3><p>{t.microphoneHelp}</p><Button disabled>{t.notConfigured}</Button></section>}{shortcutPort&&<ShortcutSettings port={shortcutPort} settings={settings.shortcuts}/>} {textServicePort&&<TextServiceSettings port={textServicePort}/>}</> :
         tab === 'personalization' ? <PersonalizationSettings store={settings.personalization} port={languagePort} visible={visible}/> :
-        tab === 'about' ? <><UpdatePanel port={updatePort} onInstall={onInstallUpdate} preparing={updatePreparing} error={updateError}/>{[t.privacy,t.terms,t.license].map(label => <div className={s.aboutRow} key={label}><h3>{label}</h3><span>{t.pending}</span></div>)}</> :
+        tab === 'about' ? <><UpdatePanel port={updatePort} onInstall={onInstallUpdate} preparing={updatePreparing} error={updateError}/>{[t.privacy,t.terms,t.license].map(label => <div className={s.aboutRow} key={label}><h3>{label}</h3><span>{label===t.license?'Apache-2.0':t.pending}</span></div>)}</> :
         tab === 'models' && modelContent ? modelContent :
         <section><p>{tab === 'models' ? t.modelsBody : tab === 'language' ? t.languageBody : t.appearanceBody}</p><p className={s.notice}>{t.notImplemented}</p></section>}
       </div>}</div>

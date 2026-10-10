@@ -63,6 +63,8 @@ jobs:
   windows-tooling:
     name: Windows update tooling
     if: inputs.phase != 'diagnose'
+    outputs:
+      reuse_run: ${{ steps.reuse.outputs.run_id }}
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -75,11 +77,38 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
-      - name: Reuse exact candidate tools
-        if: inputs.reuse_run != ''
+      - name: Resolve same-candidate reuse
+        id: reuse
         env:
           GH_TOKEN: ${{ github.token }}
-          REUSE_RUN: ${{ inputs.reuse_run }}
+          REQUESTED_REUSE: ${{ inputs.reuse_run }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+          AUTO_REUSE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: |
+          $resolvedReuse = $env:REQUESTED_REUSE
+          if ($resolvedReuse -and $resolvedReuse -notmatch '^\d+$') { throw 'Invalid reuse run.' }
+          if (-not $resolvedReuse -and $env:AUTO_REUSE -eq 'true') {
+            $runs = gh run list --repo qinghui316/Sayweave --workflow windows-ci.yml --commit $env:EXPECTED_COMMIT --event workflow_dispatch --status success --limit 20 --json databaseId,headSha | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { throw 'Reusable run lookup failed.' }
+            foreach ($candidate in $runs) {
+              if ($candidate.headSha -ne $env:EXPECTED_COMMIT -or ([string]$candidate.databaseId) -notmatch '^\d+$') { throw 'Reusable candidate identity differs.' }
+              $assets = gh api "repos/qinghui316/Sayweave/actions/runs/$($candidate.databaseId)/artifacts?per_page=100" | ConvertFrom-Json
+              if ($LASTEXITCODE -ne 0 -or $assets.artifacts -isnot [array] -or ($assets.total_count -isnot [int] -and $assets.total_count -isnot [long]) -or $assets.total_count -lt 0 -or $assets.total_count -gt 100 -or @($assets.artifacts).Count -ne $assets.total_count) { throw 'Reusable artifact inventory failed.' }
+              $tools = @($assets.artifacts | Where-Object name -eq 'windows-update-tools')
+              $packages = @($assets.artifacts | Where-Object name -eq 'windows-update-packages')
+              if ($tools.Count -gt 1 -or $packages.Count -gt 1) { throw 'Ambiguous reusable artifact inventory.' }
+              if ($tools.Count -eq 1 -and $packages.Count -eq 1 -and $tools[0].expired -eq $false -and $packages[0].expired -eq $false) {
+                $resolvedReuse = [string]$candidate.databaseId
+                break
+              }
+            }
+          }
+          "run_id=$resolvedReuse" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Reuse exact candidate tools
+        if: steps.reuse.outputs.run_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN: ${{ steps.reuse.outputs.run_id }}
           EXPECTED_COMMIT: ${{ github.sha }}
         run: |
           if ($env:REUSE_RUN -notmatch '^\d+$') { throw 'Invalid reuse run.' }
@@ -135,9 +164,9 @@ jobs:
           name: windows-update-tools
           path: .local/verified-update-tools
       - name: Reuse exact candidate package
-        if: inputs.reuse_run != ''
+        if: needs.windows-tooling.outputs.reuse_run != ''
         env:
-          REUSE_RUN: ${{ inputs.reuse_run }}
+          REUSE_RUN: ${{ needs.windows-tooling.outputs.reuse_run }}
           EXPECTED_COMMIT: ${{ github.sha }}
         run: |
           if ($env:REUSE_RUN -notmatch '^\d+$') { throw 'Invalid reuse run.' }
@@ -252,9 +281,9 @@ jobs:
           name: windows-update-tools
           path: .local/verified-update-tools
       - name: Reuse exact startup package set
-        if: inputs.reuse_run != ''
+        if: needs.windows-tooling.outputs.reuse_run != ''
         env:
-          REUSE_RUN: ${{ inputs.reuse_run }}
+          REUSE_RUN: ${{ needs.windows-tooling.outputs.reuse_run }}
           EXPECTED_COMMIT: ${{ github.sha }}
         run: |
           if ($env:REUSE_RUN -notmatch '^\d+$') { throw 'Invalid reuse run.' }
