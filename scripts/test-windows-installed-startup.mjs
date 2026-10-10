@@ -1,0 +1,87 @@
+// Diagnostic-only installation of an existing signed candidate. Never an owner host.
+import {spawn,execFileSync} from 'node:child_process';
+import {createHash,randomUUID} from 'node:crypto';
+import {mkdirSync,readFileSync,writeFileSync,renameSync,existsSync} from 'node:fs';
+import path from 'node:path';
+import {chromium,expect} from '@playwright/test';
+import {readPackages} from './windows-update-packages.mjs';
+import {boundedTail,safeStartupText,installedStartup,installedState} from './windows-update-startup.mjs';
+
+if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true')throw Error('Diagnostic installation requires an elevated disposable GitHub Windows runner.');
+const root=process.cwd(),candidate=process.env.STARTUP_CANDIDATE;
+const harness=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
+if(!/^[a-f0-9]{40}$/.test(candidate??''))throw Error('Exact product candidate required.');
+const permitted=new Set(['.github/workflows/windows-ci.yml','scripts/windows-update-startup.mjs','scripts/test-windows-installed-startup.mjs','scripts/check-distribution.mjs','scripts/test-windows-update.mjs','docs/release.md','docs/testing.md','tests/windows-update-startup.test.ts']);
+const changed=execFileSync('git',['diff','--name-only',candidate,harness],{encoding:'utf8'}).trim().split('\n').filter(Boolean);
+if(changed.some(file=>!permitted.has(file)))throw Error(`Candidate product sources differ: ${changed.filter(file=>!permitted.has(file)).join(', ')}`);
+if(execFileSync('git',['status','--porcelain','--untracked-files=no'],{encoding:'utf8'}).trim())throw Error('Diagnostic source tree is dirty.');
+const packages=readPackages('.local/prior-update-packages',candidate);
+const directory=path.join(root,'.local','installed-startup',randomUUID());mkdirSync(directory,{recursive:true});
+const report={schemaVersion:1,kind:'installed-startup-diagnostic',candidateCommit:candidate,acceptanceCommit:harness,environment:process.env.RUNNER_NAME,changedHarnessFiles:changed,passed:false,commands:[],startups:[],packages:packages.manifest};
+function persist(){const file=path.join(directory,'receipt.json');writeFileSync(`${file}.tmp`,JSON.stringify(report,null,2)+'\n');renameSync(`${file}.tmp`,file);}
+persist();
+let browser,owned,child;
+const exe=path.join(process.env.LOCALAPPDATA,packages.manifest.product,'sayweave.exe');
+const dataRoot=path.join(process.env.APPDATA,packages.manifest.identifier,'data');
+function stage(value){report.stage=value;persist();console.log(`Installed startup diagnostic: ${value}`);}
+async function command(file,args){
+ const entry={tool:path.basename(file),args,stage:report.stage,startedAt:new Date().toISOString()};report.commands.push(entry);persist();
+ let stdout=Buffer.alloc(0),stderr=Buffer.alloc(0),error;
+ const processChild=spawn(file,args,{cwd:root,windowsHide:true,stdio:['ignore','pipe','pipe'],timeout:180000});
+ processChild.stdout.on('data',bytes=>{stdout=boundedTail(stdout,bytes);});processChild.stderr.on('data',bytes=>{stderr=boundedTail(stderr,bytes);});processChild.once('error',value=>{error=value;});
+ const started=Date.now();entry.exitCode=await new Promise(resolve=>processChild.once('close',resolve));entry.elapsedMs=Date.now()-started;
+ for(const [name,bytes] of [['stdout',stdout],['stderr',stderr]]){const fileName=`command-${report.commands.length}.${name}.log`;writeFileSync(path.join(directory,fileName),safeStartupText(bytes.toString('utf8')));entry[name]=fileName;}
+ if(error)entry.error=error.code??error.message;persist();
+ if(error||processChild.killed||entry.exitCode!==0)throw Error(`Diagnostic command failed: ${entry.tool}; exit=${entry.exitCode}; see bounded streams`);
+ return stdout.toString('utf8');
+}
+try{
+ stage('elevated disposable environment');
+ await command('powershell',['-NoProfile','-Command',"$p=New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent());if(-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Disposable runner is not elevated'}"]);
+ stage('shared signature verifier');
+ // Compile only the existing shared verifier, never the application or Tauri.
+ // The two included files are identical to the frozen product candidate.
+ const verifier=path.join(directory,'verifier');mkdirSync(verifier);
+ writeFileSync(path.join(verifier,'Cargo.toml'),'[package]\nname="installed-startup-signature"\nversion="0.0.0"\nedition="2024"\n[dependencies]\nbase64="=0.22.1"\nminisign-verify="=0.2.5"\n[[bin]]\nname="verify"\npath="main.rs"\n');
+ const signatureSource=path.join(root,'src-tauri/src/update_signature.rs').replaceAll('\\','/'),mainSource=path.join(root,'src-tauri/src/bin/verify_update_signature.rs').replaceAll('\\','/');
+ writeFileSync(path.join(verifier,'main.rs'),`#[path=${JSON.stringify(signatureSource)}] pub mod update_signature;\nmod sayweave_lib {pub use crate::update_signature;}\ninclude!(${JSON.stringify(mainSource)});\n`);
+ await command('cargo',['run','--quiet','--manifest-path',path.join(verifier,'Cargo.toml'),'--',packages.manifest.publicKey,packages.old,`${packages.old}.sig`,'0.1.700']);
+ report.signatureVerified=true;
+ stage('signed installer static payload');
+ const sevenZip=path.join(process.env.ProgramFiles,'7-Zip','7z.exe');
+ if(!existsSync(sevenZip))throw Error('Disposable runner lacks the static 7-Zip extractor; no installation was attempted.');
+ const extracted=path.join(directory,'payload');
+ await command(sevenZip,['x',packages.old,`-o${extracted}`,'sayweave.exe','-y']);
+ const payload=readFileSync(path.join(extracted,'sayweave.exe'));
+ if(payload.length<1||payload.length>128*1024*1024)throw Error('Signed executable payload exceeds bound.');
+ const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
+ report.payload={sha256:hash(payload),size:payload.length,manifestSha256:packages.manifest.artifacts.old.executableSha256,manifestConsistent:hash(payload)===packages.manifest.artifacts.old.executableSha256};persist();
+ for(const value of [candidate,packages.manifest.identifier,packages.manifest.url,packages.manifest.publicKey])if(!payload.includes(Buffer.from(value)))throw Error('Frozen identity missing from signed executable.');
+ if(installedState(exe).applications.length||existsSync(exe)||existsSync(dataRoot))throw Error('Isolated candidate installation is not empty.');
+ stage('read-only WebView policy diagnostic');
+ const policy=await command('powershell',['-NoProfile','-Command',"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$items=@();foreach($scope in @('HKLM:','HKCU:')){foreach($suffix in @('Software\\Policies\\Microsoft\\Edge','Software\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments')){$key=$scope+'\\'+$suffix;if(Test-Path -LiteralPath $key){$entry=Get-Item -LiteralPath $key;foreach($name in @('RemoteDebuggingAllowed','sayweave.exe','*')){if($entry.GetValueNames() -contains $name){$value=$entry.GetValue($name);$items+=@{scope=$scope;key=$suffix;name=$name;kind=[string]$entry.GetValueKind($name);debugAllowed=if($name -eq 'RemoteDebuggingAllowed'){$value -eq 1}else{$null};hasDebugPort=([string]$value -match '--remote-debugging-port');hasLoopback=([string]$value -match '--remote-debugging-address=127.0.0.1')}}}}}};ConvertTo-Json -InputObject $items -Compress"]);
+ report.debugPolicy=JSON.parse(policy);persist();
+ stage('same candidate installation');await command(packages.old,['/S']);
+ if(hash(readFileSync(exe))!==report.payload.sha256)throw Error('Installed executable differs from signed payload.');
+ stage('process/window/page/debug/native renderer');
+ const result=await installedStartup({exe,dataRoot,directory,port:9291,record:report.startups,persist,onOwned:value=>{owned=value;},onSpawn:value=>{child=value;}});
+ browser=await chromium.connectOverCDP(result.endpoint.webSocketDebuggerUrl,{timeout:10000});
+ let page;for(let n=0;n<100;n++){page=browser.contexts().flatMap(context=>context.pages()).find(p=>p.url().includes('tauri')&&!p.url().includes('surface=overlay'));if(page)break;await new Promise(resolve=>setTimeout(resolve,100));}
+ if(!page)throw Error('Main page missing.');
+ await page.waitForFunction(()=>window.__TAURI_INTERNALS__?.invoke,{},{timeout:10000});await expect(page.locator('aside')).toBeVisible();
+ const snapshot=await page.evaluate(()=>window.__TAURI_INTERNALS__.invoke('update_snapshot'));
+ expect(snapshot.build).toMatchObject({commit:candidate,version:'0.1.700',channel:'test'});report.build=snapshot.build;
+ result.entry.rendered=true;result.entry.phase='rendererReady';persist();
+ await page.screenshot({path:path.join(directory,'native-startup.png')});
+ await page.evaluate(()=>window.__TAURI_INTERNALS__.invoke('acceptance_update_exit'));
+ await browser.close();browser=null;
+ for(let n=0;n<20;n++){if(!installedState(exe).applications.some(app=>app.CreationDate===owned.CreationDate))break;await new Promise(resolve=>setTimeout(resolve,250));}
+ if(installedState(exe).applications.some(app=>app.CreationDate===owned.CreationDate))throw Error('Native application exit did not complete.');
+ report.passed=true;
+}catch(error){report.error=safeStartupText(error.message).slice(0,2048);process.exitCode=1;}
+finally{
+ if(browser)await browser.close().catch(()=>{});
+ if(owned){try{const current=installedState(exe).applications.find(app=>app.ProcessId===owned.ProcessId&&app.CreationDate===owned.CreationDate);if(current){report.cleanupKill={ProcessId:current.ProcessId,CreationDate:current.CreationDate};await command('taskkill',['/PID',String(current.ProcessId),'/T','/F']);}}catch(error){report.cleanupError=String(error.message).slice(0,1024);report.passed=false;process.exitCode=1;}}
+ else if(child&&child.exitCode===null){report.unverifiedProcessCleanup=true;report.passed=false;process.exitCode=1;}
+ persist();console.log(JSON.stringify({kind:report.kind,candidateCommit:candidate,acceptanceCommit:harness,passed:report.passed,error:report.error,receipt:path.join(directory,'receipt.json')}));
+}

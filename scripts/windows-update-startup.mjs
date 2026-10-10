@@ -21,14 +21,21 @@ export function validateEndpoint(endpoint,port){
  if(url.protocol!=='ws:'||!['127.0.0.1','localhost'].includes(url.hostname)||url.port!==String(port)||!url.pathname.startsWith('/devtools/browser/'))throw Error('WebView endpoint escaped owned loopback port');
  return endpoint.webSocketDebuggerUrl;
 }
+export function launchEnvironment(environment,port){
+ const result=Object.fromEntries(Object.entries(environment).filter(([key])=>key.toUpperCase()!=='WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'));
+ result.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=`--remote-debugging-port=${port} --remote-debugging-address=127.0.0.1`;
+ return result;
+}
 function tail(file){
  if(!existsSync(file))return '';
  const info=lstatSync(file);if(!info.isFile()||info.isSymbolicLink())throw Error('Startup log is not an owned regular file');
  const fd=openSync(file,'r');try{const buffer=Buffer.alloc(Math.min(limit,info.size));const count=readSync(fd,buffer,0,buffer.length,Math.max(0,info.size-buffer.length));return buffer.subarray(0,count).toString('utf8');}finally{closeSync(fd);}
 }
-export function installedState(exe,port=9291){
+export function installedState(exe,port=9291,onlyPid=null){
  if(!Number.isInteger(port)||port<1024||port>65535)throw Error('Invalid owned debug port');
+ if(onlyPid!==null&&(!Number.isInteger(onlyPid)||onlyPid<1))throw Error('Invalid owned process id');
  const literal="'"+exe.replaceAll("'","''")+"'";
+ const pidFilter=onlyPid===null?'':` -and $_.ProcessId -eq ${onlyPid}`;
  // Enumerate only windows of the exact installed executable and its verified
  // descendants. Do not retain unrelated command lines or desktop titles.
  const script=String.raw`$ErrorActionPreference='Stop';[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);Add-Type -TypeDefinition @'
@@ -43,7 +50,33 @@ public class OwnedStartupWindows {
  [DllImport("user32.dll")]static extern bool GetWindowRect(IntPtr h,out Rect r);
  public static List<object> Read(int pid){var r=new List<object>();EnumWindows((h,p)=>{uint id;GetWindowThreadProcessId(h,out id);if(id==pid){var s=new StringBuilder(128);GetClassName(h,s,128);Rect rect;GetWindowRect(h,out rect);r.Add(new {handle=h.ToInt64().ToString(),visible=IsWindowVisible(h),windowClass=s.ToString(),width=rect.right-rect.left,height=rect.bottom-rect.top});}return true;},IntPtr.Zero);return r;}
 }
-'@;$all=@(Get-CimInstance Win32_Process);$parents=@($all|Where-Object {$_.ExecutablePath -eq ${literal}});$tree=@($parents);for($n=0;$n -lt $tree.Count;$n++){if($tree.Count -gt 32){throw 'Owned WebView tree exceeded bound'};$parent=$tree[$n];foreach($child in @($all|Where-Object {$_.ParentProcessId -eq $parent.ProcessId -and $_.CreationDate -ge $parent.CreationDate})){if(-not @($tree|Where-Object {$_.ProcessId -eq $child.ProcessId}).Count){$tree+=@($child)}}};$apps=@($parents|ForEach-Object {@{ProcessId=$_.ProcessId;CreationDate=$_.CreationDate.ToUniversalTime().ToString('o');ExecutablePath=$_.ExecutablePath;windows=@([OwnedStartupWindows]::Read($_.ProcessId))}});$webviews=@($tree|Where-Object {$_.Name -eq 'msedgewebview2.exe'}|ForEach-Object {@{ProcessId=$_.ProcessId;ParentProcessId=$_.ParentProcessId;CreationDate=$_.CreationDate.ToUniversalTime().ToString('o');ExecutablePath=$_.ExecutablePath;debugPort=if($_.CommandLine -match '--remote-debugging-port=(\d+)'){$Matches[1]}else{$null};browser=($_.CommandLine -notmatch '--type=')}});$listeners=@(Get-NetTCPConnection -State Listen -LocalPort ${port} -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,OwningProcess);ConvertTo-Json -InputObject @{applications=$apps;webviews=$webviews;listeners=$listeners} -Depth 6 -Compress`;
+public class OwnedStartupEnvironment {
+ [DllImport("kernel32.dll",SetLastError=true)]static extern IntPtr OpenProcess(uint access,bool inherit,int pid);
+ [DllImport("kernel32.dll")]static extern bool CloseHandle(IntPtr handle);
+ [DllImport("kernel32.dll",SetLastError=true)]static extern bool GetProcessTimes(IntPtr handle,out long created,out long exited,out long kernel,out long user);
+ [DllImport("kernel32.dll",SetLastError=true)]static extern bool ReadProcessMemory(IntPtr handle,IntPtr address,byte[] buffer,IntPtr size,out IntPtr read);
+ [DllImport("ntdll.dll")]static extern int NtQueryInformationProcess(IntPtr handle,int kind,IntPtr[] info,int size,out int length);
+ static byte[] Read(IntPtr handle,long address,int count){var buffer=new byte[count];IntPtr read;if(!ReadProcessMemory(handle,new IntPtr(address),buffer,new IntPtr(count),out read)||read.ToInt64()!=count)throw new Exception("read:"+Marshal.GetLastWin32Error());return buffer;}
+ public static object Read(int pid){
+  IntPtr handle=IntPtr.Zero;
+  try {
+   if(IntPtr.Size!=8)throw new Exception("requires-x64-inspector");
+   handle=OpenProcess(0x410,false,pid);if(handle==IntPtr.Zero)throw new Exception("open:"+Marshal.GetLastWin32Error());
+   long created,exited,kernel,user;if(!GetProcessTimes(handle,out created,out exited,out kernel,out user))throw new Exception("times:"+Marshal.GetLastWin32Error());
+   var info=new IntPtr[6];int length;int status=NtQueryInformationProcess(handle,0,info,48,out length);if(status!=0)throw new Exception("query:"+status);
+   long parameters=BitConverter.ToInt64(Read(handle,info[1].ToInt64()+0x20,8),0);
+   long address=BitConverter.ToInt64(Read(handle,parameters+0x80,8),0);
+   var bytes=new List<byte>();bool complete=false;
+   for(int offset=0;offset<65536&&!complete;offset+=512){bytes.AddRange(Read(handle,address+offset,512));for(int n=Math.Max(0,bytes.Count-514);n+3<bytes.Count;n+=2){if(bytes[n]==0&&bytes[n+1]==0&&bytes[n+2]==0&&bytes[n+3]==0){bytes.RemoveRange(n,bytes.Count-n);complete=true;break;}}}
+   if(!complete)throw new Exception("environment-exceeded-bound");
+   var values=Encoding.Unicode.GetString(bytes.ToArray()).Split('\0');string value=null;int matches=0;
+   foreach(var item in values){if(item.StartsWith("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=",StringComparison.OrdinalIgnoreCase)){matches++;value=item.Substring("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=".Length);}}
+   var port=System.Text.RegularExpressions.Regex.Match(value??"","(?:^|\\s)--remote-debugging-port=(\\d+)(?:\\s|$)");
+   return new {available=true,createdAt=DateTime.FromFileTimeUtc(created).ToString("o"),present=matches>0,matches,debugPort=port.Success?port.Groups[1].Value:null,loopback=(value??"").Contains("--remote-debugging-address=127.0.0.1")};
+  }catch(Exception error){return new {available=false,error=error.Message};}finally{if(handle!=IntPtr.Zero)CloseHandle(handle);}
+ }
+}
+'@;$all=@(Get-CimInstance Win32_Process);$parents=@($all|Where-Object {$_.ExecutablePath -eq ${literal}${pidFilter}});$tree=@($parents);for($n=0;$n -lt $tree.Count;$n++){if($tree.Count -gt 32){throw 'Owned WebView tree exceeded bound'};$parent=$tree[$n];foreach($child in @($all|Where-Object {$_.ParentProcessId -eq $parent.ProcessId -and $_.CreationDate -ge $parent.CreationDate})){if(-not @($tree|Where-Object {$_.ProcessId -eq $child.ProcessId}).Count){$tree+=@($child)}}};$apps=@($parents|ForEach-Object {@{ProcessId=$_.ProcessId;CreationDate=$_.CreationDate.ToUniversalTime().ToString('o');ExecutablePath=$_.ExecutablePath;windows=@([OwnedStartupWindows]::Read($_.ProcessId));debugEnvironment=[OwnedStartupEnvironment]::Read($_.ProcessId)}});$webviews=@($tree|Where-Object {$_.Name -eq 'msedgewebview2.exe'}|ForEach-Object {@{ProcessId=$_.ProcessId;ParentProcessId=$_.ParentProcessId;CreationDate=$_.CreationDate.ToUniversalTime().ToString('o');ExecutablePath=$_.ExecutablePath;commandLineAvailable=($null -ne $_.CommandLine);debugPort=if($_.CommandLine -match '--remote-debugging-port=(\d+)'){$Matches[1]}else{$null};browser=($_.CommandLine -notmatch '--type=')}});$listeners=@(Get-NetTCPConnection -State Listen -LocalPort ${port} -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,OwningProcess);ConvertTo-Json -InputObject @{applications=$apps;webviews=$webviews;listeners=$listeners} -Depth 6 -Compress`;
  return JSON.parse(execFileSync('powershell',['-NoProfile','-Command',script],{encoding:'utf8',windowsHide:true,timeout:10000,maxBuffer:128*1024}));
 }
 async function endpointAt(port){
@@ -75,11 +108,12 @@ export async function installedStartup({exe,dataRoot,directory,port,launch=true,
    if(entry.initial.applications.length)throw Error('Installed executable already has a process; refusing unowned reuse');
    if(entry.initial.listeners?.length)throw Error('Owned WebView listener occupied');
    if(await occupied())throw Error('Owned WebView port occupied');
-   child=launchProcess(exe,[],{windowsHide:true,env:{...process.env,WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:`--remote-debugging-port=${port} --remote-debugging-address=127.0.0.1`},stdio:['ignore','pipe','pipe']});
+   entry.requestedDebug={port,address:'127.0.0.1',environmentKeys:Object.keys(process.env).filter(key=>key.toUpperCase()==='WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS')};
+   child=launchProcess(exe,[],{windowsHide:true,env:launchEnvironment(process.env,port),stdio:['ignore','pipe','pipe']});
    onSpawn(child);entry.pid=child.pid??null;
    child.stdout.on('data',bytes=>{stdout=boundedTail(stdout,bytes);});child.stderr.on('data',bytes=>{stderr=boundedTail(stderr,bytes);});
    child.once('error',error=>{entry.spawnError={code:error.code??null,message:safeStartupText(error.message,secrets).slice(0,1024)};});
-   child.once('close',(code,signal)=>{closed=true;entry.exitCode=code;entry.signal=signal;save();});
+   child.once('close',(code,signal)=>{closed=true;entry.closedAt=new Date().toISOString();entry.exitCode=code;entry.signal=signal;save();});
   }
   entry.phase='process';let owned;
   while(Date.now()-started<timeoutMs){
@@ -110,5 +144,5 @@ export async function installedStartup({exe,dataRoot,directory,port,launch=true,
    await delay(500);
   }
   throw Error(`Installed startup timed out at ${entry.phase}`);
- }catch(error){entry.error=safeStartupText(error.message,secrets).slice(0,2048);save();throw error;}
+ }catch(error){entry.failedAt=new Date().toISOString();entry.error=safeStartupText(error.message,secrets).slice(0,2048);save();throw error;}
 }

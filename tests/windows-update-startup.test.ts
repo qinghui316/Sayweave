@@ -4,7 +4,7 @@ import path from 'node:path';
 import {EventEmitter} from 'node:events';
 import {afterEach,describe,expect,it} from 'vitest';
 // @ts-expect-error JavaScript acceptance module has no declaration file.
-import {boundedTail,safeStartupText,pageReady,validateEndpoint,installedStartup} from '../scripts/windows-update-startup.mjs';
+import {boundedTail,safeStartupText,pageReady,validateEndpoint,installedStartup,launchEnvironment} from '../scripts/windows-update-startup.mjs';
 // @ts-expect-error JavaScript acceptance module has no declaration file.
 import {readPackages,writePackages} from '../scripts/windows-update-packages.mjs';
 
@@ -14,6 +14,7 @@ function directory(){const dir=mkdtempSync(path.join(os.tmpdir(),'sayweave-start
 function packages(){const input=directory(),file=path.join(input,'setup.exe');writeFileSync(file,'same installer');writeFileSync(`${file}.sig`,'same signature');const output=directory();writePackages(output,commit,context,{old:{installer:file,executableSha256:'c'.repeat(64)}},{passed:true});return output;}
 afterEach(()=>{for(const dir of directories.splice(0))rmSync(dir,{recursive:true,force:true});});
 describe('installed startup diagnostics and immutable package reuse',()=>{
+ it('removes case-alias environment keys before requesting the owned debug port on Windows',()=>{const source={Path:'system path',WebView2_Additional_Browser_Arguments:'old arguments',WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:'other arguments'};const env=launchEnvironment(source,9291);expect(Object.keys(env).filter(key=>key.toUpperCase()==='WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS')).toEqual(['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS']);expect(env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS).toBe('--remote-debugging-port=9291 --remote-debugging-address=127.0.0.1');expect(env.Path).toBe(source.Path);expect(source.WebView2_Additional_Browser_Arguments).toBe('old arguments');});
  it('records and fails early on actual stream closure instead of waiting for the debug deadline',async()=>{const dir=directory(),exe=path.join(dir,'synthetic.exe');writeFileSync(exe,'synthetic executable');const child=Object.assign(new EventEmitter(),{pid:412,stdout:new EventEmitter(),stderr:new EventEmitter()}),records:Record<string,unknown>[]=[];
   await expect(installedStartup({exe,dataRoot:dir,directory:dir,port:9291,record:records,persist:()=>{},onOwned:()=>{},onSpawn:()=>{},timeoutMs:60000,io:{inspect:()=>({applications:[],webviews:[]}),occupied:async()=>false,spawn:()=>{queueMicrotask(()=>{child.stdout.emit('data',Buffer.from('startup setup'));child.stderr.emit('data',Buffer.from('runtime failed: synthetic WebView failure'));child.emit('close',101,null);});return child;}}})).rejects.toThrow('exit=101');
   expect(records[0]).toMatchObject({pid:412,exitCode:101,phase:'process',passed:false});expect(records[0]!.elapsedMs).toBeLessThan(5000);expect(readFileSync(path.join(dir,'startup-1.stderr.log'),'utf8')).toContain('synthetic WebView failure');expect(readFileSync(path.join(dir,'startup-1.stdout.log'),'utf8')).toContain('startup setup');
