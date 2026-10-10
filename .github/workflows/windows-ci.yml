@@ -91,6 +91,8 @@ jobs:
           if (Test-Path .local/prior-update-tools) { node scripts/test-windows-update.mjs --tools-only --tools-dir .local/prior-update-tools }
           else { node scripts/test-windows-update.mjs --tools-only }
           if ($LASTEXITCODE -ne 0) { throw 'Short tooling validation failed.' }
+        env:
+          SAYWEAVE_REGISTRATION_DIAGNOSE: '1'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: windows-update-tools
@@ -106,6 +108,8 @@ jobs:
             .local/windows-update-acceptance.json
             .local/windows-update/*/acceptance.json
             .local/windows-update/*/diagnostics/*.log
+            .local/windows-update/*/component-target/release/sayweave_text_service.dll
+            .local/windows-update/*/probe-target/release/tsf-probe.exe
           if-no-files-found: error
   windows-startup:
     name: Windows installed startup
