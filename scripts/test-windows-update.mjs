@@ -5,7 +5,8 @@ import {createServer} from 'node:https';
 import {mkdirSync,readFileSync,writeFileSync,existsSync,symlinkSync,rmSync,renameSync} from 'node:fs';
 import path from 'node:path';
 import {chromium,expect} from '@playwright/test';
-import {DatabaseSync,backup} from 'node:sqlite';
+import {DatabaseSync} from 'node:sqlite';
+import {databaseInventory,seedLegacyRows} from './windows-update-fixtures.mjs';
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'&&process.env.SAYWEAVE_DISPOSABLE_WINDOWS!=='1')throw Error('Use a disposable Windows runner; never an owner profile.');
 const root=process.cwd(),id=randomUUID(),directory=path.join(root,'.local','windows-update',id),source=path.join(directory,'source');mkdirSync(source,{recursive:true});
 const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),report={schemaVersion:1,commit,environment:process.env.RUNNER_NAME??'explicit disposable Windows',id,checks:[],installers:[],commands:[],passed:false};
@@ -24,12 +25,18 @@ async function command(file,args,cwd=root,env=process.env,expectedFailure){
  if(code!==0)throw Error(`Command failed: ${file} ${args.slice(0,3).join(' ')} (${code}); private fixture log retained`);
 }
 function stage(value){report.stage=value;checkpoint();console.log(`Windows update acceptance: ${value}`);}
-let server,browser,app,thumbprint,ownedProcess,lastEndpoint,serverMode='valid',packageBytes,signature;
+let server,browser,app,thumbprint,ownedProcess,lastEndpoint,serverMode='valid',packageBytes,signature,deniedDirectory,originalAcl,installerProcess;
+let credentialRequests=0;
 const debugPort=9291,identifier=`local.sayweave.acceptance.${id}`,product=`Sayweave 验收 ${id}`,testData=path.join(process.env.APPDATA,identifier,'data'),testExe=path.join(process.env.LOCALAPPDATA,product,'sayweave.exe');
 const invoke=(page,command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
 function processes(exe){
  const literal=exe.replaceAll("'","''");
  return JSON.parse(execFileSync('powershell',['-NoProfile','-Command',`$items=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq '${literal}' } | Select-Object ProcessId,CreationDate,ExecutablePath);ConvertTo-Json -InputObject $items -Compress`],{encoding:'utf8'}));
+}
+function processTree(process){
+ if(!Number.isInteger(process.ProcessId))throw Error('Invalid owned process');
+ const script=`$all=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,ExecutablePath);$ids=@(${process.ProcessId});do{$children=@($all|Where-Object{$ids -contains $_.ParentProcessId -and $ids -notcontains $_.ProcessId});$ids+=@($children|ForEach-Object{$_.ProcessId})}while($children.Count);ConvertTo-Json -InputObject @($all|Where-Object{$ids -contains $_.ProcessId}) -Compress`;
+ return JSON.parse(execFileSync('powershell',['-NoProfile','-Command',script],{encoding:'utf8'}));
 }
 async function connect(exe,launch=true,allowBroken=false){
  if(launch){if(await fetch(`http://127.0.0.1:${debugPort}/json/version`).then(()=>true).catch(()=>false))throw Error('Owned WebView port occupied');app=spawn(exe,[],{windowsHide:true,env:{...process.env,WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:`--remote-debugging-port=${debugPort} --remote-debugging-address=127.0.0.1`},stdio:'ignore'});}
@@ -48,6 +55,34 @@ async function close(page,acceptance=true){
 async function state(page,wanted){await expect.poll(async()=>(await invoke(page,'update_snapshot')).state,{timeout:60000}).toBe(wanted);return invoke(page,'update_snapshot');}
 async function install(installer){await command(installer,['/S']);if(!existsSync(testExe))throw Error('NSIS current-user path differs');}
 const data=page=>invoke(page,'acceptance_update_data');
+function installerIdentity(file,version,channel){
+ const bytes=readFileSync(file);
+ return {version,channel,sha256:createHash('sha256').update(bytes).digest('hex'),sha512:createHash('sha512').update(bytes).digest('base64'),size:bytes.length};
+}
+function componentIdentity(){
+ const module=execFileSync('powershell',['-NoProfile','-Command',"(Get-Item -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}\\InprocServer32').GetValue('')"],{encoding:'utf8'}).trim();
+ if(!path.isAbsolute(module))throw Error('Installed component path missing');
+ return {module,sha256:createHash('sha256').update(readFileSync(module)).digest('hex')};
+}
+function quote(value){return "'"+value.replaceAll("'","''")+"'";}
+function restoreInstallAcl(){
+ if(!deniedDirectory)return;
+ const script=`$acl=Get-Acl -LiteralPath ${quote(deniedDirectory)};$acl.SetSecurityDescriptorSddlForm(${quote(originalAcl)});Set-Acl -LiteralPath ${quote(deniedDirectory)} -AclObject $acl`;
+ execFileSync('powershell',['-NoProfile','-Command',script],{stdio:'ignore'});
+ expect(execFileSync('powershell',['-NoProfile','-Command',`(Get-Acl -LiteralPath ${quote(deniedDirectory)}).Sddl`],{encoding:'utf8'}).trim()).toBe(originalAcl);deniedDirectory=null;
+}
+async function legacyData(page,config){
+ await expect.poll(async()=>(await invoke(page,'model_status',{retry:false})).state).toBe('ready');
+ const before=credentialRequests;
+ const input={name:config.name,protocol:config.protocol,baseUrl:config.baseUrl,modelId:config.modelId,usages:config.usages};
+ await invoke(page,'model_test',{draft:{input,id:config.id,revision:config.revision,key:{action:'keep'}},requestId:randomUUID()});
+ expect(credentialRequests).toBe(before+1);
+ const models=await invoke(page,'model_overview'),dictionary=await invoke(page,'dictionary_list',{query:{kind:'term',search:'',page:1}}),history=await invoke(page,'history_usage'),profile=await invoke(page,'language_overview',{after:null}),component=await invoke(page,'text_service_status');
+ expect(component.installed).toBe(true);expect(component.error).toBeNull();
+ const application=profile.applications[0];
+ const detail=await invoke(page,'language_profile',{scope:application.scope});
+ return {models,dictionary,history,profile,detail,component:{installed:component.installed,enabled:component.enabled,error:component.error}};
+}
 async function ready(page){await invoke(page,'update_check',{manual:true});return state(page,'readyToInstall');}
 async function nativeLayout(page,label){
  for(const [minimum,zoom,motion] of [[false,1,'no-preference'],[true,1,'reduce'],[true,1.5,'reduce']]){
@@ -70,24 +105,34 @@ async function build(version,channel='test'){
  if(channel==='test'){env.SAYWEAVE_BUILD_IDENTIFIER=identifier;env.SAYWEAVE_TEST_UPDATE_URL=`https://localhost:${server.address().port}/latest.json`;env.SAYWEAVE_TEST_UPDATE_KEY=readFileSync(`${keyPath}.pub`,'utf8').trim();}else{delete env.SAYWEAVE_BUILD_IDENTIFIER;delete env.SAYWEAVE_TEST_UPDATE_URL;delete env.SAYWEAVE_TEST_UPDATE_KEY;}
  await command(process.execPath,[path.join(source,'scripts','desktop.mjs'),'package','--config',file,...(channel==='test'?['--features','desktop-acceptance']:[])],source,env);
  const installer=path.join(env.CARGO_TARGET_DIR,'release','bundle','nsis',`${config.productName}_${version}_x64-setup.exe`),copy=path.join(directory,`${channel}-${version}-setup.exe`);writeFileSync(copy,readFileSync(installer));writeFileSync(`${copy}.sig`,readFileSync(`${installer}.sig`));
- const bytes=readFileSync(copy);report.installers.push({version,channel,sha256:createHash('sha256').update(bytes).digest('hex'),sha512:createHash('sha512').update(bytes).digest('base64'),size:bytes.length});return copy;
+ report.installers.push(installerIdentity(copy,version,channel));return copy;
 }
 try{
  stage('source and build isolation');
  execFileSync('git',['archive','HEAD','--format=tar','-o',path.join(directory,'source.tar')]);execFileSync('tar',['-xf',path.join(directory,'source.tar'),'-C',source]);symlinkSync(path.join(root,'node_modules'),path.join(source,'node_modules'),'junction');
  stage('stable feature isolation');await command('cargo',['check','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance'],root,{...process.env,SAYWEAVE_BUILD_CHANNEL:'stable'},'acceptance feature in stable build');report.checks.push('actual stable build rejects the desktop-acceptance feature');
- stage('native component build');await command('cargo',['build','--manifest-path','src-tauri/text-service/Cargo.toml','--release','--lib']);
+ stage('native component build');await command('cargo',['build','--manifest-path','src-tauri/text-service/Cargo.toml','--release','--lib','--bin','tsf-probe']);
  stage('HTTPS certificate fixture');await command('cargo',['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_fixture','--','--ignored'],root,{...process.env,SAYWEAVE_DATA_ACCEPTANCE_ID:id});
  const certRoot=path.join(root,'.local','data-acceptance',id,'data');await command('certutil',['-user','-addstore','Root',path.join(certRoot,'fixture-ca.der')]);
  thumbprint=execFileSync('powershell',['-NoProfile','-Command',`(New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('${path.join(certRoot,'fixture-ca.der').replaceAll("'","''")}')).Thumbprint`],{encoding:'utf8'}).trim();await command(process.execPath,[cli,'signer','generate','--ci','--write-keys',keyPath]);
  server=createServer({cert:readFileSync(path.join(certRoot,'fixture-ca.pem')),key:readFileSync(path.join(certRoot,'fixture-key.pem'))},async(req,res)=>{
+  if(req.url==='/v1/chat/completions'){
+   let size=0;for await(const chunk of req){size+=chunk.length;if(size>8192){res.destroy();return;}}
+   if(req.headers.authorization!=='Bearer isolated-update-test-key'){res.writeHead(401);res.end();return;}
+   credentialRequests++;res.setHeader('Content-Type','application/json');res.end(JSON.stringify({choices:[{message:{content:'OK'}}]}));return;
+  }
   if(req.url==='/latest.json'){res.end(JSON.stringify({version:serverMode==='wrong-version'?'0.1.702':'0.1.701',notes:'合成验收版本，保留原有资料。',platforms:{'windows-x86_64':{url:`https://localhost:${server.address().port}/package.exe`,signature:serverMode==='bad-signature'?Buffer.from('invalid signature').toString('base64'):signature,installerSize:packageBytes?.length??1,installerSha512:createHash('sha512').update(packageBytes??Buffer.from('empty')).digest('base64')}}}));return;}
   if(req.url!=='/package.exe'){res.writeHead(404);res.end();return;}res.setHeader('Content-Length',packageBytes.length);
   if(serverMode==='interrupted'){res.write(packageBytes.subarray(0,1024));setTimeout(()=>res.destroy(),100);return;}
   if(serverMode==='slow'){for(let offset=0;offset<packageBytes.length&&!res.destroyed;offset+=65536){res.write(packageBytes.subarray(offset,offset+65536));await delay(50);}res.end();return;}res.end(packageBytes);
  });await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
  const old=await build('0.1.700'),next=await build('0.1.701');packageBytes=readFileSync(next);signature=readFileSync(`${next}.sig`,'utf8').trim();
- stage('real NSIS manual replacement');await install(old);let page=await connect(testExe);const seeded=await invoke(page,'acceptance_update_seed');expect(seeded.credentialMatches).toBe(true);expect(seeded.history.count).toBe(10);expect(seeded.profile.preferenceCount).toBe(1);expect(seeded.schema).toBe(9);
+ stage('real NSIS manual replacement');await install(old);
+ const sid=execFileSync('powershell',['-NoProfile','-Command','[Security.Principal.WindowsIdentity]::GetCurrent().User.Value'],{encoding:'utf8'}).trim();
+ await command(testExe,['--sayweave-text-service=install',`--initiator=${sid}`]);
+ const installedComponent=componentIdentity();report.componentBefore=installedComponent;
+ const probe=path.join(root,'src-tauri','text-service','target','release','tsf-probe.exe');await command(probe,['fixture',installedComponent.module,'plain']);
+ let page=await connect(testExe);const seeded=await invoke(page,'acceptance_update_seed');expect(seeded.credentialMatches).toBe(true);expect(seeded.history.count).toBe(10);expect(seeded.profile.preferenceCount).toBe(1);expect(seeded.schema).toBe(9);expect(seeded.component.installed).toBe(true);expect(seeded.component.updateAvailable).toBe(false);expect(seeded.component.error).toBeNull();
  const seedDatabase=path.join(directory,'seed.sqlite');await close(page);writeFileSync(seedDatabase,readFileSync(path.join(testData,'dictionary.sqlite')));await install(next);page=await connect(testExe);expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.701');expect(await data(page)).toEqual(seeded);await close(page);report.checks.push('real NSIS overlay preserves credential value, schema9, history, dictionary, profile and component state');
  stage('real HTTPS failures and cancellation');await install(old);page=await connect(testExe);
  for(const mode of ['interrupted','bad-signature','wrong-version']){serverMode=mode;await invoke(page,'update_check',{manual:true});await state(page,'failed');expect(await data(page)).toEqual(seeded);report.checks.push(`real HTTPS ${mode} rejected; native app/data remain usable`);}
@@ -97,12 +142,31 @@ try{
  await invoke(page,'acceptance_update_hold',{kind:'stop'});await invoke(page,'update_install',{taskId:candidate.taskId,revision:candidate.revision});await state(page,'recovery');report.checks.push('held service stop lock exceeds five seconds; no installation; recovery displayed');
  await invoke(page,'update_restart');await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);candidate=await state(page,'readyToInstall');expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.700');expect(await data(page)).toEqual(seeded);report.checks.push('restart of old binary is not update success');
  const cache=path.join(testData,'update-cache','candidate.exe'),user=execFileSync('whoami',[],{encoding:'utf8'}).trim();await command('icacls',[cache,'/deny',`${user}:(X)`]);await invoke(page,'update_install',{taskId:candidate.taskId,revision:candidate.revision});await state(page,'recovery');await command('icacls',[cache,'/remove:d',user]);report.checks.push('real Windows execute denial produces launch recovery before process exit');
- stage('native UI and real automatic upgrade');await invoke(page,'update_restart');await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);await state(page,'readyToInstall');await page.getByRole('button',{name:'关于',exact:true}).click();await page.getByRole('button',{name:'重启并更新',exact:true}).click();await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);
- await expect.poll(async()=>(await invoke(page,'update_snapshot')).build.version,{timeout:60000}).toBe('0.1.701');expect(await data(page)).toEqual(seeded);expect((await invoke(page,'update_snapshot')).state).toBe('idle');await page.screenshot({path:path.join(directory,'native-upgraded.png')});await close(page);report.checks.push('native UI initiates real HTTPS/minisign/NSIS upgrade and automatic restart; target version and exact data confirmed');
- stage('old public version and candidate replacement');const stableData=path.join(process.env.APPDATA,'local.sayweave.skeleton','data');if(existsSync(stableData))throw Error('Stable runner profile is not empty');const oldAssets=path.join(directory,'old-public');mkdirSync(oldAssets);await command('gh',['release','download','v0.1.6','--repo','qinghui316/Sayweave','--pattern','*setup.exe','--dir',oldAssets]);await command(path.join(oldAssets,'Sayweave_0.1.6_x64-setup.exe'),['/S']);const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');page=await connect(stableExe,true,true);
- await expect.poll(async()=>(await invoke(page,'model_status',{retry:false})).state).toBe('ready');const saved=await invoke(page,'model_save',{request:{input:{name:'Update synthetic model',protocol:'openai-chat',baseUrl:'https://example.invalid/v1',modelId:'update-fixture',usages:['text']},key:{action:'replace',value:'isolated-update-test-key'},id:null,revision:null,expectation:null}});await close(page,false);
- const stablePath=path.join(stableData,'dictionary.sqlite'),stable=new DatabaseSync(stablePath),models=stable.prepare('SELECT * FROM model_configs').all(),defaults=stable.prepare('SELECT * FROM model_defaults').all();stable.exec('PRAGMA wal_checkpoint(TRUNCATE)');await backup(stable,path.join(directory,'legacy.sqlite'));stable.close();for(const suffix of ['-wal','-shm'])rmSync(stablePath+suffix,{force:true});writeFileSync(stablePath,readFileSync(seedDatabase));const transplanted=new DatabaseSync(stablePath);transplanted.exec('PRAGMA foreign_keys=OFF; DELETE FROM model_defaults; DELETE FROM model_configs;');for(const [table,rows] of [['model_configs',models],['model_defaults',defaults]])for(const row of rows){const keys=Object.keys(row);transplanted.prepare(`INSERT INTO ${table}(${keys.join(',')}) VALUES(${keys.map(()=>'?').join(',')})`).run(...keys.map(key=>row[key]));}transplanted.close();
- const stableArgument=process.argv.indexOf('--stable-installer'),manual=stableArgument>=0?path.resolve(process.argv[stableArgument+1]):await build('0.1.7','internal');await command(manual,['/S']);page=await connect(stableExe);const snapshot=await invoke(page,'update_snapshot');expect(snapshot.build.version).toBe('0.1.7');expect(snapshot.build.updatesEnabled).toBe(stableArgument>=0);if(stableArgument>=0){expect(snapshot.build.channel).toBe('stable');expect(snapshot.build.commit).toBe(commit);}const preserved=await invoke(page,'model_overview');expect(preserved.configs[0].id).toBe(saved.configs[0].id);expect(preserved.configs[0].credentialStatus).toBe('present');expect((await invoke(page,'dictionary_list',{query:{kind:'term',search:'',page:1}})).total).toBe(1);expect((await invoke(page,'history_usage')).count).toBe(10);expect((await invoke(page,'language_overview',{after:null})).preferenceCount).toBe(1);await page.screenshot({path:path.join(directory,'native-manual-overlay.png')});await close(page,false);report.checks.push('actual public0.1.6 replaced by same-code0.1.7 candidate; native rendering and original credential reference/synthetic data preserved');report.passed=true;
+ stage('real launched installer interruption');await invoke(page,'update_restart');await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);candidate=await state(page,'readyToInstall');
+ const oldExecutableHash=createHash('sha256').update(readFileSync(testExe)).digest('hex');
+ deniedDirectory=path.dirname(testExe);originalAcl=execFileSync('powershell',['-NoProfile','-Command',`(Get-Acl -LiteralPath ${quote(deniedDirectory)}).Sddl`],{encoding:'utf8'}).trim();
+ await command('icacls',[deniedDirectory,'/deny',`${user}:(OI)(CI)(W,D)`]);
+ let denied=false;try{writeFileSync(path.join(deniedDirectory,'must-not-create.tmp'),'forbidden');}catch{denied=true;}expect(denied).toBe(true);
+ const originalProcess=ownedProcess,installing=invoke(page,'update_install',{taskId:candidate.taskId,revision:candidate.revision}).catch(()=>{});
+ await expect.poll(()=>{installerProcess=processes(cache)[0];return Boolean(installerProcess);},{timeout:15000,intervals:[100]}).toBe(true);
+ await expect.poll(()=>processes(testExe).some(p=>p.CreationDate===originalProcess.CreationDate),{timeout:15000,intervals:[100]}).toBe(false);
+ const launched=processes(cache).find(p=>p.ProcessId===installerProcess.ProcessId&&p.CreationDate===installerProcess.CreationDate);if(!launched)throw Error('Owned launched installer identity changed before interruption');
+ const descendants=processTree(launched);
+ execFileSync('taskkill',['/PID',String(launched.ProcessId),'/T','/F'],{stdio:'ignore'});
+ await expect.poll(()=>descendants.some(p=>processes(p.ExecutablePath).some(current=>current.ProcessId===p.ProcessId&&current.CreationDate===p.CreationDate)),{timeout:10000}).toBe(false);installerProcess=null;
+ await installing;await browser.close().catch(()=>{});browser=null;ownedProcess=null;
+ expect(createHash('sha256').update(readFileSync(testExe)).digest('hex')).toBe(oldExecutableHash);
+ const journal=JSON.parse(readFileSync(path.join(testData,'update-cache','transaction.json'),'utf8'));expect(['launching','launched']).toContain(journal.stage);
+ restoreInstallAcl();page=await connect(testExe);candidate=await state(page,'readyToInstall');expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.700');expect(candidate.error).toContain('上次更新未完成');expect(await data(page)).toEqual(seeded);
+ for(let n=0;n<21;n++){expect(processes(cache)).toHaveLength(0);await delay(1000);}expect((await invoke(page,'update_snapshot')).state).toBe('readyToInstall');
+ report.interruptedInstaller={...installerIdentity(cache,'0.1.701','test'),process:launched,descendants,stage:journal.stage,oldExecutableHash,interruption:'owned NSIS tree deliberately terminated after successful launch and app exit',aclRestored:true,noAutomaticRetrySeconds:21};report.checks.push('genuine launched NSIS installation deliberately interrupted; old binary/data retained, incomplete update shown without automatic retry');
+ stage('native UI and real automatic upgrade');await page.getByRole('button',{name:'关于',exact:true}).click();await page.getByRole('button',{name:'重启并更新',exact:true}).click();await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);
+ await expect.poll(async()=>(await invoke(page,'update_snapshot')).build.version,{timeout:60000}).toBe('0.1.701');expect(await data(page)).toEqual(seeded);expect((await invoke(page,'update_snapshot')).state).toBe('idle');expect(componentIdentity()).toEqual(installedComponent);await page.screenshot({path:path.join(directory,'native-upgraded.png')});await close(page);report.checks.push('native UI retry completes real HTTPS/minisign/NSIS upgrade and automatic restart; target version, exact data and installed component confirmed');
+ stage('old public version and candidate replacement');const stableData=path.join(process.env.APPDATA,'local.sayweave.skeleton','data');if(existsSync(stableData))throw Error('Stable runner profile is not empty');const oldAssets=path.join(directory,'old-public');mkdirSync(oldAssets);await command('gh',['release','download','v0.1.6','--repo','qinghui316/Sayweave','--pattern','*setup.exe','--dir',oldAssets]);const publicOld=path.join(oldAssets,'Sayweave_0.1.6_x64-setup.exe');report.installers.push(installerIdentity(publicOld,'0.1.6','old-public'));await command(publicOld,['/S']);const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');page=await connect(stableExe,true,true);
+ await expect.poll(async()=>(await invoke(page,'model_status',{retry:false})).state).toBe('ready');const saved=await invoke(page,'model_save',{request:{input:{name:'Update synthetic model',protocol:'openai-chat',baseUrl:`https://localhost:${server.address().port}/v1`,modelId:'update-fixture',usages:['text']},key:{action:'replace',value:'isolated-update-test-key'},id:null,revision:null,expectation:null}});await invoke(page,'dictionary_create',{input:{kind:'term',original:'旧版更新验收术语',category:null,replacement:null}});await close(page,false);
+ const stablePath=path.join(stableData,'dictionary.sqlite'),stable=new DatabaseSync(stablePath),seed=new DatabaseSync(seedDatabase,{readOnly:true});report.legacySeed=seedLegacyRows(stable,seed,saved.configs[0].id);seed.close();stable.close();
+ page=await connect(stableExe,true,true);const legacyBefore=await legacyData(page,saved.configs[0]);expect(legacyBefore.dictionary.total).toBe(1);expect(legacyBefore.history.count).toBe(10);expect(legacyBefore.detail.preferences[0].rule).toBe('保留完整理由和步骤');await close(page,false);const oldDb=new DatabaseSync(stablePath,{readOnly:true});report.legacyBefore=databaseInventory(oldDb);oldDb.close();
+ const stableArgument=process.argv.indexOf('--stable-installer'),manual=stableArgument>=0?path.resolve(process.argv[stableArgument+1]):await build('0.1.7','internal');if(stableArgument>=0)report.installers.push(installerIdentity(manual,'0.1.7','stable'));await command(manual,['/S']);page=await connect(stableExe);const snapshot=await invoke(page,'update_snapshot');expect(snapshot.build.version).toBe('0.1.7');expect(snapshot.build.updatesEnabled).toBe(stableArgument>=0);if(stableArgument>=0){expect(snapshot.build.channel).toBe('stable');expect(snapshot.build.commit).toBe(commit);}expect(await legacyData(page,saved.configs[0])).toEqual(legacyBefore);await page.screenshot({path:path.join(directory,'native-manual-overlay.png')});await close(page,false);const newDb=new DatabaseSync(stablePath,{readOnly:true});report.legacyAfter=databaseInventory(newDb);newDb.close();expect(report.legacyAfter).toEqual(report.legacyBefore);report.componentAfter=componentIdentity();expect(report.componentAfter).toEqual(installedComponent);await command(probe,['fixture',installedComponent.module,'plain']);report.checks.push('actual public0.1.6 database retained in place; old/native-created model and term plus bounded synthetic rows read before/after0.1.7 overlay, exact table hashes/real credential value/installed TSF preserved');report.passed=true;
 }catch(error){report.error=error.message;throw error;}finally{
- if(browser)await browser.close().catch(()=>{});if(ownedProcess){const remaining=processes(ownedProcess.ExecutablePath).find(p=>p.CreationDate===ownedProcess.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}if(app&&app.exitCode===null)app.kill();if(server){server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}if(thumbprint)await command('certutil',['-user','-delstore','Root',thumbprint]).catch(()=>{});rmSync(keyPath,{force:true});checkpoint();console.log(JSON.stringify({passed:report.passed,commit,checks:report.checks.length,receipt:path.join(directory,'acceptance.json')}));
+ if(browser)await browser.close().catch(()=>{});if(ownedProcess){const remaining=processes(ownedProcess.ExecutablePath).find(p=>p.CreationDate===ownedProcess.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}if(installerProcess){const remaining=processes(installerProcess.ExecutablePath).find(p=>p.ProcessId===installerProcess.ProcessId&&p.CreationDate===installerProcess.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}restoreInstallAcl();if(app&&app.exitCode===null)app.kill();if(server){server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}if(thumbprint)await command('certutil',['-user','-delstore','Root',thumbprint]).catch(()=>{});rmSync(keyPath,{force:true});checkpoint();console.log(JSON.stringify({passed:report.passed,commit,checks:report.checks.length,receipt:path.join(directory,'acceptance.json')}));
 }
