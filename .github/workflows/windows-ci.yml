@@ -143,8 +143,14 @@ jobs:
           if ($env:REUSE_RUN -notmatch '^\d+$') { throw 'Invalid reuse run.' }
           $run = gh api "repos/qinghui316/Sayweave/actions/runs/$env:REUSE_RUN" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $env:EXPECTED_COMMIT -or $run.path -ne '.github/workflows/windows-ci.yml' -or $run.event -notin @('push','workflow_dispatch','pull_request')) { throw 'Reusable run identity differs.' }
-          gh run download $env:REUSE_RUN --name windows-update-packages --dir .local/prior-update-packages
-          if ($LASTEXITCODE -ne 0) { throw 'Reusable package download failed.' }
+          $assets = gh api "repos/qinghui316/Sayweave/actions/runs/$env:REUSE_RUN/artifacts?per_page=100" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $assets.artifacts -isnot [array] -or ($assets.total_count -isnot [int] -and $assets.total_count -isnot [long]) -or $assets.total_count -lt 0 -or $assets.total_count -gt 100 -or @($assets.artifacts).Count -ne $assets.total_count) { throw 'Reusable artifact inventory failed.' }
+          $packages = @($assets.artifacts | Where-Object name -eq 'windows-update-packages')
+          if ($packages.Count -gt 1) { throw 'Ambiguous reusable packages.' }
+          if ($packages.Count -eq 1) {
+            gh run download $env:REUSE_RUN --name windows-update-packages --dir .local/prior-update-packages
+            if ($LASTEXITCODE -ne 0) { throw 'Reusable package download failed.' }
+          }
       - run: |
           $arguments = @('--startup-only', '--tools-dir', '.local/verified-update-tools')
           if (Test-Path .local/prior-update-packages) { $arguments += @('--packages-dir', '.local/prior-update-packages') }
@@ -254,8 +260,14 @@ jobs:
           if ($env:REUSE_RUN -notmatch '^\d+$') { throw 'Invalid reuse run.' }
           $run = gh api "repos/qinghui316/Sayweave/actions/runs/$env:REUSE_RUN" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $env:EXPECTED_COMMIT -or $run.path -ne '.github/workflows/windows-ci.yml' -or $run.event -notin @('push','workflow_dispatch','pull_request')) { throw 'Reusable run identity differs.' }
-          gh run download $env:REUSE_RUN --name windows-update-packages --dir .local/prior-update-packages
-          if ($LASTEXITCODE -ne 0) { throw 'Reusable package set download failed.' }
+          $assets = gh api "repos/qinghui316/Sayweave/actions/runs/$env:REUSE_RUN/artifacts?per_page=100" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $assets.artifacts -isnot [array] -or ($assets.total_count -isnot [int] -and $assets.total_count -isnot [long]) -or $assets.total_count -lt 0 -or $assets.total_count -gt 100 -or @($assets.artifacts).Count -ne $assets.total_count) { throw 'Reusable artifact inventory failed.' }
+          $packages = @($assets.artifacts | Where-Object name -eq 'windows-update-packages')
+          if ($packages.Count -gt 1) { throw 'Ambiguous reusable packages.' }
+          if ($packages.Count -eq 1) {
+            gh run download $env:REUSE_RUN --name windows-update-packages --dir .local/prior-update-packages
+            if ($LASTEXITCODE -ne 0) { throw 'Reusable package set download failed.' }
+          }
       - run: |
           $arguments = @('--tools-dir', '.local/verified-update-tools')
           if (Test-Path .local/prior-update-packages) { $arguments += @('--packages-dir', '.local/prior-update-packages') }
