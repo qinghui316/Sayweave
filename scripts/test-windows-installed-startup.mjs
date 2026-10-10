@@ -123,17 +123,19 @@ try{
   report.aclModuleDefault=JSON.parse(await command('powershell',['-NoProfile','-Command',inspect]));persist();
   report.aclModuleExplicit=JSON.parse(await command('powershell',['-NoProfile','-Command',aclPrelude+inspect.replace('Import-Module Microsoft.PowerShell.Security -ErrorAction Stop;','')]));persist();
   expect(report.aclModuleExplicit.read).toBe(true);
-  stage('owned scratch ACL denial and exact restoration');
-  const scratch=path.join(directory,'acl-fixture');mkdirSync(scratch);
+  stage('owned installation ACL denial, read comparison and exact restoration');
+  const scratch=path.dirname(exe),beforeHash=hash(readFileSync(exe));expect(beforeHash).toBe(packages.manifest.artifacts.old.executableSha256);
   const original=JSON.parse(await command('powershell',['-NoProfile','-Command',aclSnapshotScript(scratch)]));if(!original.binary)throw Error('Owned scratch ACL is empty');aclRestoreScript(scratch,original);
-  report.aclRoundtrip={directory:scratch,original,denied:false,restored:false};persist();
+  report.aclRoundtrip={directory:scratch,original,beforeHash,denied:false,restored:false};persist();
   const user=execFileSync('whoami',[],{encoding:'utf8'}).trim();
   try{
    await command('icacls',[scratch,'/deny',`${user}:(OI)(CI)(W,D)`]);
+   try{report.aclRoundtrip.readDuringDenial={succeeded:true,sha256:hash(readFileSync(exe))};}catch(error){report.aclRoundtrip.readDuringDenial={succeeded:false,code:error.code??'unknown',message:safeStartupText(error.message).slice(0,1024)};}persist();
    try{writeFileSync(path.join(scratch,'must-not-create.tmp'),'forbidden');}catch{report.aclRoundtrip.denied=true;}persist();expect(report.aclRoundtrip.denied).toBe(true);
   }finally{
    report.aclRoundtrip.after=JSON.parse(await command('powershell',['-NoProfile','-Command',aclRestoreScript(scratch,original)]));report.aclRoundtrip.restored=report.aclRoundtrip.after.descriptorMatches;persist();expect(report.aclRoundtrip.restored).toBe(true);
    const proof=path.join(scratch,'restored-write.tmp');writeFileSync(proof,'restored');unlinkSync(proof);report.aclRoundtrip.writeRestored=true;persist();
+   report.aclRoundtrip.afterHash=hash(readFileSync(exe));persist();expect(report.aclRoundtrip.afterHash).toBe(beforeHash);
   }
   report.aclCompatibilityPassed=true;persist();
  }

@@ -63,7 +63,7 @@ function captureInstallerTree(first=false){
  const all=JSON.parse(execFileSync('powershell',['-NoProfile','-Command',"[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);$all=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().ToString('o')}},ExecutablePath);ConvertTo-Json -InputObject $all -Compress"],{encoding:'utf8',timeout:10000}));
  const same=(a,b)=>a.ProcessId===b.ProcessId&&a.CreationDate===b.CreationDate&&a.ExecutablePath===b.ExecutablePath;
  if(first&&!all.some(p=>same(p,installerProcess)))throw Error('Installer root ended before its first verified ownership snapshot');
- const tree=[...installerDescendants,...(installerProcess?[installerProcess]:[])];
+ const tree=[...installerDescendants];if(installerProcess&&!tree.some(p=>same(p,installerProcess)))tree.push(installerProcess);
  for(let n=0;n<tree.length;n++){
   const parent=tree[n];
   if(all.some(p=>p.ProcessId===parent.ProcessId&&!same(p,parent)))throw Error('Installer parent PID reused during ownership tracking');
@@ -72,7 +72,9 @@ function captureInstallerTree(first=false){
    if(!tree.some(p=>same(p,child)))tree.push(child);
   }
  }
- installerDescendants=tree;if(first)installerTreeConfirmed=true;return tree;
+ if(tree.length>64)throw Error('Owned installer tree exceeded its bounded identity inventory');
+ installerDescendants=tree;if(first)installerTreeConfirmed=true;
+ const snapshot={root:installerProcess??report.installerOwnership?.first?.root,members:tree,at:new Date().toISOString()};report.installerOwnership??={};report.installerOwnership[first?'first':'last']=snapshot;checkpoint();return tree;
 }
 async function connect(exe,launch=true,allowBroken=false){
  if(!debugPolicy){debugPolicy=prepareDisposableDebugPolicy(debugPort);report.debugPolicyLease=debugPolicy.receipt;checkpoint();debugPolicy.install();checkpoint();}
@@ -411,9 +413,10 @@ try{
  for(const owned of descendants){const remaining=processes(owned.ExecutablePath).find(p=>p.ProcessId===owned.ProcessId&&p.CreationDate===owned.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}
  await expect.poll(()=>descendants.some(p=>processes(p.ExecutablePath).some(current=>current.ProcessId===p.ProcessId&&current.CreationDate===p.CreationDate)),{timeout:10000}).toBe(false);installerProcess=null;
  await installing;await browser.close().catch(()=>{});browser=null;ownedProcess=null;
+ await restoreInstallAcl();
  expect(createHash('sha256').update(readFileSync(testExe)).digest('hex')).toBe(oldExecutableHash);
  const journal=JSON.parse(readFileSync(path.join(testData,'update-cache','transaction.json'),'utf8'));expect(['launching','launched']).toContain(journal.stage);
- await restoreInstallAcl();page=await connect(testExe);candidate=await state(page,'readyToInstall');expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.700');expect(candidate.error).toContain('上次更新未完成');expect(await data(page)).toEqual(seeded);
+ page=await connect(testExe);candidate=await state(page,'readyToInstall');expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.700');expect(candidate.error).toContain('上次更新未完成');expect(await data(page)).toEqual(seeded);
  for(let n=0;n<21;n++){expect(processes(cache)).toHaveLength(0);await delay(1000);}expect((await invoke(page,'update_snapshot')).state).toBe('readyToInstall');
  report.interruptedInstaller={...installerIdentity(cache,'0.1.701','test'),process:launched,descendants,stage:journal.stage,oldExecutableHash,interruption:'owned NSIS tree deliberately terminated after successful launch and app exit',aclRestored:true,noAutomaticRetrySeconds:21};report.checks.push('genuine launched NSIS installation deliberately interrupted; old binary/data retained, incomplete update shown without automatic retry');
  stage('native UI and real automatic upgrade');await page.getByRole('button',{name:'关于',exact:true}).click();await page.getByRole('button',{name:'重启并更新',exact:true}).click();await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);
