@@ -4,6 +4,18 @@ import {mkdirSync,readFileSync,writeFileSync,existsSync,lstatSync,openSync,readS
 import path from 'node:path';
 
 const limit=65536;
+export const aclPrelude=String.raw`$ErrorActionPreference='Stop';[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop;`;
+function aclLiteral(value){if(typeof value!=='string'||!path.win32.isAbsolute(value)||value.length>2048||/[\0\r\n]/.test(value))throw Error('ACL requires a bounded absolute owned directory');return "'"+value.replaceAll("'","''")+"'";}
+export function aclSnapshotScript(directory){
+ return aclPrelude+`$acl=Get-Acl -LiteralPath ${aclLiteral(directory)};$bytes=$acl.GetSecurityDescriptorBinaryForm();$sd=[System.Security.AccessControl.RawSecurityDescriptor]::new($bytes,0);@{sddl=$sd.GetSddlForm([System.Security.AccessControl.AccessControlSections]::All);binary=[Convert]::ToBase64String($bytes);controlFlags=[int]$sd.ControlFlags;resourceManagerControl=[int]$sd.ResourceManagerControl}|ConvertTo-Json -Compress`;
+}
+export function aclRestoreScript(directory,baseline){
+ if(typeof baseline?.binary!=='string'||baseline.binary.length<4||baseline.binary.length>16384||!/^[A-Za-z0-9+/]+={0,2}$/.test(baseline.binary))throw Error('ACL baseline binary is invalid');
+ const literal=aclLiteral(directory),binary="'"+baseline.binary+"'";
+ // Windows can mark the restored DACL as auto-inherited. Permit only that
+ // direction of this one bit; compare every remaining serialized RawSD byte.
+ return aclPrelude+String.raw`$bytes=[Convert]::FromBase64String(`+binary+String.raw`);$before=[System.Security.AccessControl.RawSecurityDescriptor]::new($bytes,0);$acl=Get-Acl -LiteralPath `+literal+String.raw`;$acl.SetSecurityDescriptorBinaryForm($bytes);Set-Acl -LiteralPath `+literal+String.raw` -AclObject $acl;$actual=(Get-Acl -LiteralPath `+literal+String.raw`).GetSecurityDescriptorBinaryForm();$after=[System.Security.AccessControl.RawSecurityDescriptor]::new($actual,0);$sddl=$after.GetSddlForm([System.Security.AccessControl.AccessControlSections]::All);$flags=[int]$after.ControlFlags;$delta=[int]$before.ControlFlags -bxor $flags;$auto=[int][System.Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited;$valid=($delta -eq 0 -or ($delta -eq $auto -and ($flags -band $auto) -ne 0));$managerMatches=$before.ResourceManagerControl -eq $after.ResourceManagerControl;if($valid -and $delta -eq $auto){$after.SetFlags($before.ControlFlags)};$b=[byte[]]::new($before.BinaryLength);$a=[byte[]]::new($after.BinaryLength);$before.GetBinaryForm($b,0);$after.GetBinaryForm($a,0);$matches=$valid -and $managerMatches -and ([Convert]::ToBase64String($b) -ceq [Convert]::ToBase64String($a));@{sddl=$sddl;binary=[Convert]::ToBase64String($actual);controlFlags=$flags;controlDelta=$delta;resourceManagerControlMatches=$managerMatches;descriptorMatches=$matches}|ConvertTo-Json -Compress;if(-not $matches){throw 'Restored ACL changed identity, entries, order, resource-manager control or an unsupported control bit'}`;
+}
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 export function boundedTail(previous,bytes){return Buffer.concat([previous,Buffer.from(bytes)]).subarray(-limit);}
 export function safeStartupText(value,secrets=[]){

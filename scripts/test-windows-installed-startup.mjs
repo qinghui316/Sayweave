@@ -1,12 +1,12 @@
 // Diagnostic-only installation of an existing signed candidate. Never an owner host.
 import {spawn,execFileSync} from 'node:child_process';
 import {createHash,randomUUID} from 'node:crypto';
-import {mkdirSync,readFileSync,writeFileSync,renameSync,existsSync} from 'node:fs';
+import {mkdirSync,readFileSync,writeFileSync,renameSync,existsSync,unlinkSync} from 'node:fs';
 import path from 'node:path';
 import {chromium,expect} from '@playwright/test';
 import {readPackages} from './windows-update-packages.mjs';
 import {readTools} from './windows-update-artifacts.mjs';
-import {boundedTail,safeStartupText,installedStartup,installedState,restartAndReconnect} from './windows-update-startup.mjs';
+import {boundedTail,safeStartupText,installedStartup,installedState,restartAndReconnect,aclPrelude,aclSnapshotScript,aclRestoreScript} from './windows-update-startup.mjs';
 import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
 
 if(process.platform!=='win32'||process.arch!=='x64'||process.env.GITHUB_ACTIONS!=='true'||process.env.RUNNER_ENVIRONMENT!=='github-hosted'||process.env.RUNNER_OS!=='Windows')throw Error('Diagnostic installation requires an elevated disposable GitHub-hosted x64 Windows runner.');
@@ -21,7 +21,6 @@ const packages=readPackages('.local/prior-update-packages',candidate);
 const recovery=process.argv.includes('--restart-recovery');
 const metadata=process.argv.includes('--metadata');
 const aclDiagnostic=process.argv.includes('--acl');
-const aclPrelude=String.raw`$ErrorActionPreference='Stop';[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop;`;
 const tools=metadata?readTools('.local/prior-update-tools',candidate):null;
 if(recovery&&!packages.next)throw Error('Recovery diagnosis requires both frozen signed packages.');
 const directory=path.join(root,'.local','installed-startup',randomUUID());mkdirSync(directory,{recursive:true});
@@ -125,16 +124,16 @@ try{
   report.aclModuleExplicit=JSON.parse(await command('powershell',['-NoProfile','-Command',aclPrelude+inspect.replace('Import-Module Microsoft.PowerShell.Security -ErrorAction Stop;','')]));persist();
   expect(report.aclModuleExplicit.read).toBe(true);
   stage('owned scratch ACL denial and exact restoration');
-  const scratch=path.join(directory,'acl-fixture');mkdirSync(scratch);const quoted="'"+scratch.replaceAll("'","''")+"'";
-  const original=(await command('powershell',['-NoProfile','-Command',aclPrelude+`(Get-Acl -LiteralPath ${quoted}).Sddl`])).trim();if(!original)throw Error('Owned scratch ACL is empty');
+  const scratch=path.join(directory,'acl-fixture');mkdirSync(scratch);
+  const original=JSON.parse(await command('powershell',['-NoProfile','-Command',aclSnapshotScript(scratch)]));if(!original.binary)throw Error('Owned scratch ACL is empty');aclRestoreScript(scratch,original);
   report.aclRoundtrip={directory:scratch,original,denied:false,restored:false};persist();
   const user=execFileSync('whoami',[],{encoding:'utf8'}).trim();
   try{
    await command('icacls',[scratch,'/deny',`${user}:(OI)(CI)(W,D)`]);
    try{writeFileSync(path.join(scratch,'must-not-create.tmp'),'forbidden');}catch{report.aclRoundtrip.denied=true;}persist();expect(report.aclRoundtrip.denied).toBe(true);
   }finally{
-   const restored=(await command('powershell',['-NoProfile','-Command',aclPrelude+`$acl=Get-Acl -LiteralPath ${quoted};$acl.SetSecurityDescriptorSddlForm('${original.replaceAll("'","''")}');Set-Acl -LiteralPath ${quoted} -AclObject $acl;(Get-Acl -LiteralPath ${quoted}).Sddl`])).trim();
-   report.aclRoundtrip.restored=restored===original;persist();expect(report.aclRoundtrip.restored).toBe(true);
+   report.aclRoundtrip.after=JSON.parse(await command('powershell',['-NoProfile','-Command',aclRestoreScript(scratch,original)]));report.aclRoundtrip.restored=report.aclRoundtrip.after.descriptorMatches;persist();expect(report.aclRoundtrip.restored).toBe(true);
+   const proof=path.join(scratch,'restored-write.tmp');writeFileSync(proof,'restored');unlinkSync(proof);report.aclRoundtrip.writeRestored=true;persist();
   }
   report.aclCompatibilityPassed=true;persist();
  }

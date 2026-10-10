@@ -9,10 +9,9 @@ import {DatabaseSync} from 'node:sqlite';
 import {databaseInventory,seedLegacyRows,legacySeedRows} from './windows-update-fixtures.mjs';
 import {readTools,writeTools,readMechanismEvidence,writeMechanismEvidence,proofMarkers} from './windows-update-artifacts.mjs';
 import {temporaryPreferenceCleanup} from './windows-update-registration.mjs';
-import {installedStartup,restartAndReconnect} from './windows-update-startup.mjs';
+import {installedStartup,restartAndReconnect,aclPrelude,aclSnapshotScript,aclRestoreScript} from './windows-update-startup.mjs';
 import {readPackages,writePackages,nsisExecutableIdentity} from './windows-update-packages.mjs';
 import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
-const aclPrelude=String.raw`$ErrorActionPreference='Stop';[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop;`;
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'&&process.env.SAYWEAVE_DISPOSABLE_WINDOWS!=='1')throw Error('Use an elevated disposable Windows VM; never an owner machine.');
 const root=process.cwd(),id=randomUUID(),directory=path.join(root,'.local','windows-update',id),source=path.join(directory,'source');mkdirSync(source,{recursive:true});
 const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),report={schemaVersion:1,commit,environment:process.env.RUNNER_NAME??'explicit disposable Windows',id,checks:[],installers:[],commands:[],passed:false};
@@ -218,9 +217,10 @@ async function clearTemporaryRegistration(){
 }
 async function restoreInstallAcl(){
  if(!deniedDirectory)return;
- const script=aclPrelude+`$acl=Get-Acl -LiteralPath ${quote(deniedDirectory)};$acl.SetSecurityDescriptorSddlForm(${quote(originalAcl)});Set-Acl -LiteralPath ${quote(deniedDirectory)} -AclObject $acl;(Get-Acl -LiteralPath ${quote(deniedDirectory)}).Sddl`;
+ const script=aclRestoreScript(deniedDirectory,originalAcl);
  const result=await command('powershell',['-NoProfile','-Command',script],root,process.env,undefined,30000);
- expect(result.stdout.trim()).toBe(originalAcl);deniedDirectory=null;
+ report.aclRestoration=JSON.parse(result.stdout.trim());expect(report.aclRestoration.descriptorMatches).toBe(true);
+ const proof=path.join(deniedDirectory,`update-acl-restored-${id}.tmp`);writeFileSync(proof,'restored');rmSync(proof);report.aclRestoreWriteProbe=true;checkpoint();deniedDirectory=null;
 }
 async function legacyData(page,config){
  await expect.poll(async()=>(await invoke(page,'model_status',{retry:false})).state).toBe('ready');
@@ -399,8 +399,8 @@ try{
  const cache=path.join(testData,'update-cache','candidate.exe'),user=execFileSync('whoami',[],{encoding:'utf8'}).trim();await command('icacls',[cache,'/deny',`${user}:(X)`]);await invoke(page,'update_install',{taskId:candidate.taskId,revision:candidate.revision});await state(page,'recovery');await command('icacls',[cache,'/remove:d',user]);report.checks.push('real Windows execute denial produces launch recovery before process exit');
  stage('real launched installer interruption');page=await restartCurrent(page);candidate=await state(page,'readyToInstall');
  const oldExecutableHash=createHash('sha256').update(readFileSync(testExe)).digest('hex');
- const installDirectory=path.dirname(testExe),acl=await command('powershell',['-NoProfile','-Command',aclPrelude+`(Get-Acl -LiteralPath ${quote(installDirectory)}).Sddl`],root,process.env,undefined,30000);
- originalAcl=acl.stdout.trim();if(!originalAcl)throw Error('Original installation ACL is empty');deniedDirectory=installDirectory;
+ const installDirectory=path.dirname(testExe),acl=await command('powershell',['-NoProfile','-Command',aclSnapshotScript(installDirectory)],root,process.env,undefined,30000);
+ originalAcl=JSON.parse(acl.stdout.trim());if(!originalAcl.binary)throw Error('Original installation ACL is empty');aclRestoreScript(installDirectory,originalAcl);report.originalInstallAcl=originalAcl;deniedDirectory=installDirectory;
  await command('icacls',[deniedDirectory,'/deny',`${user}:(OI)(CI)(W,D)`]);
  let denied=false;try{writeFileSync(path.join(deniedDirectory,'must-not-create.tmp'),'forbidden');}catch{denied=true;}expect(denied).toBe(true);
  installerLaunchAttempted=true;
