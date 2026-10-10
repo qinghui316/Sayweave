@@ -9,13 +9,17 @@ import {DatabaseSync} from 'node:sqlite';
 import {databaseInventory,seedLegacyRows,legacySeedRows} from './windows-update-fixtures.mjs';
 import {readTools,writeTools,readMechanismEvidence,writeMechanismEvidence,proofMarkers} from './windows-update-artifacts.mjs';
 import {temporaryPreferenceCleanup} from './windows-update-registration.mjs';
+import {installedStartup} from './windows-update-startup.mjs';
+import {readPackages,writePackages} from './windows-update-packages.mjs';
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'&&process.env.SAYWEAVE_DISPOSABLE_WINDOWS!=='1')throw Error('Use an elevated disposable Windows VM; never an owner machine.');
 const root=process.cwd(),id=randomUUID(),directory=path.join(root,'.local','windows-update',id),source=path.join(directory,'source');mkdirSync(source,{recursive:true});
 const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),report={schemaVersion:1,commit,environment:process.env.RUNNER_NAME??'explicit disposable Windows',id,checks:[],installers:[],commands:[],passed:false};
 const argument=name=>{const n=process.argv.indexOf(name);if(n<0)return null;if(!process.argv[n+1]||process.argv[n+1].startsWith('--'))throw Error(`Missing ${name} value`);return path.resolve(process.argv[n+1]);};
-const toolsOnly=process.argv.includes('--tools-only'),stableInstaller=argument('--stable-installer'),evidenceDirectory=argument('--mechanism-evidence'),toolsDirectory=argument('--tools-dir');
+const toolsOnly=process.argv.includes('--tools-only'),startupOnly=process.argv.includes('--startup-only'),packagesDirectory=argument('--packages-dir'),stableInstaller=argument('--stable-installer'),evidenceDirectory=argument('--mechanism-evidence'),toolsDirectory=argument('--tools-dir');
 if(toolsOnly&&(stableInstaller||evidenceDirectory)||Boolean(stableInstaller)!==Boolean(evidenceDirectory))throw Error('Formal acceptance requires a draft installer and passed same-commit mechanism evidence');
-report.kind=toolsOnly?'tools':stableInstaller?'formal-installer':'mechanism';
+if(startupOnly&&(toolsOnly||stableInstaller)||packagesDirectory&&(toolsOnly||stableInstaller))throw Error('Startup packages are isolated from tooling-only and formal acceptance');
+const priorPackages=packagesDirectory?readPackages(packagesDirectory,commit):null;
+report.kind=toolsOnly?'tools':stableInstaller?'formal-installer':startupOnly?'startup':'mechanism';
 const log=path.join(directory,'build.log'),keyPath=path.join(directory,'fixture-signing.key'),cli=path.join(root,'node_modules','@tauri-apps','cli','tauri.js');
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 function checkpoint(){
@@ -47,14 +51,14 @@ let tools,legacySeed,temporaryRegistration;
 async function cleanup(label,action){
  try{await action();return true;}catch(error){report.passed=false;process.exitCode=1;(report.cleanupErrors??=[]).push({stage:label,error:String(error?.message??error?.code??error).slice(0,1024)});return false;}
 }
-const debugPort=9291,identifier=`local.sayweave.acceptance.${id}`,product=`Sayweave 验收 ${id}`,testData=path.join(process.env.APPDATA,identifier,'data'),testExe=path.join(process.env.LOCALAPPDATA,product,'sayweave.exe');
+const debugPort=9291,identifier=priorPackages?.manifest.identifier??`local.sayweave.acceptance.${id}`,product=priorPackages?.manifest.product??`Sayweave 验收 ${id}`,testData=path.join(process.env.APPDATA,identifier,'data'),testExe=path.join(process.env.LOCALAPPDATA,product,'sayweave.exe');
 const invoke=(page,command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
 function processes(exe){
  const literal=exe.replaceAll("'","''");
- return JSON.parse(execFileSync('powershell',['-NoProfile','-Command',`$items=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq '${literal}' } | Select-Object ProcessId,CreationDate,ExecutablePath);ConvertTo-Json -InputObject $items -Compress`],{encoding:'utf8'}));
+ return JSON.parse(execFileSync('powershell',['-NoProfile','-Command',`[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);$items=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq '${literal}' } | Select-Object ProcessId,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().ToString('o')}},ExecutablePath);ConvertTo-Json -InputObject $items -Compress`],{encoding:'utf8',timeout:10000}));
 }
 function captureInstallerTree(first=false){
- const all=JSON.parse(execFileSync('powershell',['-NoProfile','-Command','$all=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,ExecutablePath);ConvertTo-Json -InputObject $all -Compress'],{encoding:'utf8'}));
+ const all=JSON.parse(execFileSync('powershell',['-NoProfile','-Command',"[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);$all=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,@{Name='CreationDate';Expression={$_.CreationDate.ToUniversalTime().ToString('o')}},ExecutablePath);ConvertTo-Json -InputObject $all -Compress"],{encoding:'utf8',timeout:10000}));
  const same=(a,b)=>a.ProcessId===b.ProcessId&&a.CreationDate===b.CreationDate&&a.ExecutablePath===b.ExecutablePath;
  if(first&&!all.some(p=>same(p,installerProcess)))throw Error('Installer root ended before its first verified ownership snapshot');
  const tree=[...installerDescendants,...(installerProcess?[installerProcess]:[])];
@@ -69,10 +73,11 @@ function captureInstallerTree(first=false){
  installerDescendants=tree;if(first)installerTreeConfirmed=true;return tree;
 }
 async function connect(exe,launch=true,allowBroken=false){
- if(launch){if(await fetch(`http://127.0.0.1:${debugPort}/json/version`).then(()=>true).catch(()=>false))throw Error('Owned WebView port occupied');app=spawn(exe,[],{windowsHide:true,env:{...process.env,WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:`--remote-debugging-port=${debugPort} --remote-debugging-address=127.0.0.1`},stdio:'ignore'});}
- let endpoint;for(let n=0;n<600;n++){endpoint=await fetch(`http://127.0.0.1:${debugPort}/json/version`).then(r=>r.json()).catch(()=>null);if(endpoint&&(launch||endpoint.webSocketDebuggerUrl!==lastEndpoint))break;endpoint=null;await delay(100);}if(!endpoint)throw Error('New installed WebView did not start');
- const matches=processes(exe);if(matches.length!==1)throw Error('Installed process identity is not unique');if(!launch&&ownedProcess?.CreationDate===matches[0].CreationDate)throw Error('Old process cannot confirm restart');ownedProcess=matches[0];lastEndpoint=endpoint.webSocketDebuggerUrl;
- browser=await chromium.connectOverCDP(endpoint.webSocketDebuggerUrl);let page;for(let n=0;n<100;n++){page=browser.contexts().flatMap(c=>c.pages()).find(p=>p.url().includes('tauri')&&!p.url().includes('surface=overlay'));if(page)break;await delay(100);}if(!page)throw Error('Main WebView missing');await page.waitForFunction(()=>window.__TAURI_INTERNALS__?.invoke);if(!allowBroken)await expect(page.locator('aside')).toBeVisible();return page;
+ const result=await installedStartup({exe,dataRoot:exe===testExe?testData:path.join(process.env.APPDATA,'local.sayweave.skeleton','data'),directory:path.join(directory,'diagnostics'),port:debugPort,launch,previous:ownedProcess,record:report.startups??(report.startups=[]),persist:checkpoint,onOwned:value=>{ownedProcess=value;},onSpawn:value=>{app=value;},allowMissingPageMarker:allowBroken});
+ const endpoint=result.endpoint;if(!launch&&endpoint.webSocketDebuggerUrl===lastEndpoint)throw Error('Old debug endpoint cannot confirm restart');lastEndpoint=endpoint.webSocketDebuggerUrl;
+ try{
+  browser=await chromium.connectOverCDP(endpoint.webSocketDebuggerUrl,{timeout:10000});let page;for(let n=0;n<100;n++){page=browser.contexts().flatMap(c=>c.pages()).find(p=>p.url().includes('tauri')&&!p.url().includes('surface=overlay'));if(page)break;await delay(100);}if(!page)throw Error('Main WebView missing');await page.waitForFunction(()=>window.__TAURI_INTERNALS__?.invoke,{},{timeout:10000});if(!allowBroken)await expect(page.locator('aside')).toBeVisible();result.entry.rendered=!allowBroken;result.entry.phase='rendererReady';checkpoint();return page;
+ }catch(error){result.entry.passed=false;result.entry.phase='renderer';result.entry.error=String(error.message).slice(0,2048);checkpoint();throw error;}
 }
 async function close(page,acceptance=true){
  if(acceptance)await invoke(page,'acceptance_update_exit').catch(()=>{});if(browser){await browser.close().catch(()=>{});browser=null;}
@@ -85,6 +90,10 @@ async function close(page,acceptance=true){
 async function state(page,wanted){await expect.poll(async()=>(await invoke(page,'update_snapshot')).state,{timeout:60000}).toBe(wanted);return invoke(page,'update_snapshot');}
 async function install(installer){await command(installer,['/S']);if(!existsSync(testExe))throw Error('NSIS current-user path differs');}
 const data=page=>invoke(page,'acceptance_update_data');
+async function verifyPackage(file,version,publicKey){
+ stage(`signature verification ${version}`);
+ await command('cargo',['run','--quiet','--manifest-path','src-tauri/Cargo.toml','--bin','verify-update-signature','--',publicKey,file,`${file}.sig`,version]);
+}
 function installerIdentity(file,version,channel){
  const bytes=readFileSync(file);
  return {version,channel,sha256:createHash('sha256').update(bytes).digest('hex'),sha512:createHash('sha512').update(bytes).digest('base64'),size:bytes.length};
@@ -179,7 +188,7 @@ async function build(version,channel='test'){
  await command(process.execPath,[path.join(source,'scripts','desktop.mjs'),'package','--config',file,...(channel==='test'?['--features','desktop-acceptance']:[])],source,env);
  readTools(tools.directory,commit);
  const installer=path.join(env.CARGO_TARGET_DIR,'release','bundle','nsis',`${config.productName}_${version}_x64-setup.exe`),copy=path.join(directory,`${channel}-${version}-setup.exe`);writeFileSync(copy,readFileSync(installer));writeFileSync(`${copy}.sig`,readFileSync(`${installer}.sig`));
- report.installers.push(installerIdentity(copy,version,channel));return copy;
+ report.installers.push({...installerIdentity(copy,version,channel),executableSha256:createHash('sha256').update(readFileSync(path.join(env.CARGO_TARGET_DIR,'release','sayweave.exe'))).digest('hex')});return copy;
 }
 try{
  stage('source and build isolation');
@@ -217,6 +226,7 @@ try{
  stage('temporary production TIP cleanup');await clearTemporaryRegistration();
  const proof=tools.manifest?.proof??{...report.compiler,capabilities,markers:proofMarkers,registrationClean:true};
  tools=writeTools(path.join(root,'.local/windows-update-tools'),commit,readFileSync(tools.component),readFileSync(tools.probe),proof);report.tools=tools.manifest;
+ if(priorPackages&&priorPackages.manifest.componentSha256!==tools.manifest.artifacts.component.sha256)throw Error('Reusable package component hash differs');
  report.checks.push('separate production DLL/acceptance probe; capabilities, actual protocol/control text, absent fault export and final COM unload passed');
  if(toolsOnly){report.passed=true;}
  else{
@@ -227,7 +237,7 @@ try{
  stage('isolated HTTPS trust import');
  await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$cert=New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(${quote(certificateFile)});$store=New-Object System.Security.Cryptography.X509Certificates.X509Store('Root','LocalMachine');try{$store.Open('ReadWrite');$store.Add($cert);if($store.Certificates.Find('FindByThumbprint',${quote(thumbprint)},$false).Count -ne 1){throw 'Isolated root import not confirmed'}}finally{$store.Close();$cert.Dispose()}`],root,process.env,undefined,60000);
  report.trust={store:'LocalMachine/Root',thumbprint};report.checks.push('disposable elevated VM root imported without CurrentUser protected-root interaction; exact thumbprint confirmed');
- if(!stableInstaller){stage('temporary signature key');await command(process.execPath,[cli,'signer','generate','--ci','--write-keys',keyPath],root,process.env,undefined,60000);}
+ if(!stableInstaller&&!priorPackages){stage('temporary signature key');await command(process.execPath,[cli,'signer','generate','--ci','--write-keys',keyPath],root,process.env,undefined,60000);}
  server=createServer({cert:readFileSync(path.join(certRoot,'fixture-ca.pem')),key:readFileSync(path.join(certRoot,'fixture-key.pem'))},async(req,res)=>{
   if(req.url==='/v1/chat/completions'){
    let size=0;for await(const chunk of req){size+=chunk.length;if(size>8192){res.destroy();return;}}
@@ -238,16 +248,30 @@ try{
   if(req.url!=='/package.exe'){res.writeHead(404);res.end();return;}res.setHeader('Content-Length',packageBytes.length);
   if(serverMode==='interrupted'){res.write(packageBytes.subarray(0,1024));setTimeout(()=>res.destroy(),100);return;}
   if(serverMode==='slow'){for(let offset=0;offset<packageBytes.length&&!res.destroyed;offset+=65536){res.write(packageBytes.subarray(offset,offset+65536));await delay(50);}res.end();return;}res.end(packageBytes);
- });await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ });await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(priorPackages?.manifest.port??0,'127.0.0.1',resolve);});
  let page;const sid=execFileSync('powershell',['-NoProfile','-Command','[Security.Principal.WindowsIdentity]::GetCurrent().User.Value'],{encoding:'utf8'}).trim();
  const probe=tools.probe;
  if(!stableInstaller){
- const old=await build('0.1.700'),next=await build('0.1.701');packageBytes=readFileSync(next);signature=readFileSync(`${next}.sig`,'utf8').trim();
- stage('real NSIS manual replacement');await install(old);
+ const context=priorPackages?.manifest??{identifier,product,port:server.address().port,url:`https://localhost:${server.address().port}/latest.json`,publicKey:readFileSync(`${keyPath}.pub`,'utf8').trim(),componentSha256:tools.manifest.artifacts.component.sha256};
+ const packageOutput=path.join(root,'.local/windows-update-packages');
+ const publishPackages=()=>{writePackages(packageOutput,commit,context,packageEntries,report.startupProof??null);report.packages=readPackages(packageOutput,commit).manifest;checkpoint();};
+ const old=priorPackages?.old??await build('0.1.700');
+ const packageEntries=priorPackages?{...priorPackages.entries}:{old:{installer:old,executableSha256:report.installers.at(-1).executableSha256}};publishPackages();
+ await verifyPackage(old,'0.1.700',context.publicKey);
+ stage('installed startup short verification');await install(old);
  await command(testExe,['--sayweave-text-service=install',`--initiator=${sid}`]);
  const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);
  await command(probe,['installed-fixture',installedComponent.module]);
- page=await connect(testExe);const seeded=await invoke(page,'acceptance_update_seed');expect(seeded.credentialMatches).toBe(true);expect(seeded.history.count).toBe(10);expect(seeded.profile.preferenceCount).toBe(1);expect(seeded.schema).toBe(9);expect(seeded.component.installed).toBe(true);expect(seeded.component.updateAvailable).toBe(false);expect(seeded.component.error).toBeNull();
+ page=await connect(testExe);const buildInfo=(await invoke(page,'update_snapshot')).build;expect(buildInfo).toMatchObject({version:'0.1.700',channel:'test',commit});const installedBytes=readFileSync(testExe);expect(createHash('sha256').update(installedBytes).digest('hex')).toBe(packageEntries.old.executableSha256);for(const value of [commit,identifier,context.url,context.publicKey])if(!installedBytes.includes(Buffer.from(value)))throw Error('Frozen build context absent in installed executable');
+ report.startupProof={passed:true,build:buildInfo,executableSha256:packageEntries.old.executableSha256,installerSha256:installerIdentity(old,'0.1.700','test').sha256};await close(page);publishPackages();console.log('Windows installed startup short proof passed: exact process/window/page/CDP/native renderer/build identity.');
+ if(priorPackages&&!priorPackages.next&&!startupOnly)throw Error('Reusable package set has no target package; no implicit rebuild');
+ const next=priorPackages?.next??(!priorPackages?await build('0.1.701'):null);
+ if(next&&!packageEntries.next){packageEntries.next={installer:next,executableSha256:report.installers.at(-1).executableSha256};publishPackages();}
+ if(next)await verifyPackage(next,'0.1.701',context.publicKey);
+ if(startupOnly){report.checks.push('actual installed startup short proof; no update mechanism or formal package acceptance');report.passed=true;}
+ else{
+ packageBytes=readFileSync(next);signature=readFileSync(`${next}.sig`,'utf8').trim();
+ stage('real NSIS manual replacement');page=await connect(testExe);const seeded=await invoke(page,'acceptance_update_seed');expect(seeded.credentialMatches).toBe(true);expect(seeded.history.count).toBe(10);expect(seeded.profile.preferenceCount).toBe(1);expect(seeded.schema).toBe(9);expect(seeded.component.installed).toBe(true);expect(seeded.component.updateAvailable).toBe(false);expect(seeded.component.error).toBeNull();
  await close(page);const seedDb=new DatabaseSync(path.join(testData,'dictionary.sqlite'),{readOnly:true});legacySeed=legacySeedRows(seedDb);seedDb.close();await install(next);page=await connect(testExe);expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.701');expect(await data(page)).toEqual(seeded);await close(page);report.checks.push('real NSIS overlay preserves credential value, schema9, history, dictionary, profile and component state');
  stage('real HTTPS failures and cancellation');await install(old);page=await connect(testExe);
  for(const mode of ['interrupted','bad-signature','wrong-version']){serverMode=mode;await invoke(page,'update_check',{manual:true});await state(page,'failed');expect(await data(page)).toEqual(seeded);report.checks.push(`real HTTPS ${mode} rejected; native app/data remain usable`);}
@@ -277,6 +301,7 @@ try{
  stage('native UI and real automatic upgrade');await page.getByRole('button',{name:'关于',exact:true}).click();await page.getByRole('button',{name:'重启并更新',exact:true}).click();await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);
  await expect.poll(async()=>(await invoke(page,'update_snapshot')).build.version,{timeout:60000}).toBe('0.1.701');expect(await data(page)).toEqual(seeded);expect((await invoke(page,'update_snapshot')).state).toBe('idle');expect(componentIdentity()).toEqual(installedComponent);await page.screenshot({path:path.join(directory,'native-upgraded.png')});await close(page);report.checks.push('native UI retry completes real HTTPS/minisign/NSIS upgrade and automatic restart; target version, exact data and installed component confirmed');
  report.passed=true;
+ }
  }else{
  stage('formal draft component baseline');const stableData=path.join(process.env.APPDATA,'local.sayweave.skeleton','data');if(existsSync(stableData))throw Error('Stable runner profile is not empty');
  const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');report.installers.push(installerIdentity(stableInstaller,'0.1.7','stable'));await command(stableInstaller,['/S']);await command(stableExe,['--sayweave-text-service=install',`--initiator=${sid}`]);const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);await command(probe,['installed-fixture',installedComponent.module]);

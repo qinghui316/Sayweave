@@ -573,6 +573,16 @@ pub fn run() {
         .manage(lifecycle::Lifecycle::default())
         .on_page_load(|webview, payload| {
             if webview.label() == "main"
+                && payload.event() == tauri::webview::PageLoadEvent::Finished
+            {
+                let build = build_info::current();
+                let at_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                log::info!(target: "sayweave", "operation=startup phase=main_page_ready pid={} at_ms={} version={} commit={} channel={}", std::process::id(), at_ms, build.version, build.commit, build.channel);
+            }
+            if webview.label() == "main"
                 && payload.event() == tauri::webview::PageLoadEvent::Started
                 && let Some(service) = webview
                     .app_handle()
@@ -653,6 +663,7 @@ pub fn run() {
             acceptance_main_size
         ])
         .setup(|app| {
+            eprintln!("SAYWEAVE_STARTUP phase=setup pid={}", std::process::id());
             if app.config().identifier != env!("SAYWEAVE_BUILD_IDENTIFIER") {
                 return Err("compiled application identity mismatch".into());
             }
@@ -779,6 +790,8 @@ pub fn run() {
             tauri::WebviewWindowBuilder::from_config(app, &app.config().app.windows[0])?
                 .data_directory(root.join("webview2"))
                 .build()?;
+            let build = build_info::current();
+            log::info!(target: "sayweave", "operation=startup phase=main_window_created pid={} version={} commit={} channel={}", std::process::id(), build.version, build.commit, build.channel);
             if let Some(main) = app.get_webview_window("main")
                 && let Some(monitor) = main.primary_monitor()?
             {
