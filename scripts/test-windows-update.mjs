@@ -27,6 +27,7 @@ async function command(file,args,cwd=root,env=process.env,expectedFailure){
 function stage(value){report.stage=value;checkpoint();console.log(`Windows update acceptance: ${value}`);}
 let server,browser,app,thumbprint,ownedProcess,lastEndpoint,serverMode='valid',packageBytes,signature,deniedDirectory,originalAcl,installerProcess;
 let installerDescendants=[];
+let installerTreeConfirmed=false;
 let credentialRequests=0;
 async function cleanup(label,action){
  try{await action();return true;}catch(error){report.passed=false;process.exitCode=1;(report.cleanupErrors??=[]).push({stage:label,error:String(error?.message??error?.code??error).slice(0,1024)});return false;}
@@ -37,10 +38,20 @@ function processes(exe){
  const literal=exe.replaceAll("'","''");
  return JSON.parse(execFileSync('powershell',['-NoProfile','-Command',`$items=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq '${literal}' } | Select-Object ProcessId,CreationDate,ExecutablePath);ConvertTo-Json -InputObject $items -Compress`],{encoding:'utf8'}));
 }
-function processTree(process){
- if(!Number.isInteger(process.ProcessId))throw Error('Invalid owned process');
- const script=`$all=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,ExecutablePath);$ids=@(${process.ProcessId});do{$children=@($all|Where-Object{$ids -contains $_.ParentProcessId -and $ids -notcontains $_.ProcessId});$ids+=@($children|ForEach-Object{$_.ProcessId})}while($children.Count);ConvertTo-Json -InputObject @($all|Where-Object{$ids -contains $_.ProcessId}) -Compress`;
- return JSON.parse(execFileSync('powershell',['-NoProfile','-Command',script],{encoding:'utf8'}));
+function captureInstallerTree(first=false){
+ const all=JSON.parse(execFileSync('powershell',['-NoProfile','-Command','$all=@(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,ExecutablePath);ConvertTo-Json -InputObject $all -Compress'],{encoding:'utf8'}));
+ const same=(a,b)=>a.ProcessId===b.ProcessId&&a.CreationDate===b.CreationDate&&a.ExecutablePath===b.ExecutablePath;
+ if(first&&!all.some(p=>same(p,installerProcess)))throw Error('Installer root ended before its first verified ownership snapshot');
+ const tree=[...installerDescendants,...(installerProcess?[installerProcess]:[])];
+ for(let n=0;n<tree.length;n++){
+  const parent=tree[n];
+  if(all.some(p=>p.ProcessId===parent.ProcessId&&!same(p,parent)))throw Error('Installer parent PID reused during ownership tracking');
+  for(const child of all.filter(p=>p.ParentProcessId===parent.ProcessId&&p.CreationDate>=parent.CreationDate)){
+   if(!Number.isInteger(child.ProcessId)||!child.ExecutablePath)throw Error('Installer descendant identity unavailable');
+   if(!tree.some(p=>same(p,child)))tree.push(child);
+  }
+ }
+ installerDescendants=tree;if(first)installerTreeConfirmed=true;return tree;
 }
 async function connect(exe,launch=true,allowBroken=false){
  if(launch){if(await fetch(`http://127.0.0.1:${debugPort}/json/version`).then(()=>true).catch(()=>false))throw Error('Owned WebView port occupied');app=spawn(exe,[],{windowsHide:true,env:{...process.env,WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:`--remote-debugging-port=${debugPort} --remote-debugging-address=127.0.0.1`},stdio:'ignore'});}
@@ -152,11 +163,10 @@ try{
  await command('icacls',[deniedDirectory,'/deny',`${user}:(OI)(CI)(W,D)`]);
  let denied=false;try{writeFileSync(path.join(deniedDirectory,'must-not-create.tmp'),'forbidden');}catch{denied=true;}expect(denied).toBe(true);
  const originalProcess=ownedProcess,installing=invoke(page,'update_install',{taskId:candidate.taskId,revision:candidate.revision}).catch(()=>{});
- await expect.poll(()=>{installerProcess=processes(cache)[0];return Boolean(installerProcess);},{timeout:15000,intervals:[100]}).toBe(true);
- await expect.poll(()=>processes(testExe).some(p=>p.CreationDate===originalProcess.CreationDate),{timeout:15000,intervals:[100]}).toBe(false);
- const launched=processes(cache).find(p=>p.ProcessId===installerProcess.ProcessId&&p.CreationDate===installerProcess.CreationDate);if(!launched)throw Error('Owned launched installer identity changed before interruption');
- const descendants=installerDescendants=processTree(launched);
- execFileSync('taskkill',['/PID',String(launched.ProcessId),'/T','/F'],{stdio:'ignore'});
+ await expect.poll(()=>{installerProcess=processes(cache)[0];if(installerProcess)captureInstallerTree(true);return Boolean(installerProcess);},{timeout:15000,intervals:[100]}).toBe(true);
+ await expect.poll(()=>{captureInstallerTree();return processes(testExe).some(p=>p.CreationDate===originalProcess.CreationDate);},{timeout:15000,intervals:[100]}).toBe(false);
+ const launched=installerProcess,descendants=captureInstallerTree();
+ for(const owned of descendants){const remaining=processes(owned.ExecutablePath).find(p=>p.ProcessId===owned.ProcessId&&p.CreationDate===owned.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}
  await expect.poll(()=>descendants.some(p=>processes(p.ExecutablePath).some(current=>current.ProcessId===p.ProcessId&&current.CreationDate===p.CreationDate)),{timeout:10000}).toBe(false);installerProcess=null;
  await installing;await browser.close().catch(()=>{});browser=null;ownedProcess=null;
  expect(createHash('sha256').update(readFileSync(testExe)).digest('hex')).toBe(oldExecutableHash);
@@ -175,6 +185,8 @@ try{
  await cleanup('browser',async()=>{if(browser)await browser.close();});
  await cleanup('application',()=>{if(ownedProcess){const remaining=processes(ownedProcess.ExecutablePath).find(p=>p.ProcessId===ownedProcess.ProcessId&&p.CreationDate===ownedProcess.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}if(app&&app.exitCode===null)app.kill();});
  const installersStopped=await cleanup('interrupted installer tree',async()=>{
+  if(deniedDirectory&&!installerTreeConfirmed)throw Error('Installer ownership snapshot unconfirmed; retain directory denial');
+  if(installerTreeConfirmed&&deniedDirectory)captureInstallerTree();
   const identities=[...installerDescendants,...(installerProcess?[installerProcess]:[])];
   for(const owned of identities){const remaining=processes(owned.ExecutablePath).find(p=>p.ProcessId===owned.ProcessId&&p.CreationDate===owned.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}
   await expect.poll(()=>identities.some(owned=>processes(owned.ExecutablePath).some(p=>p.ProcessId===owned.ProcessId&&p.CreationDate===owned.CreationDate)),{timeout:10000}).toBe(false);
