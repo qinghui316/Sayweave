@@ -64,6 +64,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(feature = "acceptance")]
             Some("fixture") => fixture()?,
             #[cfg(feature = "acceptance")]
+            Some("installed-fixture") => fixture()?,
+            #[cfg(feature = "acceptance")]
+            Some("capabilities") => println!(
+                "{{\"acceptance\":true,\"installedFixture\":true,\"protocol\":{}}}",
+                sayweave_text_service::wire::PROTOCOL
+            ),
+            #[cfg(feature = "acceptance")]
             Some("observation-script") => {
                 observation_script(args.get(2).ok_or("owned PID required")?.parse()?)?;
             }
@@ -546,7 +553,11 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
             },
             core::w,
         };
-        let plain = std::env::args().nth(3).as_deref() == Some("plain");
+        let installed = std::env::args().nth(1).as_deref() == Some("installed-fixture");
+        if installed && std::env::args().nth(2).is_none() {
+            return Err("installed fixture requires an explicit production DLL".into());
+        }
+        let plain = installed || std::env::args().nth(3).as_deref() == Some("plain");
         println!("owned fixture stage=library");
         let library = LoadLibraryExW(w!("Msftedit.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)?;
         println!("owned fixture stage=window");
@@ -683,18 +694,29 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         let capability = uuid::Uuid::new_v4().to_string();
         let host = registration::host_capability(std::process::id(), &capability)?;
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            if installed {
+                if GetProcAddress(component, windows::core::s!("SayweaveSettleFixtureFault"))
+                    .is_some()
+                    || GetProcAddress(component, windows::core::s!("SayweaveInitialFixtureFault"))
+                        .is_some()
+                {
+                    return Err("installed production DLL exposes a test fault hook".into());
+                }
+                println!("owned production DLL fault export absent=true");
+            }
             let context = manager.GetFocus()?.GetTop()?;
             println!(
                 "owned TSF context available; readonly={}",
                 context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0
             );
             let pipe = Pipe::client(std::process::id(), GetCurrentThreadId())?;
-            if plain && std::env::var_os("SAYWEAVE_EDIT_SETTLEMENT_TRACE").is_some() {
+            if plain && !installed && std::env::var_os("SAYWEAVE_EDIT_SETTLEMENT_TRACE").is_some() {
                 return trace_native_initial_settlement(editor, &context, &pipe, &capability);
             }
             let task = uuid::Uuid::new_v4().to_string();
             let mut expected = String::new();
-            let observation = std::env::var_os("SAYWEAVE_TSF_OBSERVATION_ONLY").is_some();
+            let observation =
+                !installed && std::env::var_os("SAYWEAVE_TSF_OBSERVATION_ONLY").is_some();
             for (operation, revision, action, text) in [
                 (1, 0, Action::Begin, ""),
                 (2, 1, Action::Update, "Sayweave 原位"),
@@ -770,6 +792,14 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                         "controlText"
                     }
                 );
+            }
+            // Installed production DLLs deliberately omit fault-injection exports.
+            // Exercise their actual ordinary protocol and control text, then use
+            // the shared COM/lease cleanup below; leave fault tests to fixture.
+            if installed {
+                prefix_fixture(editor, &manager, &pipe, &capability)?;
+                println!("owned installed production DLL actual text=true protocol8=true");
+                return Ok(());
             }
             if observation {
                 // Observer installation is deferred until the write callback returns.

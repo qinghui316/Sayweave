@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: sayweave-windows-release
@@ -39,6 +40,7 @@ jobs:
     environment: windows-signing
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -53,6 +55,11 @@ jobs:
         shell: pwsh
         run: |
           if ('${{ github.ref_name }}' -ne "v$(node -p "require('./package.json').version")") { throw 'Tag and package version differ.' }
+      - name: Reuse exact main mechanism evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SAYWEAVE_RELEASE_COMMIT: ${{ github.sha }}
+        run: node scripts/reuse-windows-update-evidence.mjs .local/release-mechanism-evidence
       - name: Build signed NSIS package
         shell: pwsh
         env:
@@ -63,8 +70,13 @@ jobs:
           SAYWEAVE_BUILD_COMMIT: ${{ github.sha }}
           SAYWEAVE_BUILD_CHANNEL: stable
         run: |
+          $env:SAYWEAVE_TSF_PAYLOAD = (Resolve-Path '.local/release-mechanism-evidence/tools/sayweave_text_service.dll').Path
+          node --input-type=module -e "import {readMechanismEvidence} from './scripts/windows-update-artifacts.mjs'; readMechanismEvidence('.local/release-mechanism-evidence', process.env.SAYWEAVE_RELEASE_COMMIT)"
+          if ($LASTEXITCODE -ne 0) { throw 'Production component evidence invalid.' }
           npm run desktop:package
           if ($LASTEXITCODE -ne 0) { throw 'Signed package build failed.' }
+          node --input-type=module -e "import {readMechanismEvidence} from './scripts/windows-update-artifacts.mjs'; readMechanismEvidence('.local/release-mechanism-evidence', process.env.SAYWEAVE_RELEASE_COMMIT)"
+          if ($LASTEXITCODE -ne 0) { throw 'Production component changed during packaging.' }
           npm run desktop:release:manifest
           if ($LASTEXITCODE -ne 0) { throw 'Manifest generation failed.' }
           npm run desktop:release:verify
@@ -113,6 +125,8 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
+      - name: Reuse exact main mechanism evidence
+        run: node scripts/reuse-windows-update-evidence.mjs .local/release-mechanism-evidence
       - name: Verify and actually install the draft package
         shell: pwsh
         run: |
@@ -123,7 +137,7 @@ jobs:
           $env:SAYWEAVE_RELEASE_DIR = $download
           node scripts/verify-update-release.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Draft identity verification failed.' }
-          node scripts/test-windows-update.mjs --stable-installer (Join-Path $download "Sayweave_$(node -p "require('./package.json').version")_x64-setup.exe")
+          node scripts/test-windows-update.mjs --stable-installer (Join-Path $download "Sayweave_$(node -p "require('./package.json').version")_x64-setup.exe") --mechanism-evidence .local/release-mechanism-evidence
           if ($LASTEXITCODE -ne 0) { throw 'Draft installation acceptance failed.' }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
@@ -134,6 +148,7 @@ jobs:
             .local/windows-update-acceptance.json
             .local/windows-update/*/acceptance.json
             .local/windows-update/*/native-*.png
+            .local/windows-update/*/diagnostics/*.log
           if-no-files-found: error
   publish:
     if: startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave'
