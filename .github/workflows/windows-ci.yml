@@ -16,9 +16,13 @@ jobs:
   ci:
     name: CI
     needs: windows-tooling
+    if: always()
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
+      - name: Require successful short tooling proof
+        if: needs.windows-tooling.result != 'success'
+        run: throw 'Short Windows tooling proof failed; long validation is blocked.'
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
@@ -67,11 +71,15 @@ jobs:
   windows-update:
     name: Windows update acceptance
     needs: windows-tooling
+    if: always()
     runs-on: windows-latest
     timeout-minutes: 90
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Require successful short tooling proof
+        if: needs.windows-tooling.result != 'success'
+        run: throw 'Short Windows tooling proof failed; package validation is blocked.'
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
