@@ -594,7 +594,7 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         let manager: ITfThreadMgr =
             CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)
                 .map_err(|e| format!("owned manager create: {e}"))?;
-        manager
+        let thread_client = manager
             .Activate()
             .map_err(|e| format!("owned manager activate: {e}"))?;
         println!("owned fixture stage=manager-active");
@@ -686,11 +686,19 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("owned fixture stage=component");
         let (component, processor) = load_processor(&module_path)?;
-        let service_client = manager
-            .cast::<ITfClientId>()?
-            .GetClientId(&registration::CLASS)?;
-        println!("owned fixture stage=service");
-        processor.Activate(&manager, service_client)?;
+        // A directly loaded, unregistered DLL must use this fixture's activated
+        // client. A CLSID lookup does not activate that client on a fresh runner.
+        let service_client = if installed {
+            thread_client
+        } else {
+            manager
+                .cast::<ITfClientId>()?
+                .GetClientId(&registration::CLASS)?
+        };
+        println!("owned fixture stage=service client={service_client} direct={installed}");
+        processor
+            .Activate(&manager, service_client)
+            .map_err(|e| format!("owned processor activate client={service_client}: {e}"))?;
         let capability = uuid::Uuid::new_v4().to_string();
         let host = registration::host_capability(std::process::id(), &capability)?;
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
