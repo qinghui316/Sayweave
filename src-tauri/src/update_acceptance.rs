@@ -79,7 +79,7 @@ pub async fn acceptance_update_seed(
         let attempt = Attempt {
             id: id.clone(),
             record_id: record.clone(),
-            kind: "capture".into(),
+            kind: "live".into(),
             config_id: config_id.clone(),
             config_name: "Update synthetic model".into(),
             model_id: "update-fixture".into(),
