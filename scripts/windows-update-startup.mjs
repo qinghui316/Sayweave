@@ -26,6 +26,30 @@ export function launchEnvironment(environment,port){
  result.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=`--remote-debugging-port=${port} --remote-debugging-address=127.0.0.1`;
  return result;
 }
+// Restart deliberately destroys the invoking renderer before an IPC reply.
+// Closure is evidence only when the old lifetime ends and a new owned host is ready.
+export async function restartAndReconnect({original,invoke,disconnect,inspect,reconnect,current,record,persist,timeoutMs=15000,intervalMs=250}){
+ if(!Number.isInteger(original?.ProcessId)||!original.CreationDate||!original.ExecutablePath)throw Error('Restart requires the original process identity');
+ const entry={original,startedAt:new Date().toISOString(),passed:false};record.push(entry);persist();
+ const same=value=>value.ProcessId===original.ProcessId&&value.CreationDate===original.CreationDate;
+ let timer;
+ try{
+  try{await Promise.race([invoke(),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('Restart command exceeded deadline')),timeoutMs);})]);}
+  catch(error){
+   if(!String(error.message).includes('Target page, context or browser has been closed'))throw error;
+   entry.rendererClosed=true;entry.invokeClosure=String(error.message).slice(0,512);persist();
+  }finally{clearTimeout(timer);}
+  const deadline=Date.now()+timeoutMs;
+  while(inspect().some(same)){
+   if(Date.now()>=deadline)throw Error('Original process did not exit during restart');
+   await new Promise(resolve=>setTimeout(resolve,intervalMs));
+  }
+  entry.originalEnded=true;persist();await disconnect();
+  const page=await reconnect(),next=current();
+  if(!next||same(next)||next.ExecutablePath!==original.ExecutablePath||Date.parse(next.CreationDate)<=Date.parse(original.CreationDate))throw Error('Restart did not produce a new owned process lifetime');
+  entry.next=next;entry.passed=true;persist();return page;
+ }catch(error){entry.error=String(error.message).slice(0,2048);persist();throw error;}
+}
 function tail(file){
  if(!existsSync(file))return '';
  const info=lstatSync(file);if(!info.isFile()||info.isSymbolicLink())throw Error('Startup log is not an owned regular file');

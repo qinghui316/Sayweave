@@ -9,7 +9,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {databaseInventory,seedLegacyRows,legacySeedRows} from './windows-update-fixtures.mjs';
 import {readTools,writeTools,readMechanismEvidence,writeMechanismEvidence,proofMarkers} from './windows-update-artifacts.mjs';
 import {temporaryPreferenceCleanup} from './windows-update-registration.mjs';
-import {installedStartup} from './windows-update-startup.mjs';
+import {installedStartup,restartAndReconnect} from './windows-update-startup.mjs';
 import {readPackages,writePackages,nsisExecutableIdentity} from './windows-update-packages.mjs';
 import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'&&process.env.SAYWEAVE_DISPOSABLE_WINDOWS!=='1')throw Error('Use an elevated disposable Windows VM; never an owner machine.');
@@ -88,6 +88,9 @@ async function close(page,acceptance=true){
   const remaining=processes(ownedProcess.ExecutablePath).find(p=>p.CreationDate===ownedProcess.CreationDate);
   if(remaining){if(acceptance)throw Error('Native exit did not complete');execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}
  }app=null;ownedProcess=null;await delay(600);
+}
+async function restartCurrent(page){
+ return restartAndReconnect({original:ownedProcess,invoke:()=>invoke(page,'update_restart'),disconnect:async()=>{await browser.close().catch(()=>{});browser=null;},inspect:()=>processes(testExe),reconnect:()=>connect(testExe,false),current:()=>ownedProcess,record:report.restarts??(report.restarts=[]),persist:checkpoint});
 }
 async function state(page,wanted){await expect.poll(async()=>(await invoke(page,'update_snapshot')).state,{timeout:60000}).toBe(wanted);return invoke(page,'update_snapshot');}
 async function install(installer){await command(installer,['/S']);if(!existsSync(testExe))throw Error('NSIS current-user path differs');}
@@ -287,9 +290,9 @@ try{
  serverMode='slow';await invoke(page,'update_check',{manual:true});await state(page,'downloading');await invoke(page,'update_cancel');await delay(500);expect((await invoke(page,'update_snapshot')).state).toBe('idle');report.checks.push('real streaming cancellation rejects late completion');serverMode='valid';let candidate=await ready(page);
  await nativeLayout(page,'ready');stage('preparation, shutdown and launch recovery');await invoke(page,'acceptance_update_hold',{kind:'mutation'});await invoke(page,'update_install',{taskId:candidate.taskId,revision:candidate.revision});candidate=await state(page,'readyToInstall');expect(candidate.failureStage).toBe('prepareTimeout');await delay(2500);expect(await data(page)).toEqual(seeded);report.checks.push('admitted mutation exceeds preparation deadline; fence releases and data remains usable');
  await invoke(page,'acceptance_update_hold',{kind:'stop'});await invoke(page,'update_install',{taskId:candidate.taskId,revision:candidate.revision});await state(page,'recovery');report.checks.push('held service stop lock exceeds five seconds; no installation; recovery displayed');
- await invoke(page,'update_restart');await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);candidate=await state(page,'readyToInstall');expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.700');expect(await data(page)).toEqual(seeded);report.checks.push('restart of old binary is not update success');
+ page=await restartCurrent(page);candidate=await state(page,'readyToInstall');expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.700');expect(await data(page)).toEqual(seeded);report.checks.push('restart of old binary is not update success');
  const cache=path.join(testData,'update-cache','candidate.exe'),user=execFileSync('whoami',[],{encoding:'utf8'}).trim();await command('icacls',[cache,'/deny',`${user}:(X)`]);await invoke(page,'update_install',{taskId:candidate.taskId,revision:candidate.revision});await state(page,'recovery');await command('icacls',[cache,'/remove:d',user]);report.checks.push('real Windows execute denial produces launch recovery before process exit');
- stage('real launched installer interruption');await invoke(page,'update_restart');await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);candidate=await state(page,'readyToInstall');
+ stage('real launched installer interruption');page=await restartCurrent(page);candidate=await state(page,'readyToInstall');
  const oldExecutableHash=createHash('sha256').update(readFileSync(testExe)).digest('hex');
  deniedDirectory=path.dirname(testExe);originalAcl=execFileSync('powershell',['-NoProfile','-Command',`(Get-Acl -LiteralPath ${quote(deniedDirectory)}).Sddl`],{encoding:'utf8'}).trim();
  await command('icacls',[deniedDirectory,'/deny',`${user}:(OI)(CI)(W,D)`]);

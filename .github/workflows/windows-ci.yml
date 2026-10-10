@@ -19,6 +19,14 @@ on:
         description: Frozen product SHA for diagnostic-only package reuse
         type: string
         default: ''
+      diagnose_recovery:
+        description: Diagnose restart after a real stop timeout using the same signed pair
+        type: boolean
+        default: false
+      diagnose_metadata:
+        description: Read raw and TSF API descriptions from the frozen ordinary component
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -177,17 +185,27 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REUSE_RUN: ${{ inputs.reuse_run }}
           STARTUP_CANDIDATE: ${{ inputs.candidate_sha }}
+          DIAGNOSE_METADATA: ${{ inputs.diagnose_metadata }}
         run: |
           if ($env:REUSE_RUN -notmatch '^\d+$' -or $env:STARTUP_CANDIDATE -notmatch '^[a-f0-9]{40}$') { throw 'Exact diagnostic identities required.' }
           $run = gh api "repos/qinghui316/Sayweave/actions/runs/$env:REUSE_RUN" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $env:STARTUP_CANDIDATE -or $run.path -ne '.github/workflows/windows-ci.yml' -or $run.event -notin @('push','workflow_dispatch','pull_request')) { throw 'Diagnostic package origin differs.' }
           gh run download $env:REUSE_RUN --name windows-update-packages --dir .local/prior-update-packages
           if ($LASTEXITCODE -ne 0) { throw 'Frozen product download failed.' }
+          if ($env:DIAGNOSE_METADATA -eq 'true') {
+            gh run download $env:REUSE_RUN --name windows-update-tools --dir .local/prior-update-tools
+            if ($LASTEXITCODE -ne 0) { throw 'Frozen ordinary tooling download failed.' }
+          }
       - name: Short startup with the same signed installer
         env:
           STARTUP_CANDIDATE: ${{ inputs.candidate_sha }}
+          DIAGNOSE_RECOVERY: ${{ inputs.diagnose_recovery }}
+          DIAGNOSE_METADATA: ${{ inputs.diagnose_metadata }}
         run: |
-          node scripts/test-windows-installed-startup.mjs
+          $arguments = @()
+          if ($env:DIAGNOSE_RECOVERY -eq 'true') { $arguments += '--restart-recovery' }
+          if ($env:DIAGNOSE_METADATA -eq 'true') { $arguments += '--metadata' }
+          node scripts/test-windows-installed-startup.mjs @arguments
           if ($LASTEXITCODE -ne 0) { throw 'Installed startup diagnosis failed; full validation remains blocked.' }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
@@ -198,6 +216,7 @@ jobs:
             .local/installed-startup/*/receipt.json
             .local/installed-startup/*/*.log
             .local/installed-startup/*/native-startup.png
+            .local/update-metadata/*.json
           if-no-files-found: error
   windows-update:
     name: Windows update acceptance

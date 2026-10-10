@@ -4,7 +4,7 @@ import path from 'node:path';
 import {EventEmitter} from 'node:events';
 import {afterEach,describe,expect,it,vi} from 'vitest';
 // @ts-expect-error JavaScript acceptance module has no declaration file.
-import {boundedTail,safeStartupText,pageReady,validateEndpoint,installedStartup,launchEnvironment} from '../scripts/windows-update-startup.mjs';
+import {boundedTail,safeStartupText,pageReady,validateEndpoint,installedStartup,launchEnvironment,restartAndReconnect} from '../scripts/windows-update-startup.mjs';
 // @ts-expect-error JavaScript acceptance module has no declaration file.
 import {readPackages,writePackages,nsisExecutableIdentity} from '../scripts/windows-update-packages.mjs';
 // @ts-expect-error JavaScript acceptance module has no declaration file.
@@ -16,6 +16,15 @@ function directory(){const dir=mkdtempSync(path.join(os.tmpdir(),'sayweave-start
 function packages(){const input=directory(),file=path.join(input,'setup.exe');writeFileSync(file,'same installer');writeFileSync(`${file}.sig`,'same signature');const output=directory();writePackages(output,commit,context,{old:{installer:file,executableSha256:'c'.repeat(64)}},{passed:true});return output;}
 afterEach(()=>{for(const dir of directories.splice(0))rmSync(dir,{recursive:true,force:true});});
 describe('installed startup diagnostics and immutable package reuse',()=>{
+ it('accepts renderer closure only after a genuinely new process is ready',async()=>{
+  const original={ProcessId:42,CreationDate:'2026-10-10T10:00:00Z',ExecutablePath:'owned.exe'},next={...original,ProcessId:43,CreationDate:'2026-10-10T10:00:01Z'},record:Record<string,unknown>[]=[];
+  const reconnect=vi.fn(async()=> 'new page');
+  const input={original,invoke:async()=>{throw Error('page.evaluate: Target page, context or browser has been closed');},disconnect:async()=>{},inspect:()=>[next],reconnect,current:()=>next,record,persist:()=>{},timeoutMs:2,intervalMs:1};
+  expect(await restartAndReconnect(input)).toBe('new page');expect(record[0]).toMatchObject({passed:true,rendererClosed:true,originalEnded:true,next});
+  await expect(restartAndReconnect({...input,inspect:()=>[original]})).rejects.toThrow('did not exit');
+  await expect(restartAndReconnect({...input,current:()=>original})).rejects.toThrow('new owned');
+  reconnect.mockClear();await expect(restartAndReconnect({...input,invoke:async()=>{throw Error('invalidState');}})).rejects.toThrow('invalidState');expect(reconnect).not.toHaveBeenCalled();
+ });
  it('binds signed NSIS payload bytes instead of the restored build-output hash',()=>{const source=String.raw`D:\candidate\release\sayweave.exe`,script=`!define MAINBINARYSRCPATH "${source}"\r\n`,original=Buffer.from('MZ-before-__TAURI_BUNDLE_TYPE_VAR_UNK-after'),payload=Buffer.from('MZ-before-__TAURI_BUNDLE_TYPE_VAR_NSS-after');const identity=nsisExecutableIdentity(script,source,original,payload);expect(identity.restoredBuildSha256).not.toBe(identity.executableSha256);expect(identity.executableSize).toBe(payload.length);expect({...{size:999},...identity}.size).toBe(999);expect(identity.mainBinarySource).toBe(source);expect(payload.toString()).toContain('VAR_NSS');const tampered=Buffer.from(payload);tampered[0]=0;expect(()=>nsisExecutableIdentity(script,source,original,tampered)).toThrow('beyond');expect(()=>nsisExecutableIdentity(script,String.raw`D:\other\sayweave.exe`,original,payload)).toThrow('source differs');expect(()=>nsisExecutableIdentity(script+script,source,original,payload)).toThrow('ambiguous');});
  it('refuses existing per-app or wildcard debug policy and running hosts',()=>{const fresh={present:[true,false,false],appPresent:false,wildcardPresent:false,running:0};expect(validateDebugPolicyState(fresh)).toBe(fresh);for(const conflict of [{appPresent:true},{wildcardPresent:true},{running:1},{present:[false,true,false]},{present:[true]},{running:-1}])expect(()=>validateDebugPolicyState({...fresh,...conflict})).toThrow();});
  it('requires a unique ownership identity before any policy mutation or cleanup',()=>{const fresh={present:[true,false,false],appPresent:false,wildcardPresent:false,running:0};for(const operation of ['install','remove'])for(const lease of [null,'',String.raw`wrong';throw 'injected`])expect(()=>debugPolicyScript(operation,9291,fresh,lease)).toThrow('Unique');});

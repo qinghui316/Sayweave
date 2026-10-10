@@ -5,18 +5,23 @@ import {mkdirSync,readFileSync,writeFileSync,renameSync,existsSync} from 'node:f
 import path from 'node:path';
 import {chromium,expect} from '@playwright/test';
 import {readPackages} from './windows-update-packages.mjs';
-import {boundedTail,safeStartupText,installedStartup,installedState} from './windows-update-startup.mjs';
+import {readTools} from './windows-update-artifacts.mjs';
+import {boundedTail,safeStartupText,installedStartup,installedState,restartAndReconnect} from './windows-update-startup.mjs';
 import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
 
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true')throw Error('Diagnostic installation requires an elevated disposable GitHub Windows runner.');
 const root=process.cwd(),candidate=process.env.STARTUP_CANDIDATE;
 const harness=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
 if(!/^[a-f0-9]{40}$/.test(candidate??''))throw Error('Exact product candidate required.');
-const permitted=new Set(['.github/workflows/windows-ci.yml','scripts/windows-update-startup.mjs','scripts/windows-update-debug-policy.mjs','scripts/test-windows-installed-startup.mjs','scripts/check-distribution.mjs','scripts/test-windows-update.mjs','docs/release.md','docs/testing.md','tests/windows-update-startup.test.ts']);
+const permitted=new Set(['.github/workflows/windows-ci.yml','scripts/windows-update-startup.mjs','scripts/windows-update-debug-policy.mjs','scripts/windows-update-metadata.ps1','scripts/windows-update-metadata.cs','scripts/test-windows-installed-startup.mjs','scripts/check-distribution.mjs','scripts/test-windows-update.mjs','docs/release.md','docs/testing.md','tests/windows-update-startup.test.ts']);
 const changed=execFileSync('git',['diff','--name-only',candidate,harness],{encoding:'utf8'}).trim().split('\n').filter(Boolean);
 if(changed.some(file=>!permitted.has(file)))throw Error(`Candidate product sources differ: ${changed.filter(file=>!permitted.has(file)).join(', ')}`);
 if(execFileSync('git',['status','--porcelain','--untracked-files=no'],{encoding:'utf8'}).trim())throw Error('Diagnostic source tree is dirty.');
 const packages=readPackages('.local/prior-update-packages',candidate);
+const recovery=process.argv.includes('--restart-recovery');
+const metadata=process.argv.includes('--metadata');
+const tools=metadata?readTools('.local/prior-update-tools',candidate):null;
+if(recovery&&!packages.next)throw Error('Recovery diagnosis requires both frozen signed packages.');
 const directory=path.join(root,'.local','installed-startup',randomUUID());mkdirSync(directory,{recursive:true});
 const report={schemaVersion:1,kind:'installed-startup-diagnostic',candidateCommit:candidate,acceptanceCommit:harness,environment:process.env.RUNNER_NAME,changedHarnessFiles:changed,passed:false,commands:[],startups:[],packages:packages.manifest};
 function persist(){const file=path.join(directory,'receipt.json');writeFileSync(`${file}.tmp`,JSON.stringify(report,null,2)+'\n');renameSync(`${file}.tmp`,file);}
@@ -25,6 +30,22 @@ let browser,owned,child,debugPolicy;
 const exe=path.join(process.env.LOCALAPPDATA,packages.manifest.product,'sayweave.exe');
 const dataRoot=path.join(process.env.APPDATA,packages.manifest.identifier,'data');
 function stage(value){report.stage=value;persist();console.log(`Installed startup diagnostic: ${value}`);}
+const invoke=(page,command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
+async function connect(launch=true){
+ const result=await installedStartup({exe,dataRoot,directory,port:9291,launch,previous:owned,record:report.startups,persist,onOwned:value=>{owned=value;},onSpawn:value=>{child=value;}});
+ browser=await chromium.connectOverCDP(result.endpoint.webSocketDebuggerUrl,{timeout:10000});
+ let page;for(let n=0;n<100;n++){page=browser.contexts().flatMap(context=>context.pages()).find(p=>p.url().includes('tauri')&&!p.url().includes('surface=overlay'));if(page)break;await new Promise(resolve=>setTimeout(resolve,100));}
+ if(!page)throw Error('Main page missing.');
+ await page.waitForFunction(()=>window.__TAURI_INTERNALS__?.invoke,{},{timeout:10000});await expect(page.locator('aside')).toBeVisible();
+ const snapshot=await invoke(page,'update_snapshot');expect(snapshot.build).toMatchObject({commit:candidate,version:'0.1.700',channel:'test'});report.build=snapshot.build;
+ result.entry.rendered=true;result.entry.phase='rendererReady';persist();return page;
+}
+async function closeCurrent(page){
+ await invoke(page,'acceptance_update_exit').catch(error=>{if(!String(error.message).includes('Target page, context or browser has been closed'))throw error;});
+ await browser.close();browser=null;
+ for(let n=0;n<20;n++){if(!installedState(exe).applications.some(app=>app.CreationDate===owned.CreationDate))break;await new Promise(resolve=>setTimeout(resolve,250));}
+ if(installedState(exe).applications.some(app=>app.CreationDate===owned.CreationDate))throw Error('Native application exit did not complete.');
+}
 async function command(file,args){
  const entry={tool:path.basename(file),args,stage:report.stage,startedAt:new Date().toISOString()};report.commands.push(entry);persist();
  let stdout=Buffer.alloc(0),stderr=Buffer.alloc(0),error;
@@ -47,6 +68,7 @@ try{
  const signatureSource=path.join(root,'src-tauri/src/update_signature.rs').replaceAll('\\','/'),mainSource=path.join(root,'src-tauri/src/bin/verify_update_signature.rs').replaceAll('\\','/');
  writeFileSync(path.join(verifier,'main.rs'),`#[path=${JSON.stringify(signatureSource)}] pub mod update_signature;\nmod sayweave_lib {pub use crate::update_signature;}\ninclude!(${JSON.stringify(mainSource)});\n`);
  await command('cargo',['run','--quiet','--manifest-path',path.join(verifier,'Cargo.toml'),'--',packages.manifest.publicKey,packages.old,`${packages.old}.sig`,'0.1.700']);
+ if(recovery)await command('cargo',['run','--quiet','--manifest-path',path.join(verifier,'Cargo.toml'),'--',packages.manifest.publicKey,packages.next,`${packages.next}.sig`,'0.1.701']);
  report.signatureVerified=true;
  stage('signed installer static payload');
  const sevenZip=path.join(process.env.ProgramFiles,'7-Zip','7z.exe');
@@ -64,22 +86,38 @@ try{
  report.debugPolicy=JSON.parse(policy);persist();
  stage('same candidate installation');await command(packages.old,['/S']);
  if(hash(readFileSync(exe))!==report.payload.sha256)throw Error('Installed executable differs from signed payload.');
+ if(metadata){
+  stage('frozen ordinary component metadata characterization');
+  const sid=execFileSync('powershell',['-NoProfile','-Command','[Security.Principal.WindowsIdentity]::GetCurrent().User.Value'],{encoding:'utf8'}).trim();
+  const prestate=execFileSync('powershell',['-NoProfile','-Command',"$ErrorActionPreference='Stop';foreach($root in @('HKCU:','HKLM:')){foreach($key in @('Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}','Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}')){if(Test-Path -LiteralPath ($root+'\\'+$key)){throw 'Existing component registration'}}};'empty'"],{encoding:'utf8'}).trim();
+  if(prestate!=='empty'||tools.manifest.artifacts.component.sha256!==packages.manifest.componentSha256)throw Error('Metadata component prestate/identity differs');
+  await command(exe,['--sayweave-text-service=install',`--initiator=${sid}`]);
+  const module=execFileSync('powershell',['-NoProfile','-Command',"(Get-Item -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}\\InprocServer32').GetValue('')"],{encoding:'utf8'}).trim();
+  await command('powershell',['-NoProfile','-ExecutionPolicy','Bypass','-File','scripts/windows-update-metadata.ps1','-ExpectedCommit',harness,'-ExpectedModulePath',module,'-ExpectedComponentSha256',tools.manifest.artifacts.component.sha256]);
+  report.metadataCharacterized=true;persist();
+ }
  stage('temporary elevated WebView debug policy');
  debugPolicy=prepareDisposableDebugPolicy(9291);report.debugPolicyLease=debugPolicy.receipt;persist();debugPolicy.install();persist();
  stage('process/window/page/debug/native renderer');
- const result=await installedStartup({exe,dataRoot,directory,port:9291,record:report.startups,persist,onOwned:value=>{owned=value;},onSpawn:value=>{child=value;}});
- browser=await chromium.connectOverCDP(result.endpoint.webSocketDebuggerUrl,{timeout:10000});
- let page;for(let n=0;n<100;n++){page=browser.contexts().flatMap(context=>context.pages()).find(p=>p.url().includes('tauri')&&!p.url().includes('surface=overlay'));if(page)break;await new Promise(resolve=>setTimeout(resolve,100));}
- if(!page)throw Error('Main page missing.');
- await page.waitForFunction(()=>window.__TAURI_INTERNALS__?.invoke,{},{timeout:10000});await expect(page.locator('aside')).toBeVisible();
- const snapshot=await page.evaluate(()=>window.__TAURI_INTERNALS__.invoke('update_snapshot'));
- expect(snapshot.build).toMatchObject({commit:candidate,version:'0.1.700',channel:'test'});report.build=snapshot.build;
- result.entry.rendered=true;result.entry.phase='rendererReady';persist();
+ let page=await connect();
  await page.screenshot({path:path.join(directory,'native-startup.png')});
- await page.evaluate(()=>window.__TAURI_INTERNALS__.invoke('acceptance_update_exit'));
- await browser.close();browser=null;
- for(let n=0;n<20;n++){if(!installedState(exe).applications.some(app=>app.CreationDate===owned.CreationDate))break;await new Promise(resolve=>setTimeout(resolve,250));}
- if(installedState(exe).applications.some(app=>app.CreationDate===owned.CreationDate))throw Error('Native application exit did not complete.');
+ await closeCurrent(page);
+ if(recovery){
+  stage('signed cache fixture for restart boundary only');
+  if(!report.payload.manifestConsistent)throw Error('Recovery fixture requires consistent signed payload identity');
+  const bytes=readFileSync(packages.next),cache=path.join(dataRoot,'update-cache');
+  writeFileSync(path.join(cache,'candidate.exe'),bytes);
+  const journal={schemaVersion:1,stage:'ready',candidate:{version:'0.1.701',signature:readFileSync(`${packages.next}.sig`,'utf8').trim(),url:`https://localhost:${packages.manifest.port}/package.exe`,installerSize:bytes.length,installerSha512:createHash('sha512').update(bytes).digest('base64'),notes:'Synthetic signed-cache fixture; restart diagnosis only.'}};
+  writeFileSync(path.join(cache,'transaction.json'),JSON.stringify(journal));report.recoveryFixture={synthetic:true,installerSha256:packages.manifest.artifacts.next.sha256};persist();
+  page=await connect();const snapshot=await invoke(page,'update_snapshot');expect(snapshot.state).toBe('readyToInstall');
+  const before=await invoke(page,'acceptance_update_data');
+  stage('real stop timeout then restart current version');
+  await invoke(page,'acceptance_update_hold',{kind:'stop'});await invoke(page,'update_install',{taskId:snapshot.taskId,revision:snapshot.revision});
+  await expect.poll(async()=>(await invoke(page,'update_snapshot')).state,{timeout:15000}).toBe('recovery');
+  page=await restartAndReconnect({original:owned,invoke:()=>invoke(page,'update_restart'),disconnect:async()=>{await browser.close().catch(()=>{});browser=null;},inspect:()=>installedState(exe).applications,reconnect:()=>connect(false),current:()=>owned,record:report.restarts??(report.restarts=[]),persist});
+  const after=await invoke(page,'update_snapshot');expect(after.state).toBe('readyToInstall');expect(after.build.version).toBe('0.1.700');expect(await invoke(page,'acceptance_update_data')).toEqual(before);
+  report.recoveryPassed=true;persist();await closeCurrent(page);
+ }
  report.passed=true;
 }catch(error){report.error=safeStartupText(error.message).slice(0,2048);process.exitCode=1;}
 finally{
