@@ -107,6 +107,7 @@ namespace SayweaveMetadata
             {
                 uint type, size = 0;
                 int status = RegQueryValueExW(key, name, IntPtr.Zero, out type, null, ref size);
+                if (status == 2) return null; // HKCU preference-only profile can lack Description.
                 if (status != 0 || type != 1 || size < 2 || size > MaxValueBytes || (size & 1) != 0)
                     throw new InvalidOperationException("Description/module value is not bounded REG_SZ: " + status);
                 byte[] bytes = new byte[(int)size];

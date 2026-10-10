@@ -1,5 +1,6 @@
 param(
     [Parameter(Mandatory=$true)][ValidatePattern('^[a-f0-9]{40}$')][string]$ExpectedCommit,
+    [Parameter(Mandatory=$true)][ValidatePattern('^[a-f0-9]{40}$')][string]$ProductCommit,
     [Parameter(Mandatory=$true)][string]$ExpectedModulePath,
     [Parameter(Mandatory=$true)][ValidatePattern('^[a-f0-9]{64}$')][string]$ExpectedComponentSha256
 )
@@ -19,7 +20,8 @@ if ('SayweaveMetadata.Characterization' -as [type]) { throw 'Use a fresh PowerSh
 Add-Type -Path $readerPath
 $result = [SayweaveMetadata.Characterization]::Read($ExpectedModulePath, $ExpectedComponentSha256)
 $receipt = [ordered]@{
-    candidateCommit = $ExpectedCommit
+    productCommit = $ProductCommit
+    acceptanceCommit = $ExpectedCommit
     environment = 'GitHub-hosted disposable elevated Windows x64'
     runnerName = $env:RUNNER_NAME
     observedAt = [DateTime]::UtcNow.ToString('o')
