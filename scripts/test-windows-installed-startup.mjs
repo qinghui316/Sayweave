@@ -120,9 +120,9 @@ try{
  if(aclDiagnostic){
   stage('PowerShell ACL module comparison');
   const literal="'"+path.dirname(exe).replaceAll("'","''")+"'";
-  const inspect=String.raw`[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);$r=@{version=$PSVersionTable.PSVersion.ToString();edition=$PSVersionTable.PSEdition;pshome=$PSHOME;modulePath=@($env:PSModulePath -split ';');available=@(Get-Module -ListAvailable Microsoft.PowerShell.Security|ForEach-Object{@{version=$_.Version.ToString();path=$_.Path}});loaded=@();read=false};try{Import-Module Microsoft.PowerShell.Security -ErrorAction Stop;$null=Get-Acl -LiteralPath `+literal+String.raw` -ErrorAction Stop;$r.read=$true}catch{$r.error=$_.Exception.ToString();$r.errorId=$_.FullyQualifiedErrorId};$r.loaded=@(Get-Module Microsoft.PowerShell.Security|ForEach-Object{@{version=$_.Version.ToString();path=$_.Path}});ConvertTo-Json -InputObject $r -Compress -Depth 5`;
+  const inspect=String.raw`[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);$r=@{version=$PSVersionTable.PSVersion.ToString();edition=$PSVersionTable.PSEdition;pshome=$PSHOME;modulePath=@($env:PSModulePath -split ';');available=@(Get-Module -ListAvailable Microsoft.PowerShell.Security|ForEach-Object{@{version=$_.Version.ToString();path=$_.Path}});loaded=@();read=$false};try{Import-Module Microsoft.PowerShell.Security -ErrorAction Stop;$null=Get-Acl -LiteralPath `+literal+String.raw` -ErrorAction Stop;$r.read=$true}catch{$r.error=$_.Exception.ToString();$r.errorId=$_.FullyQualifiedErrorId};$r.loaded=@(Get-Module Microsoft.PowerShell.Security|ForEach-Object{@{version=$_.Version.ToString();path=$_.Path}});ConvertTo-Json -InputObject $r -Compress -Depth 5`;
   report.aclModuleDefault=JSON.parse(await command('powershell',['-NoProfile','-Command',inspect]));persist();
-  report.aclModuleExplicit=JSON.parse(await command('powershell',['-NoProfile','-Command',aclPrelude+inspect]));persist();
+  report.aclModuleExplicit=JSON.parse(await command('powershell',['-NoProfile','-Command',aclPrelude+inspect.replace('Import-Module Microsoft.PowerShell.Security -ErrorAction Stop;','')]));persist();
   expect(report.aclModuleExplicit.read).toBe(true);
   stage('owned scratch ACL denial and exact restoration');
   const scratch=path.join(directory,'acl-fixture');mkdirSync(scratch);const quoted="'"+scratch.replaceAll("'","''")+"'";
