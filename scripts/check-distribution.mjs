@@ -13,6 +13,8 @@ const publicWorkflow = file => ['windows-release.yml','windows-ci.yml'].includes
 const scripts = new Set(["windows-update-debug-policy.mjs",'release-validation.mjs','test-windows-installed-startup.mjs','windows-update-startup.mjs','windows-update-packages.mjs','windows-update-registration.mjs','windows-update-artifacts.mjs','reuse-windows-update-evidence.mjs','windows-update-fixtures.mjs','test-windows-update.mjs','test-windows-update.ps1','check-boundaries.mjs', 'check-native-boundaries.mjs', 'check-text.mjs', 'check-distribution.mjs', 'generate-update-manifest.mjs', 'verify-update-release.mjs',
   'test-desktop.ps1', 'test-dictionary-desktop.mjs', 'test-models-desktop.mjs', 'test-speech-desktop.mjs', 'test-prefix-input.mjs', 'test-input.ps1', 'desktop.mjs', 'test-language-actor.mjs', 'test-language-dashboard-live.mjs']);
 const testRoots = new Set(['contracts', 'e2e']);
+scripts.add('windows-update-metadata.cs');
+scripts.add('windows-update-metadata.ps1');
 const testFixtures = new Set(['voice-recovery.html', 'voice-recovery.tsx', 'input-target.ts', 'faithful-v1.txt']);
 const generated = /(?:^|\/)(?:node_modules|target|gen|dist|coverage|test-results|playwright-report|\.local|\.git)(?:\/|$)|^tests\/visual\//i;
 const ownerLocal = /(?:^|\/)(?:\.agents|\.claude|\.codex|\.impeccable)(?:\/|$)|(?:^|\/)(?:AGENTS\.md|CLAUDE\.md|\.env[^/]*|dev\.ps1|doctor\.mjs|environment\.ps1|setup-tools\.ps1|harness-skill-link\.(?:mjs|ps1|py))$|\.cmd$/i;
