@@ -9,7 +9,7 @@ import {readTools} from './windows-update-artifacts.mjs';
 import {boundedTail,safeStartupText,installedStartup,installedState,restartAndReconnect} from './windows-update-startup.mjs';
 import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
 
-if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true')throw Error('Diagnostic installation requires an elevated disposable GitHub Windows runner.');
+if(process.platform!=='win32'||process.arch!=='x64'||process.env.GITHUB_ACTIONS!=='true'||process.env.RUNNER_ENVIRONMENT!=='github-hosted'||process.env.RUNNER_OS!=='Windows')throw Error('Diagnostic installation requires an elevated disposable GitHub-hosted x64 Windows runner.');
 const root=process.cwd(),candidate=process.env.STARTUP_CANDIDATE;
 const harness=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
 if(!/^[a-f0-9]{40}$/.test(candidate??''))throw Error('Exact product candidate required.');
@@ -26,7 +26,7 @@ const directory=path.join(root,'.local','installed-startup',randomUUID());mkdirS
 const report={schemaVersion:1,kind:'installed-startup-diagnostic',candidateCommit:candidate,acceptanceCommit:harness,environment:process.env.RUNNER_NAME,changedHarnessFiles:changed,passed:false,commands:[],startups:[],packages:packages.manifest};
 function persist(){const file=path.join(directory,'receipt.json');writeFileSync(`${file}.tmp`,JSON.stringify(report,null,2)+'\n');renameSync(`${file}.tmp`,file);}
 persist();
-let browser,owned,child,debugPolicy;
+let browser,owned,child,debugPolicy,componentPreparation;
 const exe=path.join(process.env.LOCALAPPDATA,packages.manifest.product,'sayweave.exe');
 const dataRoot=path.join(process.env.APPDATA,packages.manifest.identifier,'data');
 function stage(value){report.stage=value;persist();console.log(`Installed startup diagnostic: ${value}`);}
@@ -91,9 +91,11 @@ try{
   const sid=execFileSync('powershell',['-NoProfile','-Command','[Security.Principal.WindowsIdentity]::GetCurrent().User.Value'],{encoding:'utf8'}).trim();
   const prestate=execFileSync('powershell',['-NoProfile','-Command',"$ErrorActionPreference='Stop';foreach($root in @('HKCU:','HKLM:')){foreach($key in @('Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}','Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}')){if(Test-Path -LiteralPath ($root+'\\'+$key)){throw 'Existing component registration'}}};'empty'"],{encoding:'utf8'}).trim();
   if(prestate!=='empty'||tools.manifest.artifacts.component.sha256!==packages.manifest.componentSha256)throw Error('Metadata component prestate/identity differs');
+  componentPreparation={sid,prestate,attempted:true};report.componentPreparation=componentPreparation;persist();
   await command(exe,['--sayweave-text-service=install',`--initiator=${sid}`]);
   const module=execFileSync('powershell',['-NoProfile','-Command',"(Get-Item -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}\\InprocServer32').GetValue('')"],{encoding:'utf8'}).trim();
-  await command('powershell',['-NoProfile','-ExecutionPolicy','Bypass','-File','scripts/windows-update-metadata.ps1','-ExpectedCommit',harness,'-ExpectedModulePath',module,'-ExpectedComponentSha256',tools.manifest.artifacts.component.sha256]);
+  componentPreparation.module=module;componentPreparation.sha256=hash(readFileSync(module));if(componentPreparation.sha256!==tools.manifest.artifacts.component.sha256)throw Error('Prepared module differs from frozen tooling');persist();
+  await command('powershell',['-NoProfile','-ExecutionPolicy','Bypass','-File','scripts/windows-update-metadata.ps1','-ExpectedCommit',harness,'-ProductCommit',candidate,'-ExpectedModulePath',module,'-ExpectedComponentSha256',tools.manifest.artifacts.component.sha256]);
   report.metadataCharacterized=true;persist();
  }
  stage('temporary elevated WebView debug policy');
@@ -110,7 +112,7 @@ try{
   const journal={schemaVersion:1,stage:'ready',candidate:{version:'0.1.701',signature:readFileSync(`${packages.next}.sig`,'utf8').trim(),url:`https://localhost:${packages.manifest.port}/package.exe`,installerSize:bytes.length,installerSha512:createHash('sha512').update(bytes).digest('base64'),notes:'Synthetic signed-cache fixture; restart diagnosis only.'}};
   writeFileSync(path.join(cache,'transaction.json'),JSON.stringify(journal));report.recoveryFixture={synthetic:true,installerSha256:packages.manifest.artifacts.next.sha256};persist();
   page=await connect();const snapshot=await invoke(page,'update_snapshot');expect(snapshot.state).toBe('readyToInstall');
-  const before=await invoke(page,'acceptance_update_data');
+  const before=await invoke(page,'acceptance_update_seed');expect(before.credentialMatches).toBe(true);expect(before.schema).toBe(9);expect(before.history.count).toBe(10);expect(before.profile.preferenceCount).toBe(1);
   stage('real stop timeout then restart current version');
   await invoke(page,'acceptance_update_hold',{kind:'stop'});await invoke(page,'update_install',{taskId:snapshot.taskId,revision:snapshot.revision});
   await expect.poll(async()=>(await invoke(page,'update_snapshot')).state,{timeout:15000}).toBe('recovery');
@@ -119,11 +121,19 @@ try{
   report.recoveryPassed=true;persist();await closeCurrent(page);
  }
  report.passed=true;
-}catch(error){report.error=safeStartupText(error.message).slice(0,2048);process.exitCode=1;}
+}catch(error){report.error=safeStartupText(error?.message??error?.code??String(error)).slice(0,2048);process.exitCode=1;}
 finally{
  if(browser)await browser.close().catch(()=>{});
  if(owned){try{const current=installedState(exe).applications.find(app=>app.ProcessId===owned.ProcessId&&app.CreationDate===owned.CreationDate);if(current){report.cleanupKill={ProcessId:current.ProcessId,CreationDate:current.CreationDate};await command('taskkill',['/PID',String(current.ProcessId),'/T','/F']);}}catch(error){report.cleanupError=String(error.message).slice(0,1024);report.passed=false;process.exitCode=1;}}
  else if(child&&child.exitCode===null){report.unverifiedProcessCleanup=true;report.passed=false;process.exitCode=1;}
+ if(componentPreparation){try{
+  const registered=execFileSync('powershell',['-NoProfile','-Command',"$key=Get-Item -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}\\InprocServer32' -ErrorAction Stop;@{module=$key.GetValue('');owner=$key.GetValue('SayweaveOwner')}|ConvertTo-Json -Compress"],{encoding:'utf8'});
+  const identity=JSON.parse(registered),expected=path.join(process.env.ProgramFiles,'Sayweave','TextService',tools.manifest.artifacts.component.sha256,'sayweave_text_service.dll');
+  if(identity.owner!=='SayweaveStageA-v1'||path.normalize(identity.module.replace(/^\\\\\?\\/,'' )).toLowerCase()!==path.normalize(expected).toLowerCase()||createHash('sha256').update(readFileSync(identity.module)).digest('hex')!==tools.manifest.artifacts.component.sha256)throw Error('Refusing cleanup of changed component identity');
+  await command(exe,['--sayweave-text-service=remove',`--initiator=${componentPreparation.sid}`]);
+  await command('powershell',['-NoProfile','-Command',"$ErrorActionPreference='Stop';foreach($root in @('HKCU:','HKLM:')){foreach($key in @('Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}','Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}')){if(Test-Path -LiteralPath ($root+'\\'+$key)){throw 'Prepared component cleanup incomplete'}}};'empty'"]);
+  componentPreparation.removed=true;
+ }catch(error){report.componentCleanupError=safeStartupText(error.message).slice(0,1024);report.passed=false;process.exitCode=1;}}
  if(debugPolicy){try{debugPolicy.remove();}catch(error){report.policyCleanupError=safeStartupText(error.message).slice(0,1024);report.passed=false;process.exitCode=1;}}
  persist();console.log(JSON.stringify({kind:report.kind,candidateCommit:candidate,acceptanceCommit:harness,passed:report.passed,error:report.error,receipt:path.join(directory,'receipt.json')}));
 }
