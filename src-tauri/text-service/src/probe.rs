@@ -72,7 +72,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ),
             #[cfg(feature = "acceptance")]
             Some("registration-state") => {
-                let profiles = input_profiles()?
+                let all = input_profiles()?;
+                for profile in all.iter().filter(|p| p.clsid == registration::CLASS) {
+                    eprintln!(
+                        "owned profile language={} type={} profile={:?} category={:?} flags={}",
+                        profile.langid,
+                        profile.dwProfileType,
+                        profile.guidProfile,
+                        profile.catid,
+                        profile.dwFlags
+                    );
+                }
+                let profiles = all
                     .iter()
                     .filter(|p| p.clsid == registration::CLASS)
                     .count();
@@ -714,18 +725,39 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("owned fixture stage=component");
         let (component, processor) = load_processor(&module_path)?;
-        // The runner prepares the real TIP registration before direct loading;
-        // an application client is not a substitute for the service identity.
-        let service_client = manager
-            .cast::<ITfClientId>()?
-            .GetClientId(&registration::CLASS)?;
-        println!("owned fixture stage=service client={service_client} direct={installed}");
-        processor
-            .Activate(&manager, service_client)
-            .map_err(|e| format!("owned processor activate client={service_client}: {e}"))?;
         let capability = uuid::Uuid::new_v4().to_string();
         let host = registration::host_capability(std::process::id(), &capability)?;
         let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            if installed {
+                // Only TSF owns a registered TIP's activation identity. The spare
+                // COM instance above validates this explicit module's factory,
+                // while TSF creates/activates the real service for this process.
+                println!("owned fixture stage=service process_scope=true");
+                let activated = registration::activate(false)
+                    .map_err(|e| format!("owned process TIP activate: {e}"))?;
+                if activated != language
+                    || !sayweave_text_service::client::own_profile_active(language)?
+                    || sayweave_text_service::client::speech_activation()?
+                        != (
+                            sayweave_text_service::client::SpeechActivation::Own,
+                            language,
+                        )
+                {
+                    return Err("owned process TIP activation identity mismatch".into());
+                }
+                println!(
+                    "owned process TIP activation identity confirmed=true language={language}"
+                );
+                pump(Duration::from_millis(200));
+            } else {
+                let service_client = manager
+                    .cast::<ITfClientId>()?
+                    .GetClientId(&registration::CLASS)?;
+                println!("owned fixture stage=service client={service_client} direct=true");
+                processor.Activate(&manager, service_client).map_err(|e| {
+                    format!("owned processor activate client={service_client}: {e}")
+                })?;
+            }
             if installed {
                 if GetProcAddress(component, windows::core::s!("SayweaveSettleFixtureFault"))
                     .is_some()
@@ -1334,9 +1366,13 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         })();
         drop(host);
-        let _ = processor.Deactivate();
+        let stopped = if installed {
+            registration::deactivate(language, false)
+        } else {
+            processor.Deactivate()
+        };
         drop(processor);
-        let _ = manager.Deactivate();
+        let manager_stopped = manager.Deactivate();
         let _ = DestroyWindow(top);
         let _ = FreeLibrary(library);
         pump(Duration::from_millis(100));
@@ -1349,7 +1385,10 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         }
         FreeLibrary(component)?;
         println!("owned COM DLL unloaded with no live leases=true");
-        result
+        result?;
+        stopped.map_err(|e| format!("owned service deactivation: {e}"))?;
+        manager_stopped.map_err(|e| format!("owned manager deactivation: {e}"))?;
+        Ok(())
     }
 }
 #[cfg(feature = "acceptance")]
