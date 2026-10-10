@@ -254,10 +254,19 @@ fn register_scope(path: &str, root: HKEY) -> windows::core::Result<()> {
                 .Register(&CLASS)
                 .map_err(|e| windows::core::Error::new(e.code(), "profilesRegister"))?;
             registered = true;
-            let desc: Vec<u16> = "Sayweave Voice".encode_utf16().collect();
-            let icon: Vec<u16> = path.encode_utf16().collect();
+            // Some Windows TSF implementations read through the backing string despite
+            // the explicit count. Keep terminated storage without counting the NUL.
+            let desc = wide("Sayweave Voice");
+            let icon = wide(path);
             profile
-                .AddLanguageProfile(&CLASS, language, &PROFILE, &desc, &icon, 0)
+                .AddLanguageProfile(
+                    &CLASS,
+                    language,
+                    &PROFILE,
+                    &desc[..desc.len() - 1],
+                    &icon[..icon.len() - 1],
+                    0,
+                )
                 .map_err(|e| windows::core::Error::new(e.code(), "addLanguageProfile"))?;
             category
                 .RegisterCategory(&CLASS, &GUID_TFCAT_TIP_SPEECH, &CLASS)
@@ -383,7 +392,45 @@ fn unregister_scope(root: HKEY) -> windows::core::Result<()> {
                 CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)?;
             category.UnregisterCategory(&CLASS, &GUID_TFCAT_TIP_SPEECH, &CLASS)
         })();
-        let profile = profiles().and_then(|p| p.Unregister(&CLASS));
+        let profile = profiles().and_then(|p| {
+            // Remove the initiating user's exact profile before unregistering the
+            // machine class. Unregister alone can retain an enabled user profile.
+            let manager: ITfInputProcessorProfileMgr = p.cast()?;
+            let enumerator = manager.EnumProfiles(0)?;
+            let mut owned = std::collections::BTreeSet::new();
+            let mut count = 0usize;
+            loop {
+                let mut batch = [TF_INPUTPROCESSORPROFILE::default(); 16];
+                let mut fetched = 0;
+                enumerator.Next(&mut batch, &mut fetched)?;
+                if fetched as usize > batch.len() || count + fetched as usize > 512 {
+                    return Err(windows::core::Error::new(
+                        E_FAIL,
+                        "profileInventoryExceeded",
+                    ));
+                }
+                count += fetched as usize;
+                for profile in &batch[..fetched as usize] {
+                    if profile.clsid == CLASS {
+                        if profile.guidProfile != PROFILE {
+                            return Err(windows::core::Error::new(
+                                E_ACCESSDENIED,
+                                "profileIdentityChanged",
+                            ));
+                        }
+                        owned.insert(profile.langid);
+                    }
+                }
+                if fetched == 0 {
+                    break;
+                }
+            }
+            for language in owned {
+                p.EnableLanguageProfile(&CLASS, language, &PROFILE, false)?;
+                p.RemoveLanguageProfile(&CLASS, language, &PROFILE)?;
+            }
+            p.Unregister(&CLASS)
+        });
         // Keep COM registration until TSF removal succeeds, so cleanup can be retried.
         category?;
         profile?;
