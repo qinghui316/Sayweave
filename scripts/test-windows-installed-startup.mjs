@@ -6,12 +6,13 @@ import path from 'node:path';
 import {chromium,expect} from '@playwright/test';
 import {readPackages} from './windows-update-packages.mjs';
 import {boundedTail,safeStartupText,installedStartup,installedState} from './windows-update-startup.mjs';
+import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
 
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true')throw Error('Diagnostic installation requires an elevated disposable GitHub Windows runner.');
 const root=process.cwd(),candidate=process.env.STARTUP_CANDIDATE;
 const harness=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
 if(!/^[a-f0-9]{40}$/.test(candidate??''))throw Error('Exact product candidate required.');
-const permitted=new Set(['.github/workflows/windows-ci.yml','scripts/windows-update-startup.mjs','scripts/test-windows-installed-startup.mjs','scripts/check-distribution.mjs','scripts/test-windows-update.mjs','docs/release.md','docs/testing.md','tests/windows-update-startup.test.ts']);
+const permitted=new Set(['.github/workflows/windows-ci.yml','scripts/windows-update-startup.mjs','scripts/windows-update-debug-policy.mjs','scripts/test-windows-installed-startup.mjs','scripts/check-distribution.mjs','scripts/test-windows-update.mjs','docs/release.md','docs/testing.md','tests/windows-update-startup.test.ts']);
 const changed=execFileSync('git',['diff','--name-only',candidate,harness],{encoding:'utf8'}).trim().split('\n').filter(Boolean);
 if(changed.some(file=>!permitted.has(file)))throw Error(`Candidate product sources differ: ${changed.filter(file=>!permitted.has(file)).join(', ')}`);
 if(execFileSync('git',['status','--porcelain','--untracked-files=no'],{encoding:'utf8'}).trim())throw Error('Diagnostic source tree is dirty.');
@@ -20,7 +21,7 @@ const directory=path.join(root,'.local','installed-startup',randomUUID());mkdirS
 const report={schemaVersion:1,kind:'installed-startup-diagnostic',candidateCommit:candidate,acceptanceCommit:harness,environment:process.env.RUNNER_NAME,changedHarnessFiles:changed,passed:false,commands:[],startups:[],packages:packages.manifest};
 function persist(){const file=path.join(directory,'receipt.json');writeFileSync(`${file}.tmp`,JSON.stringify(report,null,2)+'\n');renameSync(`${file}.tmp`,file);}
 persist();
-let browser,owned,child;
+let browser,owned,child,debugPolicy;
 const exe=path.join(process.env.LOCALAPPDATA,packages.manifest.product,'sayweave.exe');
 const dataRoot=path.join(process.env.APPDATA,packages.manifest.identifier,'data');
 function stage(value){report.stage=value;persist();console.log(`Installed startup diagnostic: ${value}`);}
@@ -63,6 +64,8 @@ try{
  report.debugPolicy=JSON.parse(policy);persist();
  stage('same candidate installation');await command(packages.old,['/S']);
  if(hash(readFileSync(exe))!==report.payload.sha256)throw Error('Installed executable differs from signed payload.');
+ stage('temporary elevated WebView debug policy');
+ debugPolicy=prepareDisposableDebugPolicy(9291);report.debugPolicyLease=debugPolicy.receipt;persist();debugPolicy.install();persist();
  stage('process/window/page/debug/native renderer');
  const result=await installedStartup({exe,dataRoot,directory,port:9291,record:report.startups,persist,onOwned:value=>{owned=value;},onSpawn:value=>{child=value;}});
  browser=await chromium.connectOverCDP(result.endpoint.webSocketDebuggerUrl,{timeout:10000});
@@ -83,5 +86,6 @@ finally{
  if(browser)await browser.close().catch(()=>{});
  if(owned){try{const current=installedState(exe).applications.find(app=>app.ProcessId===owned.ProcessId&&app.CreationDate===owned.CreationDate);if(current){report.cleanupKill={ProcessId:current.ProcessId,CreationDate:current.CreationDate};await command('taskkill',['/PID',String(current.ProcessId),'/T','/F']);}}catch(error){report.cleanupError=String(error.message).slice(0,1024);report.passed=false;process.exitCode=1;}}
  else if(child&&child.exitCode===null){report.unverifiedProcessCleanup=true;report.passed=false;process.exitCode=1;}
+ if(debugPolicy){try{debugPolicy.remove();}catch(error){report.policyCleanupError=safeStartupText(error.message).slice(0,1024);report.passed=false;process.exitCode=1;}}
  persist();console.log(JSON.stringify({kind:report.kind,candidateCommit:candidate,acceptanceCommit:harness,passed:report.passed,error:report.error,receipt:path.join(directory,'receipt.json')}));
 }

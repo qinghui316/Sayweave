@@ -2,11 +2,13 @@ import {mkdtempSync,writeFileSync,readFileSync,rmSync} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {EventEmitter} from 'node:events';
-import {afterEach,describe,expect,it} from 'vitest';
+import {afterEach,describe,expect,it,vi} from 'vitest';
 // @ts-expect-error JavaScript acceptance module has no declaration file.
 import {boundedTail,safeStartupText,pageReady,validateEndpoint,installedStartup,launchEnvironment} from '../scripts/windows-update-startup.mjs';
 // @ts-expect-error JavaScript acceptance module has no declaration file.
 import {readPackages,writePackages} from '../scripts/windows-update-packages.mjs';
+// @ts-expect-error JavaScript acceptance module has no declaration file.
+import {validateDebugPolicyState,debugPolicyScript,prepareDisposableDebugPolicy} from '../scripts/windows-update-debug-policy.mjs';
 
 const directories:string[]=[],commit='a'.repeat(40),uuid='23456789-1234-4321-8123-123456789012';
 const context={identifier:`local.sayweave.acceptance.${uuid}`,product:`Sayweave 验收 ${uuid}`,port:19443,publicKey:'public test key '.repeat(4),componentSha256:'b'.repeat(64)};
@@ -14,6 +16,9 @@ function directory(){const dir=mkdtempSync(path.join(os.tmpdir(),'sayweave-start
 function packages(){const input=directory(),file=path.join(input,'setup.exe');writeFileSync(file,'same installer');writeFileSync(`${file}.sig`,'same signature');const output=directory();writePackages(output,commit,context,{old:{installer:file,executableSha256:'c'.repeat(64)}},{passed:true});return output;}
 afterEach(()=>{for(const dir of directories.splice(0))rmSync(dir,{recursive:true,force:true});});
 describe('installed startup diagnostics and immutable package reuse',()=>{
+ it('refuses existing per-app or wildcard debug policy and running hosts',()=>{const fresh={present:[true,false,false],appPresent:false,wildcardPresent:false,running:0};expect(validateDebugPolicyState(fresh)).toBe(fresh);for(const conflict of [{appPresent:true},{wildcardPresent:true},{running:1},{present:[false,true,false]},{present:[true]},{running:-1}])expect(()=>validateDebugPolicyState({...fresh,...conflict})).toThrow();});
+ it('requires a unique ownership identity before any policy mutation or cleanup',()=>{const fresh={present:[true,false,false],appPresent:false,wildcardPresent:false,running:0};for(const operation of ['install','remove'])for(const lease of [null,'',String.raw`wrong';throw 'injected`])expect(()=>debugPolicyScript(operation,9291,fresh,lease)).toThrow('Unique');});
+ it('refuses invalid ports before registry access and never grants owner-host permission',()=>{for(const port of [0,80,65536,NaN,9291.5])expect(()=>debugPolicyScript('read',port)).toThrow();vi.stubEnv('GITHUB_ACTIONS','false');vi.stubEnv('SAYWEAVE_DISPOSABLE_WINDOWS','');try{expect(()=>prepareDisposableDebugPolicy(9291)).toThrow('disposable Windows runner');}finally{vi.unstubAllEnvs();}});
  it('removes case-alias environment keys before requesting the owned debug port on Windows',()=>{const source={Path:'system path',WebView2_Additional_Browser_Arguments:'old arguments',WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:'other arguments'};const env=launchEnvironment(source,9291);expect(Object.keys(env).filter(key=>key.toUpperCase()==='WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS')).toEqual(['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS']);expect(env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS).toBe('--remote-debugging-port=9291 --remote-debugging-address=127.0.0.1');expect(env.Path).toBe(source.Path);expect(source.WebView2_Additional_Browser_Arguments).toBe('old arguments');});
  it('records and fails early on actual stream closure instead of waiting for the debug deadline',async()=>{const dir=directory(),exe=path.join(dir,'synthetic.exe');writeFileSync(exe,'synthetic executable');const child=Object.assign(new EventEmitter(),{pid:412,stdout:new EventEmitter(),stderr:new EventEmitter()}),records:Record<string,unknown>[]=[];
   await expect(installedStartup({exe,dataRoot:dir,directory:dir,port:9291,record:records,persist:()=>{},onOwned:()=>{},onSpawn:()=>{},timeoutMs:60000,io:{inspect:()=>({applications:[],webviews:[]}),occupied:async()=>false,spawn:()=>{queueMicrotask(()=>{child.stdout.emit('data',Buffer.from('startup setup'));child.stderr.emit('data',Buffer.from('runtime failed: synthetic WebView failure'));child.emit('close',101,null);});return child;}}})).rejects.toThrow('exit=101');

@@ -55,6 +55,8 @@ public class OwnedStartupEnvironment {
  [DllImport("kernel32.dll")]static extern bool CloseHandle(IntPtr handle);
  [DllImport("kernel32.dll",SetLastError=true)]static extern bool GetProcessTimes(IntPtr handle,out long created,out long exited,out long kernel,out long user);
  [DllImport("kernel32.dll",SetLastError=true)]static extern bool ReadProcessMemory(IntPtr handle,IntPtr address,byte[] buffer,IntPtr size,out IntPtr read);
+ [DllImport("advapi32.dll",SetLastError=true)]static extern bool OpenProcessToken(IntPtr process,uint access,out IntPtr token);
+ [DllImport("advapi32.dll",SetLastError=true)]static extern bool GetTokenInformation(IntPtr token,int kind,out int elevation,int size,out int length);
  [DllImport("ntdll.dll")]static extern int NtQueryInformationProcess(IntPtr handle,int kind,IntPtr[] info,int size,out int length);
  static byte[] Read(IntPtr handle,long address,int count){var buffer=new byte[count];IntPtr read;if(!ReadProcessMemory(handle,new IntPtr(address),buffer,new IntPtr(count),out read)||read.ToInt64()!=count)throw new Exception("read:"+Marshal.GetLastWin32Error());return buffer;}
  public static object Read(int pid){
@@ -63,6 +65,8 @@ public class OwnedStartupEnvironment {
    if(IntPtr.Size!=8)throw new Exception("requires-x64-inspector");
    handle=OpenProcess(0x410,false,pid);if(handle==IntPtr.Zero)throw new Exception("open:"+Marshal.GetLastWin32Error());
    long created,exited,kernel,user;if(!GetProcessTimes(handle,out created,out exited,out kernel,out user))throw new Exception("times:"+Marshal.GetLastWin32Error());
+   IntPtr token;if(!OpenProcessToken(handle,8,out token))throw new Exception("token:"+Marshal.GetLastWin32Error());int elevation;
+   try{int tokenLength;if(!GetTokenInformation(token,20,out elevation,4,out tokenLength))throw new Exception("elevation:"+Marshal.GetLastWin32Error());}finally{CloseHandle(token);}
    var info=new IntPtr[6];int length;int status=NtQueryInformationProcess(handle,0,info,48,out length);if(status!=0)throw new Exception("query:"+status);
    long parameters=BitConverter.ToInt64(Read(handle,info[1].ToInt64()+0x20,8),0);
    long address=BitConverter.ToInt64(Read(handle,parameters+0x80,8),0);
@@ -72,7 +76,7 @@ public class OwnedStartupEnvironment {
    var values=Encoding.Unicode.GetString(bytes.ToArray()).Split('\0');string value=null;int matches=0;
    foreach(var item in values){if(item.StartsWith("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=",StringComparison.OrdinalIgnoreCase)){matches++;value=item.Substring("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=".Length);}}
    var port=System.Text.RegularExpressions.Regex.Match(value??"","(?:^|\\s)--remote-debugging-port=(\\d+)(?:\\s|$)");
-   return new {available=true,createdAt=DateTime.FromFileTimeUtc(created).ToString("o"),present=matches>0,matches,debugPort=port.Success?port.Groups[1].Value:null,loopback=(value??"").Contains("--remote-debugging-address=127.0.0.1")};
+   return new {available=true,createdAt=DateTime.FromFileTimeUtc(created).ToString("o"),elevated=elevation!=0,present=matches>0,matches,debugPort=port.Success?port.Groups[1].Value:null,loopback=(value??"").Contains("--remote-debugging-address=127.0.0.1")};
   }catch(Exception error){return new {available=false,error=error.Message};}finally{if(handle!=IntPtr.Zero)CloseHandle(handle);}
  }
 }
