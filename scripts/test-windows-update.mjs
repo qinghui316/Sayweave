@@ -8,6 +8,7 @@ import {chromium,expect} from '@playwright/test';
 import {DatabaseSync} from 'node:sqlite';
 import {databaseInventory,seedLegacyRows,legacySeedRows} from './windows-update-fixtures.mjs';
 import {readTools,writeTools,readMechanismEvidence,writeMechanismEvidence,proofMarkers} from './windows-update-artifacts.mjs';
+import {temporaryPreferenceCleanup} from './windows-update-registration.mjs';
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'&&process.env.SAYWEAVE_DISPOSABLE_WINDOWS!=='1')throw Error('Use an elevated disposable Windows VM; never an owner machine.');
 const root=process.cwd(),id=randomUUID(),directory=path.join(root,'.local','windows-update',id),source=path.join(directory,'source');mkdirSync(source,{recursive:true});
 const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),report={schemaVersion:1,commit,environment:process.env.RUNNER_NAME??'explicit disposable Windows',id,checks:[],installers:[],commands:[],passed:false};
@@ -99,12 +100,12 @@ async function registrationInventory(timeoutMs=30000){
  return JSON.parse((await command('powershell',['-NoProfile','-Command',script],root,process.env,undefined,timeoutMs)).stdout);
 }
 const registrationEmpty=info=>Object.values(info).every(item=>!item.com&&!item.tip);
-async function awaitRegistrationState(probe,registered){
+async function awaitRegistrationState(probe,registered,requireEmptyRoots=true){
  const deadline=Date.now()+10000;let state,stable=0;
  do{
   state=JSON.parse((await command(probe,['registration-state'],root,process.env,undefined,Math.max(1,deadline-Date.now()))).stdout.trim());
   let emptyRoots=true;
-  if(!registered){const inventory=await registrationInventory(Math.max(1,deadline-Date.now()));report.toolRegistrationLastCleanup={inventory,profiles:state};checkpoint();emptyRoots=registrationEmpty(inventory);}
+  if(!registered){const inventory=await registrationInventory(Math.max(1,deadline-Date.now()));report.toolRegistrationLastCleanup={inventory,profiles:state};checkpoint();emptyRoots=!requireEmptyRoots||registrationEmpty(inventory);}
   const matches=registered?state.profiles>0&&state.categories>0&&state.speechCategory:state.profiles===0&&state.categories===0&&!state.speechCategory&&emptyRoots;
   stable=matches?stable+1:0;if(stable===2&&Date.now()<=deadline)return state;
   await delay(Math.max(0,Math.min(250,deadline-Date.now())));
@@ -115,9 +116,21 @@ function moduleKey(value){return (value.startsWith('\\\\?\\')?value.slice(4):val
 async function clearTemporaryRegistration(){
  if(!temporaryRegistration)return;
  const before=await registrationInventory(),user=before.HKEY_CURRENT_USER,machine=before.HKEY_LOCAL_MACHINE;
- if(!registrationEmpty(before)){
+ if(user.com||machine.com){
   if(!user.com||user.owner!=='SayweaveStageA-v1'||typeof user.module!=='string'||moduleKey(user.module)!==moduleKey(temporaryRegistration.component)||machine.com)throw Error('Temporary TIP identity is unavailable or changed; no blind removal');
+  temporaryRegistration.anchor=before;report.toolRegistrationRemoval={anchor:before,initial:temporaryRegistration.initial,componentSha256:temporaryRegistration.sha256};checkpoint();
   await command(temporaryRegistration.probe,['remove'],root,process.env,undefined,30000);
+  temporaryRegistration.apiRemoved=true;
+ }
+ const metadata=await awaitRegistrationState(temporaryRegistration.probe,false,false),remaining=await registrationInventory();
+ if(!registrationEmpty(remaining)){
+  if(!temporaryRegistration.apiRemoved||createHash('sha256').update(readFileSync(temporaryRegistration.component)).digest('hex')!==temporaryRegistration.sha256)throw Error('Owned TIP removal identity is unavailable');
+  const paths=temporaryPreferenceCleanup({initial:temporaryRegistration.initial,prepared:temporaryRegistration.prepared,anchor:temporaryRegistration.anchor,after:remaining,component:temporaryRegistration.component,metadata});
+  report.toolRegistrationPreferenceCleanup={before:remaining,paths};checkpoint();
+  // Recheck every fixed-class key immediately before mutation. Delete only the
+  // observed Enable value, then empty leaves with non-recursive DeleteSubKey.
+  const script=String.raw`$ErrorActionPreference='Stop';$base='Software\Microsoft\CTF\TIP\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$root=[Microsoft.Win32.Registry]::CurrentUser;$paths=ConvertFrom-Json ${quote(JSON.stringify(paths))};foreach($scope in @('HKEY_CURRENT_USER','HKEY_LOCAL_MACHINE')){if(Test-Path -LiteralPath ('Registry::'+$scope+'\Software\Classes\CLSID\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}')){throw 'COM registration reappeared'}};if(Test-Path -LiteralPath ('Registry::HKEY_LOCAL_MACHINE\'+$base)){throw 'Machine TIP registration reappeared'};for($n=0;$n -lt $paths.Count;$n++){$key=$root.OpenSubKey($base+$paths[$n]);if(-not $key){throw 'Owned TIP preference changed'};try{if($n -eq 0){if($key.SubKeyCount -ne 0 -or $key.ValueCount -ne 1 -or $key.GetValueKind('Enable') -ne [Microsoft.Win32.RegistryValueKind]::DWord -or $key.GetValue('Enable') -ne 1){throw 'Owned Enable preference changed'}}else{$children=@($key.GetSubKeyNames());$expected=$paths[$n-1].Substring($paths[$n].Length+1);if($key.ValueCount -ne 0 -or $children.Count -ne 1 -or $children[0] -cne $expected){throw 'Owned TIP parent changed'}}}finally{$key.Close()}};$key=$root.OpenSubKey($base+$paths[0],$true);try{if(-not $key -or $key.SubKeyCount -ne 0 -or $key.ValueCount -ne 1 -or $key.GetValueKind('Enable') -ne [Microsoft.Win32.RegistryValueKind]::DWord -or $key.GetValue('Enable') -ne 1){throw 'Owned Enable preference changed'};$key.DeleteValue('Enable',$true)}finally{if($key){$key.Close()}};foreach($relative in $paths){$subkey=$base+$relative;$key=$root.OpenSubKey($subkey);if(-not $key){throw 'Owned TIP leaf changed'};try{if($key.ValueCount -ne 0 -or $key.SubKeyCount -ne 0){throw 'Owned TIP leaf is not empty'}}finally{$key.Close()};$root.DeleteSubKey($subkey,$true)};'Owned temporary TIP Enable preference removed with empty-leaf deletion'`;
+  const result=await command('powershell',['-NoProfile','-Command',script],root,process.env,undefined,5000);report.toolRegistrationPreferenceCleanup.result=result.stdout.trim();checkpoint();
  }
  const profiles=await awaitRegistrationState(temporaryRegistration.probe,false),after=await registrationInventory();
  report.toolRegistration={before,after,profiles,removed:registrationEmpty(after)};checkpoint();
@@ -191,12 +204,13 @@ try{
  report.toolRegistrationInitial=initialRegistration;checkpoint();
  expect(JSON.parse(initialProfiles.stdout.trim())).toEqual({profiles:0,categories:0,speechCategory:false});
  if(!registrationEmpty(initialRegistration))throw Error('Short tooling requires an empty owned TIP registration');
- temporaryRegistration={probe:tools.probe,component:tools.component};
+ temporaryRegistration={probe:tools.probe,component:tools.component,initial:initialRegistration,sha256:createHash('sha256').update(readFileSync(tools.component)).digest('hex')};
  await command(tools.probe,['register',tools.component],root,process.env,undefined,30000);
  const prepared=await awaitRegistrationState(tools.probe,true);report.toolRegistrationPrepared=prepared;
  const preparedIdentity=await registrationInventory();report.toolRegistrationIdentity=preparedIdentity;
  const preparedUser=preparedIdentity.HKEY_CURRENT_USER;
  if(!preparedUser.com||preparedUser.owner!=='SayweaveStageA-v1'||typeof preparedUser.module!=='string'||moduleKey(preparedUser.module)!==moduleKey(tools.component)||preparedIdentity.HKEY_LOCAL_MACHINE.com)throw Error('Prepared TIP module identity differs from the verified production DLL');
+ temporaryRegistration.prepared=preparedIdentity;
  stage('short production DLL actual text');
  const smoke=await command(tools.probe,['installed-fixture',tools.component],root,process.env,undefined,60000);
  for(const marker of proofMarkers)expect(smoke.stdout).toContain(marker);
