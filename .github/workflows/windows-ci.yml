@@ -9,10 +9,14 @@ on:
       phase:
         description: Startup proof or full upgrade acceptance (report startup first)
         type: choice
-        options: [startup, full]
+        options: [diagnose, startup, full]
         default: startup
       reuse_run:
         description: Same-commit run containing immutable tools/packages (optional)
+        type: string
+        default: ''
+      candidate_sha:
+        description: Frozen product SHA for diagnostic-only package reuse
         type: string
         default: ''
 permissions:
@@ -50,6 +54,7 @@ jobs:
       - run: npm run check:distribution
   windows-tooling:
     name: Windows update tooling
+    if: inputs.phase != 'diagnose'
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -97,7 +102,7 @@ jobs:
   windows-startup:
     name: Windows installed startup
     needs: windows-tooling
-    if: always() && github.ref != 'refs/heads/main' && github.event_name != 'pull_request' && inputs.phase != 'full'
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.phase == 'startup'
     runs-on: windows-latest
     timeout-minutes: 90
     env:
@@ -151,6 +156,48 @@ jobs:
             .local/windows-update-acceptance.json
             .local/windows-update/*/acceptance.json
             .local/windows-update/*/diagnostics/*.log
+          if-no-files-found: error
+  windows-startup-diagnostic:
+    name: Same-package installed startup diagnosis
+    if: github.event_name == 'workflow_dispatch' && inputs.phase == 'diagnose'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Download frozen product package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_RUN: ${{ inputs.reuse_run }}
+          STARTUP_CANDIDATE: ${{ inputs.candidate_sha }}
+        run: |
+          if ($env:REUSE_RUN -notmatch '^\d+$' -or $env:STARTUP_CANDIDATE -notmatch '^[a-f0-9]{40}$') { throw 'Exact diagnostic identities required.' }
+          $run = gh api "repos/qinghui316/Sayweave/actions/runs/$env:REUSE_RUN" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $env:STARTUP_CANDIDATE -or $run.path -ne '.github/workflows/windows-ci.yml' -or $run.event -notin @('push','workflow_dispatch','pull_request')) { throw 'Diagnostic package origin differs.' }
+          gh run download $env:REUSE_RUN --name windows-update-packages --dir .local/prior-update-packages
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen product download failed.' }
+      - name: Short startup with the same signed installer
+        env:
+          STARTUP_CANDIDATE: ${{ inputs.candidate_sha }}
+        run: |
+          node scripts/test-windows-installed-startup.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Installed startup diagnosis failed; full validation remains blocked.' }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: installed-startup-diagnostic
+          include-hidden-files: true
+          path: |
+            .local/installed-startup/*/receipt.json
+            .local/installed-startup/*/*.log
+            .local/installed-startup/*/native-startup.png
           if-no-files-found: error
   windows-update:
     name: Windows update acceptance
