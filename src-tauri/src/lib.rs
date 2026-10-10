@@ -69,10 +69,17 @@ fn acceptance_exit(app: tauri::AppHandle, window: WebviewWindow) -> Result<(), R
 }
 #[cfg(feature = "desktop-acceptance")]
 #[tauri::command]
-fn acceptance_main_size(window: WebviewWindow, minimum: bool) -> Result<f64, RuntimeError> {
+fn acceptance_main_size(
+    window: WebviewWindow,
+    minimum: bool,
+    zoom: Option<f64>,
+) -> Result<f64, RuntimeError> {
+    let test_build = crate::build_info::current().channel == "test"
+        && env!("SAYWEAVE_BUILD_IDENTIFIER").starts_with("local.sayweave.acceptance.");
     if window.label() != "main"
-        || !std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID")
-            .is_ok_and(|id| uuid::Uuid::parse_str(&id).is_ok())
+        || !(test_build
+            || std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID")
+                .is_ok_and(|id| uuid::Uuid::parse_str(&id).is_ok()))
     {
         return Err(RuntimeError::new("forbidden"));
     }
@@ -83,6 +90,13 @@ fn acceptance_main_size(window: WebviewWindow, minimum: bool) -> Result<f64, Run
     };
     window
         .set_size(LogicalSize::new(size.0, size.1))
+        .map_err(|_| RuntimeError::new("unavailable"))?;
+    let zoom = zoom.unwrap_or(1.0);
+    if ![1.0, 1.5].contains(&zoom) {
+        return Err(RuntimeError::new("invalid"));
+    }
+    window
+        .set_zoom(zoom)
         .map_err(|_| RuntimeError::new("unavailable"))?;
     window
         .scale_factor()

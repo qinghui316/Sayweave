@@ -4,7 +4,7 @@ use crate::{
     data::{DataWorker, Operation, Output},
     models::{ModelService, types::ModelError},
 };
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
@@ -30,6 +30,38 @@ enum Job {
     Speech(StyleObservation),
     Pending(Vec<String>),
 }
+// Persistence is independent of foreground/model availability. Accepted source
+// evidence must survive a shutdown even when analysis has not started.
+async fn persist_job(data: &DataWorker, job: &Job) -> Result<(), DataError> {
+    let value = match job {
+        Job::Edit(e) => {
+            if e.expires_at <= crate::data::repository::now() {
+                return Ok(());
+            }
+            DbOperation::SaveEdit(e.clone())
+        }
+        Job::Speech(o) => DbOperation::Observe(o.clone()),
+        Job::Pending(_) => return Ok(()),
+    };
+    match operation(data, value).await {
+        // Expired/withdrawn qualifications are intentionally not persisted.
+        Err(error) if matches!(error.code.as_str(), "conflict" | "invalid") => Ok(()),
+        result => result.map(|_| ()),
+    }
+}
+async fn persist_pending(
+    data: &DataWorker,
+    receiver: &mut mpsc::Receiver<Job>,
+) -> Result<(), DataError> {
+    receiver.close();
+    let mut failure = None;
+    while let Some(job) = receiver.recv().await {
+        if let Err(error) = persist_job(data, &job).await {
+            failure.get_or_insert(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
 struct WorkerCompletion {
     remaining: AtomicUsize,
     finished: watch::Sender<bool>,
@@ -50,6 +82,7 @@ pub struct LanguageLearning {
     control: Arc<crate::language_policy::LearningControl>,
     interrupted: watch::Sender<u64>,
     finished: watch::Receiver<bool>,
+    persistence_failed: Arc<AtomicBool>,
 }
 impl LanguageLearning {
     pub fn new(app: tauri::AppHandle) -> Self {
@@ -63,6 +96,8 @@ impl LanguageLearning {
         let control = Arc::new(crate::language_policy::LearningControl::default());
         let accepting = control.clone();
         let (finished_sender, finished) = watch::channel(false);
+        let persistence_failed = Arc::new(AtomicBool::new(false));
+        let worker_failed = persistence_failed.clone();
         let completion = Arc::new(WorkerCompletion {
             remaining: AtomicUsize::new(2),
             finished: finished_sender,
@@ -110,23 +145,38 @@ impl LanguageLearning {
             let mut retry = None;
             let mut timer = tokio::time::interval(Duration::from_millis(250));
             loop {
+                if *stopped.borrow() {
+                    if persist_pending(&app.state::<DataWorker>(), &mut receiver)
+                        .await
+                        .is_err()
+                    {
+                        worker_failed.store(true, Ordering::Release);
+                    }
+                    return;
+                }
                 tokio::select! {biased;
-                    _=stopped.changed()=>{if *stopped.borrow(){return;}},
+                    _=stopped.changed()=>{},
                     Some(job)=async { match retry.take() { Some(e)=>Some(Job::Edit(e)),None=>receiver.recv().await } }=>{
                         if !accepting.any(){continue;}
                         if let Job::Pending(pending) = job { scopes.extend(pending); continue; }
+                        if let Err(error) = persist_job(&app.state::<DataWorker>(), &job).await {
+                            worker_failed.store(true, Ordering::Release);
+                            log::info!(target:"sayweave","operation=language_persist result=failed error={}",error.code);
+                            continue;
+                        }
                         let interest=match &job {Job::Edit(e)=>e.eligibility.clone(),Job::Speech(o)=>LearningEligibility{automatic_terms:None,personalization:Some(o.settings_revision)},Job::Pending(_)=>unreachable!()};
                         let deadline=match &job{Job::Edit(e)=>Some(e.expires_at),_=>None};
                         let scope=match &job{Job::Edit(e)=>e.application.key.clone(),Job::Speech(o)=>o.application.key.clone(),Job::Pending(_)=>unreachable!()};
                         // Keep the event frozen while foreground work runs. A bounded channel
                         // limits producers; this actor never spawns a second model request.
-                        while accepting.live(&interest).any() && foreground(&app) && deadline.is_none_or(|t|t>crate::data::repository::now()) {tokio::select!{_=stopped.changed()=>return,_=tokio::time::sleep(Duration::from_millis(100))=>{}}}
+                        while accepting.live(&interest).any() && foreground(&app) && deadline.is_none_or(|t|t>crate::data::repository::now()) {tokio::select!{_=stopped.changed()=>break,_=tokio::time::sleep(Duration::from_millis(100))=>{}}}
+                        if *stopped.borrow() {continue;}
                         if !accepting.live(&interest).any() || deadline.is_some_and(|t|t<=crate::data::repository::now()){continue;}
                         let ticket=generation.load(Ordering::Acquire);
                         let interrupted_edit=match &job {Job::Edit(e)=>Some(e.clone()),_=>None};
                         let result=match job {
                             Job::Edit(e)=>classify(&app,e,&active,&mut stopped,&generation,ticket).await,
-                            Job::Speech(o)=>operation(&app.state::<DataWorker>(),DbOperation::Observe(o)).await.map(|_|{let _=app.emit_to("main","language:changed",());}).map_err(ModelError::from),
+                            Job::Speech(_)=>{let _=app.emit_to("main","language:changed",());Ok(())},
                             Job::Pending(_)=>unreachable!(),
                         };
                         if let Err(error)=result {
@@ -159,6 +209,7 @@ impl LanguageLearning {
             control,
             interrupted,
             finished,
+            persistence_failed,
         }
     }
     pub fn edit(&self, evidence: EditEvidence) {
@@ -201,12 +252,17 @@ impl LanguageLearning {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.stop.send_replace(true);
     }
-    pub async fn drain(&self) {
+    pub async fn drain(&self) -> Result<(), DataError> {
         let mut finished = self.finished.clone();
         while !*finished.borrow_and_update() {
             if finished.changed().await.is_err() {
-                break;
+                return Err(DataError::new("unavailable"));
             }
+        }
+        if self.persistence_failed.load(Ordering::Acquire) {
+            Err(DataError::new("unavailable"))
+        } else {
+            Ok(())
         }
     }
 }
@@ -734,6 +790,73 @@ pub async fn language_save(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+    fn final_edit() -> EditEvidence {
+        EditEvidence {
+            id: uuid::Uuid::new_v4().to_string(),
+            task: uuid::Uuid::new_v4().to_string(),
+            turn: 1,
+            operation: 2,
+            sequence: 1,
+            region: "tail".into(),
+            expires_at: crate::data::repository::now() + 600000,
+            application: ApplicationContext::from_identity(None, "Codex.exe"),
+            eligibility: LearningEligibility {
+                automatic_terms: Some(1),
+                personalization: Some(1),
+            },
+            raw: "项目名是起蓝".into(),
+            before: "项目名是起蓝".into(),
+            after: "项目名是绮蓝".into(),
+        }
+    }
+    #[tokio::test]
+    async fn shutdown_persists_queued_final_edit_before_database_seal_and_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let data = DataWorker::start(root.path().to_path_buf()).unwrap();
+        let evidence = final_edit();
+        let (sender, mut receiver) = mpsc::channel(16);
+        sender.try_send(Job::Edit(evidence.clone())).unwrap();
+        persist_pending(&data, &mut receiver).await.unwrap();
+        assert!(sender.try_send(Job::Edit(final_edit())).is_err());
+        data.seal_and_drain().await.unwrap();
+        data.shutdown().await;
+        drop(data);
+        // Dropping the final sender wakes the dedicated DB thread. Wait for
+        // that thread to release its OS lease, as a new process must do.
+        let restored = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match DataWorker::start(root.path().to_path_buf()) {
+                    Ok(worker) => break worker,
+                    Err(error) if error.code == "alreadyRunning" => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    Err(error) => panic!("restart failed: {}", error.code),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let DbOutput::PendingEdits(pending) = operation(&restored, DbOperation::PendingEdits)
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, evidence.id);
+        assert_eq!(pending[0].after, evidence.after);
+        restored.shutdown().await;
+    }
+    #[tokio::test]
+    async fn final_evidence_storage_failure_is_not_a_successful_drain() {
+        let root = tempfile::tempdir().unwrap();
+        let data = DataWorker::start(root.path().to_path_buf()).unwrap();
+        data.seal_and_drain().await.unwrap();
+        let (sender, mut receiver) = mpsc::channel(16);
+        sender.try_send(Job::Edit(final_edit())).unwrap();
+        assert!(persist_pending(&data, &mut receiver).await.is_err());
+        data.shutdown().await;
+    }
     #[tokio::test]
     async fn interruption_before_watch_subscription_does_not_poll_configuration() {
         let (_stop, mut stopped) = watch::channel(false);

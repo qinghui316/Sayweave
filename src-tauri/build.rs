@@ -40,6 +40,10 @@ fn main() {
         }
     }
     if channel == "stable" {
+        assert!(
+            std::env::var_os("CARGO_FEATURE_DESKTOP_ACCEPTANCE").is_none(),
+            "acceptance feature in stable build"
+        );
         assert_eq!(
             commit,
             git(&["rev-parse", "HEAD"]),

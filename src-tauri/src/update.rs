@@ -208,7 +208,7 @@ impl UpdateService {
             )
         };
         let root = root.join("update-cache");
-        fs::create_dir_all(&root).map_err(|_| Error::new("cacheWrite"))?;
+        let cache_available = fs::create_dir_all(&root).is_ok();
         let last_check = bounded_read(&root.join("last-check"), 32)
             .ok()
             .and_then(|v| String::from_utf8(v).ok())
@@ -228,6 +228,11 @@ impl UpdateService {
             build,
         };
         let mut candidate = None;
+        if !cache_available {
+            snapshot.state = "failed".into();
+            snapshot.error = Some("无法准备更新缓存，当前程序可以继续使用。".into());
+            snapshot.failure_stage = Some("cacheWrite".into());
+        }
         if snapshot.build.updates_enabled
             && let Ok(bytes) = bounded_read(&root.join("transaction.json"), MAX_METADATA)
             && let Ok(journal) = serde_json::from_slice::<Journal>(&bytes)
@@ -854,5 +859,17 @@ mod tests {
         assert_eq!(bounded_read(&path, 9).unwrap(), b"new value");
         assert!(bounded_read(&path, 8).is_err());
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+    #[test]
+    fn inaccessible_update_cache_does_not_prevent_native_application_setup() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("update-cache"), b"blocked directory").unwrap();
+        let service =
+            UpdateService::new(root.path(), Arc::new(RequestCoordinator::default())).unwrap();
+        assert_eq!(service.snapshot().unwrap().state, "failed");
+        assert_eq!(
+            service.snapshot().unwrap().failure_stage.as_deref(),
+            Some("cacheWrite")
+        );
     }
 }
