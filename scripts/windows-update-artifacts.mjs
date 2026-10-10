@@ -29,7 +29,7 @@ function write(directory,name,bytes,limit=jsonLimit){
  writeFileSync(target(directory,name),bytes);
 }
 function checkProof(proof){
- if(proof?.capabilities?.acceptance!==true||proof.capabilities.installedFixture!==true||proof.capabilities.protocol!==8||proof.markers?.join()!==proofMarkers.join()||typeof proof.rustc!=='string'||!proof.rustc.startsWith('rustc ')||typeof proof.cargo!=='string'||!proof.cargo.startsWith('cargo '))throw Error('Tooling proof is incomplete');
+ if(proof?.registrationClean!==true||proof.capabilities?.acceptance!==true||proof.capabilities.installedFixture!==true||proof.capabilities.protocol!==8||proof.markers?.join()!==proofMarkers.join()||typeof proof.rustc!=='string'||!proof.rustc.startsWith('rustc ')||typeof proof.cargo!=='string'||!proof.cargo.startsWith('cargo '))throw Error('Tooling proof is incomplete');
 }
 export function writeTools(directory,commit,component,probe,proof){
  identity(commit);checkProof(proof);mkdirSync(directory,{recursive:true});root(directory);

@@ -8,7 +8,7 @@ import {readTools,writeTools,readMechanismEvidence,writeMechanismEvidence,proofM
 
 const commit='a'.repeat(40),directories:string[]=[];
 function directory(){const value=mkdtempSync(path.join(os.tmpdir(),'sayweave-evidence-'));directories.push(value);return value;}
-function tools(){return writeTools(directory(),commit,Buffer.from('production DLL'),Buffer.from('acceptance probe'),{rustc:'rustc 1.92',cargo:'cargo 1.92',capabilities:{acceptance:true,installedFixture:true,protocol:8},markers:proofMarkers});}
+function tools(){return writeTools(directory(),commit,Buffer.from('production DLL'),Buffer.from('acceptance probe'),{rustc:'rustc 1.92',cargo:'cargo 1.92',capabilities:{acceptance:true,installedFixture:true,protocol:8},markers:proofMarkers,registrationClean:true});}
 function evidence(){const t=tools(),dir=directory();writeMechanismEvidence(dir,commit,t,{synthetic:true},{passed:true,kind:'mechanism',commit,tools:t.manifest});return dir;}
 afterEach(()=>{for(const dir of directories.splice(0))rmSync(dir,{recursive:true,force:true});});
 describe('immutable Windows acceptance artifact reuse',()=>{

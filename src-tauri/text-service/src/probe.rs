@@ -71,6 +71,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 sayweave_text_service::wire::PROTOCOL
             ),
             #[cfg(feature = "acceptance")]
+            Some("registration-state") => {
+                let profiles = input_profiles()?
+                    .iter()
+                    .filter(|p| p.clsid == registration::CLASS)
+                    .count();
+                let manager: ITfCategoryMgr =
+                    CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)?;
+                let enumerator = manager.EnumCategoriesInItem(&registration::CLASS)?;
+                let mut categories = 0;
+                let mut speech = false;
+                loop {
+                    let mut batch = [windows::core::GUID::default(); 16];
+                    let mut fetched = 0;
+                    enumerator.Next(&mut batch, Some(&mut fetched)).ok()?;
+                    if fetched as usize > batch.len() || categories + fetched > 512 {
+                        return Err("owned category enumeration exceeded bound".into());
+                    }
+                    categories += fetched;
+                    speech |= batch[..fetched as usize].contains(&GUID_TFCAT_TIP_SPEECH);
+                    if fetched == 0 {
+                        break;
+                    }
+                }
+                println!(
+                    "{{\"profiles\":{profiles},\"categories\":{categories},\"speechCategory\":{speech}}}"
+                );
+            }
+            #[cfg(feature = "acceptance")]
             Some("observation-script") => {
                 observation_script(args.get(2).ok_or("owned PID required")?.parse()?)?;
             }
@@ -594,7 +622,7 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         let manager: ITfThreadMgr =
             CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)
                 .map_err(|e| format!("owned manager create: {e}"))?;
-        let thread_client = manager
+        manager
             .Activate()
             .map_err(|e| format!("owned manager activate: {e}"))?;
         println!("owned fixture stage=manager-active");
@@ -686,15 +714,11 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("owned fixture stage=component");
         let (component, processor) = load_processor(&module_path)?;
-        // A directly loaded, unregistered DLL must use this fixture's activated
-        // client. A CLSID lookup does not activate that client on a fresh runner.
-        let service_client = if installed {
-            thread_client
-        } else {
-            manager
-                .cast::<ITfClientId>()?
-                .GetClientId(&registration::CLASS)?
-        };
+        // The runner prepares the real TIP registration before direct loading;
+        // an application client is not a substitute for the service identity.
+        let service_client = manager
+            .cast::<ITfClientId>()?
+            .GetClientId(&registration::CLASS)?;
         println!("owned fixture stage=service client={service_client} direct={installed}");
         processor
             .Activate(&manager, service_client)
