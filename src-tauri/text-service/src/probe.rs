@@ -71,6 +71,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 sayweave_text_service::wire::PROTOCOL
             ),
             #[cfg(feature = "acceptance")]
+            Some("registration-query-detail") => {
+                println!("{}", registration_query_detail()?);
+            }
+            #[cfg(feature = "acceptance")]
+            Some("registration-removal-diagnosis") => {
+                registration_removal_diagnosis(args.get(2).ok_or("DLL path required")?)?;
+            }
+            #[cfg(feature = "acceptance")]
             Some("registration-state") => {
                 let all = input_profiles()?;
                 for profile in all.iter().filter(|p| p.clsid == registration::CLASS) {
@@ -575,6 +583,156 @@ fn observation_script(expected: u32) -> Result<(), Box<dyn std::error::Error>> {
         return Err("owned observation changed keyboard profile".into());
     }
     result
+}
+#[cfg(feature = "acceptance")]
+fn registration_query_detail() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    use windows::Win32::System::Registry::*;
+    unsafe {
+        let all = input_profiles()?;
+        let profile_rows: Vec<_> = all.iter().filter(|p| p.clsid == registration::CLASS).map(|p| {
+            serde_json::json!({"clsid":format!("{:?}",p.clsid),"profile":format!("{:?}",p.guidProfile),
+                "category":format!("{:?}",p.catid),"language":p.langid,"type":p.dwProfileType,"flags":p.dwFlags})
+        }).collect();
+        let category: ITfCategoryMgr =
+            CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)?;
+        let enumerator = category.EnumCategoriesInItem(&registration::CLASS)?;
+        let mut category_rows = Vec::new();
+        loop {
+            let mut batch = [windows::core::GUID::default(); 16];
+            let mut fetched = 0;
+            enumerator.Next(&mut batch, Some(&mut fetched)).ok()?;
+            if fetched as usize > batch.len() || category_rows.len() + fetched as usize > 512 {
+                return Err("category inventory exceeded bound".into());
+            }
+            category_rows.extend(batch[..fetched as usize].iter().map(|g| format!("{g:?}")));
+            if fetched == 0 {
+                break;
+            }
+        }
+        let profiles = registration::profiles()?;
+        let language = profiles.GetCurrentLanguage()?;
+        let legacy = profiles.EnumLanguageProfiles(language)?;
+        let mut legacy_rows = Vec::new();
+        let mut seen = 0;
+        loop {
+            let mut batch = [TF_LANGUAGEPROFILE::default(); 16];
+            let mut fetched = 0;
+            legacy.Next(&mut batch, &mut fetched)?;
+            if fetched as usize > batch.len() || seen + fetched > 512 {
+                return Err("legacy inventory exceeded bound".into());
+            }
+            seen += fetched;
+            legacy_rows.extend(batch[..fetched as usize].iter().filter(|p| p.clsid == registration::CLASS).map(|p| {
+                serde_json::json!({"clsid":format!("{:?}",p.clsid),"profile":format!("{:?}",p.guidProfile),
+                    "category":format!("{:?}",p.catid),"language":p.langid,"active":p.fActive.as_bool()})
+            }));
+            if fetched == 0 {
+                break;
+            }
+        }
+        let mut roots = serde_json::Map::new();
+        for (name, root) in [("user", HKEY_CURRENT_USER), ("machine", HKEY_LOCAL_MACHINE)] {
+            let mut state = serde_json::Map::new();
+            for (label, path) in [
+                (
+                    "tip",
+                    "Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}",
+                ),
+                (
+                    "com",
+                    "Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}",
+                ),
+            ] {
+                let wide: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+                let mut key = HKEY::default();
+                let status = RegOpenKeyExW(
+                    root,
+                    windows::core::PCWSTR(wide.as_ptr()),
+                    None,
+                    KEY_READ,
+                    &mut key,
+                );
+                if status == windows::Win32::Foundation::ERROR_SUCCESS {
+                    RegCloseKey(key).ok()?;
+                    state.insert(label.into(), true.into());
+                } else if status == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND
+                    || status == windows::Win32::Foundation::ERROR_PATH_NOT_FOUND
+                {
+                    state.insert(label.into(), false.into());
+                } else {
+                    status.ok()?;
+                }
+            }
+            roots.insert(name.into(), state.into());
+        }
+        Ok(
+            serde_json::json!({"pid":std::process::id(),"class":format!("{:?}",registration::CLASS),
+            "expectedProfile":format!("{:?}",registration::PROFILE),"profilesClass":format!("{CLSID_TF_InputProcessorProfiles:?}"),
+            "categoryClass":format!("{CLSID_TF_CategoryMgr:?}"),"managerProfiles":profile_rows,
+            "categories":category_rows,"legacyLanguage":language,"legacyProfiles":legacy_rows,"roots":roots}),
+        )
+    }
+}
+#[cfg(feature = "acceptance")]
+fn registration_removal_diagnosis(module: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    if std::env::var("GITHUB_ACTIONS").as_deref() != Ok("true")
+        || std::env::var("RUNNER_ENVIRONMENT").as_deref() != Ok("github-hosted")
+    {
+        return Err("requires disposable GitHub-hosted runner".into());
+    }
+    let module = std::fs::canonicalize(module)?;
+    if std::fs::metadata(&module)?.len() > 32 * 1024 * 1024 {
+        return Err("module exceeds bound".into());
+    }
+    let bytes = std::fs::read(&module)?;
+    println!(
+        "{}",
+        serde_json::json!({"phase":"before","module":module,"sha256":format!("{:x}",Sha256::digest(bytes)),"state":registration_query_detail()?})
+    );
+    std::io::stdout().flush()?;
+    let start = Instant::now();
+    let removed = registration::unregister();
+    println!(
+        "{}",
+        serde_json::json!({"phase":"remove","elapsedMs":start.elapsed().as_millis(),"result":removed.as_ref().map(|_| "ok").map_err(|e| e.to_string())})
+    );
+    std::io::stdout().flush()?;
+    for (phase, sleep) in [
+        ("immediate", 0),
+        ("noPump100", 100),
+        ("noPump500", 400),
+        ("noPump1500", 1000),
+        ("beforePump1500", 0),
+        ("pump2500", 1000),
+        ("pump4500", 2000),
+    ] {
+        if phase.starts_with("pump") {
+            pump(Duration::from_millis(sleep));
+        } else {
+            std::thread::sleep(Duration::from_millis(sleep));
+        }
+        let current = registration_query_detail()?;
+        let mut child = std::process::Command::new(std::env::current_exe()?);
+        use std::os::windows::process::CommandExt;
+        child.creation_flags(0x08000000);
+        let independent = child.arg("registration-query-detail").output()?;
+        if independent.stdout.len() > 131072 || independent.stderr.len() > 8192 {
+            return Err("child query exceeded bound".into());
+        }
+        let child_state: serde_json::Value = if independent.status.success() {
+            serde_json::from_slice(&independent.stdout)?
+        } else {
+            serde_json::json!({"exit":independent.status.code(),"stderr":String::from_utf8_lossy(&independent.stderr)})
+        };
+        println!(
+            "{}",
+            serde_json::json!({"phase":phase,"elapsedMs":start.elapsed().as_millis(),"currentNewCom":current,"independentProcess":child_state})
+        );
+        std::io::stdout().flush()?;
+    }
+    Ok(())
 }
 fn input_profiles() -> windows::core::Result<Vec<TF_INPUTPROCESSORPROFILE>> {
     unsafe {

@@ -308,6 +308,11 @@ try{
  stage('short production DLL actual text');
  const smoke=await command(tools.probe,['installed-fixture',tools.component],root,process.env,undefined,60000);
  for(const marker of proofMarkers)expect(smoke.stdout).toContain(marker);
+ if(process.env.SAYWEAVE_REGISTRATION_DIAGNOSE==='1'){
+  stage('same-binary TSF removal diagnosis');
+  await command(tools.probe,['registration-removal-diagnosis',tools.component],root,process.env,undefined,30000);
+  throw Error('Focused TSF diagnosis complete; deliberately blocked package and acceptance progression');
+ }
  stage('temporary production TIP cleanup');await clearTemporaryRegistration();
  if(report.toolRegistrationPreferenceCleanup)throw Error('Product cleanup cannot rely on a test preference deletion fallback');
  report.normalRegistrationRemoval=report.toolRegistration;
