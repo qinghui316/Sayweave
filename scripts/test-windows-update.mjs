@@ -2,7 +2,7 @@
 import {spawn,execFileSync} from 'node:child_process';
 import {randomUUID,createHash} from 'node:crypto';
 import {createServer} from 'node:https';
-import {mkdirSync,readFileSync,writeFileSync,existsSync,symlinkSync,rmSync,renameSync} from 'node:fs';
+import {mkdirSync,readFileSync,writeFileSync,existsSync,symlinkSync,rmSync,rmdirSync,renameSync} from 'node:fs';
 import path from 'node:path';
 import {chromium,expect} from '@playwright/test';
 import {DatabaseSync} from 'node:sqlite';
@@ -29,7 +29,7 @@ function checkpoint(){
 }
 async function command(file,args,cwd=root,env=process.env,expectedFailure,timeoutMs=30*60_000){
  const started=Date.now(),entry={stage:report.stage,tool:path.basename(file),startedAt:new Date(started).toISOString()};report.commands.push(entry);checkpoint();
- let tail='',stdout='',stderr='';const safe=path.basename(file)==='tsf-probe.exe'||file==='cargo'&&(args.includes('verify-update-signature')||args[0]==='build'&&args.some(arg=>arg.includes('text-service')));
+ let tail='',stdout='',stderr='';const safe=path.basename(file)==='tsf-probe.exe'||file==='powershell'&&args.includes('scripts/windows-update-metadata.ps1')||file==='cargo'&&(args.includes('verify-update-signature')||args[0]==='build'&&args.some(arg=>arg.includes('text-service')));
  if(safe)entry.args=args;
  const diagnostics=path.join(directory,'diagnostics');if(safe)mkdirSync(diagnostics,{recursive:true});
  const child=spawn(file,args,{cwd,env,windowsHide:true,timeout:timeoutMs,stdio:['ignore','pipe','pipe']});
@@ -48,7 +48,7 @@ let server,browser,app,thumbprint,ownedProcess,lastEndpoint,serverMode='valid',p
 let installerDescendants=[];
 let installerTreeConfirmed=false;
 let credentialRequests=0;
-let tools,legacySeed,temporaryRegistration,debugPolicy;
+let tools,legacySeed,temporaryRegistration,temporaryMachineRegistration,temporaryMachineFiles,unknownPreference,debugPolicy;
 async function cleanup(label,action){
  try{await action();return true;}catch(error){report.passed=false;process.exitCode=1;(report.cleanupErrors??=[]).push({stage:label,error:String(error?.message??error?.code??error).slice(0,1024)});return false;}
 }
@@ -114,6 +114,63 @@ async function registrationInventory(timeoutMs=30000){
  return JSON.parse((await command('powershell',['-NoProfile','-Command',script],root,process.env,undefined,timeoutMs)).stdout);
 }
 const registrationEmpty=info=>Object.values(info).every(item=>!item.com&&!item.tip);
+async function characterizeComponent(module,sha256){
+ const result=await command('powershell',['-NoProfile','-ExecutionPolicy','Bypass','-File','scripts/windows-update-metadata.ps1','-ExpectedCommit',commit,'-ProductCommit',commit,'-ExpectedModulePath',module,'-ExpectedComponentSha256',sha256],root,process.env,undefined,30000);
+ const end=result.stdout.indexOf('Read-only metadata receipt:');if(end<0)throw Error('Metadata receipt output missing');
+ const receipt=JSON.parse(result.stdout.slice(0,end).trim());(report.metadataReadings??=[]).push(receipt);checkpoint();expect(receipt.characterization.readComplete).toBe(true);expect(receipt.metadataExpected).toBe(true);return receipt;
+}
+async function clearMachineRegistration(){
+ if(!temporaryMachineRegistration)return;
+ const current=await registrationInventory(),identity=current.HKEY_LOCAL_MACHINE;
+ if(registrationEmpty(current)){await awaitRegistrationState(tools.probe,false);temporaryMachineRegistration=null;return;}
+ if(!identity.com||identity.owner!=='SayweaveStageA-v1'||typeof identity.module!=='string'||!temporaryMachineRegistration.paths.some(module=>moduleKey(module)===moduleKey(identity.module))||createHash('sha256').update(readFileSync(identity.module)).digest('hex')!==temporaryMachineRegistration.sha256)throw Error('Machine metadata fixture ownership changed');
+ await command(tools.probe,['remove-machine'],root,process.env,undefined,30000);
+ report.machineRemoval={inventory:await registrationInventory(),api:await awaitRegistrationState(tools.probe,false)};checkpoint();
+ if(!registrationEmpty(report.machineRemoval.inventory))throw Error('Product machine removal left registrations');
+ temporaryMachineRegistration=null;
+}
+async function clearMachineFiles(){
+ if(!temporaryMachineFiles)return;
+ if(!registrationEmpty(await registrationInventory()))throw Error('Fixture files remain registered; retaining them for diagnosis');
+ await awaitRegistrationState(tools.probe,false);
+ for(const module of temporaryMachineFiles.paths){if(!existsSync(module))continue;if(createHash('sha256').update(readFileSync(module)).digest('hex')!==temporaryMachineFiles.sha256)throw Error('Fixture module changed');rmSync(module);}
+ for(const directory of [...temporaryMachineFiles.directories].reverse()){if(existsSync(directory))rmdirSync(directory);}
+ temporaryMachineFiles=null;
+}
+async function clearUnknownPreference(){
+ if(!unknownPreference)return;
+ const {key,name}=unknownPreference;
+ await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$key=Get-Item -LiteralPath ${quote(key)};if($key.GetValueNames() -contains ${quote(name)}){if($key.GetValueKind(${quote(name)}) -ne [Microsoft.Win32.RegistryValueKind]::DWord -or $key.GetValue(${quote(name)}) -ne 123){throw 'Fixture value changed'};$key.DeleteValue(${quote(name)},$true)}`]);
+ unknownPreference=null;
+}
+async function machineMetadataProof(){
+ stage('owned machine metadata repair and rollback');
+ if(!registrationEmpty(await registrationInventory()))throw Error('Machine metadata proof requires absent registration');
+ const base=path.join(process.env.ProgramFiles,'Sayweave','TextService'),componentHash=createHash('sha256').update(readFileSync(tools.component)).digest('hex');
+ if(existsSync(path.dirname(base)))throw Error('Machine metadata fixture parent already exists');
+ const paths=[componentHash,createHash('sha256').update(`replacement-fixture-${id}`).digest('hex')].map(folder=>path.join(base,folder,'sayweave_text_service.dll'));
+ temporaryMachineFiles={paths,sha256:componentHash,directories:[]};
+ for(const directory of [path.dirname(base),base,...paths.map(module=>path.dirname(module))]){mkdirSync(directory);temporaryMachineFiles.directories.push(directory);}
+ for(const module of paths)writeFileSync(module,readFileSync(tools.component),{flag:'wx'});
+ temporaryMachineRegistration={paths,sha256:componentHash};
+ await command(tools.probe,['register-machine',paths[0]],root,process.env,undefined,30000);
+ const prepared=await registrationInventory();report.machineMetadata={syntheticPaths:true,prepared,initial:await characterizeComponent(paths[0],componentHash)};checkpoint();
+ const leaf=prepared.HKEY_LOCAL_MACHINE.tipEntries.find(entry=>Object.hasOwn(entry.values,'Description'))?.path;
+ if(!leaf)throw Error('Machine metadata profile missing');
+ const key=`Registry::HKEY_LOCAL_MACHINE\\Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}${leaf}`;
+ await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$key=Get-Item -LiteralPath ${quote(key)};$key.SetValue('Description','Sayweave Voice Files',[Microsoft.Win32.RegistryValueKind]::String)`]);
+ const malformed=await registrationInventory();report.machineMetadata.malformed=malformed;checkpoint();
+ await command(tools.probe,['repair-machine-metadata',paths[1],prepared.HKEY_LOCAL_MACHINE.module,'reject-confirmation'],root,process.env,'acceptanceReplacementFailure',30000);
+ expect(await registrationInventory()).toEqual(malformed);report.machineMetadata.rollbackPreserved=true;checkpoint();
+ await command(tools.probe,['repair-machine-metadata',paths[1],prepared.HKEY_LOCAL_MACHINE.module],root,process.env,undefined,30000);
+ const repaired=await registrationInventory(),expected=structuredClone(prepared);expected.HKEY_LOCAL_MACHINE.module=paths[1];
+ expected.HKEY_LOCAL_MACHINE.tipEntries.find(entry=>Object.hasOwn(entry.values,'IconFile')).values.IconFile.value=paths[1];
+ // Register stores the canonical Win32 extended path; replacement preserves the provided path.
+ expect(repaired).toEqual(expected);report.machineMetadata.repaired=await characterizeComponent(paths[1],componentHash);checkpoint();
+ await clearMachineRegistration();
+ await clearMachineFiles();
+ report.checks.push('owned machine replacement repairs malformed raw/API metadata without changing profile enablement; post-write failure restores exact prior registry; native machine removal is empty');
+}
 async function awaitRegistrationState(probe,registered,requireEmptyRoots=true){
  const deadline=Date.now()+10000;let state,stable=0;
  do{
@@ -231,17 +288,29 @@ try{
  const preparedUser=preparedIdentity.HKEY_CURRENT_USER;
  if(!preparedUser.com||preparedUser.owner!=='SayweaveStageA-v1'||typeof preparedUser.module!=='string'||moduleKey(preparedUser.module)!==moduleKey(tools.component)||preparedIdentity.HKEY_LOCAL_MACHINE.com)throw Error('Prepared TIP module identity differs from the verified production DLL');
  temporaryRegistration.prepared=preparedIdentity;
+ stage('unknown user preference refuses native removal');
+ const userLeaf=preparedUser.tipEntries.find(entry=>Object.hasOwn(entry.values,'Enable'))?.path;
+ if(!userLeaf)throw Error('Prepared user preference missing');
+ const userKey=`Registry::HKEY_CURRENT_USER\\Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}${userLeaf}`,unknownName=`Acceptance-${id}`;
+ unknownPreference={key:userKey,name:unknownName};
+ await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$key=Get-Item -LiteralPath ${quote(userKey)};if($key.GetValueNames() -contains ${quote(unknownName)}){throw 'Fixture value exists'};$key.SetValue(${quote(unknownName)},123,[Microsoft.Win32.RegistryValueKind]::DWord)`]);
+ const unknown=await registrationInventory();await command(tools.probe,['remove'],root,process.env,'preferenceIdentityChanged',30000);expect(await registrationInventory()).toEqual(unknown);
+ await clearUnknownPreference();
+ report.checks.push('unknown preference rejects product removal with exact registry and COM anchor retained');
  stage('short production DLL metadata proof');
- const metadataOutput=await command('powershell',['-NoProfile','-ExecutionPolicy','Bypass','-File','scripts/windows-update-metadata.ps1','-ExpectedCommit',commit,'-ProductCommit',commit,'-ExpectedModulePath',preparedUser.module,'-ExpectedComponentSha256',temporaryRegistration.sha256],root,process.env,undefined,30000);
- const metadataEnd=metadataOutput.stdout.indexOf('Read-only metadata receipt:');
- if(metadataEnd<0)throw Error('Metadata receipt output missing');
- report.componentMetadata=JSON.parse(metadataOutput.stdout.slice(0,metadataEnd).trim());checkpoint();
- expect(report.componentMetadata.characterization.readComplete).toBe(true);
- expect(report.componentMetadata.metadataExpected).toBe(true);
+ report.componentMetadata=await characterizeComponent(preparedUser.module,temporaryRegistration.sha256);checkpoint();
  stage('short production DLL actual text');
  const smoke=await command(tools.probe,['installed-fixture',tools.component],root,process.env,undefined,60000);
  for(const marker of proofMarkers)expect(smoke.stdout).toContain(marker);
  stage('temporary production TIP cleanup');await clearTemporaryRegistration();
+ if(report.toolRegistrationPreferenceCleanup)throw Error('Product cleanup cannot rely on a test preference deletion fallback');
+ stage('native registration failure rollback');
+ temporaryRegistration={probe:tools.probe,component:tools.component,initial:await registrationInventory(),sha256:createHash('sha256').update(readFileSync(tools.component)).digest('hex')};
+ await command(tools.probe,['registration-rollback',tools.component],root,process.env,'acceptanceRegistrationFailure',30000);
+ expect(registrationEmpty(await registrationInventory())).toBe(true);await awaitRegistrationState(tools.probe,false);
+ await clearTemporaryRegistration();
+ report.checks.push('failure after profile enablement rolls back native registration, user preference and COM');
+ await machineMetadataProof();
  const proof=tools.manifest?.proof??{...report.compiler,capabilities,markers:proofMarkers,registrationClean:true};
  tools=writeTools(path.join(root,'.local/windows-update-tools'),commit,readFileSync(tools.component),readFileSync(tools.probe),proof);report.tools=tools.manifest;
  if(priorPackages&&priorPackages.manifest.componentSha256!==tools.manifest.artifacts.component.sha256)throw Error('Reusable package component hash differs');
@@ -331,6 +400,9 @@ try{
  }
  }
 }catch(error){report.passed=false;report.failureStage=report.stage;report.error=String(error?.message??error?.code??error);throw error;}finally{
+ await cleanup('temporary unknown preference value',clearUnknownPreference);
+ await cleanup('temporary machine metadata registration',clearMachineRegistration);
+ await cleanup('temporary machine metadata files',clearMachineFiles);
  await cleanup('temporary production TIP registration',clearTemporaryRegistration);
  await cleanup('browser',async()=>{if(browser)await browser.close();});
  await cleanup('application',()=>{if(ownedProcess){const remaining=processes(ownedProcess.ExecutablePath).find(p=>p.ProcessId===ownedProcess.ProcessId&&p.CreationDate===ownedProcess.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}if(app&&app.exitCode===null)app.kill();});

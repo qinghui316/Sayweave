@@ -126,6 +126,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 registration::unregister_machine()?;
                 println!("Removed owned machine speech component.");
             }
+            #[cfg(feature = "acceptance")]
+            Some("repair-machine-metadata") => {
+                registration::acceptance_replace_machine(
+                    args.get(2).ok_or("replacement path required")?,
+                    args.get(3).ok_or("expected owned path required")?,
+                    args.get(4)
+                        .is_some_and(|value| value == "reject-confirmation"),
+                )?;
+                println!("Owned component metadata repaired; profile relationships retained.");
+            }
+            #[cfg(feature = "acceptance")]
+            Some("registration-rollback") => {
+                let path = std::fs::canonicalize(args.get(2).ok_or("DLL path required")?)?;
+                registration::acceptance_registration_rollback(&path.to_string_lossy())?;
+            }
             Some("remove") => {
                 registration::unregister()?;
                 println!("Removed Sayweave speech profile.");
