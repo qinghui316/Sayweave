@@ -84,6 +84,7 @@ pub async fn model_save(
     state: State<'_, ModelService>,
     request: SaveRequest,
 ) -> Result<Overview, ModelError> {
+    let _admission = crate::lifecycle::mutation(&window).map_err(ModelError::from)?;
     observed("model_save", None, state.save(window.label(), request)).await
 }
 #[tauri::command]
@@ -92,6 +93,7 @@ pub async fn model_remove(
     state: State<'_, ModelService>,
     request: RemoveRequest,
 ) -> Result<Overview, ModelError> {
+    let _admission = crate::lifecycle::mutation(&window).map_err(ModelError::from)?;
     observed("model_remove", None, state.remove(window.label(), request)).await
 }
 #[tauri::command]
@@ -100,6 +102,7 @@ pub async fn model_default(
     state: State<'_, ModelService>,
     request: DefaultRequest,
 ) -> Result<Overview, ModelError> {
+    let _admission = crate::lifecycle::mutation(&window).map_err(ModelError::from)?;
     observed(
         "model_default",
         None,
@@ -114,6 +117,7 @@ pub async fn model_fetch(
     draft: NetworkDraft,
     request_id: String,
 ) -> Result<Vec<String>, ModelError> {
+    let _admission = crate::lifecycle::mutation(&window).map_err(ModelError::from)?;
     observed(
         "model_fetch",
         Some(&request_id),
@@ -128,6 +132,7 @@ pub async fn model_test(
     draft: NetworkDraft,
     request_id: String,
 ) -> Result<TestResult, ModelError> {
+    let _admission = crate::lifecycle::mutation(&window).map_err(ModelError::from)?;
     observed(
         "model_test",
         Some(&request_id),

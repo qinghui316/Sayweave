@@ -67,6 +67,26 @@ function RuntimeApp() {
   useEffect(()=>{if(!processing.onArchived)return;let stopped=false;let release:(()=>void)|undefined;void processing.onArchived(dataChanged).then(value=>{if(stopped)value();else release=value;});return()=>{stopped=true;release?.();};},[processing,dataChanged]);
   const [ready,setReady]=useState({model:'',device:''});
   const modelGuard=useRef<((action:()=>void)=>void)|null>(null);
+  const dictionaryGuard=useRef<((action:()=>void)=>void)|null>(null);
+  const updateDictionaryGuard=useCallback((guard:((action:()=>void)=>void)|null)=>{dictionaryGuard.current=guard;},[]);
+  const [updatePreparing,setUpdatePreparing]=useState(false),[updateError,setUpdateError]=useState<string|null>(null);
+  const updateFlight=useRef(false);
+  const installUpdate=()=>{
+    if(updateFlight.current)return;
+    const candidate=updates.snapshot();if(candidate.state!=='readyToInstall'||!candidate.taskId)return;
+    const install=()=>{
+      if(updateFlight.current)return;updateFlight.current=true;setUpdatePreparing(true);setUpdateError(null);
+      const stores=Object.values(settings);stores.forEach(value=>value.pause());
+      void (async()=>{
+        let timer:ReturnType<typeof setTimeout>|undefined;
+        try{await Promise.race([Promise.all(stores.map(value=>value.flush())),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error('设置保存超时，请确认后重试。')),5000);})]);await updates.install(candidate.taskId!,candidate.revision);}
+        catch(error){setUpdateError(error instanceof Error?error.message:'更新准备未完成，请重试。');}
+        finally{clearTimeout(timer);if(!updates.snapshot().recovery)stores.forEach(value=>value.resume());updateFlight.current=false;setUpdatePreparing(false);}
+      })();
+    };
+    const afterModel=()=>dictionaryGuard.current?dictionaryGuard.current(install):install();
+    if(modelGuard.current)modelGuard.current(afterModel);else afterModel();
+  };
   const updateModelGuard=useCallback((guard:((action:()=>void)=>void)|null)=>{modelGuard.current=guard;},[]);
   const snapshot = useSyncExternalStore(store.subscribe,store.getSnapshot);
   const [error,setError]=useState<RuntimeErrorCode | null>(null);
@@ -113,7 +133,6 @@ function RuntimeApp() {
   const startSpeech=()=>{setSpeechFailure('');void ports.speech.start().then(speechStore.accept).catch(e=>setSpeechFailure(speechMessages[speechError(e).code]));};
   const controlSpeech=(action:'finish'|'cancel')=>{const id=speech.snapshot.taskId;if(id)void ports.speech.control(id,action).catch(e=>setSpeechFailure(speechMessages[speechError(e).code]));};
   const occupied=['connecting','recording','processing'].includes(speech.snapshot.phase)||['preparing','recognizing','delivering'].includes(dictation.stage)||dictation.stage==='result'&&['recognizing','delivering'].includes(dictation.presentation);
-  useEffect(()=>{updates.setInstallAllowed(!occupied&&!archiveFailure);},[updates,occupied,archiveFailure]);
   const trialCurrent=trial.snapshot.taskId!==null&&speech.snapshot.taskId===trial.snapshot.taskId&&speech.snapshot.source==='trial'&&(!dictationPorts.dictation||dictation.taskId===trial.snapshot.taskId);
   const trialPhase=!trialCurrent&&['connecting','recording','processing'].includes(trial.snapshot.phase)?'idle':trial.snapshot.phase;
   const startTrial=()=>{
@@ -143,17 +162,17 @@ function RuntimeApp() {
   return <MotionScope enabled={snapshot.windows.main}><div className={s.window}>
     <aside className={s.sidebar}><div className={s.brand} data-tauri-drag-region><img src={brand} alt="" width={24} height={24}/><span>{zh.brand}</span></div>
       <nav className={s.navigation} aria-label={zh.navigation.home}><NavItem to="/" onClick={event=>navigation(event,'/')} icon="house">{zh.navigation.home}</NavItem><NavItem to="/history" onClick={event=>navigation(event,'/history')} icon="clock">{zh.navigation.history}</NavItem><NavItem to="/dictionary" onClick={event=>navigation(event,'/dictionary')} icon="book-open">{zh.navigation.dictionary}</NavItem><NavItem to="/preferences" onClick={event=>navigation(event,'/preferences')} icon="sliders-horizontal">{zh.navigation.preferences}</NavItem></nav>
-      <footer className={s.sidebarFooter}>{import.meta.env.DEV && <Link to="/dev/components" className={s.devEntry}>{zh.dev.component}</Link>}<div className={s.utility}><button onClick={()=>openSettings('device')}><Icon name="settings" size={18}/>{zh.navigation.settings}</button><IconButton label={zh.navigation.about} onClick={()=>openSettings('about')}><Icon name="info" size={18}/></IconButton><UpdateIndicator port={updates}/></div></footer>
+      <footer className={s.sidebarFooter}>{import.meta.env.DEV && <Link to="/dev/components" className={s.devEntry}>{zh.dev.component}</Link>}<div className={s.utility}><button onClick={()=>openSettings('device')}><Icon name="settings" size={18}/>{zh.navigation.settings}</button><IconButton label={zh.navigation.about} onClick={()=>openSettings('about')}><Icon name="info" size={18}/></IconButton><UpdateIndicator port={updates} onOpen={()=>openSettings('about')}/></div></footer>
     </aside>
     <div className={s.body}><header className={s.titlebar} data-tauri-drag-region><IconButton label={zh.window.minimize} onClick={()=>windowAction('main','minimize')}><Icon name="minus" size={16}/></IconButton><IconButton label={zh.window.maximize} onClick={()=>windowAction('main','toggleMaximize')}><Icon name="square" size={16}/></IconButton><IconButton label={zh.window.close} onClick={()=>windowAction('main','hide')}><Icon name="x" size={16}/></IconButton></header>
       <main className={`${s.content} ${location.pathname==='/history'?s.historyContent:''}`}>{archiveFailure&&<div role="status"><InlineMessage status="error">有一条口述未完整保存，已输入的文字不受影响。</InlineMessage><Button onClick={speechStore.dismissArchiveFailure}>关闭</Button></div>}{speechFailure&&!speech.snapshot.error&&<InlineMessage status="error">{speechFailure}</InlineMessage>}{error && <div className={s.error}><InlineMessage status="error">{zh.error[error]}</InlineMessage><Button onClick={()=>{setError(null);setConnection(x=>x+1);}}>{zh.error.retry}</Button></div>}
-        <MotionScope enabled={!settingsVisible}><Routes><Route path="/" element={home}/><Route path="/history" element={<History contentRevision={dataRevision} deliveryRevision={dictation.delivery?[dictation.taskId,dictation.delivery.state,dictation.delivery.error].join(':'):''} reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} recordingSettings={settings.recording} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/><Route path="/dictionary" element={<Dictionary port={dictionary} automaticTerms={settings.automaticTerms}/>}/><Route path="/preferences" element={home}/><Route path="/onboarding" element={<Onboarding/>}/>{DevCatalogue && <Route path="/dev/components" element={<Suspense><DevCatalogue snapshot={snapshot} demo={demo} windowAction={windowAction} resync={()=>store.resync().catch(report)}/></Suspense>}/>}<Route path="*" element={<History contentRevision={dataRevision} deliveryRevision={dictation.delivery?[dictation.taskId,dictation.delivery.state,dictation.delivery.error].join(':'):''} reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} recordingSettings={settings.recording} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/></Routes></MotionScope>
+        <MotionScope enabled={!settingsVisible}><Routes><Route path="/" element={home}/><Route path="/history" element={<History contentRevision={dataRevision} deliveryRevision={dictation.delivery?[dictation.taskId,dictation.delivery.state,dictation.delivery.error].join(':'):''} reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} recordingSettings={settings.recording} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/><Route path="/dictionary" element={<Dictionary port={dictionary} automaticTerms={settings.automaticTerms} onGuardChange={updateDictionaryGuard}/>}/><Route path="/preferences" element={home}/><Route path="/onboarding" element={<Onboarding/>}/>{DevCatalogue && <Route path="/dev/components" element={<Suspense><DevCatalogue snapshot={snapshot} demo={demo} windowAction={windowAction} resync={()=>store.resync().catch(report)}/></Suspense>}/>}<Route path="*" element={<History contentRevision={dataRevision} deliveryRevision={dictation.delivery?[dictation.taskId,dictation.delivery.state,dictation.delivery.error].join(':'):''} reading={reading} visible={snapshot.windows.main&&!settingsOpen} onChanged={dataChanged} recordingSettings={settings.recording} port={ports.history} speech={ports.speech} models={models} snapshot={speech.snapshot}/>}/></Routes></MotionScope>
       </main>
     </div>
     <SettingsShell languagePort={language} visible={snapshot.windows.main} shortcutPort={dictationPorts.shortcuts} textServicePort={dictationPorts.textService} settings={settings} speechPort={ports.speech} open={settingsVisible} tab={activeSettingsTab}
       onTabChange={tab=>guardSettings(()=>{if(preferenceRoute){setSettingsOpen(true);navigate('/',{replace:true});}setSettingsTab(tab);})}
       onOpenChange={open=>{if(!open)guardSettings(()=>{setSettingsOpen(false);if(preferenceRoute)navigate('/',{replace:true});});else setSettingsOpen(true);}}
-      updatePort={updates} modelContent={settingsVisible&&activeSettingsTab==='models'?<ModelPanel extraContent={<ProcessingSettings port={processing} store={settings.polish} revision={dataRevision}/>} onChanged={dataChanged} onHelp={openModelHelp} onSpeech={()=>{setSettingsOpen(false);navigate('/');}} port={models} onGuardChange={updateModelGuard}/>:undefined}/>
+      updatePort={updates} onInstallUpdate={installUpdate} updatePreparing={updatePreparing} updateError={updateError} modelContent={settingsVisible&&activeSettingsTab==='models'?<ModelPanel extraContent={<ProcessingSettings port={processing} store={settings.polish} revision={dataRevision}/>} onChanged={dataChanged} onHelp={openModelHelp} onSpeech={()=>{setSettingsOpen(false);navigate('/');}} port={models} onGuardChange={updateModelGuard}/>:undefined}/>
   </div></MotionScope>;
 }
 export function App() { return <ErrorBoundary><HashRouter><RuntimeApp/></HashRouter></ErrorBoundary>; }

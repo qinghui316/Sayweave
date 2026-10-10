@@ -19,6 +19,7 @@ pub async fn shortcut_save(
     service: State<'_, ShortcutService>,
     config: Config,
 ) -> Result<Status, Error> {
+    let _admission = crate::lifecycle::mutation(&window)?;
     crate::data::model::authorize(window.label())?;
     service.save(&app, config).await
 }
@@ -30,6 +31,7 @@ pub fn shortcut_capture(
     begin: bool,
     token: Option<String>,
 ) -> Result<Status, Error> {
+    let _admission = crate::lifecycle::mutation(&window)?;
     crate::data::model::authorize(window.label())?;
     let status = service.capture_owned(&app, begin, token)?;
     let generation = service.capture_generation();

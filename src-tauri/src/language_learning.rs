@@ -720,6 +720,7 @@ pub async fn language_save(
     data: tauri::State<'_, DataWorker>,
     settings: LanguageSettingsPatch,
 ) -> Result<LanguageSettings, DataError> {
+    let _admission = crate::lifecycle::mutation(&window)?;
     crate::contracts::dictionary::authorize(window.label())?;
     let DbOutput::Settings(value) = operation(&data, DbOperation::SaveSettings(settings)).await?
     else {

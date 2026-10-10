@@ -60,10 +60,15 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           SAYWEAVE_RELEASE_TAG: ${{ github.ref_name }}
           SAYWEAVE_RELEASE_COMMIT: ${{ github.sha }}
+          SAYWEAVE_BUILD_COMMIT: ${{ github.sha }}
+          SAYWEAVE_BUILD_CHANNEL: stable
         run: |
           npm run desktop:package
+          if ($LASTEXITCODE -ne 0) { throw 'Signed package build failed.' }
           npm run desktop:release:manifest
+          if ($LASTEXITCODE -ne 0) { throw 'Manifest generation failed.' }
           npm run desktop:release:verify
+          if ($LASTEXITCODE -ne 0) { throw 'Release verification failed.' }
       - name: Create immutable draft
         shell: pwsh
         env:
@@ -71,13 +76,16 @@ jobs:
         run: |
           gh release view '${{ github.ref_name }}' --repo '${{ github.repository }}' 2>$null
           if ($LASTEXITCODE -eq 0) { throw 'Release tag already exists.' }
-          $notes = "release-notes/$($env:GITHUB_REF_NAME).json"
+          $notes = 'release/release-notes.md'
           if (-not (Test-Path -LiteralPath $notes)) { throw "Release notes are missing: $notes" }
           gh release create '${{ github.ref_name }}' --repo '${{ github.repository }}' --draft --verify-tag --target '${{ github.sha }}' --title "Sayweave ${{ github.ref_name }}" --notes-file $notes release/sayweave/*
+          if ($LASTEXITCODE -ne 0) { throw 'Immutable draft creation failed.' }
       - name: Re-download and verify draft
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          SAYWEAVE_RELEASE_TAG: ${{ github.ref_name }}
+          SAYWEAVE_RELEASE_COMMIT: ${{ github.sha }}
         run: |
           $download = Join-Path $env:RUNNER_TEMP 'sayweave-release'
           New-Item -ItemType Directory -Force -Path $download | Out-Null
@@ -86,9 +94,49 @@ jobs:
           $env:SAYWEAVE_RELEASE_DIR = $download
           node scripts/verify-update-release.mjs
 
-  publish:
+  accept-installer:
     if: startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave'
     needs: draft
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SAYWEAVE_RELEASE_TAG: ${{ github.ref_name }}
+      SAYWEAVE_RELEASE_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Verify and actually install the draft package
+        shell: pwsh
+        run: |
+          $download = Join-Path $env:RUNNER_TEMP 'sayweave-draft-acceptance'
+          New-Item -ItemType Directory -Path $download | Out-Null
+          gh release download '${{ github.ref_name }}' --repo '${{ github.repository }}' --dir $download
+          if ($LASTEXITCODE -ne 0) { throw 'Draft download failed.' }
+          $env:SAYWEAVE_RELEASE_DIR = $download
+          node scripts/verify-update-release.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Draft identity verification failed.' }
+          node scripts/test-windows-update.mjs --stable-installer (Join-Path $download "Sayweave_$(node -p "require('./package.json').version")_x64-setup.exe")
+          if ($LASTEXITCODE -ne 0) { throw 'Draft installation acceptance failed.' }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: stable-install-acceptance
+          path: |
+            .local/windows-update-acceptance.json
+            .local/windows-update/*/acceptance.json
+            .local/windows-update/*/native-*.png
+          if-no-files-found: error
+  publish:
+    if: startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave'
+    needs: accept-installer
     runs-on: windows-latest
     environment: windows-release
     permissions:
@@ -107,12 +155,16 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          SAYWEAVE_RELEASE_TAG: ${{ github.ref_name }}
+          SAYWEAVE_RELEASE_COMMIT: ${{ github.sha }}
         run: |
           $download = Join-Path $env:RUNNER_TEMP 'sayweave-approved-release'
           New-Item -ItemType Directory -Force -Path $download | Out-Null
           gh release download '${{ github.ref_name }}' --repo '${{ github.repository }}' --dir $download
+          if ($LASTEXITCODE -ne 0) { throw 'Approved draft download failed.' }
           $env:SAYWEAVE_RELEASE_DIR = $download
           node scripts/verify-update-release.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Approved draft verification failed.' }
       - name: Publish latest release
         shell: pwsh
         env:

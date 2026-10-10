@@ -574,7 +574,7 @@ async fn main_only_queue_shutdown_and_missing_credential() {
         "credentialMissing"
     );
     s.begin_shutdown();
-    s.finish_shutdown().await;
+    s.finish_shutdown().await.unwrap();
     assert_eq!(
         s.save("main", request("no", vec![Usage::Text]))
             .await

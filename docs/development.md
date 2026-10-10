@@ -41,7 +41,7 @@ npm run build
 npm run desktop:build
 ```
 
-桌面 dev/build 包装先编译独立 TSF DLL，再通过构建期变量嵌入主程序；构建仍执行 `tauri build --no-bundle`。通常生成 `src-tauri/target/release/sayweave.exe`；显式 `--target x86_64-pc-windows-msvc` 时位于对应目标子目录。关闭开发服务后可以独立运行，它不是应用安装包。应用签名及整体自动更新尚未配置。
+桌面 dev/build 包装先编译独立 TSF DLL，再通过构建期变量嵌入主程序；构建仍执行 `tauri build --no-bundle`。通常生成 `src-tauri/target/release/sayweave.exe`；显式 `--target x86_64-pc-windows-msvc` 时位于对应目标子目录。关闭开发服务后可以独立运行。普通源码／日常构建使用开发渠道，禁用公开自动更新；正式签名安装包和隔离更新验收见 [发布说明](release.md)。
 
 在「设备与快捷键 → 原位输入」中启用当前用户的组件。首次安装、版本更新及移除经 Windows UAC 确认，由主程序固定 helper 操作受保护的 Program Files 目录；不替换默认键盘输入法。更新使用 DLL 内容哈希目录，保留正在被输入软件加载的旧版本；更新后重开输入软件再验收。移除先注销登记，仍被使用的组件文件显示待清理，可在关闭输入软件后重试。直接 Cargo 检查不嵌入安装载荷，仍能使用已安装的组件；标准桌面命令负责可交付程序的载荷。
 

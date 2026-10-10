@@ -1,6 +1,8 @@
 #[cfg(feature = "desktop-acceptance")]
 mod acceptance;
+mod application_exit;
 mod archive;
+mod build_info;
 mod contracts;
 mod coordinator;
 mod data;
@@ -9,6 +11,7 @@ mod history;
 mod input_state;
 mod language_learning;
 mod language_policy;
+mod lifecycle;
 mod models;
 mod network;
 mod processing;
@@ -18,6 +21,10 @@ mod speech;
 mod speech_projection;
 mod task_stop;
 mod text_service;
+mod update;
+#[cfg(feature = "desktop-acceptance")]
+mod update_acceptance;
+pub mod update_signature;
 mod voice_window;
 pub use text_service::helper_entry as text_service_helper_entry;
 use text_service::{text_service_action, text_service_status};
@@ -377,31 +384,22 @@ fn tray_action(app: &tauri::AppHandle, id: &str) -> Result<(), RuntimeError> {
                 state.revision, state.session.phase
             );
             drop(state);
-            let service = app.state::<models::ModelService>();
-            app.state::<shortcuts::ShortcutService>().shutdown(app);
-            app.state::<dictation::DictationCoordinator>().shutdown();
-            app.state::<speech::SpeechService>().shutdown();
-            app.state::<windows_input::WindowsInputService>().shutdown();
-            app.state::<language_learning::LanguageLearning>()
-                .shutdown();
-            service.begin_shutdown();
+            let lifecycle = app.state::<lifecycle::Lifecycle>();
+            let _ = lifecycle.fence(|| false);
+            let watermark = archive::watermark();
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
-                let service = app.state::<models::ModelService>();
-                let _ = tokio::time::timeout(Duration::from_secs(5), async {
-                    app.state::<shortcuts::ShortcutService>().drain(&app).await;
-                    app.state::<speech::SpeechService>().drain().await;
-                    app.state::<dictation::DictationCoordinator>().drain().await;
-                    app.state::<windows_input::WindowsInputService>()
+                let stopped = tokio::time::timeout(Duration::from_secs(5), async {
+                    app.state::<lifecycle::Lifecycle>()
                         .drain()
-                        .await;
-                    crate::archive::drain().await;
-                    app.state::<language_learning::LanguageLearning>()
-                        .drain()
-                        .await;
-                    service.finish_shutdown().await;
+                        .await
+                        .map_err(str::to_owned)?;
+                    application_exit::stop(&app, watermark).await
                 })
                 .await;
+                if !matches!(stopped, Ok(Ok(()))) {
+                    log::error!(target:"sayweave","operation=shutdown result=failed");
+                }
                 log::logger().flush();
                 app.exit(0);
             });
@@ -472,6 +470,7 @@ async fn dictionary_create(
     state: State<'_, DataWorker>,
     input: Input,
 ) -> Result<Record, DataError> {
+    let _admission = lifecycle::mutation(&window)?;
     match state
         .request(window.label(), Operation::Create(input))
         .await?
@@ -488,6 +487,7 @@ async fn dictionary_update(
     id: String,
     revision: i64,
 ) -> Result<Record, DataError> {
+    let _admission = lifecycle::mutation(&window)?;
     match state
         .request(window.label(), Operation::Update(input, id, revision))
         .await?
@@ -504,6 +504,7 @@ async fn dictionary_delete(
     id: String,
     revision: i64,
 ) -> Result<(), DataError> {
+    let _admission = lifecycle::mutation(&window)?;
     match state
         .request(window.label(), Operation::Delete(kind, id, revision))
         .await?
@@ -543,7 +544,6 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, _shortcut, event| {
@@ -556,6 +556,7 @@ pub fn run() {
         .manage(dictation::DictationCoordinator::default())
         .manage(windows_input::WindowsInputService::new())
         .manage(Runtime(Mutex::new(Snapshot::default())))
+        .manage(lifecycle::Lifecycle::default())
         .on_page_load(|webview, payload| {
             if webview.label() == "main"
                 && payload.event() == tauri::webview::PageLoadEvent::Started
@@ -567,6 +568,19 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            update::update_snapshot,
+            update::update_check,
+            update::update_cancel,
+            update::update_install,
+            update::update_restart,
+            #[cfg(feature = "desktop-acceptance")]
+            update_acceptance::acceptance_update_seed,
+            #[cfg(feature = "desktop-acceptance")]
+            update_acceptance::acceptance_update_data,
+            #[cfg(feature = "desktop-acceptance")]
+            update_acceptance::acceptance_update_exit,
+            #[cfg(feature = "desktop-acceptance")]
+            update_acceptance::acceptance_update_hold,
             processing_commands::processing_status,
             processing_commands::processing_settings,
             processing_commands::processing_save,
@@ -625,6 +639,9 @@ pub fn run() {
             acceptance_main_size
         ])
         .setup(|app| {
+            if app.config().identifier != env!("SAYWEAVE_BUILD_IDENTIFIER") {
+                return Err("compiled application identity mismatch".into());
+            }
             let base = app.path().app_data_dir()?;
             #[cfg(feature = "desktop-acceptance")]
             let base = match std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID") {
@@ -639,7 +656,8 @@ pub fn run() {
             #[cfg(feature = "desktop-acceptance")]
             println!("SAYWEAVE_DATA_DIRECTORY {}", root.display());
             let namespace = format!(
-                "local.sayweave.skeleton.{}",
+                "{}.{}",
+                env!("SAYWEAVE_BUILD_IDENTIFIER"),
                 if cfg!(debug_assertions) {
                     "dev"
                 } else {
@@ -655,13 +673,14 @@ pub fn run() {
             };
             match DataWorker::start(root.clone()) {
                 Ok(worker) => {
-                    let service = models::ModelService::new(
-                        worker.clone(),
-                        namespace,
-                        &root,
-                        std::sync::Arc::new(network::RequestCoordinator::default()),
-                    )
-                    .map_err(|e| e.code)?;
+                    let requests = std::sync::Arc::new(network::RequestCoordinator::default());
+                    app.manage(
+                        update::UpdateService::new(&root, requests.clone())
+                            .map_err(|e| format!("update setup: {e:?}"))?,
+                    );
+                    let service =
+                        models::ModelService::new(worker.clone(), namespace, &root, requests)
+                            .map_err(|e| e.code)?;
                     app.manage(service);
                     app.manage(speech::SpeechService::new(history::HistoryService::new(
                         worker.clone(),
@@ -672,6 +691,7 @@ pub fn run() {
                     app.manage(language_learning::LanguageLearning::new(
                         app.handle().clone(),
                     ));
+                    update::schedule(app.handle().clone());
                     let handle = app.handle().clone();
                     let mut transcripts = handle
                         .state::<speech::SpeechService>()

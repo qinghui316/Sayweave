@@ -37,7 +37,11 @@ export function useSelectionHighlight() {
     };
     const schedule = () => { if (!frame) frame = requestAnimationFrame(paint); };
     const pointer = (event: Event) => { const row=event.target instanceof HTMLElement?event.target.closest<HTMLElement>(rowSelector):null;if(row)hovered=row;schedule(); };
-    const focus = () => { hovered = null; schedule(); };
+    const focus = (event: Event) => {
+      // Radix focuses the container when the pointer leaves an item; preserve browsing there.
+      if (event.type === 'keydown' || event.target instanceof HTMLElement && event.target.closest(rowSelector)) hovered = null;
+      schedule();
+    };
     const leave = () => { schedule(); }; // Remember the last browsed row until keyboard/focus takes over.
     const resize = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(schedule);
     const observeRows=()=>{resize?.disconnect();resize?.observe(root);root.querySelectorAll(rowSelector).forEach(row=>resize?.observe(row));};

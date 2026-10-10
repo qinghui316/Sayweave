@@ -55,6 +55,7 @@ pub struct DataWorker {
     sender: mpsc::Sender<Request>,
     status: Arc<Mutex<Status>>,
     stopping: Arc<AtomicBool>,
+    sealed: Arc<AtomicBool>,
     dispatch: Arc<Mutex<()>>,
     root: PathBuf,
     journal_io: Arc<Mutex<()>>,
@@ -243,6 +244,7 @@ impl DataWorker {
             sender,
             status,
             stopping: Arc::new(AtomicBool::new(false)),
+            sealed: Arc::new(AtomicBool::new(false)),
             dispatch: Arc::new(Mutex::new(())),
             root: worker_root,
             journal_io,
@@ -314,6 +316,7 @@ impl DataWorker {
                 | Operation::History(crate::contracts::history::DbOperation::PruneCancelled { .. })
         ) {
             if !self.lease_active.load(Ordering::Acquire)
+                || self.sealed.load(Ordering::Acquire)
                 || (self.stopping.load(Ordering::Acquire) && !admitted)
             {
                 return Err(DataError::new("unavailable"));
@@ -332,7 +335,9 @@ impl DataWorker {
                 .dispatch
                 .lock()
                 .map_err(|_| DataError::new("unavailable"))?;
-            if self.stopping.load(Ordering::Acquire) && !admitted {
+            if self.sealed.load(Ordering::Acquire)
+                || (self.stopping.load(Ordering::Acquire) && !admitted)
+            {
                 return Err(DataError::new("unavailable"));
             }
             self.sender
@@ -373,28 +378,38 @@ impl DataWorker {
         .map_err(|_| DataError::new("unavailable"))??;
         Ok(())
     }
+    #[cfg(test)]
     pub fn begin_shutdown(&self) {
         if let Ok(_guard) = self.dispatch.lock() {
             self.stopping.store(true, Ordering::Release);
         }
     }
+    #[cfg(test)]
     pub async fn shutdown(&self) {
-        self.begin_shutdown();
+        let _ = self.seal_and_drain().await;
+    }
+    pub async fn seal_and_drain(&self) -> Result<(), DataError> {
+        {
+            let _dispatch = self
+                .dispatch
+                .lock()
+                .map_err(|_| DataError::new("unavailable"))?;
+            self.stopping.store(true, Ordering::Release);
+            self.sealed.store(true, Ordering::Release);
+        }
         let (response, receive) = oneshot::channel();
-        if self
-            .sender
+        self.sender
             .send(Request {
                 operation: Operation::Drain,
                 response,
                 queued: Instant::now(),
             })
             .await
-            .is_ok()
-        {
-            let _ = receive.await;
-        }
+            .map_err(|_| DataError::new("unavailable"))?;
+        receive.await.map_err(|_| DataError::new("unavailable"))??;
         if let Ok(mut status) = self.status.lock() {
             status.state = "stopping".into();
         }
+        Ok(())
     }
 }

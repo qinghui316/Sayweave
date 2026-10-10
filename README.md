@@ -43,4 +43,4 @@ Sayweave 采用 [Apache-2.0](./LICENSE) 开源。第三方字体、图标及动�
 
 ## Windows 发布与更新
 
-公开安装包发布在 [GitHub Releases](https://github.com/qinghui316/Sayweave/releases)。安装后的稳定版会在后台检查新版本，下载时显示圆形进度；下载完成后由用户点击“重启并更新”。源码构建用于开发和验证，不会接入稳定版更新通道。
+公开安装包位于 [GitHub Releases](https://github.com/qinghui316/Sayweave/releases)。当前故障发行版已撤下，修复版 0.1.7 完成验收前暂停下载。已安装旧版的用户需要手动覆盖安装修复版；后续正式版本提供应用内更新。源码及日常开发构建使用独立构建渠道，不接收公开自动更新。

@@ -79,6 +79,7 @@ pub(crate) async fn stop_observer() -> Result<(), Error> {
         && let Err(error) = old.close().await
     {
         log::info!(target:"sayweave","operation=observation_retire result=failed error={}",error.code);
+        return Err(error);
     }
     Ok(())
 }
