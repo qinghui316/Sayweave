@@ -41,7 +41,7 @@ let server,browser,app,thumbprint,ownedProcess,lastEndpoint,serverMode='valid',p
 let installerDescendants=[];
 let installerTreeConfirmed=false;
 let credentialRequests=0;
-let tools,legacySeed;
+let tools,legacySeed,temporaryRegistration;
 async function cleanup(label,action){
  try{await action();return true;}catch(error){report.passed=false;process.exitCode=1;(report.cleanupErrors??=[]).push({stage:label,error:String(error?.message??error?.code??error).slice(0,1024)});return false;}
 }
@@ -93,6 +93,24 @@ function componentIdentity(){
  return {module,sha256:createHash('sha256').update(readFileSync(module)).digest('hex')};
 }
 function quote(value){return "'"+value.replaceAll("'","''")+"'";}
+async function registrationInventory(){
+ const script="$ErrorActionPreference='Stop';$items=@{};foreach($scope in @('HKEY_CURRENT_USER','HKEY_LOCAL_MACHINE')){$base='Registry::'+$scope;$com=$base+'\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$tip=$base+'\\Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$item=@{com=(Test-Path -LiteralPath $com);tip=(Test-Path -LiteralPath $tip);module=$null;owner=$null};if(Test-Path -LiteralPath ($com+'\\InprocServer32')){$key=Get-Item -LiteralPath ($com+'\\InprocServer32');$item.module=$key.GetValue('');$item.owner=$key.GetValue('SayweaveOwner')};$items[$scope]=$item};ConvertTo-Json -InputObject $items -Compress";
+ return JSON.parse((await command('powershell',['-NoProfile','-Command',script],root,process.env,undefined,30000)).stdout);
+}
+const registrationEmpty=info=>Object.values(info).every(item=>!item.com&&!item.tip);
+function moduleKey(value){return (value.startsWith('\\\\?\\')?value.slice(4):value).toLowerCase();}
+async function clearTemporaryRegistration(){
+ if(!temporaryRegistration)return;
+ const before=await registrationInventory(),user=before.HKEY_CURRENT_USER,machine=before.HKEY_LOCAL_MACHINE;
+ if(!registrationEmpty(before)){
+  if(!user.com||user.owner!=='SayweaveStageA-v1'||typeof user.module!=='string'||moduleKey(user.module)!==moduleKey(temporaryRegistration.component)||machine.com)throw Error('Temporary TIP identity is unavailable or changed; no blind removal');
+  await command(temporaryRegistration.probe,['remove'],root,process.env,undefined,30000);
+ }
+ const after=await registrationInventory(),state=await command(temporaryRegistration.probe,['registration-state'],root,process.env,undefined,30000);
+ const profiles=JSON.parse(state.stdout.trim());expect(profiles).toEqual({profiles:0,categories:0,speechCategory:false});
+ if(!registrationEmpty(after))throw Error('Temporary TIP registration was not fully removed');
+ report.toolRegistration={before,after,profiles,removed:true};temporaryRegistration=null;
+}
 function restoreInstallAcl(){
  if(!deniedDirectory)return;
  const script=`$acl=Get-Acl -LiteralPath ${quote(deniedDirectory)};$acl.SetSecurityDescriptorSddlForm(${quote(originalAcl)});Set-Acl -LiteralPath ${quote(deniedDirectory)} -AclObject $acl`;
@@ -155,9 +173,19 @@ try{
  }
  stage('short production DLL tooling proof');
  const capability=await command(tools.probe,['capabilities']);const capabilities=JSON.parse(capability.stdout.trim());expect(capabilities).toEqual({acceptance:true,installedFixture:true,protocol:8});
+ stage('temporary production TIP preparation');
+ const initialRegistration=await registrationInventory(),initialProfiles=await command(tools.probe,['registration-state'],root,process.env,undefined,30000);
+ expect(JSON.parse(initialProfiles.stdout.trim())).toEqual({profiles:0,categories:0,speechCategory:false});
+ if(!registrationEmpty(initialRegistration))throw Error('Short tooling requires an empty owned TIP registration');
+ temporaryRegistration={probe:tools.probe,component:tools.component};
+ await command(tools.probe,['register',tools.component],root,process.env,undefined,30000);
+ const prepared=JSON.parse((await command(tools.probe,['registration-state'],root,process.env,undefined,30000)).stdout.trim());
+ expect(prepared.profiles).toBeGreaterThan(0);expect(prepared.speechCategory).toBe(true);report.toolRegistrationPrepared=prepared;
+ stage('short production DLL actual text');
  const smoke=await command(tools.probe,['installed-fixture',tools.component],root,process.env,undefined,60000);
  for(const marker of proofMarkers)expect(smoke.stdout).toContain(marker);
- const proof=tools.manifest?.proof??{...report.compiler,capabilities,markers:proofMarkers};
+ stage('temporary production TIP cleanup');await clearTemporaryRegistration();
+ const proof=tools.manifest?.proof??{...report.compiler,capabilities,markers:proofMarkers,registrationClean:true};
  tools=writeTools(path.join(root,'.local/windows-update-tools'),commit,readFileSync(tools.component),readFileSync(tools.probe),proof);report.tools=tools.manifest;
  report.checks.push('separate production DLL/acceptance probe; capabilities, actual protocol/control text, absent fault export and final COM unload passed');
  if(toolsOnly){report.passed=true;}
@@ -230,6 +258,7 @@ try{
  }
  }
 }catch(error){report.passed=false;report.failureStage=report.stage;report.error=String(error?.message??error?.code??error);throw error;}finally{
+ await cleanup('temporary production TIP registration',clearTemporaryRegistration);
  await cleanup('browser',async()=>{if(browser)await browser.close();});
  await cleanup('application',()=>{if(ownedProcess){const remaining=processes(ownedProcess.ExecutablePath).find(p=>p.ProcessId===ownedProcess.ProcessId&&p.CreationDate===ownedProcess.CreationDate);if(remaining)execFileSync('taskkill',['/PID',String(remaining.ProcessId),'/T','/F'],{stdio:'ignore'});}if(app&&app.exitCode===null)app.kill();});
  const installersStopped=await cleanup('interrupted installer tree',async()=>{

@@ -48,7 +48,7 @@ npm run desktop:release:verify
 
 ## 真实 Windows 验收
 
-验收分为工具、更新机制和正式安装包三个独立阶段。先运行 `node scripts/test-windows-update.mjs --tools-only`：从精确提交归档分别在 `component-target` 和 `probe-target` 构建正式 DLL 与启用 `acceptance` 的探针，验证 `capabilities` 及 `installed-fixture`。后者加载明确指定的正式 DLL，检查实际 EDIT 文字、协议8、故障注入导出缺失及 COM 最终卸载；短检查失败时不会导入证书、签名或构建安装包。
+验收分为工具、更新机制和正式安装包三个独立阶段。先运行 `node scripts/test-windows-update.mjs --tools-only`：从精确提交归档分别在 `component-target` 和 `probe-target` 构建正式 DLL 与启用 `acceptance` 的探针，验证 `capabilities` 及 `installed-fixture`。短检查在一次性机器临时注册正式 TIP，以真实服务身份加载明确指定的 DLL，检查实际 EDIT 文字、协议8、故障注入导出缺失及 COM 最终卸载。注册前检查 HKCU/HKLM 的本组件 COM/TIP 和 TSF 资料均为空；收尾只移除路径与所有者匹配的本次注册，确认两处注册及资料均已移除后才通过。TSF 注册 API 可能修改机器元数据，不能称为只写 HKCU。短检查失败时不会导入证书、签名或构建安装包。
 
 通过后使用 `--tools-dir <工具目录>` 运行机制验收，构建两份隔离版本。每次打包前后重新核对工具哈希，包内组件只来自正式 DLL 目录。所有清理成功后才生成可复用的 `windows-update-evidence`，绑定完整提交、工具哈希、成功机制记录和有界合成数据；不上传签名私钥、证书私钥或凭据值。
 
