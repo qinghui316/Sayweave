@@ -505,9 +505,8 @@ fn register_profile(
             if category_cleanup.is_err()
                 || profile_cleanup.is_err()
                 || clear_user_preferences().is_err()
-                || exists(HKEY_LOCAL_MACHINE, TIP_ROOT)?
-                || !owned_languages(&profiles()?)?.is_empty()
-                || owned_category_count()? != 0
+                || confirm_registry_removal().is_err()
+                || !com_anchor_matches(root, &string_bytes(OWNER), &string_bytes(path))?
             {
                 // Keep the owned COM path and protected binary for an explicit retry.
                 return Err(windows::core::Error::new(
@@ -603,6 +602,16 @@ fn unregister_scope(root: HKEY) -> windows::core::Result<()> {
                 "registrationOwnerMismatch",
             ));
         }
+        let anchor = open_existing(root, COM_PATH, KEY_READ)?.ok_or_else(preference_error)?;
+        let expected_owner = raw_string(&anchor, "SayweaveOwner")?;
+        let expected_module = raw_string(&anchor, "")?;
+        drop(anchor);
+        if expected_owner != string_bytes(OWNER) {
+            return Err(windows::core::Error::new(
+                E_ACCESSDENIED,
+                "registrationOwnerMismatch",
+            ));
+        }
         // Refuse an unknown preference tree while the owned COM anchor is retryable.
         user_preferences()?;
         owned_languages(&profiles()?)?;
@@ -621,16 +630,9 @@ fn unregister_scope(root: HKEY) -> windows::core::Result<()> {
         category?;
         profile?;
         clear_user_preferences()?;
-        let machine_remaining = exists(HKEY_LOCAL_MACHINE, TIP_ROOT)?;
-        let profiles_remaining = owned_languages(&profiles()?)?.len();
-        let categories_remaining = owned_category_count()?;
-        if machine_remaining || profiles_remaining != 0 || categories_remaining != 0 {
-            return Err(windows::core::Error::new(
-                E_FAIL,
-                format!(
-                    "profileRemovalIncomplete machine={machine_remaining} profiles={profiles_remaining} categories={categories_remaining}"
-                ),
-            ));
+        confirm_registry_removal()?;
+        if !com_anchor_matches(root, &expected_owner, &expected_module)? {
+            return Err(preference_error());
         }
         let status = RegDeleteTreeW(root, PCWSTR(wide(COM_ROOT).as_ptr()));
         if status != ERROR_SUCCESS && status != ERROR_FILE_NOT_FOUND {
@@ -638,6 +640,26 @@ fn unregister_scope(root: HKEY) -> windows::core::Result<()> {
         }
         Ok(())
     }
+}
+fn com_anchor_matches(root: HKEY, owner: &[u8], module: &[u8]) -> windows::core::Result<bool> {
+    let Some(key) = open_existing(root, COM_PATH, KEY_READ)? else {
+        return Ok(false);
+    };
+    Ok(raw_string(&key, "SayweaveOwner")? == owner && raw_string(&key, "")? == module)
+}
+fn confirm_registry_removal() -> windows::core::Result<()> {
+    let machine = exists(HKEY_LOCAL_MACHINE, TIP_ROOT)?;
+    let user = exists(HKEY_CURRENT_USER, TIP_ROOT)?;
+    if machine || user {
+        return Err(windows::core::Error::new(
+            E_FAIL,
+            format!("profileRemovalIncomplete machine={machine} user={user}"),
+        ));
+    }
+    // TSF category enumeration can retain this process's pre-removal inventory.
+    // Successful native removals and absent persisted roots establish cleanup;
+    // acceptance separately confirms profiles/categories in a new process.
+    Ok(())
 }
 
 fn open_existing(
