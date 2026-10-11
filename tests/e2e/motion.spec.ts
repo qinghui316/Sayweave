@@ -1,8 +1,10 @@
 import { test, expect } from '@playwright/test';
 import { writeFile } from 'node:fs/promises';
 
-test('password geometry/caret and async examples have no service side effects', async ({ page }) => {
-  const requests: string[] = []; page.on('request', req => { if (req.url().startsWith('http') && !req.url().startsWith('http://127.0.0.1:5173')) requests.push(req.url()); });
+test('password geometry/caret and async examples have no service side effects', async ({ page,baseURL }) => {
+  if(!baseURL)throw new Error('Product test server is required');
+  const origin=new URL(baseURL).origin;
+  const requests: string[] = []; page.on('request', req => { if (req.url().startsWith('http') && new URL(req.url()).origin!==origin) requests.push(req.url()); });
   await page.goto('/#/dev/components');
   const input = page.getByLabel('演示密钥', { exact: true }); const before = await input.boundingBox();
   await input.evaluate((node: HTMLInputElement) => node.setSelectionRange(2, 5));

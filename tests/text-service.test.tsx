@@ -21,7 +21,7 @@ describe('component lifecycle',()=>{
   expect(action.mock.calls.map(c=>c[0])).toEqual(['install','disable','enable','remove']);
  });
  it('retains the saved status after a failed action and ignores late replies after unmount',async()=>{
-  const value:TextServiceStatus={installed:true,enabled:false,updateAvailable:false,payloadAvailable:true,cleanupPending:false,error:null};
+  const value:TextServiceStatus={installed:true,enabled:false,updateAvailable:false,payloadAvailable:true,cleanupPending:false,deploymentState:'ready',error:null};
   let resolve!:(v:TextServiceStatus)=>void;
   const port:TextServicePort={mode:'native',status:async()=>value,act:vi.fn().mockRejectedValueOnce({code:'componentEnableFailed'}).mockImplementationOnce(()=>new Promise<TextServiceStatus>(r=>{resolve=r;}))};
   const view=render(<TextServiceSettings port={port}/>),user=userEvent.setup();
@@ -33,21 +33,21 @@ describe('component lifecycle',()=>{
   view.unmount();await act(async()=>{resolve({...value,enabled:true});});
  });
  it('rejects impossible native state combinations',()=>{
-  expect(()=>parseTextService({installed:false,enabled:true,updateAvailable:false,payloadAvailable:true,cleanupPending:false,error:null})).toThrow();
-  expect(()=>parseTextService({installed:true,enabled:true,updateAvailable:true,payloadAvailable:false,cleanupPending:false,error:null})).toThrow();
+  expect(()=>parseTextService({installed:false,enabled:true,updateAvailable:false,payloadAvailable:true,cleanupPending:false,deploymentState:'ready',error:null})).toThrow();
+  expect(()=>parseTextService({installed:true,enabled:true,updateAvailable:true,payloadAvailable:false,cleanupPending:false,deploymentState:'ready',error:null})).toThrow();
  });
  it('keeps repair available when an owned registration has lost its module',async()=>{
-  const damaged:TextServiceStatus={installed:true,enabled:false,updateAvailable:true,payloadAvailable:true,cleanupPending:false,error:'componentRegistration'};
+  const damaged:TextServiceStatus={installed:true,enabled:false,updateAvailable:true,payloadAvailable:true,cleanupPending:false,deploymentState:'required',error:'componentRegistration'};
   const restored:TextServiceStatus={...damaged,enabled:true,updateAvailable:false,error:null};
   const port:TextServicePort={mode:'native',status:async()=>damaged,act:vi.fn().mockResolvedValue(restored)};
   render(<TextServiceSettings port={port}/>);const user=userEvent.setup();
-  await user.click(await screen.findByRole('button',{name:'更新组件'}));
+  await user.click(await screen.findByText('组件管理'));await user.click(await screen.findByRole('button',{name:'修复组件'}));
   expect(port.act).toHaveBeenCalledWith('install');
   await screen.findByRole('button',{name:'检查状态'});
-  expect(screen.queryByRole('button',{name:'更新组件'})).not.toBeInTheDocument();
+  expect(screen.queryByRole('button',{name:'修复组件'})).not.toBeInTheDocument();
  });
  it('offers exact cleanup again after registration removal leaves a mapped file',async()=>{
-  const value:TextServiceStatus={installed:false,enabled:false,updateAvailable:false,payloadAvailable:true,cleanupPending:true,error:null};
+  const value:TextServiceStatus={installed:false,enabled:false,updateAvailable:false,payloadAvailable:true,cleanupPending:true,deploymentState:'required',error:null};
   const port:TextServicePort={mode:'native',status:async()=>value,act:vi.fn().mockResolvedValue({...value,cleanupPending:false})};
   render(<TextServiceSettings port={port}/>);const user=userEvent.setup();
   await user.click(await screen.findByText('组件管理'));
@@ -56,5 +56,16 @@ describe('component lifecycle',()=>{
   await user.click(screen.getByRole('button',{name:'移除'}));
   await waitFor(()=>expect(screen.queryByText('组件管理')).not.toBeInTheDocument());
   expect(port.act).toHaveBeenCalledWith('remove');
+ });
+ it.each(['pending','failed'] as const)('keeps an unfinished %s deployment under installer recovery ownership',async(deploymentState)=>{
+  const value:TextServiceStatus={installed:true,enabled:true,updateAvailable:true,payloadAvailable:true,cleanupPending:false,deploymentState,error:null};
+  const port:TextServicePort={mode:'native',status:async()=>value,act:vi.fn()};
+  render(<TextServiceSettings port={port}/>);const user=userEvent.setup();
+  expect(await screen.findByRole('button',{name:'检查状态'})).toBeDisabled();
+  expect(screen.getByRole('button',{name:'停用'})).toBeDisabled();
+  await user.click(screen.getByText('组件管理'));
+  expect(screen.getByRole('button',{name:'修复组件'})).toBeDisabled();
+  expect(screen.getByRole('button',{name:'移除组件'})).toBeDisabled();
+  expect(port.act).not.toHaveBeenCalled();
  });
 });

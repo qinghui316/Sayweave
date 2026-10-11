@@ -4,3 +4,5 @@ Copyright 2026 Sayweave contributors.
 Third-party fonts, icons, editor components, and runtime dependencies retain
 their respective licenses. See src/assets/licenses for the project-maintained
 license notices.
+
+Brand lettering uses Newsreader Italic outlines, Copyright2020 The Newsreader Project Authors, under SIL OFL1.1. Source: https://github.com/productiontype/Newsreader . License: src/assets/licenses/Newsreader-OFL.txt.

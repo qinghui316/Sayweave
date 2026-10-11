@@ -7,6 +7,11 @@ export interface SpeechSegment {id:number;sequence:number;text:string;confirmed:
 export type SpeechSource='trial'|'external'|'history';
 export interface SpeechSnapshot {protocol:1;sequence:number;lifecycle:number;taskId:string|null;source:SpeechSource|null;attemptId:string|null;recordId:string|null;phase:Phase;text:string;segments:SpeechSegment[];modelName:string|null;deviceName:string|null;durationMs:number;error:SpeechErrorCode|null;saveError:boolean;saved:boolean;retry:boolean;canRetry:boolean}
 export interface SpeechArchive {taskId:string;saved:boolean;saveError:boolean}
+export function isQuietLiveTerminal(value:SpeechSnapshot):boolean {
+ return value.taskId!==null&&(value.source==='trial'||value.source==='external')&&!value.retry
+  &&['completed','cancelled','failed'].includes(value.phase)&&!value.text.trim()&&!value.saveError
+  &&(value.error===null||value.error==='emptyText'||value.error==='cancelled');
+}
 export interface SpeechMeter {taskId:string;sequence:number;level:number;energies:number[];bars:number[];captureSequence:number;durationMs:number}
 export type SpeechMeterFrame=SpeechMeter & {receivedAt:number};
 export interface SpeechMeterSource {subscribe:(listener:()=>void)=>()=>void;getSnapshot:()=>SpeechMeterFrame|null}

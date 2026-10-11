@@ -1,9 +1,10 @@
 import {useState,useSyncExternalStore} from 'react';
 import type {UpdatePort} from '../contracts/update';
 import {Button,InlineMessage} from './index';
-import {updateLabel} from './UpdateIndicator';
+import {updateLabel} from './update-state';
+import {Brand} from './Brand';
 import s from './update-panel.module.css';
-export function UpdatePanel({port,onInstall,preparing,error}:{port:UpdatePort;onInstall:()=>void;preparing:boolean;error:string|null}){
+export function UpdatePanel({port,onInstall,preparing,error,showIdentity=true}:{port:UpdatePort;onInstall:()=>void;preparing:boolean;error:string|null;showIdentity?:boolean}){
  const value=useSyncExternalStore(port.subscribe,port.snapshot);
  const [commandError,setCommandError]=useState<string|null>(null);
  const [requesting,setRequesting]=useState(false);
@@ -13,7 +14,7 @@ export function UpdatePanel({port,onInstall,preparing,error}:{port:UpdatePort;on
  const saving=preparing&&value.state==='readyToInstall';
  const actionLabel=value.state==='installing'?'正在安装':value.state==='stopping'?'正在停止服务':value.state==='preparing'?'正在准备更新':value.state==='verifying'?'正在验证':value.state==='downloading'?'正在下载':value.state==='checking'?'正在检查':value.state==='failed'?'重试':'检查更新';
  return <div className={s.panel}>
-  <section className={s.identity}><h3>Sayweave</h3><p>{value.build.version||'正在读取版本…'}<span>{value.build.channel==='stable'?'稳定版':value.build.channel==='test'?'验收版':'开发版'}</span></p>{value.build.commit&&<small>{value.build.commit.slice(0,8)} · {value.build.target}</small>}</section>
+  {showIdentity&&<section className={s.identity}><h3><Brand/></h3><p>{value.build.version||'正在读取版本…'}<span>{value.build.channel==='stable'?'稳定版':value.build.channel==='test'?'验收版':'开发版'}</span></p>{value.build.commit&&<details><summary>构建信息</summary><small>{value.build.commit.slice(0,8)} · {value.build.target}</small></details>}</section>}
   <section className={s.update} aria-label="软件更新"><div className={s.status}><h3>软件更新</h3><p role="status">{saving?'正在保存设置':value.build.updatesEnabled?updateLabel(value.state,value.version,value.progress):'此构建使用开发渠道'}</p></div>
    {value.state==='downloading'&&<div className={s.track} role="progressbar" aria-label="更新下载进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={value.progress??undefined}><span style={{width:`${value.progress??0}%`}}/></div>}
    {message&&<InlineMessage status="error">{message}</InlineMessage>}

@@ -190,3 +190,15 @@ SAYWEAVE_SPEECH operation=transport_connect connection_id=<UUID> stage=tls_webso
 Shared selection controls own interaction and transient animation only; feature pages own current values, persistence and rollback. A standalone task-bound meter subscription feeds the waveform leaf without page-level frame updates. Native meter extraction and renderer envelopes are independently testable; microphone, recognition and input lifecycles remain owned by their existing services.
 
 History reading owns a bounded three-page summary cache and lightweight page identity/cursor bookmarks. Browse(pageSize≤50, default50) and reread(ids≤20) share repository summary selection and a transactional count. Reading navigation never loads full attempt bodies; detail and copy retain their existing explicit paths. Background changes reconcile IDs and mark new records without rearranging reading boundaries.
+
+## 安装与组件部署事务
+
+`installer` 是独立原生编排模块，负责固定程序文件、NSIS 元数据和事务记录；`text-service::deployment/registration` 保持组件文件、机器登记和 TSF 用户启用的所有权。前端只读取 `deploymentState`（required/pending/ready/failed），不接收 DLL 或登记路径。维护入口不启动 Tauri、不打开数据库或凭据服务；源码边界检查限制 installer 对业务模块的依赖。
+
+锁定 CLI 2.12.1 的 NSIS 模板由包内原生绑定提取，来源和散列在 windows/installer-source.json。当前用户安装只覆盖 sayweave.exe、卸载器、固定 helper、桌面与开始菜单根目录的两个产品快捷方式，以及两处固定 HKCU 安装元数据。包的额外资源、关联、非空开始菜单目录或其他安装范围必须先扩展并验证备份契约。手动与应用内升级均覆盖安装，不调用旧卸载器。
+
+普通用户控制器在任何覆盖之前持久备份；机器服务持全局互斥锁，核验安装器 PID、会话、创建时间、SID 和包哈希，暂存固定 payload 后再提交机器登记。机器登记和清理不启停提升管理员的资料。普通用户启用前先持久化意图，明确缺省与 DWORD0/1 的区别。先核对 before/known-after 值，再恢复半写元数据；未知修改保留恢复锚点。receipt 文件锁和活跃安装器身份禁止第二个安装器接管。
+
+任一必要阶段失败不得显示成功。中断后的下一次安装先恢复未完成事务；无法确认原文件、登记或恢复效果时保留备份并拒绝叠加。旧 DLL 按哈希保留，已加载它的目标软件需重新打开。卸载也先持锁、按已提交收据核对和备份，只删除本安装的程序与元数据。全机组件及 TSF 启停选择是共享资源，不能证明没有其他消费者时保留并记录原因。数据库、凭据、录音与学习资料不进入备份或卸载清理。
+
+更新日志继续读取 schema1。新进程清除日志前必须同时核对当前 EXE/helper/卸载器身份、组件 payload、已提交部署事务，以及已验签候选包的 SHA256 与安装器收据；相同版本号不足以确认完成。

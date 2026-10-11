@@ -111,6 +111,27 @@ fn main() {
         assert_eq!(identifier, "local.sayweave.skeleton");
     }
     println!("cargo:rustc-env=SAYWEAVE_BUILD_IDENTIFIER={identifier}");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read("tauri.conf.json").expect("Tauri config"))
+            .expect("Tauri JSON");
+    let overlay = std::env::var("TAURI_CONFIG")
+        .ok()
+        .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok());
+    let product = overlay
+        .as_ref()
+        .and_then(|v| v["productName"].as_str())
+        .or_else(|| config["productName"].as_str())
+        .expect("product identity");
+    assert!(
+        !product.is_empty()
+            && product.len() <= 128
+            && !product.contains(['\\', '/', '\0', '\n', '\r']),
+        "invalid product identity"
+    );
+    if channel != "test" {
+        assert_eq!(product, "Sayweave");
+    }
+    println!("cargo:rustc-env=SAYWEAVE_BUILD_PRODUCT={product}");
     println!("cargo:rustc-env=SAYWEAVE_BUILD_COMMIT={commit}");
     println!(
         "cargo:rustc-env=SAYWEAVE_BUILD_TARGET={}",

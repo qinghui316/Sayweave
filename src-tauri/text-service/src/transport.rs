@@ -70,9 +70,13 @@ pub fn name(pid: u32, thread: u32) -> windows::core::Result<Vec<u16>> {
     .collect())
 }
 pub fn current_user_sid() -> windows::core::Result<String> {
+    process_user_sid(std::process::id())
+}
+pub fn process_user_sid(pid: u32) -> windows::core::Result<String> {
     unsafe {
+        let process = Pipe(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)?);
         let mut token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
+        OpenProcessToken(process.0, TOKEN_QUERY, &mut token)?;
         let token = Pipe(token);
         let mut needed = 0;
         let _ = GetTokenInformation(token.0, TokenUser, None, 0, &mut needed);

@@ -15,7 +15,7 @@ export const zh = {
     connection: { idle: '尚未测试', pending: '正在测试演示连接', success: '演示连接成功', error: '演示连接失败，请重试' },
   },
   brand: 'Sayweave', homeTitle: '随言 — 随口表达，文字随言而来',
-  navigation: { home: '首页', history: '历史记录', dictionary: '词典', preferences: '表达偏好', onboarding: '首次使用', settings: '设置', about: '关于' },
+  navigation: { home: '首页', history: '历史记录', dictionary: '词典', preferences: '个性化', onboarding: '首次使用', settings: '设置', about: '关于' },
   window: { minimize: '最小化', maximize: '最大化或还原', close: '隐藏到托盘' },
   home: {
     shortcuts: '按一下，开始说', globalKeys: '全局快捷键', setKey: '设置快捷键',
@@ -31,7 +31,7 @@ export const zh = {
   voice: { start: '开始预设演示', cancel: '取消演示', finish: '完成演示', retry: '重试演示', hide: '隐藏悬浮窗', statuses: { idle: '待机', connecting: '连接中', recording: '录音展示', processing: '处理中', completed: '完成', cancelled: '已取消', failed: '演示失败' }, liveStatuses: { idle: '待机', connecting: '连接中', recording: '录音中', processing: '识别中', completed: '识别完成', cancelled: '已取消', failed: '识别失败' }, liveHints: { idle:'点击麦克风开始录音', connecting:'正在连接语音服务', recording:'左侧取消，右侧结束录音', processing:'正在等待最终结果', completed:'识别完成', cancelled:'已取消，可重新开始', failed:'录音可用时，可以重识别' } },
   settings: {
     title: '设置', close: '关闭设置', description: '调整设备、模型和应用偏好。',
-    tabs: { device: '设备与快捷键', models: '模型', personalization:'个性化', language: '语言与翻译', appearance: '外观与历史保存', about: '关于' },
+    tabs: { device: '设备与快捷键', models: '模型', language: '语言与翻译', appearance: '外观与历史保存', about: '关于' },
     notImplemented: '此项功能稍后提供。',
     deviceHeading: '设备与快捷键', microphone: '麦克风', microphoneHelp: '真实设备检测在系统能力阶段接入。', notConfigured: '未配置',
     modelsHeading: '模型', modelsBody: '模型配置会直接在当前面板展开，API 与本地来源同属模型。完整表单在下一阶段接入。',
