@@ -245,7 +245,7 @@ pub fn dispatch(args: &[String]) -> Result<()> {
     }
 }
 fn record_dir(directory: &Path) -> Result<PathBuf> {
-    reject_links(directory)?;
+    let directory = metadata::normalized_directory(directory)?;
     let name = directory
         .to_string_lossy()
         .trim_start_matches("\\\\?\\")
@@ -794,4 +794,26 @@ fn version(value: &str) -> Option<Vec<u32>> {
         .map(str::parse)
         .collect::<std::result::Result<Vec<_>, _>>()
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn receipt_lookup_is_identical_for_short_name_launch_and_long_install_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut short = vec![0u16; 32768];
+        let length = unsafe {
+            windows::Win32::Storage::FileSystem::GetShortPathNameW(
+                PCWSTR(metadata::wide(&directory.path().to_string_lossy()).as_ptr()),
+                Some(&mut short),
+            )
+        };
+        assert!(length > 0 && length < (short.len() as u32));
+        let alias = PathBuf::from(String::from_utf16(&short[..length as usize]).unwrap());
+        assert_eq!(
+            record_dir(directory.path()).unwrap(),
+            record_dir(&alias).unwrap()
+        );
+    }
 }
