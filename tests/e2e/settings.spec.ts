@@ -19,6 +19,7 @@ test('planned modes, unknown routes, learning help and history settings have tru
   await page.screenshot({path:'.local/terminal-ui/dictionary-'+width+'.png'});
   await page.getByRole('link',{name:'个性化',exact:true}).click();await expect(page.getByText(/学习需配置默认文字模型/)).toBeVisible();
   await page.screenshot({path:'.local/terminal-ui/personalization-'+width+'.png'});
+  await page.getByRole('button',{name:'文字模型设置'}).click();await expect(page.getByRole('tab',{name:'文字处理',exact:true})).toHaveAttribute('aria-selected','true');await page.keyboard.press('Escape');await expect(page.getByRole('dialog')).toHaveCount(0);
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
  }
  for(const [path,title] of [['translation','翻译规划中'],['edit','编辑规划中'],['unknown','页面未找到']]){

@@ -25,9 +25,9 @@ function fromRecord(c:ModelRecord):Editor {
  const input = {name:c.name, protocol:c.protocol, baseUrl:c.baseUrl, modelId:c.modelId, usages:[...c.usages]};
  return {input, initial:structuredClone(input), key:'', record:c, automaticName:false};
 }
-export interface ModelPanelProps {port:ModelConfigPort; onSpeech?:()=>void; onChanged?:()=>void; onHelp?:(help:import('../../contracts/models').ModelHelp)=>Promise<void>; onGuardChange?:(guard:((action:()=>void)=>void)|null)=>void;extraContent?:ReactNode}
-export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,extraContent}: ModelPanelProps) {
- const [usage, setUsage] = useState<ModelUsage>('speech');
+export interface ModelPanelProps {port:ModelConfigPort; onSpeech?:()=>void; onChanged?:()=>void; onHelp?:(help:import('../../contracts/models').ModelHelp)=>Promise<void>; onGuardChange?:(guard:((action:()=>void)=>void)|null)=>void;extraContent?:ReactNode;initialUsage?:ModelUsage}
+export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,extraContent,initialUsage='speech'}: ModelPanelProps) {
+ const [usage, setUsage] = useState<ModelUsage>(initialUsage);
  const [view, setView] = useState<ModelOverview|null>(null);
  const [editor, setEditor] = useState<Editor|null>(null);
  const [advanced, setAdvanced] = useState(false);
