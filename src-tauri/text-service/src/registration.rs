@@ -351,7 +351,7 @@ fn restore_string(
         return Ok(());
     }
     // An unrelated write invalidates rollback ownership; never overwrite it.
-    if current != written {
+    if !rollback_value_known(&current, before, written) {
         return Err(preference_error());
     }
     unsafe {
@@ -364,6 +364,9 @@ fn restore_string(
         )
         .ok()
     }
+}
+fn rollback_value_known(current: &[u8], before: &[u8], written: &[u8]) -> bool {
+    current == before || current == written
 }
 fn string_bytes(value: &str) -> Vec<u8> {
     wide(value).iter().flat_map(|c| c.to_le_bytes()).collect()
@@ -402,11 +405,19 @@ fn raw_string(key: &Key, name: &str) -> windows::core::Result<Vec<u8>> {
     }
 }
 fn register_scope(path: &str, root: HKEY) -> windows::core::Result<()> {
-    register_profile(path, root, || Ok(()))
+    register_profile(path, root, None, true, || Ok(()))
+}
+/// Machine registration must never enable the administrator's user profile.
+pub fn register_installer_machine(path: &str, language: u16) -> windows::core::Result<()> {
+    administrator()?;
+    if language == 0 {
+        return Err(preference_error());
+    }
+    register_profile(path, HKEY_LOCAL_MACHINE, Some(language), false, || Ok(()))
 }
 #[cfg(feature = "acceptance")]
 pub fn acceptance_registration_rollback(path: &str) -> windows::core::Result<()> {
-    register_profile(path, HKEY_CURRENT_USER, || {
+    register_profile(path, HKEY_CURRENT_USER, None, true, || {
         Err(windows::core::Error::new(
             E_FAIL,
             "acceptanceRegistrationFailure",
@@ -416,11 +427,18 @@ pub fn acceptance_registration_rollback(path: &str) -> windows::core::Result<()>
 fn register_profile(
     path: &str,
     root: HKEY,
+    requested_language: Option<u16>,
+    enable_user: bool,
     confirm: impl FnOnce() -> windows::core::Result<()>,
 ) -> windows::core::Result<()> {
     unsafe {
         // Fresh-install only: never overwrite or roll back an existing installation.
-        for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        let roots: &[HKEY] = if enable_user {
+            &[HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE]
+        } else {
+            &[HKEY_LOCAL_MACHINE]
+        };
+        for &root in roots {
             for path in [
                 COM_ROOT,
                 "Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}",
@@ -442,7 +460,7 @@ fn register_profile(
         }
         let category: ITfCategoryMgr =
             CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)?;
-        let language = profile.GetCurrentLanguage()?;
+        let language = requested_language.unwrap_or(profile.GetCurrentLanguage()?);
         let mut registered = false;
         let mut category_registered = false;
         let result = (|| {
@@ -476,13 +494,15 @@ fn register_profile(
                     .EnableLanguageProfileByDefault(&CLASS, language, &PROFILE, false)
                     .map_err(|e| windows::core::Error::new(e.code(), "disableDefaultEnablement"))?;
             }
-            profile
-                .EnableLanguageProfile(&CLASS, language, &PROFILE, true)
-                .map_err(|e| windows::core::Error::new(e.code(), "enableProfile"))?;
+            if enable_user {
+                profile
+                    .EnableLanguageProfile(&CLASS, language, &PROFILE, true)
+                    .map_err(|e| windows::core::Error::new(e.code(), "enableProfile"))?;
+            }
             confirm()
         })();
         if result.is_err() {
-            if user_preferences().is_err() {
+            if enable_user && user_preferences().is_err() {
                 return Err(windows::core::Error::new(
                     E_FAIL,
                     "registrationRollbackIncomplete",
@@ -498,14 +518,14 @@ fn register_profile(
                     HKEY_LOCAL_MACHINE,
                     "Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}",
                 )? {
-                remove_registered_profiles(&profile)
+                remove_registered_profiles(&profile, enable_user)
             } else {
                 Ok(())
             };
             if category_cleanup.is_err()
                 || profile_cleanup.is_err()
-                || clear_user_preferences().is_err()
-                || confirm_registry_removal().is_err()
+                || enable_user && clear_user_preferences().is_err()
+                || confirm_registry_removal(enable_user).is_err()
                 || !com_anchor_matches(root, &string_bytes(OWNER), &string_bytes(path))?
             {
                 // Keep the owned COM path and protected binary for an explicit retry.
@@ -562,14 +582,257 @@ pub fn deactivate(language: u16, session: bool) -> windows::core::Result<()> {
         )
     }
 }
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct InstallerRegistration {
+    pub module: String,
+    module_bytes: Vec<u8>,
+    profiles: Vec<InstallerProfile>,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct InstallerProfile {
+    language: u16,
+    description: Vec<u8>,
+    icon: Vec<u8>,
+}
+pub fn snapshot_installer_machine() -> windows::core::Result<Option<InstallerRegistration>> {
+    let Some(module) = owned_module()? else {
+        return Ok(None);
+    };
+    let key =
+        open_existing(HKEY_LOCAL_MACHINE, COM_PATH, KEY_READ)?.ok_or_else(preference_error)?;
+    if raw_string(&key, "SayweaveOwner")? != string_bytes(OWNER) {
+        return Err(preference_error());
+    }
+    let module_bytes = raw_string(&key, "")?;
+    let mut snapshots = Vec::new();
+    owned_category_count()?;
+    for language in owned_languages(&profiles()?)? {
+        let path = format!("{TIP_ROOT}\\LanguageProfile\\0x{language:08X}\\{PROFILE_KEY}");
+        let key =
+            open_existing(HKEY_LOCAL_MACHINE, &path, KEY_READ)?.ok_or_else(preference_error)?;
+        snapshots.push(InstallerProfile {
+            language,
+            description: raw_string(&key, "Description")?,
+            icon: raw_string(&key, "IconFile")?,
+        });
+    }
+    if snapshots.is_empty() {
+        return Err(preference_error());
+    }
+    Ok(Some(InstallerRegistration {
+        module,
+        module_bytes,
+        profiles: snapshots,
+    }))
+}
+pub fn restore_installer_machine(
+    snapshot: Option<&InstallerRegistration>,
+    expected: &str,
+) -> windows::core::Result<()> {
+    administrator()?;
+    let Some(before) = snapshot else {
+        if !installer_fresh_anchor_known(expected)? {
+            if exists(HKEY_LOCAL_MACHINE, TIP_ROOT)? || owned_category_count()? != 0 {
+                return Err(preference_error());
+            }
+            return Ok(());
+        }
+        // Fresh registration can crash between the three COM values. There was
+        // no prior namespace: accept only the exact subset this transaction writes.
+        if owned_category_count()? != 0 {
+            let category: ITfCategoryMgr =
+                unsafe { CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)? };
+            unsafe {
+                category.UnregisterCategory(&CLASS, &GUID_TFCAT_TIP_SPEECH, &CLASS)?;
+            }
+        }
+        remove_registered_profiles(&profiles()?, false)?;
+        confirm_registry_removal(false)?;
+        if !installer_fresh_anchor_known(expected)? {
+            return Err(preference_error());
+        }
+        unsafe {
+            RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(wide(COM_ROOT).as_ptr())).ok()?;
+        }
+        return Ok(());
+    };
+    let current = owned_module()?;
+    if current.as_deref() != Some(before.module.as_str()) && current.as_deref() != Some(expected) {
+        return Err(preference_error());
+    }
+    owned_category_count()?;
+    let languages = owned_languages(&profiles()?)?;
+    if languages
+        != before
+            .profiles
+            .iter()
+            .map(|p| p.language)
+            .collect::<std::collections::BTreeSet<_>>()
+    {
+        return Err(preference_error());
+    }
+    // Validate the entire snapshot first. A crash can leave COM old with only
+    // one profile field new, or COM new with some fields already restored.
+    let com_key = open_existing(HKEY_LOCAL_MACHINE, COM_PATH, KEY_READ | KEY_WRITE)?
+        .ok_or_else(preference_error)?;
+    if raw_string(&com_key, "SayweaveOwner")? != string_bytes(OWNER)
+        || !rollback_value_known(
+            &raw_string(&com_key, "")?,
+            &before.module_bytes,
+            &string_bytes(expected),
+        )
+    {
+        return Err(preference_error());
+    }
+    let mut profile_keys = Vec::new();
+    for profile in &before.profiles {
+        let path = format!(
+            "{TIP_ROOT}\\LanguageProfile\\0x{:08X}\\{PROFILE_KEY}",
+            profile.language
+        );
+        let key = open_existing(HKEY_LOCAL_MACHINE, &path, KEY_READ | KEY_WRITE)?
+            .ok_or_else(preference_error)?;
+        if !rollback_value_known(
+            &raw_string(&key, "Description")?,
+            &profile.description,
+            &string_bytes("Sayweave Voice"),
+        ) || !rollback_value_known(
+            &raw_string(&key, "IconFile")?,
+            &profile.icon,
+            &string_bytes(expected),
+        ) {
+            return Err(preference_error());
+        }
+        profile_keys.push(key);
+    }
+    // Every write requires the precise value produced by this transaction.
+    for (profile, key) in before.profiles.iter().zip(profile_keys) {
+        restore_string(
+            &key,
+            "Description",
+            &profile.description,
+            &string_bytes("Sayweave Voice"),
+        )?;
+        restore_string(&key, "IconFile", &profile.icon, &string_bytes(expected))?;
+    }
+    restore_string(&com_key, "", &before.module_bytes, &string_bytes(expected))?;
+    verify_installer_snapshot(before)
+}
+fn installer_fresh_anchor_known(expected: &str) -> windows::core::Result<bool> {
+    if exists(HKEY_CURRENT_USER, COM_ROOT)? {
+        return Err(preference_error());
+    }
+    let Some(root) = open_existing(HKEY_LOCAL_MACHINE, COM_ROOT, KEY_READ)? else {
+        return Ok(false);
+    };
+    if !names(&root, false)?.is_empty() || names(&root, true)?.iter().any(|v| v != "InprocServer32")
+    {
+        return Err(preference_error());
+    }
+    if let Some(key) = open_existing(HKEY_LOCAL_MACHINE, COM_PATH, KEY_READ)? {
+        if !names(&key, true)?.is_empty() {
+            return Err(preference_error());
+        }
+        let values = names(&key, false)?;
+        for name in &values {
+            let value = match name.as_str() {
+                "" => expected,
+                "SayweaveOwner" => OWNER,
+                "ThreadingModel" => "Apartment",
+                _ => return Err(preference_error()),
+            };
+            if raw_string(&key, name)? != string_bytes(value) {
+                return Err(preference_error());
+            }
+        }
+        if !values.is_empty() && !values.iter().any(|v| v == "SayweaveOwner") {
+            return Err(preference_error());
+        }
+    }
+    Ok(true)
+}
+fn verify_installer_snapshot(snapshot: &InstallerRegistration) -> windows::core::Result<()> {
+    let current = snapshot_installer_machine()?.ok_or_else(preference_error)?;
+    if current.module_bytes != snapshot.module_bytes
+        || current.profiles.len() != snapshot.profiles.len()
+    {
+        return Err(preference_error());
+    }
+    for (a, b) in current.profiles.iter().zip(&snapshot.profiles) {
+        if a.language != b.language || a.description != b.description || a.icon != b.icon {
+            return Err(preference_error());
+        }
+    }
+    Ok(())
+}
+/// The ordinary initiating account owns this choice; missing and explicit false differ.
+pub fn installer_user_choice(language: u16) -> windows::core::Result<Option<bool>> {
+    let target = format!("{TIP_ROOT}\\LanguageProfile\\0x{language:08X}\\{PROFILE_KEY}");
+    Ok(user_preferences()?
+        .into_iter()
+        .find(|(p, _)| p == &target)
+        .and_then(|(_, v)| v.map(|v| v == 1)))
+}
+pub fn initialize_installer_user(
+    language: u16,
+    before: Option<bool>,
+) -> windows::core::Result<bool> {
+    let p = profiles()?;
+    unsafe {
+        if p.GetCurrentLanguage()? != language || installer_user_choice(language)? != before {
+            return Err(preference_error());
+        }
+        let enabled = before.unwrap_or(true);
+        if before.is_none() {
+            p.EnableLanguageProfile(&CLASS, language, &PROFILE, enabled)?;
+        }
+        if p.IsEnabledLanguageProfile(&CLASS, language, &PROFILE)?
+            .as_bool()
+            != enabled
+        {
+            return Err(preference_error());
+        }
+        Ok(enabled)
+    }
+}
+pub fn restore_installer_user(language: u16, before: Option<bool>) -> windows::core::Result<()> {
+    let current = installer_user_choice(language)?;
+    if current == before {
+        return Ok(());
+    }
+    if before.is_some() || current != Some(true) {
+        return Err(preference_error());
+    }
+    // First enablement wrote only this known DWORD. Never clear another language/choice.
+    let leaf = format!("{TIP_ROOT}\\LanguageProfile\\0x{language:08X}\\{PROFILE_KEY}");
+    let key = open_existing(HKEY_CURRENT_USER, &leaf, KEY_READ | KEY_WRITE)?
+        .ok_or_else(preference_error)?;
+    unsafe {
+        RegDeleteValueW(key.0, w!("Enable")).ok()?;
+    }
+    drop(key);
+    for path in [
+        &leaf,
+        &format!("{TIP_ROOT}\\LanguageProfile\\0x{language:08X}"),
+        &format!("{TIP_ROOT}\\LanguageProfile"),
+        TIP_ROOT,
+    ] {
+        let value = unsafe { SHDeleteEmptyKeyW(HKEY_CURRENT_USER, PCWSTR(wide(path).as_ptr())) };
+        if value != ERROR_SUCCESS && value != ERROR_FILE_NOT_FOUND && value != ERROR_DIR_NOT_EMPTY {
+            return Err(preference_error());
+        }
+    }
+    Ok(())
+}
 pub fn unregister() -> windows::core::Result<()> {
-    unregister_scope(HKEY_CURRENT_USER)
+    unregister_scope(HKEY_CURRENT_USER, true)
 }
 pub fn unregister_machine() -> windows::core::Result<()> {
     administrator()?;
-    unregister_scope(HKEY_LOCAL_MACHINE)
+    unregister_scope(HKEY_LOCAL_MACHINE, true)
 }
-fn unregister_scope(root: HKEY) -> windows::core::Result<()> {
+fn unregister_scope(root: HKEY, cleanup_user: bool) -> windows::core::Result<()> {
     unsafe {
         if root == HKEY_LOCAL_MACHINE && exists(HKEY_CURRENT_USER, COM_ROOT)? {
             return Err(windows::core::Error::new(
@@ -613,7 +876,9 @@ fn unregister_scope(root: HKEY) -> windows::core::Result<()> {
             ));
         }
         // Refuse an unknown preference tree while the owned COM anchor is retryable.
-        user_preferences()?;
+        if cleanup_user {
+            user_preferences()?;
+        }
         owned_languages(&profiles()?)?;
         let category_count = owned_category_count()?;
         // Attempt every cleanup even when one COM service is unavailable.
@@ -625,12 +890,14 @@ fn unregister_scope(root: HKEY) -> windows::core::Result<()> {
                 CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)?;
             category.UnregisterCategory(&CLASS, &GUID_TFCAT_TIP_SPEECH, &CLASS)
         })();
-        let profile = profiles().and_then(|p| remove_registered_profiles(&p));
+        let profile = profiles().and_then(|p| remove_registered_profiles(&p, cleanup_user));
         // Keep COM registration until TSF removal succeeds, so cleanup can be retried.
         category?;
         profile?;
-        clear_user_preferences()?;
-        confirm_registry_removal()?;
+        if cleanup_user {
+            clear_user_preferences()?;
+        }
+        confirm_registry_removal(cleanup_user)?;
         if !com_anchor_matches(root, &expected_owner, &expected_module)? {
             return Err(preference_error());
         }
@@ -647,9 +914,9 @@ fn com_anchor_matches(root: HKEY, owner: &[u8], module: &[u8]) -> windows::core:
     };
     Ok(raw_string(&key, "SayweaveOwner")? == owner && raw_string(&key, "")? == module)
 }
-fn confirm_registry_removal() -> windows::core::Result<()> {
+fn confirm_registry_removal(cleanup_user: bool) -> windows::core::Result<()> {
     let machine = exists(HKEY_LOCAL_MACHINE, TIP_ROOT)?;
-    let user = exists(HKEY_CURRENT_USER, TIP_ROOT)?;
+    let user = cleanup_user && exists(HKEY_CURRENT_USER, TIP_ROOT)?;
     if machine || user {
         return Err(windows::core::Error::new(
             E_FAIL,
@@ -916,10 +1183,15 @@ fn owned_languages(
     }
 }
 
-fn remove_registered_profiles(profile: &ITfInputProcessorProfiles) -> windows::core::Result<()> {
+fn remove_registered_profiles(
+    profile: &ITfInputProcessorProfiles,
+    cleanup_user: bool,
+) -> windows::core::Result<()> {
     unsafe {
         for language in owned_languages(profile)? {
-            profile.EnableLanguageProfile(&CLASS, language, &PROFILE, false)?;
+            if cleanup_user {
+                profile.EnableLanguageProfile(&CLASS, language, &PROFILE, false)?;
+            }
             profile.RemoveLanguageProfile(&CLASS, language, &PROFILE)?;
         }
         if exists(HKEY_LOCAL_MACHINE, TIP_ROOT)? {
@@ -943,5 +1215,23 @@ fn exists(root: HKEY, path: &str) -> windows::core::Result<bool> {
                 Ok(false)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod installer_snapshot_tests {
+    use super::*;
+    #[test]
+    fn half_written_metadata_is_restorable_only_from_exact_known_values() {
+        let old = string_bytes("original.dll");
+        let next = string_bytes("new.dll");
+        assert!(rollback_value_known(&old, &old, &next));
+        assert!(rollback_value_known(&next, &old, &next));
+        assert!(!rollback_value_known(
+            &string_bytes("third-party.dll"),
+            &old,
+            &next
+        ));
+        assert!(!rollback_value_known(b"malformed", &old, &next));
     }
 }

@@ -198,3 +198,9 @@ Genuine package builds record the generated NSIS `MAINBINARYSRCPATH`, verify the
 A successful diagnostic is an installed-startup proof for that original signed package. It does not resolve a recorded package-metadata mismatch, produce mechanism evidence or authorize a formal release. Repair affected tooling, then run the appropriate full candidate acceptance. Repair-branch pushes run short tooling only; explicitly dispatch `startup` or `full` for package work after reviewing the current diagnostic outcome.
 
 Current WebView2 runtimes ignore environment/HKCU browser-argument overrides for elevated hosts ([Microsoft security documentation](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/security#for-an-elevated-host-app-use-appropriate-override-flags)). These disposable elevated jobs use a temporary, app-specific HKLM policy lease instead. It refuses existing app/wildcard values and running hosts, records a unique lease identity before changing anything, and verifies the exact owned string/type before removing only that value. Parent keys are retained and reported until the disposable runner is destroyed, avoiding deletion of unrelated concurrent writes. Confirmed value removal is required for a pass. Process-token elevation is captured with the owned lifecycle; production source and debug configuration stay unchanged.
+
+## 安装器自动部署验收
+
+新候选的首次安装和升级证据必须由安装器自动部署组件取得，不能再调用设置按钮或 `--sayweave-text-service=install` 补齐。旧版环境的准备单独记录。验证缺省启用、显式停用保持、重复安装、旧 DLL 占用、异账户提权、程序复制后的失败、安装器中断及恢复，并核对程序/包/helper/DLL 哈希、事务阶段、账户和原始数据/凭据。
+
+浏览器测试通过 `SAYWEAVE_E2E_PORT` 指定独立端口，并禁止复用已有服务器；已有官网预览不能被当作产品。正常空结果测试覆盖首页和外部任务，真实错误、存储失败及原位输入效果不确定仍保留提示。已通过的相同候选产物继续按原身份复用。

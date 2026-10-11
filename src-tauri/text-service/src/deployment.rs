@@ -202,6 +202,17 @@ pub fn install(bytes: &[u8], expected_sid: &str) -> windows::core::Result<()> {
     if expected_sid != crate::transport::current_user_sid()? {
         return Err(fail("initiatingUserChanged"));
     }
+    let old = registration::owned_module()?;
+    let module = prepare_installer(bytes)?;
+    match old {
+        Some(old) => registration::replace_machine(&module, &old),
+        None => registration::register_machine(&module),
+    }
+}
+
+/// Stage only fixed embedded bytes. No user SID/profile state is changed here.
+pub fn prepare_installer(bytes: &[u8]) -> windows::core::Result<String> {
+    registration::administrator()?;
     if bytes.len() < 1024 || bytes.len() > 32 * 1024 * 1024 || !bytes.starts_with(b"MZ") {
         return Err(fail("invalidPayload"));
     }
@@ -261,12 +272,12 @@ pub fn install(bytes: &[u8], expected_sid: &str) -> windows::core::Result<()> {
     }
     write_managed(&base, &managed)?;
     pending.durable = true;
-    match old {
-        Some(old) => registration::replace_machine(&module.to_string_lossy(), &old),
-        None => registration::register_machine(&module.to_string_lossy()),
-    }
-    // Keep old protected modules: applications may still have those versions mapped.
+    Ok(module.to_string_lossy().into_owned())
 }
+pub fn authorize_installer() -> windows::core::Result<()> {
+    registration::administrator()
+}
+
 fn write_payload(module: &Path, bytes: &[u8]) -> windows::core::Result<()> {
     let temp = module.with_file_name(format!("payload-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
@@ -400,6 +411,106 @@ pub fn matches_payload(bytes: &[u8]) -> windows::core::Result<Option<bool>> {
     let module = owned_path(&path)?;
     let data = std::fs::read(module).map_err(|_| fail("payloadReadFailed"))?;
     Ok(Some(!bytes.is_empty() && version(&data) == version(bytes)))
+}
+
+/// Read/replace the one protected deployment record, never a caller-selected path.
+pub fn installer_record() -> windows::core::Result<Option<Vec<u8>>> {
+    let base = program_files()?.join("Sayweave").join("TextService");
+    let file = base.join("installer.json");
+    if !present(&file)? {
+        return Ok(None);
+    }
+    protected(&program_files()?)?;
+    protected(base.parent().unwrap())?;
+    protected(&base)?;
+    protected(&file)?;
+    if std::fs::metadata(&file)
+        .map_err(|_| fail("installerReadFailed"))?
+        .len()
+        > 128 * 1024
+    {
+        return Err(fail("installerRecordLimit"));
+    }
+    Ok(Some(
+        std::fs::read(file).map_err(|_| fail("installerReadFailed"))?,
+    ))
+}
+pub fn write_installer_record(bytes: &[u8]) -> windows::core::Result<()> {
+    registration::administrator()?;
+    if bytes.is_empty() || bytes.len() > 128 * 1024 {
+        return Err(fail("installerRecordLimit"));
+    }
+    let app = program_files()?.join("Sayweave");
+    ensure_directory(&app)?;
+    let base = app.join("TextService");
+    ensure_directory(&base)?;
+    let target = base.join("installer.json");
+    if present(&target)? {
+        protected(&target)?;
+    }
+    let temp = base.join(format!("installer-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .map_err(|_| fail("installerWriteFailed"))?;
+        file.write_all(bytes)
+            .map_err(|_| fail("installerWriteFailed"))?;
+        file.sync_all().map_err(|_| fail("installerWriteFailed"))?;
+        drop(file);
+        protected(&temp)?;
+        unsafe {
+            MoveFileExW(
+                PCWSTR(wide(&temp.to_string_lossy()).as_ptr()),
+                PCWSTR(wide(&target.to_string_lossy()).as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )?;
+        }
+        protected(&target)
+    })();
+    if result.is_err() && present(&temp).unwrap_or(false) {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+pub fn installer_module_hash(module: &str) -> windows::core::Result<String> {
+    let file = owned_path(module)?;
+    let meta = std::fs::metadata(&file).map_err(|_| fail("payloadReadFailed"))?;
+    if !(1024..=32 * 1024 * 1024).contains(&meta.len()) {
+        return Err(fail("invalidPayload"));
+    }
+    let bytes = std::fs::read(&file).map_err(|_| fail("payloadReadFailed"))?;
+    if !bytes.starts_with(b"MZ") {
+        return Err(fail("invalidPayload"));
+    }
+    Ok(version(&bytes))
+}
+pub fn commit_installer(
+    module: &str,
+    expected: Option<&str>,
+    language: u16,
+) -> windows::core::Result<()> {
+    registration::administrator()?;
+    let hash = installer_module_hash(module)?;
+    if owned_location(module)?
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        != Some(hash.as_str())
+    {
+        return Err(fail("payloadMismatch"));
+    }
+    let current = registration::owned_module()?;
+    if current.as_deref() != expected {
+        return Err(fail("registrationChanged"));
+    }
+    match current {
+        Some(old) if old == module => Ok(()),
+        Some(old) => registration::replace_machine(module, &old),
+        None => registration::register_installer_machine(module, language),
+    }
 }
 #[cfg(test)]
 mod tests {

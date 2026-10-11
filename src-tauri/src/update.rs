@@ -238,14 +238,20 @@ impl UpdateService {
             && let Ok(journal) = serde_json::from_slice::<Journal>(&bytes)
             && journal.schema_version == 1
         {
-            if journal.candidate.version == snapshot.build.version {
+            let verified_package = bounded_read(&root.join("candidate.exe"), MAX_PACKAGE)
+                .ok()
+                .filter(|bytes| verify_package(bytes, &journal.candidate, &key).is_ok());
+            if journal.candidate.version == snapshot.build.version
+                && verified_package.as_ref().is_some_and(|bytes| {
+                    crate::installer::acknowledge_running(&crate::installer::package_hash(bytes))
+                })
+            {
                 let _ = fs::remove_file(root.join("candidate.exe"));
                 let _ = fs::remove_file(root.join("transaction.json"));
             } else if validate_candidate(&journal.candidate, snapshot.build.channel == "test")
                 .is_ok()
-                && let Ok(bytes) = bounded_read(&root.join("candidate.exe"), MAX_PACKAGE)
-                && verify_package(&bytes, &journal.candidate, &key).is_ok()
-                && version(&journal.candidate.version) > version(snapshot.build.version)
+                && verified_package.is_some()
+                && version(&journal.candidate.version) >= version(snapshot.build.version)
             {
                 snapshot.task_id = Some(uuid::Uuid::new_v4().to_string());
                 snapshot.state = "readyToInstall".into();
@@ -257,6 +263,11 @@ impl UpdateService {
                     snapshot.failure_stage = Some(journal.stage);
                 }
                 candidate = Some(journal.candidate);
+            } else if journal.candidate.version == snapshot.build.version {
+                snapshot.state = "recovery".into();
+                snapshot.recovery = true;
+                snapshot.failure_stage = Some("componentDeployment".into());
+                snapshot.error = Some("输入组件维护尚未完成，请重新运行安装包恢复。".into());
             }
         }
         Ok(Self {

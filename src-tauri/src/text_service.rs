@@ -3,6 +3,9 @@ use crate::history::types::Error;
 use serde::{Deserialize, Serialize};
 use tauri::{State, WebviewWindow};
 const PAYLOAD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text-service.dll"));
+pub(crate) fn payload() -> &'static [u8] {
+    PAYLOAD
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
@@ -11,6 +14,7 @@ pub struct Status {
     update_available: bool,
     payload_available: bool,
     cleanup_pending: bool,
+    deployment_state: &'static str,
     error: Option<String>,
 }
 #[derive(Clone, Copy, Deserialize)]
@@ -73,6 +77,7 @@ fn status() -> Result<Status, Error> {
         update_available: installed && !PAYLOAD.is_empty() && !matches!(matches, Ok(Some(true))),
         payload_available: !PAYLOAD.is_empty(),
         cleanup_pending: cleanup.as_ref().copied().unwrap_or(false),
+        deployment_state: crate::installer::deployment_state(PAYLOAD),
         error: if matches.is_err() || cleanup.is_err() {
             Some("componentRegistration".into())
         } else {
@@ -86,6 +91,9 @@ pub(crate) fn require_ready() -> Result<(), Error> {
     let value = status()?;
     if let Some(code) = value.error {
         return Err(Error::new(&code));
+    }
+    if matches!(value.deployment_state, "pending" | "failed") {
+        return Err(Error::new("componentDeploymentPending"));
     }
     if !value.installed {
         return Err(Error::new("componentMissing"));
@@ -106,6 +114,7 @@ fn status() -> Result<Status, Error> {
         update_available: false,
         payload_available: false,
         cleanup_pending: false,
+        deployment_state: "required",
         error: Some("platform".into()),
     })
 }
@@ -138,6 +147,12 @@ fn operate(
     maintenance: crate::dictation::ComponentMaintenance,
 ) -> Result<(), Error> {
     use sayweave_text_service::{client, registration};
+    if matches!(
+        crate::installer::deployment_state(PAYLOAD),
+        "pending" | "failed"
+    ) {
+        return Err(Error::new("componentDeploymentPending"));
+    }
     let maintenance = if matches!(action, Action::Install | Action::Remove) {
         // Registration is machine-wide. Enablement belongs to this ordinary initiating
         // user's process, not to the elevated helper or a diagnostic launch environment.
@@ -289,6 +304,8 @@ pub fn helper_entry() -> Option<i32> {
         };
         let action = args[0].as_str();
         let result = apartment(|| {
+            let _installer_guard = crate::installer::legacy_maintenance_guard(PAYLOAD)
+                .map_err(|code| Error::new(&code))?;
             let _lease = sayweave_text_service::registration::host_capability(
                 std::process::id(),
                 &uuid::Uuid::new_v4().to_string(),

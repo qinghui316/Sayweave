@@ -38,9 +38,9 @@ class NativeTextService implements TextServicePort {
 }
 export class BrowserTextService implements TextServicePort {
  readonly mode='simulation' as const;
- private value:TextServiceStatus={installed:false,enabled:false,updateAvailable:false,payloadAvailable:true,cleanupPending:false,error:null};
+ private value:TextServiceStatus={installed:false,enabled:false,updateAvailable:false,payloadAvailable:true,cleanupPending:false,deploymentState:'required',error:null};
  async status(){return {...this.value};}
- async act(action:TextServiceAction){this.value=action==='remove'?{...this.value,installed:false,enabled:false}:{...this.value,installed:true,enabled:action!=='disable',updateAvailable:false};return this.status();}
+ async act(action:TextServiceAction){this.value=action==='remove'?{...this.value,installed:false,enabled:false,deploymentState:'required'}:{...this.value,installed:true,enabled:action!=='disable',updateAvailable:false,deploymentState:'ready'};return this.status();}
 }
 export function createDictationPorts():{shortcuts:ShortcutConfigPort;dictation:DictationPort|null;textService:TextServicePort}{return isTauri()?{shortcuts:new NativeShortcuts(),dictation:new NativeDictation(),textService:new NativeTextService()}:{shortcuts:new BrowserShortcuts(),dictation:null,textService:new BrowserTextService()};}
 export {initialDictation};

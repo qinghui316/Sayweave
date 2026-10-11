@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Sayweave",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "identifier": "local.sayweave.skeleton",
   "build": {
     "frontendDist": "../dist",
@@ -47,7 +47,14 @@
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "template": "windows/installer.nsi"
+      }
+    },
+    "publisher": "sayweave"
   },
   "plugins": {
     "updater": {

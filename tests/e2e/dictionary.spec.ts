@@ -15,8 +15,8 @@ test('compact dictionary and real-zero dashboard fit desktop sizes',async({page}
  for(const [width,height] of [[1120,760],[960,640]] as const){
   await page.setViewportSize({width,height});await page.goto('/#/dictionary');await expect(page.getByRole('switch',{name:'自动入词'})).toBeEnabled();
   const bounds=await page.getByRole('switch',{name:'自动入词'}).boundingBox();expect(bounds!.y).toBeLessThan(130);await page.screenshot({path:'.local/dictionary-simple-'+width+'.png'});
-  await page.getByRole('button',{name:'设置',exact:true}).click();const dialog=page.getByRole('dialog',{name:'设置'});await dialog.getByRole('button',{name:'个性化',exact:true}).click();await expect(dialog.getByText('学习记录',{exact:true})).toBeVisible();await expect(dialog.getByText('使用一段时间后，这里会显示学到的表达习惯。')).toBeVisible();
-  await page.screenshot({path:'.local/personalization-dashboard-'+width+'.png'});expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);await dialog.getByRole('button',{name:'关闭',exact:true}).click();
+  await page.getByRole('link',{name:'个性化',exact:true}).click();await expect(page.getByText('学习记录',{exact:true})).toBeVisible();await expect(page.getByText('使用一段时间后，这里会显示学到的表达习惯。')).toBeVisible();
+  await page.screenshot({path:'.local/personalization-dashboard-'+width+'.png'});expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
  }
 });
 test('search expands in place and animated filters are not clipped',async({page})=>{

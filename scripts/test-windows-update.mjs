@@ -40,7 +40,7 @@ async function command(file,args,cwd=root,env=process.env,expectedFailure,timeou
  try{code=await new Promise(resolve=>child.once('close',(value,signal)=>{entry.signal=signal;resolve(value);}));}finally{clearInterval(heartbeat);entry.elapsedMs=Date.now()-started;entry.exitCode=code??null;entry.timeout=child.killed;if(spawnError)entry.spawnError=spawnError.code;if(safe){entry.stdout=stdout.slice(-8192);entry.stderr=stderr.slice(-8192);for(const [label,value] of [['stdout',stdout],['stderr',stderr]])writeFileSync(path.join(diagnostics,`${report.commands.length}-${entry.tool}.${label}.log`),value);}checkpoint();}
  if(spawnError)throw spawnError;
  if(child.killed)throw Error(`Command exceeded ${timeoutMs}ms: ${path.basename(file)}`);
- if(expectedFailure){if(code!==0&&tail.includes(expectedFailure))return;throw Error('Expected build-isolation rejection was not observed');}
+ if(expectedFailure){if(code!==0&&(expectedFailure===true||tail.includes(expectedFailure)))return;throw Error('Expected command rejection was not observed');}
  if(code!==0)throw Error(`Command failed: ${file} ${args.slice(0,3).join(' ')} (${code}); ${safe?stderr.slice(-4096):'private fixture log retained'}`);
  return {stdout,stderr};
 }
@@ -247,7 +247,8 @@ async function ready(page){await invoke(page,'update_check',{manual:true});retur
 async function nativeLayout(page,label){
  for(const [minimum,zoom,motion] of [[false,1,'no-preference'],[true,1,'reduce'],[true,1.5,'reduce']]){
   await invoke(page,'acceptance_main_size',{minimum,zoom});await page.emulateMedia({reducedMotion:motion});
-  await page.getByRole('button',{name:'关于',exact:true}).click();const dialog=page.getByRole('dialog');await expect(dialog).toBeVisible();
+  const update=await invoke(page,'update_snapshot');
+  await (update.version||update.recovery?page.locator('aside button[aria-haspopup="dialog"]'):page.getByRole('button',{name:'关于',exact:true})).click();const dialog=page.getByRole('dialog');await expect(dialog).toBeVisible();
   const panel=dialog.locator('section[aria-label="软件更新"]');await expect(panel).toBeVisible();
   const geometry=await dialog.evaluate(el=>{const r=el.getBoundingClientRect();return{x:r.x,y:r.y,right:r.right,bottom:r.bottom,width:innerWidth,height:innerHeight,ratio:devicePixelRatio};});
   expect(geometry.x).toBeGreaterThanOrEqual(0);expect(geometry.y).toBeGreaterThanOrEqual(0);expect(geometry.right).toBeLessThanOrEqual(geometry.width+1);expect(geometry.bottom).toBeLessThanOrEqual(geometry.height+1);
@@ -374,7 +375,7 @@ try{
   if(serverMode==='interrupted'){res.write(packageBytes.subarray(0,1024));setTimeout(()=>res.destroy(),100);return;}
   if(serverMode==='slow'){for(let offset=0;offset<packageBytes.length&&!res.destroyed;offset+=65536){res.write(packageBytes.subarray(offset,offset+65536));await delay(50);}res.end();return;}res.end(packageBytes);
  });await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(priorPackages?.manifest.port??0,'127.0.0.1',resolve);});
- let page;const sid=execFileSync('powershell',['-NoProfile','-Command','[Security.Principal.WindowsIdentity]::GetCurrent().User.Value'],{encoding:'utf8'}).trim();
+ let page;
  const probe=tools.probe;
  if(!stableInstaller){
  const context=priorPackages?.manifest??{identifier,product,port:server.address().port,url:`https://localhost:${server.address().port}/latest.json`,publicKey:readFileSync(`${keyPath}.pub`,'utf8').trim(),componentSha256:tools.manifest.artifacts.component.sha256};
@@ -384,7 +385,6 @@ try{
  const packageEntries=priorPackages?{...priorPackages.entries}:{old:{installer:old,executableSha256:report.installers.at(-1).executableSha256}};publishPackages();
  await verifyPackage(old,'0.1.700',context.publicKey);
  stage('installed startup short verification');await install(old);
- await command(testExe,['--sayweave-text-service=install',`--initiator=${sid}`]);
  const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);
  await installedRegistrationReady(probe);await command(probe,['installed-fixture',installedComponent.module]);
  page=await connect(testExe);const buildInfo=(await invoke(page,'update_snapshot')).build;expect(buildInfo).toMatchObject({version:'0.1.700',channel:'test',commit});const installedBytes=readFileSync(testExe);expect(createHash('sha256').update(installedBytes).digest('hex')).toBe(packageEntries.old.executableSha256);for(const value of [commit,identifier,context.url,context.publicKey])if(!installedBytes.includes(Buffer.from(value)))throw Error('Frozen build context absent in installed executable');
@@ -397,7 +397,14 @@ try{
  else{
  packageBytes=readFileSync(next);signature=readFileSync(`${next}.sig`,'utf8').trim();
  stage('real NSIS manual replacement');page=await connect(testExe);const seeded=await invoke(page,'acceptance_update_seed');expect(seeded.credentialMatches).toBe(true);expect(seeded.history.count).toBe(10);expect(seeded.profile.preferenceCount).toBe(1);expect(seeded.schema).toBe(9);expect(seeded.component.installed).toBe(true);expect(seeded.component.updateAvailable).toBe(false);expect(seeded.component.error).toBeNull();
- await close(page);const seedDb=new DatabaseSync(path.join(testData,'dictionary.sqlite'),{readOnly:true});legacySeed=legacySeedRows(seedDb);seedDb.close();await install(next);page=await connect(testExe);expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.701');expect(await data(page)).toEqual(seeded);await close(page);report.checks.push('real NSIS overlay preserves credential value, schema9, history, dictionary, profile and component state');
+ await invoke(page,'text_service_action',{action:'disable'});const disabledData=await data(page);expect(disabledData.component.enabled).toBe(false);
+ await close(page);const seedDb=new DatabaseSync(path.join(testData,'dictionary.sqlite'),{readOnly:true});legacySeed=legacySeedRows(seedDb);seedDb.close();
+ stage('installer program-copy failure rollback');const beforeExecutable=createHash('sha256').update(readFileSync(testExe)).digest('hex');
+ await command(next,['/S'],root,{...process.env,SAYWEAVE_INSTALL_ACCEPTANCE_FAULT:'after-program'},true);
+ expect(createHash('sha256').update(readFileSync(testExe)).digest('hex')).toBe(beforeExecutable);expect(componentIdentity()).toEqual(installedComponent);
+ page=await connect(testExe);expect(await data(page)).toEqual(disabledData);await close(page);report.checks.push('necessary component commit failure after program copy restores exact old EXE, component and disabled user choice with data/credentials');
+ stage('manual overlay with disabled choice');await install(next);page=await connect(testExe);expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.701');expect(await data(page)).toEqual(disabledData);expect((await invoke(page,'text_service_status')).deploymentState).toBe('ready');
+ await invoke(page,'text_service_action',{action:'enable'});expect(await data(page)).toEqual(seeded);await close(page);report.checks.push('real NSIS overlay automatically maintains component, preserves disabled choice, credential value, schema9, history, dictionary and profile');
  stage('real HTTPS failures and cancellation');await install(old);page=await connect(testExe);
  for(const mode of ['interrupted','bad-signature','wrong-version']){serverMode=mode;await invoke(page,'update_check',{manual:true});await state(page,'failed');expect(await data(page)).toEqual(seeded);report.checks.push(`real HTTPS ${mode} rejected; native app/data remain usable`);}
  await nativeLayout(page,'failure');
@@ -426,13 +433,13 @@ try{
  page=await connect(testExe);candidate=await state(page,'readyToInstall');expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.700');expect(candidate.error).toContain('上次更新未完成');expect(await data(page)).toEqual(seeded);
  for(let n=0;n<21;n++){expect(processes(cache)).toHaveLength(0);await delay(1000);}expect((await invoke(page,'update_snapshot')).state).toBe('readyToInstall');
  report.interruptedInstaller={...installerIdentity(cache,'0.1.701','test'),process:launched,descendants,stage:journal.stage,oldExecutableHash,interruption:'owned NSIS tree deliberately terminated after successful launch and app exit',aclRestored:true,noAutomaticRetrySeconds:21};report.checks.push('genuine launched NSIS installation deliberately interrupted; old binary/data retained, incomplete update shown without automatic retry');
- stage('native UI and real automatic upgrade');await page.getByRole('button',{name:'关于',exact:true}).click();await page.getByRole('button',{name:'重启并更新',exact:true}).click();await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);
+ stage('native UI and real automatic upgrade');await page.locator('aside button[aria-haspopup="dialog"]').click();await page.getByRole('button',{name:'重启并更新',exact:true}).click();await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);
  await expect.poll(async()=>(await invoke(page,'update_snapshot')).build.version,{timeout:60000}).toBe('0.1.701');expect(await data(page)).toEqual(seeded);expect((await invoke(page,'update_snapshot')).state).toBe('idle');expect(componentIdentity()).toEqual(installedComponent);await page.screenshot({path:path.join(directory,'native-upgraded.png')});await close(page);report.checks.push('native UI retry completes real HTTPS/minisign/NSIS upgrade and automatic restart; target version, exact data and installed component confirmed');
  report.passed=true;
  }
  }else{
  stage('formal draft component baseline');const stableData=path.join(process.env.APPDATA,'local.sayweave.skeleton','data');if(existsSync(stableData))throw Error('Stable runner profile is not empty');
- const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');report.installers.push(installerIdentity(stableInstaller,stableVersion,'stable'));await command(stableInstaller,['/S']);await command(stableExe,['--sayweave-text-service=install',`--initiator=${sid}`]);const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);await installedRegistrationReady(probe);await command(probe,['installed-fixture',installedComponent.module]);
+ const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');report.installers.push(installerIdentity(stableInstaller,stableVersion,'stable'));await command(stableInstaller,['/S']);const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);await installedRegistrationReady(probe);await command(probe,['installed-fixture',installedComponent.module]);
  stage('old public version and formal draft replacement');const oldAssets=path.join(directory,'old-public');mkdirSync(oldAssets);await command('gh',['release','download','v0.1.6','--repo','qinghui316/Sayweave','--pattern','*setup.exe','--dir',oldAssets]);const publicOld=path.join(oldAssets,'Sayweave_0.1.6_x64-setup.exe');report.installers.push(installerIdentity(publicOld,'0.1.6','old-public'));await command(publicOld,['/S']);
  const oldVersion=await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$v=(Get-Item -LiteralPath ${quote(stableExe)}).VersionInfo;@{fileVersion=$v.FileVersion;productVersion=$v.ProductVersion;fileParts=@($v.FileMajorPart,$v.FileMinorPart,$v.FileBuildPart,$v.FilePrivatePart);productParts=@($v.ProductMajorPart,$v.ProductMinorPart,$v.ProductBuildPart,$v.ProductPrivatePart)}|ConvertTo-Json -Compress`],root,process.env,undefined,30000);
  report.legacyExecutableIdentity={...JSON.parse(oldVersion.stdout.trim()),sha256:createHash('sha256').update(readFileSync(stableExe)).digest('hex')};checkpoint();expect(report.legacyExecutableIdentity.fileParts).toEqual([0,1,6,0]);expect(report.legacyExecutableIdentity.productParts).toEqual([0,1,6,0]);page=await connect(stableExe,true,true);

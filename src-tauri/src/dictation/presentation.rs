@@ -40,6 +40,18 @@ pub fn final_presentation(
     delivery: Option<&Delivery>,
     error: Option<&str>,
 ) -> Presentation {
+    let quiet_empty = text.trim().is_empty()
+        && error.is_none_or(|e| matches!(e, "emptyText" | "cancelled"))
+        && delivery.is_none_or(|d| {
+            !d.restore_error
+                && d.submission != Submission::Uncertain
+                && d.error
+                    .as_deref()
+                    .is_none_or(|e| matches!(e, "emptyText" | "cancelled"))
+        });
+    if quiet_empty {
+        return Presentation::Idle;
+    }
     let cancelled = error == Some("cancelled")
         || delivery.is_some_and(|d| d.error.as_deref() == Some("cancelled"));
     if cancelled

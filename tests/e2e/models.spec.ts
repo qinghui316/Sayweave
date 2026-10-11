@@ -95,15 +95,14 @@ test('compact actions, selected surface and reduced motion remain clear',async({
  await page.keyboard.press('Escape');await expect(dialog).toHaveCount(0);
 });
 test('feature settings save immediately through their own entries',async({page})=>{
- const dialog=await open(page);await dialog.getByRole('button',{name:'个性化',exact:true}).click();
- const personal=dialog.getByRole('switch',{name:'个性化'});await expect(personal).toBeChecked();await personal.click();await dialog.getByRole('button',{name:'关闭',exact:true}).click();await expect(page.getByRole('alertdialog')).toHaveCount(0);
+ await page.goto('/#/preferences');const personal=page.getByRole('switch',{name:'个性化'});await expect(personal).toBeChecked();await personal.click();await expect(personal).not.toBeChecked();await expect(page.getByRole('alertdialog')).toHaveCount(0);
  await page.getByRole('link',{name:'词典',exact:true}).click();const automatic=page.getByRole('switch',{name:'自动入词'});await expect(automatic).toBeChecked();await automatic.click();
  await page.getByRole('button',{name:'词典更多操作'}).click();await page.getByRole('menuitem',{name:'纠错映射'}).click();await expect(automatic).toBeVisible();await expect(automatic).not.toBeChecked();
- await page.getByRole('button',{name:'设置',exact:true}).click();const reopened=page.getByRole('dialog',{name:'设置'});await reopened.getByRole('button',{name:'个性化',exact:true}).click();await expect(reopened.getByRole('switch',{name:'个性化'})).not.toBeChecked();
+ await page.getByRole('link',{name:'个性化',exact:true}).click();await expect(page.getByRole('switch',{name:'个性化'})).not.toBeChecked();await page.getByRole('button',{name:'设置',exact:true}).click();const reopened=page.getByRole('dialog',{name:'设置'});
  await reopened.getByRole('button',{name:'模型',exact:true}).click();await reopened.getByRole('tab',{name:'文字处理'}).click();
  await reopened.getByLabel('API 密钥').fill('fixture-key');await manualModel(reopened);await reopened.getByLabel('模型',{exact:true}).fill('fixture-text');await reopened.getByRole('button',{name:'保存',exact:true}).click();
  const polish=reopened.getByRole('switch',{name:'整理口述'});await expect(polish).toBeChecked();await expect(reopened.getByRole('switch')).toHaveCount(1);await polish.click();await reopened.getByRole('button',{name:'关闭',exact:true}).click();await expect(page.getByRole('alertdialog')).toHaveCount(0);
- await page.getByRole('link',{name:'表达偏好',exact:true}).click();const preferences=page.getByRole('dialog',{name:'设置'});await expect(preferences.getByRole('switch',{name:'个性化'})).not.toBeChecked();await preferences.getByRole('button',{name:'模型',exact:true}).click();await preferences.getByRole('tab',{name:'文字处理'}).click();await expect(preferences.getByRole('switch',{name:'整理口述'})).not.toBeChecked();
+ await page.getByRole('link',{name:'个性化',exact:true}).click();await expect(page.getByRole('switch',{name:'个性化'})).not.toBeChecked();await page.getByRole('button',{name:'设置',exact:true}).click();const preferences=page.getByRole('dialog',{name:'设置'});await preferences.getByRole('button',{name:'模型',exact:true}).click();await preferences.getByRole('tab',{name:'文字处理'}).click();await expect(preferences.getByRole('switch',{name:'整理口述'})).not.toBeChecked();
 });
 
 test('synchronized text model picker stays visible, searches and restores focus',async({page})=>{

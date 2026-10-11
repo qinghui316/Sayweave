@@ -41,6 +41,7 @@ for (const file of checked) {
     : file.startsWith('data/') ? [...refs].filter(name => name !== 'contracts' && name !== 'data')
     : file === 'network.rs' ? [...refs]
     : file.startsWith('processing/') ? [...refs].filter(name => name !== 'contracts' && name !== 'processing')
+    : file.startsWith('installer/') ? [...refs].filter(name => !['installer','build_info','text_service'].includes(name))
     : [];
   for (const name of forbidden) violations.push(`${file} -> crate::${name}`);
   if (/^(?:models|history|shortcuts)\//.test(file) && /\bimpl\s+Repository\b/.test(source)) {
