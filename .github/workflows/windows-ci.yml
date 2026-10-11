@@ -7,10 +7,10 @@ on:
   workflow_dispatch:
     inputs:
       phase:
-        description: Startup proof or full upgrade acceptance (report startup first)
+        description: CI only, or explicitly requested update acceptance
         type: choice
-        options: [diagnose, startup, full, controller]
-        default: startup
+        options: [ci, diagnose, startup, full, controller]
+        default: ci
       reuse_run:
         description: Same-commit run containing immutable tools/packages (optional)
         type: string
@@ -47,12 +47,12 @@ jobs:
   ci:
     name: CI
     needs: windows-tooling
-    if: always() && !cancelled() && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || inputs.phase == 'full' || needs.windows-tooling.outputs.product_commit != '')
+    if: always() && !cancelled() && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || inputs.phase == 'ci' || inputs.phase == 'full' || needs.windows-tooling.outputs.product_commit != '')
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
       - name: Require successful short tooling proof
-        if: needs.windows-tooling.result != 'success'
+        if: github.event_name == 'workflow_dispatch' && inputs.phase != 'ci' && needs.windows-tooling.result != 'success'
         run: throw 'Short Windows tooling proof failed; long validation is blocked.'
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -83,7 +83,7 @@ jobs:
       - run: npm run check:distribution
   windows-tooling:
     name: Windows update tooling
-    if: inputs.phase != 'diagnose'
+    if: github.event_name == 'workflow_dispatch' && inputs.phase != 'diagnose' && inputs.phase != 'ci'
     outputs:
       reuse_run: ${{ steps.reuse.outputs.run_id }}
       product_commit: ${{ steps.scope.outputs.product_commit }}
@@ -346,7 +346,7 @@ jobs:
   windows-update:
     name: Windows update acceptance
     needs: windows-tooling
-    if: always() && !cancelled() && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || inputs.phase == 'full' || needs.windows-tooling.outputs.product_commit != '')
+    if: always() && !cancelled() && github.event_name == 'workflow_dispatch' && (inputs.phase == 'full' || needs.windows-tooling.outputs.product_commit != '')
     runs-on: windows-latest
     timeout-minutes: 90
     env:

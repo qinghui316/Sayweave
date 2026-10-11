@@ -5,12 +5,34 @@ import path from 'node:path';
 import {afterEach,describe,expect,it} from 'vitest';
 // @ts-expect-error JavaScript acceptance module has no declaration file.
 import {readTools,writeTools,readMechanismEvidence,writeMechanismEvidence,proofMarkers} from '../scripts/windows-update-artifacts.mjs';
+// @ts-expect-error JavaScript release entry point has no declaration file.
+import {findMechanismRun} from '../scripts/reuse-windows-update-evidence.mjs';
 
 const commit='a'.repeat(40),directories:string[]=[];
 function directory(){const value=mkdtempSync(path.join(os.tmpdir(),'sayweave-evidence-'));directories.push(value);return value;}
 function tools(){return writeTools(directory(),commit,Buffer.from('production DLL'),Buffer.from('acceptance probe'),{rustc:'rustc 1.92',cargo:'cargo 1.92',capabilities:{acceptance:true,installedFixture:true,protocol:8},markers:proofMarkers,registrationClean:true});}
 function evidence(){const t=tools(),dir=directory();writeMechanismEvidence(dir,commit,t,{synthetic:true},{passed:true,kind:'mechanism',commit,tools:t.manifest});return dir;}
 afterEach(()=>{for(const dir of directories.splice(0))rmSync(dir,{recursive:true,force:true});});
+describe('manual release mechanism evidence selection',()=>{
+ const run=(databaseId:number,event='workflow_dispatch')=>({databaseId,event,headSha:commit,headBranch:'main',status:'completed',conclusion:'success'});
+ const inventory=(artifacts:{name:string;expired:boolean}[])=>({total_count:artifacts.length,artifacts});
+ const live=[{name:'windows-update-evidence',expired:false}];
+ it('skips a newer successful CI-only run and reuses exact manual full evidence',()=>{
+  expect(findMechanismRun([run(2,'push'),run(1)],commit,(id:number)=>inventory(id===1?live:[])).databaseId).toBe(1);
+ });
+ it('retains successful legacy main push evidence',()=>expect(findMechanismRun([run(1,'push')],commit,()=>inventory(live)).databaseId).toBe(1));
+ it.each([{headSha:'b'.repeat(40)},{headBranch:'feature'},{event:'pull_request'},{conclusion:'failure'},{databaseId:0}])('rejects a wrong run identity %j',delta=>{
+  expect(()=>findMechanismRun([{...run(1),...delta}],commit,()=>{throw Error('must not read rejected identity');})).toThrow('exact-commit');
+ });
+ it('rejects CI-only or expired evidence',()=>{
+  expect(()=>findMechanismRun([run(1)],commit,()=>inventory([]))).toThrow('exact-commit');
+  expect(()=>findMechanismRun([run(1)],commit,()=>inventory([{name:'windows-update-evidence',expired:true}]))).toThrow('exact-commit');
+ });
+ it('rejects duplicate or truncated inventories',()=>{
+  expect(()=>findMechanismRun([run(1)],commit,()=>inventory([...live,...live]))).toThrow('Ambiguous');
+  expect(()=>findMechanismRun([run(1)],commit,()=>({total_count:2,artifacts:live}))).toThrow('inventory');
+ });
+});
 describe('immutable Windows acceptance artifact reuse',()=>{
  it('reuses the same source, DLL, probe and completed mechanism receipt',()=>{const dir=evidence(),result=readMechanismEvidence(dir,commit);expect(result.receipt.passed).toBe(true);expect(result.tools.manifest.commit).toBe(commit);expect(result.seed).toEqual({synthetic:true});});
  it('rejects a different candidate and an unproven probe',()=>{const t=tools();expect(()=>readTools(t.directory,'b'.repeat(40))).toThrow('identity');const m=t.manifest;m.proof.markers=[];writeFileSync(path.join(t.directory,'tools.json'),JSON.stringify(m));expect(()=>readTools(t.directory,commit)).toThrow('proof');});
