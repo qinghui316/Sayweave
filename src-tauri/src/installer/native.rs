@@ -200,7 +200,8 @@ pub fn dispatch(args: &[String]) -> Result<()> {
     {
         return Err("installerArguments".into());
     }
-    let directory = PathBuf::from(required(&values, "install-dir")?);
+    let directory =
+        metadata::normalized_directory(&PathBuf::from(required(&values, "install-dir")?))?;
     reject_links(&directory)?;
     if directory.parent().is_none() || directory.file_name().is_none() {
         return Err("installerDirectory".into());

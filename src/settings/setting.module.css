@@ -2,6 +2,7 @@
 .row { display:flex;align-items:center;justify-content:space-between;gap:var(--space-20); }
 .row>div { min-width:0; }
 .setting h3 { font-size:var(--text-mode);line-height:var(--line-mode);font-weight:500; }
+.pageHeading { margin-bottom:0; }.pageHeading h1 { font-size:var(--text-page);line-height:var(--line-page);font-weight:500; }.pageHeading .row { align-items:flex-start; }
 .setting p { margin-top:var(--space-8);font-size:var(--text-small);line-height:var(--line-small);color:var(--text-secondary);max-width:520px; }
 .compact { margin:0; }.compact h3 { font-size:var(--text-body);line-height:var(--line-body);font-weight:400; }
 .hidden { position:absolute;width:1px;height:1px;padding:0;margin:-1px !important;overflow:hidden;clip-path:inset(50%);white-space:nowrap; }

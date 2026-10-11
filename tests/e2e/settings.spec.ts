@@ -4,6 +4,8 @@ test('personalization and automatic terms are findable at both desktop sizes',as
  for(const [width,height] of [[1120,760],[960,640]] as const){
   await page.setViewportSize({width,height});await page.goto('/#/preferences');
   await expect(page.getByRole('switch',{name:'个性化'})).toBeEnabled();await expect(page.getByRole('heading',{name:'个性化',exact:true,level:1})).toBeVisible();
+  await expect(page.getByRole('heading',{name:'个性化',exact:true})).toHaveCount(1);
+  expect(await page.getByRole('switch',{name:'个性化'}).evaluate(node=>innerWidth-node.getBoundingClientRect().right)).toBeLessThanOrEqual(40);
   await expect(page.getByRole('dialog')).toHaveCount(0);await expect(page.getByRole('link',{name:'个性化'})).toHaveAttribute('aria-current','page');
   const footer=page.locator('footer');await expect(footer.getByRole('button')).toHaveCount(2);await expect(footer.getByRole('button',{name:'关于'})).toBeVisible();
   expect(await footer.getByRole('button',{name:'设置',exact:true}).evaluate(node=>{const r=node.getBoundingClientRect();return r.height<=40&&node.scrollWidth<=node.clientWidth;})).toBe(true);
