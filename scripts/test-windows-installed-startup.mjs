@@ -104,7 +104,9 @@ async function deploymentLifecycle(){
  expect(createHash('sha256').update(readFileSync(uninstaller)).digest('hex')).toBe(original.user.target.uninstallHash);
  stage('owned true uninstall retains data, credentials and shared component');
  try{await attemptInstallation(uninstaller);}finally{cases.uninstall={records:deploymentReading()};persist();}
- expect(cases.uninstall.records.user.phase).toBe('uninstalled');
+ // NSIS's original uninstaller returns after spawning its temporary copy.
+ // Parent exit0 is only launch evidence; wait for the owned durable terminal.
+ await expect.poll(()=>{cases.uninstall.records=deploymentReading();persist();return cases.uninstall.records.user.phase;},{timeout:180000,intervals:[100,200,500]}).toBe('uninstalled');
  expect(existsSync(exe)).toBe(false);expect(existsSync(uninstaller)).toBe(false);expect(existsSync(path.join(path.dirname(exe),'sayweave-installer-helper.exe'))).toBe(false);
  for(const file of original.user.files)expect(existsSync(file.path)).toBe(false);
  const keys=JSON.stringify(original.user.keys.map(key=>key.path));
