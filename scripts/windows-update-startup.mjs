@@ -1,9 +1,39 @@
 import {spawn,execFileSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {mkdirSync,readFileSync,writeFileSync,existsSync,lstatSync,openSync,readSync,closeSync} from 'node:fs';
+import {mkdirSync,readFileSync,writeFileSync,existsSync,lstatSync,openSync,readSync,closeSync,realpathSync} from 'node:fs';
 import path from 'node:path';
 
 const limit=65536;
+// Fixed installer records only. Project each scalar so damaged records cannot
+// smuggle registry values, free-text errors or unrelated objects into artifacts.
+export function deploymentSummary(value){
+ const text=(v,max=2048)=>typeof v==='string'&&v.length<=max&&!/[\0\r\n]/.test(v)?v:null;
+ const hash=v=>typeof v==='string'&&/^[a-f0-9]{64}$/i.test(v)?v:null;
+ const code=v=>typeof v==='string'&&/^[a-zA-Z][a-zA-Z0-9]{0,127}$/.test(v)?v:null;
+ const number=v=>Number.isSafeInteger(v)&&v>=0?v:null;
+ const boolean=v=>typeof v==='boolean'?v:null;
+ const process=v=>v&&typeof v==='object'?{pid:number(v.pid),session:number(v.session),created:number(v.created),sid:typeof v.sid==='string'&&/^S-1-[0-9-]{1,180}$/.test(v.sid)?v.sid:null,imageHash:hash(v.imageHash)}:null;
+ const target=v=>v&&typeof v==='object'?{version:typeof v.version==='string'&&/^\d+\.\d+\.\d+(?:[-+][a-zA-Z0-9.-]+)?$/.test(v.version)&&v.version.length<=64?v.version:null,commit:typeof v.commit==='string'&&/^[a-f0-9]{40}$/i.test(v.commit)?v.commit:null,payloadHash:hash(v.payloadHash),mainHash:hash(v.mainHash),helperHash:hash(v.helperHash),uninstallHash:hash(v.uninstallHash)}:null;
+ const values=value&&typeof value==='object'?value:{};
+ return {schemaVersion:number(values.schemaVersion),transaction:typeof values.transaction==='string'&&/^[a-f0-9-]{36}$/i.test(values.transaction)?values.transaction:null,phase:code(values.phase),target:target(values.target),installer:process(values.installer),server:process(values.server),language:number(values.language),userChoice:boolean(values.userChoice),userInitializationStarted:boolean(values.userInitializationStarted),userInitialized:boolean(values.userInitialized),module:text(values.module),oldModule:text(values.old?.module),oldHash:hash(values.oldHash),error:code(values.error),lastFailure:values.lastFailure?{phase:code(values.lastFailure.phase),code:code(values.lastFailure.code)}:null,files:Array.isArray(values.files)?values.files.slice(0,5).map(v=>({path:text(v?.path),backup:code(v?.backup),beforeHash:hash(v?.beforeHash),installedHash:hash(v?.installedHash)})):null,keys:Array.isArray(values.keys)?values.keys.slice(0,2).map(v=>({path:text(v?.path),existed:boolean(v?.existed),valueCount:Array.isArray(v?.values)?v.values.length:null})):null};
+}
+export function deploymentReading(installDirectory){
+ let ancestor=installDirectory;const suffix=[];
+ while(!existsSync(ancestor)){const parent=path.dirname(ancestor);if(parent===ancestor)throw Error('Deployment directory ancestor missing');suffix.unshift(path.basename(ancestor));ancestor=parent;}
+ const canonical=path.join(realpathSync.native(ancestor),...suffix);
+ const name=createHash('sha256').update(canonical.replace(/^\\\\\?\\/,'').replace(/\\$/,'').toLowerCase()).digest('hex');
+ const paths={user:path.join(process.env.LOCALAPPDATA,'SayweaveInstallTransactions',name,'receipt.json'),machine:path.join(process.env.ProgramFiles,'Sayweave','TextService','installer.json')};
+ const readings={};
+ for(const [role,file] of Object.entries(paths)){
+  if(!existsSync(file)){readings[role]={exists:false};continue;}
+  try{
+   const info=lstatSync(file);if(info.isSymbolicLink()||!info.isFile()||info.size>128*1024)throw Error('Deployment diagnostic record exceeds fixed bound');
+   const bytes=readFileSync(file);if(bytes.length>128*1024)throw Error('Deployment diagnostic read exceeds bound');
+   readings[role]={exists:true,sha256:createHash('sha256').update(bytes).digest('hex'),...deploymentSummary(JSON.parse(bytes))};
+  }catch{readings[role]={exists:true,readFailed:true};}
+ }
+ return readings;
+}
 export const aclPrelude=String.raw`$ErrorActionPreference='Stop';[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false);Import-Module (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1') -ErrorAction Stop;`;
 function aclLiteral(value){if(typeof value!=='string'||!path.win32.isAbsolute(value)||value.length>2048||/[\0\r\n]/.test(value))throw Error('ACL requires a bounded absolute owned directory');return "'"+value.replaceAll("'","''")+"'";}
 export function aclSnapshotScript(directory){

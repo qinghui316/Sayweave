@@ -5,7 +5,7 @@ import {EventEmitter} from 'node:events';
 import {spawnSync} from 'node:child_process';
 import {afterEach,describe,expect,it,vi} from 'vitest';
 // @ts-expect-error JavaScript acceptance module has no declaration file.
-import {boundedTail,safeStartupText,pageReady,validateEndpoint,installedStartup,launchEnvironment,restartAndReconnect,aclPrelude,aclRestoreScript} from '../scripts/windows-update-startup.mjs';
+import {boundedTail,safeStartupText,pageReady,validateEndpoint,installedStartup,launchEnvironment,restartAndReconnect,aclPrelude,aclRestoreScript,deploymentSummary} from '../scripts/windows-update-startup.mjs';
 // @ts-expect-error JavaScript acceptance module has no declaration file.
 import {readPackages,writePackages,nsisExecutableIdentity} from '../scripts/windows-update-packages.mjs';
 // @ts-expect-error JavaScript acceptance module has no declaration file.
@@ -17,6 +17,13 @@ function directory(){const dir=mkdtempSync(path.join(os.tmpdir(),'sayweave-start
 function packages(){const input=directory(),file=path.join(input,'setup.exe');writeFileSync(file,'same installer');writeFileSync(`${file}.sig`,'same signature');const output=directory();writePackages(output,commit,context,{old:{installer:file,executableSha256:'c'.repeat(64)}},{passed:true});return output;}
 afterEach(()=>{for(const dir of directories.splice(0))rmSync(dir,{recursive:true,force:true});});
 describe('installed startup diagnostics and immutable package reuse',()=>{
+ it('projects bounded deployment metadata and excludes nested secrets and registry values',()=>{
+  const result=deploymentSummary({schemaVersion:1,transaction:uuid,phase:'recovery',target:{version:'0.1.700',commit,payloadHash:'b'.repeat(64),credential:'hidden'},installer:{pid:42,session:1,created:1000,sid:'S-1-5-21-123',imageHash:'c'.repeat(64),credential:'hidden'},server:{pid:'hidden'},userChoice:false,error:'password=hidden',lastFailure:{phase:'programInstalled',code:'installerCommitFailed',extra:'hidden'},files:[{path:'C:\\owned\\sayweave.exe',backup:'main',bytes:'hidden'}],keys:[{path:'Software\\owned',existed:true,values:[{name:'hidden',bytes:'hidden'}]}]});
+  expect(result).toMatchObject({phase:'recovery',userChoice:false,error:null,target:{version:'0.1.700',commit},installer:{pid:42},server:{pid:null},keys:[{valueCount:1}],lastFailure:{phase:'programInstalled',code:'installerCommitFailed'}});
+  expect(JSON.stringify(result)).not.toContain('hidden');
+  expect(deploymentSummary({target:{version:'x'.repeat(100)},phase:[],files:Array(12).fill({path:'x'.repeat(3000)}),keys:Array(4).fill({})})).toMatchObject({phase:null,target:{version:null},files:Array(5).fill({path:null})});
+  expect(deploymentSummary(null).phase).toBeNull();
+ });
  it.skipIf(process.platform!=='win32')('accepts only the documented ACL bit addition and rejects permission or identity changes without filesystem operations',()=>{
   const encode=String.raw`$sd=[System.Security.AccessControl.RawSecurityDescriptor]::new('O:BAG:BAD:(A;;FA;;;BA)(A;;FR;;;BU)');$bytes=[byte[]]::new($sd.BinaryLength);$sd.GetBinaryForm($bytes,0);[Convert]::ToBase64String($bytes)`;
   const baseline=spawnSync('powershell',['-NoProfile','-Command',encode],{encoding:'utf8',windowsHide:true,timeout:10000});expect(baseline.status).toBe(0);

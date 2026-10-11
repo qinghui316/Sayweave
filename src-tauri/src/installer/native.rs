@@ -398,6 +398,7 @@ fn begin(
         .iter()
         .map(|key| metadata::snapshot(key))
         .collect::<Result<Vec<_>>>()?;
+    metadata::validate_main_binary(&key_snapshots[1])?;
     if !key_snapshots[1].existed
         && (directory.join("sayweave.exe").exists()
             || directory.join("uninstall.exe").exists()

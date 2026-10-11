@@ -22,6 +22,7 @@ describe('installer ownership and ordering',()=>{
   expect(install.indexOf('Call SayweaveBegin')).toBeLessThan(install.indexOf('File "${MAINBINARYSRCPATH}"'));
   expect(install.indexOf('--sayweave-installer=commit')).toBeGreaterThan(install.indexOf('WriteRegStr SHCTX "${UNINSTKEY}" "DisplayVersion"'));
   expect(install).not.toContain('CheckIfAppIsRunning');
+  expect(install).not.toContain('Delete "$INSTDIR\\$OldMainBinaryName"');
   expect(template).not.toContain("ExecWait '$R1'");
  });
  it('routes true uninstall through the locked controller with no second destructive pass',()=>{

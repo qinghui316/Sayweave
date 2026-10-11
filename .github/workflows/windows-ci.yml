@@ -414,6 +414,13 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always() && needs.windows-tooling.outputs.product_commit == ''
         with:
+          name: windows-update-packages
+          include-hidden-files: true
+          path: .local/windows-update-packages/
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && needs.windows-tooling.outputs.product_commit == ''
+        with:
           name: windows-update-receipt
           include-hidden-files: true
           path: |
