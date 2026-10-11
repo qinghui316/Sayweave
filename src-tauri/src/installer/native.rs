@@ -2,8 +2,8 @@
 use super::{
     ipc, machine, metadata,
     record::{
-        FileBackup, MAX_FILE, MAX_RECORD, Phase, Process, Result, Target, UserRecord, hash, read,
-        recovery_owner, reject_links, write,
+        Failure, FileBackup, MAX_FILE, MAX_RECORD, Phase, Process, Result, Target, UserRecord,
+        hash, read, recovery_owner, reject_links, write,
     },
 };
 use sayweave_text_service::{registration, transport::Pipe};
@@ -451,6 +451,7 @@ fn begin(
         files,
         keys: key_snapshots,
         error: None,
+        last_failure: None,
     };
     save(&root, &record)?;
     match stage_server(&record, false) {
@@ -541,6 +542,10 @@ fn commit(directory: &Path, installer: &Process, target: &Target) -> Result<()> 
         verify_ready(&record)
     })();
     if let Err(error) = result {
+        record.last_failure = Some(Failure {
+            phase: record.phase,
+            code: error.clone(),
+        });
         record.error = Some(error.clone());
         record.phase = Phase::Recovery;
         save(&root, &record)?;
