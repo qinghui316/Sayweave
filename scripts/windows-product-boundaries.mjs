@@ -114,10 +114,14 @@ export async function installerBoundaryCases(ctx){
   }
   const driverFile=path.join(ctx.directory,'driver-'+kind+'.ps1');
   writeFileSync(driverFile,`$ErrorActionPreference='Stop';function Run-Helper([string]$action){& ${quote(helper)} ("--sayweave-installer="+$action) ${quote('--install-dir='+path.dirname(ctx.exe))} ("--installer-pid="+$PID) ${quote('--product-key=Software\\sayweave\\'+ctx.packages.manifest.product)} ${quote('--main-source='+main)};return $LASTEXITCODE};$result=Run-Helper 'begin';if($result -ne 0){exit $result};[Console]::WriteLine('PREPARED');[Console]::Out.Flush();$null=[Console]::ReadLine();${kind==='program-recovery'?"$env:SAYWEAVE_INSTALL_ACCEPTANCE_FAULT='after-program';":''}$result=Run-Helper 'commit';[Console]::WriteLine('COMMIT_EXIT '+$result);[Console]::Out.Flush();$null=[Console]::ReadLine();exit $result`,'utf8');
+  ctx.ownedBoundaryServer=null;ctx.ownedBoundaryController=null;
   const driver=spawn('powershell',['-NoProfile','-ExecutionPolicy','Bypass','-File',driverFile],{windowsHide:true,stdio:['pipe','pipe','pipe']});let text='',errors='';driver.stdout.on('data',bytes=>{text+=bytes;});driver.stderr.on('data',bytes=>{errors=(errors+bytes).slice(-2048);});
   ctx.boundaryDriver=driver;test.driverPid=driver.pid;
   await expect.poll(()=>text.includes('PREPARED')?'prepared':driver.exitCode!==null?'exited:'+driver.exitCode+':'+errors:'waiting',{timeout:15000}).toBe('prepared');
   test.prepared=ctx.deploymentReading();ctx.persist();expect(boundaryCheckpoint('prepared',test.prepared)).toBe(true);
+  const preparedRaw=readFileSync(path.join(process.env.ProgramFiles,'Sayweave','TextService','installer.json'),'utf8');
+  ctx.ownedBoundaryServer=preciseProcessRecord(preparedRaw,'server');ctx.ownedBoundaryController=preciseProcessRecord(preparedRaw,'installer');
+  expect(ctx.ownedBoundaryController.pid).toBe(driver.pid);expect(ctx.ownedBoundaryServer.imageHash).toBe(ctx.report.helperIdentity.helperSha256);
   try{
    if(kind==='machine-recovery'){
     const snapshot=await ctx.command('powershell',['-NoProfile','-Command',aclPrelude+`$key=${quote(tipRoot)};$acl=Get-Acl -LiteralPath $key;@{binary=[Convert]::ToBase64String($acl.GetSecurityDescriptorBinaryForm())}|ConvertTo-Json -Compress`]);test.registryAcl=JSON.parse(snapshot);ctx.registryAcl={key:tipRoot,...test.registryAcl};ctx.persist();
@@ -129,7 +133,7 @@ export async function installerBoundaryCases(ctx){
    const raw=readFileSync(path.join(process.env.ProgramFiles,'Sayweave','TextService','installer.json'),'utf8');
    const server=preciseProcessRecord(raw,'server'),controller=preciseProcessRecord(raw,'installer');
    expect(server.pid).toBe(test.interrupted.machine.server.pid);expect(server.imageHash).toBe(ctx.report.helperIdentity.helperSha256);expect(controller.pid).toBe(driver.pid);
-   ctx.ownedBoundaryServer=server;ctx.ownedBoundaryController=controller;
+   expect(server).toEqual(ctx.ownedBoundaryServer);expect(controller).toEqual(ctx.ownedBoundaryController);
    test.originalNativeProcesses={server,controller};ctx.persist();
    test.killedServer=await stopProcess(ctx,server);
    test.killedController=await stopProcess(ctx,controller);ctx.persist();
@@ -159,8 +163,10 @@ export async function restoreRegistryAcl(ctx){
 }
 export async function cleanupBoundaryDriver(ctx){
  const driver=ctx.boundaryDriver;if(!driver)return;
- if(ctx.ownedBoundaryServer)await stopProcess(ctx,ctx.ownedBoundaryServer);
- if(ctx.ownedBoundaryController)await stopProcess(ctx,ctx.ownedBoundaryController);
- else if(driver.exitCode===null)driver.kill(); // Original child handle, not an arbitrary PID.
+ const errors=[];
+ if(ctx.ownedBoundaryServer)try{await stopProcess(ctx,ctx.ownedBoundaryServer);}catch(error){errors.push(error.message);}
+ if(ctx.ownedBoundaryController)try{await stopProcess(ctx,ctx.ownedBoundaryController);}catch(error){errors.push(error.message);}
+ if(driver.exitCode===null)driver.kill(); // Original child handle, not an arbitrary PID.
  ctx.boundaryDriver=null;
+ if(errors.length)throw Error('Boundary termination unconfirmed: '+errors.join('; '));
 }

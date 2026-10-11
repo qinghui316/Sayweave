@@ -319,7 +319,7 @@ try{
  report.passed=true;
 }catch(error){report.error=safeStartupText(error?.message??error?.code??String(error)).slice(0,2048);process.exitCode=1;}
 finally{
- if(boundaries){try{await restoreRegistryAcl(boundaryContext);await cleanupBoundaryDriver(boundaryContext);await releaseOlderComponent(boundaryContext);}catch(error){report.boundaryCleanupError=String(error.message).slice(0,1024);report.passed=false;process.exitCode=1;}}
+ if(boundaries)for(const action of [restoreRegistryAcl,cleanupBoundaryDriver,releaseOlderComponent]){try{await action(boundaryContext);}catch(error){(report.boundaryCleanupErrors??=[]).push({action:action.name,error:String(error.message).slice(0,1024)});report.passed=false;process.exitCode=1;}}
  if(browser)await browser.close().catch(()=>{});
  if(owned){try{const current=installedState(exe).applications.find(app=>app.ProcessId===owned.ProcessId&&app.CreationDate===owned.CreationDate);if(current){report.cleanupKill={ProcessId:current.ProcessId,CreationDate:current.CreationDate};await command('taskkill',['/PID',String(current.ProcessId),'/T','/F']);}}catch(error){report.cleanupError=String(error.message).slice(0,1024);report.passed=false;process.exitCode=1;}}
  else if(child&&child.exitCode===null){report.unverifiedProcessCleanup=true;report.passed=false;process.exitCode=1;}
