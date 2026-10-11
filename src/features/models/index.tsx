@@ -74,11 +74,11 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
    if(!overview)return;
    if(!alive.current || loadVersion.current !== version) return;
    setView(overview);
-   setEditor(recordsFor(overview, 'speech').length ? null : newEditor('speech'));
-   setUsage('speech'); setAdvanced(false);
+   setEditor(recordsFor(overview, initialUsage).length ? null : newEditor(initialUsage));
+   setUsage(initialUsage); setAdvanced(false);
   } catch(e) {if(alive.current && loadVersion.current === version) report(e);}
   finally {if(alive.current && loadVersion.current === version) setLoading(false);}
- }, [port, report]);
+ }, [port, report, initialUsage]);
  useEffect(() => {
   let stopped = false; alive.current = true;
   void Promise.resolve().then(() => {if(!stopped) void load();});
