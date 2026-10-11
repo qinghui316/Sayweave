@@ -9,7 +9,7 @@ on:
       phase:
         description: Startup proof or full upgrade acceptance (report startup first)
         type: choice
-        options: [diagnose, startup, full]
+        options: [diagnose, startup, full, controller]
         default: startup
       reuse_run:
         description: Same-commit run containing immutable tools/packages (optional)
@@ -17,6 +17,10 @@ on:
         default: ''
       candidate_sha:
         description: Frozen product SHA for diagnostic-only package reuse
+        type: string
+        default: ''
+      product_commit:
+        description: Frozen verified product for workflow-only controller validation
         type: string
         default: ''
       diagnose_recovery:
@@ -43,7 +47,7 @@ jobs:
   ci:
     name: CI
     needs: windows-tooling
-    if: always() && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || inputs.phase == 'full')
+    if: always() && !cancelled() && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || inputs.phase == 'full' || needs.windows-tooling.outputs.product_commit != '')
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
@@ -69,6 +73,7 @@ jobs:
     if: inputs.phase != 'diagnose'
     outputs:
       reuse_run: ${{ steps.reuse.outputs.run_id }}
+      product_commit: ${{ steps.scope.outputs.product_commit }}
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -80,8 +85,70 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+      - name: Resolve workflow-only product scope
+        id: scope
+        env:
+          REQUESTED_PRODUCT: ${{ inputs.product_commit }}
+          CONTROLLER_PHASE: ${{ inputs.phase }}
+          AUTO_CONTROLLER: ${{ github.event_name == 'push' }}
+          EXPECTED_CONTROLLER: ${{ github.sha }}
+        run: |
+          $product = ''
+          if ($env:CONTROLLER_PHASE -eq 'controller') {
+            if ($env:REQUESTED_PRODUCT -notmatch '^[a-f0-9]{40}$') { throw 'Exact frozen product commit required.' }
+            $product = $env:REQUESTED_PRODUCT
+          } elseif ($env:AUTO_CONTROLLER -eq 'true') {
+            $version = (Get-Content -LiteralPath package.json -Raw -Encoding utf8 | ConvertFrom-Json).version
+            $candidate = git rev-parse --verify "refs/tags/v${version}^{commit}" 2>$null
+            if ($LASTEXITCODE -eq 0) { $product = ([string]$candidate).Trim() }
+          }
+          $eligible = $false
+          if ($product -match '^[a-f0-9]{40}$' -and $product -ne $env:EXPECTED_CONTROLLER) {
+            git merge-base --is-ancestor $product origin/main
+            if ($LASTEXITCODE -eq 0) {
+              $changes = @(git diff --name-only $product $env:EXPECTED_CONTROLLER)
+              if ($LASTEXITCODE -ne 0) { throw 'Product/source comparison failed.' }
+              $allowed = @('.github/workflows/windows-release.yml','.github/workflows/windows-ci.yml')
+              $eligible = $changes.Count -gt 0 -and @($changes | Where-Object { $_ -notin $allowed }).Count -eq 0
+            }
+          }
+          if ($env:CONTROLLER_PHASE -eq 'controller' -and -not $eligible) { throw 'Controller differs from the frozen product outside the two workflow files.' }
+          if (-not $eligible) { $product = '' }
+          "product_commit=$product" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          exit 0
       - run: npm ci
+      - name: Verify unchanged product and original main evidence
+        if: steps.scope.outputs.product_commit != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FROZEN_PRODUCT: ${{ steps.scope.outputs.product_commit }}
+          EXPECTED_CONTROLLER: ${{ github.sha }}
+        run: |
+          $productSource = Join-Path $env:RUNNER_TEMP 'sayweave-frozen-product'
+          $evidence = Join-Path $env:GITHUB_WORKSPACE '.local/reused-product-evidence'
+          git worktree add --detach $productSource $env:FROZEN_PRODUCT
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen product checkout failed.' }
+          Push-Location $productSource
+          try {
+            $env:SAYWEAVE_RELEASE_COMMIT = $env:FROZEN_PRODUCT
+            node scripts/reuse-windows-update-evidence.mjs $evidence
+            if ($LASTEXITCODE -ne 0) { throw 'Original successful product main evidence invalid.' }
+          } finally { Pop-Location }
+          node --input-type=module -e "import {readFileSync,writeFileSync} from 'node:fs';import {readMechanismEvidence} from './scripts/windows-update-artifacts.mjs';const e=readMechanismEvidence('.local/reused-product-evidence',process.env.FROZEN_PRODUCT),ci=JSON.parse(readFileSync('.local/reused-product-evidence/ci-run.json','utf8'));writeFileSync('.local/controller-product-binding.json',JSON.stringify({controllerCommit:process.env.EXPECTED_CONTROLLER,productCommit:process.env.FROZEN_PRODUCT,productMainRun:ci.databaseId,productChecks:e.receipt.checks,productComponentSha256:e.tools.manifest.artifacts.component.sha256,productCodeUnchangedExceptWorkflows:true,newProductPackagesBuilt:false},null,2)+'\n')"
+          if ($LASTEXITCODE -ne 0) { throw 'Controller/product binding failed.' }
+          git worktree remove $productSource
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen product checkout cleanup failed.' }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: steps.scope.outputs.product_commit != ''
+        with:
+          name: workflow-product-evidence
+          include-hidden-files: true
+          path: |
+            .local/reused-product-evidence/
+            .local/controller-product-binding.json
+          if-no-files-found: error
       - name: Resolve same-candidate reuse
+        if: steps.scope.outputs.product_commit == ''
         id: reuse
         env:
           GH_TOKEN: ${{ github.token }}
@@ -109,7 +176,7 @@ jobs:
           }
           "run_id=$resolvedReuse" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
       - name: Reuse exact candidate tools
-        if: steps.reuse.outputs.run_id != ''
+        if: steps.scope.outputs.product_commit == '' && steps.reuse.outputs.run_id != ''
         env:
           GH_TOKEN: ${{ github.token }}
           REUSE_RUN: ${{ steps.reuse.outputs.run_id }}
@@ -120,18 +187,20 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $env:EXPECTED_COMMIT -or $run.path -ne '.github/workflows/windows-ci.yml' -or $run.event -notin @('push','workflow_dispatch','pull_request')) { throw 'Reusable run identity differs.' }
           gh run download $env:REUSE_RUN --name windows-update-tools --dir .local/prior-update-tools
           if ($LASTEXITCODE -ne 0) { throw 'Reusable tools download failed.' }
-      - run: |
+      - if: steps.scope.outputs.product_commit == ''
+        run: |
           if (Test-Path .local/prior-update-tools) { node scripts/test-windows-update.mjs --tools-only --tools-dir .local/prior-update-tools }
           else { node scripts/test-windows-update.mjs --tools-only }
           if ($LASTEXITCODE -ne 0) { throw 'Short tooling validation failed.' }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: steps.scope.outputs.product_commit == ''
         with:
           name: windows-update-tools
           include-hidden-files: true
           path: .local/windows-update-tools/
           if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
+        if: always() && steps.scope.outputs.product_commit == ''
         with:
           name: windows-tooling-diagnostics
           include-hidden-files: true
@@ -264,7 +333,7 @@ jobs:
   windows-update:
     name: Windows update acceptance
     needs: windows-tooling
-    if: always() && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || inputs.phase == 'full')
+    if: always() && !cancelled() && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || inputs.phase == 'full' || needs.windows-tooling.outputs.product_commit != '')
     runs-on: windows-latest
     timeout-minutes: 90
     env:
@@ -282,12 +351,27 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
+      - name: Read original product proof for workflow-only changes
+        if: needs.windows-tooling.outputs.product_commit != ''
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: workflow-product-evidence
+          path: .local/validated-product
+      - name: Validate separate controller and product identities
+        if: needs.windows-tooling.outputs.product_commit != ''
+        env:
+          FROZEN_PRODUCT: ${{ needs.windows-tooling.outputs.product_commit }}
+          EXPECTED_CONTROLLER: ${{ github.sha }}
+        run: |
+          node --input-type=module -e "import {readFileSync} from 'node:fs';import {readMechanismEvidence} from './scripts/windows-update-artifacts.mjs';const b=JSON.parse(readFileSync('.local/validated-product/controller-product-binding.json','utf8')),e=readMechanismEvidence('.local/validated-product/reused-product-evidence',process.env.FROZEN_PRODUCT);if(b.controllerCommit!==process.env.EXPECTED_CONTROLLER||b.productCommit!==process.env.FROZEN_PRODUCT||b.newProductPackagesBuilt!==false||b.productCodeUnchangedExceptWorkflows!==true||!e.receipt.passed)throw Error('Frozen product/controller proof differs');console.log('Verified existing product '+b.productCommit+' for workflow controller '+b.controllerCommit+'; no product package build or new native upgrade claim')"
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen product acceptance evidence rejected.' }
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.windows-tooling.outputs.product_commit == ''
         with:
           name: windows-update-tools
           path: .local/verified-update-tools
       - name: Reuse exact startup package set
-        if: needs.windows-tooling.outputs.reuse_run != ''
+        if: needs.windows-tooling.outputs.product_commit == '' && needs.windows-tooling.outputs.reuse_run != ''
         env:
           REUSE_RUN: ${{ needs.windows-tooling.outputs.reuse_run }}
           EXPECTED_COMMIT: ${{ github.sha }}
@@ -303,19 +387,21 @@ jobs:
             gh run download $env:REUSE_RUN --name windows-update-packages --dir .local/prior-update-packages
             if ($LASTEXITCODE -ne 0) { throw 'Reusable package set download failed.' }
           }
-      - run: |
+      - if: needs.windows-tooling.outputs.product_commit == ''
+        run: |
           $arguments = @('--tools-dir', '.local/verified-update-tools')
           if (Test-Path .local/prior-update-packages) { $arguments += @('--packages-dir', '.local/prior-update-packages') }
           node scripts/test-windows-update.mjs @arguments
           if ($LASTEXITCODE -ne 0) { throw 'Full upgrade acceptance failed.' }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: needs.windows-tooling.outputs.product_commit == ''
         with:
           name: windows-update-evidence
           include-hidden-files: true
           path: .local/windows-update-evidence/
           if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
+        if: always() && needs.windows-tooling.outputs.product_commit == ''
         with:
           name: windows-update-receipt
           include-hidden-files: true
