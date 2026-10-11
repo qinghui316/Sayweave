@@ -78,6 +78,7 @@ async function deploymentLifecycle(){
   const geometry=await toggle.evaluate(el=>{const r=el.getBoundingClientRect();return {rightGutter:innerWidth-r.right,width:innerWidth,height:innerHeight,ratio:devicePixelRatio};});
   expect(geometry.rightGutter).toBeGreaterThanOrEqual(0);expect(geometry.rightGutter).toBeLessThanOrEqual(40);
   const file=`native-personalization-${minimum?'960':'1120'}-${zoom}.png`;
+  await page.evaluate(()=>document.fonts.ready);
   // Wry zoom changes CSS viewport metrics. Capture the surface without a CSS
   // clip so the right edge and footer remain in the native viewport image.
   const session=await page.context().newCDPSession(page);
