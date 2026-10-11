@@ -37,6 +37,10 @@ on:
         description: Same-package first choice, repeat and owned uninstall acceptance
         type: boolean
         default: false
+      product_boundaries:
+        description: Missing mapped DLL and abandoned installer checkpoints only; immutable package reuse
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -320,15 +324,22 @@ jobs:
           REUSE_RUN: ${{ inputs.reuse_run }}
           STARTUP_CANDIDATE: ${{ inputs.candidate_sha }}
           DIAGNOSE_METADATA: ${{ inputs.diagnose_metadata }}
+          PRODUCT_BOUNDARIES: ${{ inputs.product_boundaries }}
         run: |
           if ($env:REUSE_RUN -notmatch '^\d+$' -or $env:STARTUP_CANDIDATE -notmatch '^[a-f0-9]{40}$') { throw 'Exact diagnostic identities required.' }
           $run = gh api "repos/qinghui316/Sayweave/actions/runs/$env:REUSE_RUN" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0 -or $run.head_sha -ne $env:STARTUP_CANDIDATE -or $run.path -ne '.github/workflows/windows-ci.yml' -or $run.event -notin @('push','workflow_dispatch','pull_request')) { throw 'Diagnostic package origin differs.' }
           gh run download $env:REUSE_RUN --name windows-update-packages --dir .local/prior-update-packages
           if ($LASTEXITCODE -ne 0) { throw 'Frozen product download failed.' }
-          if ($env:DIAGNOSE_METADATA -eq 'true') {
+          if ($env:DIAGNOSE_METADATA -eq 'true' -or $env:PRODUCT_BOUNDARIES -eq 'true') {
             gh run download $env:REUSE_RUN --name windows-update-tools --dir .local/prior-update-tools
             if ($LASTEXITCODE -ne 0) { throw 'Frozen ordinary tooling download failed.' }
+          }
+          if ($env:PRODUCT_BOUNDARIES -eq 'true') {
+            $old = gh api repos/qinghui316/Sayweave/actions/runs/38109598818 | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $old.head_sha -ne 'abc3eed9375b3c170e7b144158ca24bb632fd41e' -or $old.conclusion -ne 'success' -or $old.path -ne '.github/workflows/windows-ci.yml') { throw 'Historical production component origin differs.' }
+            gh run download 38109598818 --name windows-update-tools --dir .local/prior-old-component-tools
+            if ($LASTEXITCODE -ne 0) { throw 'Historical production component download failed.' }
           }
       - name: Short startup with the same signed installer
         env:
@@ -337,12 +348,14 @@ jobs:
           DIAGNOSE_METADATA: ${{ inputs.diagnose_metadata }}
           DIAGNOSE_ACL: ${{ inputs.diagnose_acl }}
           DEPLOYMENT_LIFECYCLE: ${{ inputs.deployment_lifecycle }}
+          PRODUCT_BOUNDARIES: ${{ inputs.product_boundaries }}
         run: |
           $arguments = @()
           if ($env:DIAGNOSE_RECOVERY -eq 'true') { $arguments += '--restart-recovery' }
           if ($env:DIAGNOSE_METADATA -eq 'true') { $arguments += '--metadata' }
           if ($env:DIAGNOSE_ACL -eq 'true') { $arguments += '--acl' }
           if ($env:DEPLOYMENT_LIFECYCLE -eq 'true') { $arguments += '--deployment-lifecycle' }
+          if ($env:PRODUCT_BOUNDARIES -eq 'true') { $arguments += '--product-boundaries' }
           node scripts/test-windows-installed-startup.mjs @arguments
           if ($LASTEXITCODE -ne 0) { throw 'Installed startup diagnosis failed; full validation remains blocked.' }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -356,6 +369,7 @@ jobs:
             .local/installed-startup/*/*.log
             .local/installed-startup/*/native-*.png
             .local/update-metadata/*.json
+            .local/installed-startup/*/driver-*.ps1
           if-no-files-found: error
   windows-update:
     name: Windows update acceptance
