@@ -8,7 +8,7 @@ const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
 if(!/^[a-f0-9]{40}$/.test(commit)||process.env.SAYWEAVE_RELEASE_COMMIT!==commit)throw Error('Release evidence requires the exact release commit');
 execFileSync('git',['merge-base','--is-ancestor',commit,'origin/main']);
 const output=process.argv[2];if(!output||process.argv.length!==3)throw Error('Pass one empty output directory');
-const directory=path.resolve(output);mkdirSync(directory);
+const directory=path.resolve(output);mkdirSync(path.dirname(directory),{recursive:true});mkdirSync(directory);
 const repo='qinghui316/Sayweave';
 const runs=JSON.parse(execFileSync('gh',['run','list','--repo',repo,'--workflow','windows-ci.yml','--commit',commit,'--branch','main','--event','push','--status','success','--limit','20','--json','databaseId,headSha,headBranch,status,conclusion,event'],{encoding:'utf8',timeout:60000}));
 const run=runs.find(item=>item.headSha===commit&&item.headBranch==='main'&&item.event==='push'&&item.status==='completed'&&item.conclusion==='success'&&Number.isSafeInteger(item.databaseId));
