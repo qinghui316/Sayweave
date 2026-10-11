@@ -26,7 +26,7 @@ export function preciseProcessRecord(text,role){
 }
 const processBirth=String.raw`Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public static class BoundaryBirth{[StructLayout(LayoutKind.Sequential)]public struct FT{public uint lo,hi;}[DllImport("kernel32")]static extern IntPtr OpenProcess(uint access,bool inherit,uint pid);[DllImport("kernel32")]static extern bool GetProcessTimes(IntPtr process,out FT created,out FT exited,out FT kernel,out FT user);[DllImport("kernel32")]static extern bool TerminateProcess(IntPtr h,uint code);[DllImport("kernel32")]static extern bool CloseHandle(IntPtr h);public static void Stop(uint pid,string expected){var h=OpenProcess(0x1001,false,pid);if(h==IntPtr.Zero)throw new Exception("Process query failed");try{FT a,b,c,d;if(!GetProcessTimes(h,out a,out b,out c,out d))throw new Exception("Process birth query failed");if((((ulong)a.hi<<32)|a.lo).ToString()!=expected)throw new Exception("Original native process identity changed");if(!TerminateProcess(h,1))throw new Exception("Owned termination failed");}finally{CloseHandle(h);}}}' ;`;
 async function stopProcess(ctx,expected){
- const result=await ctx.command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$p=Get-CimInstance Win32_Process -Filter 'ProcessId=${expected.pid}';if(-not $p){'absent';exit};${processBirth}$hash=(Get-FileHash -LiteralPath $p.ExecutablePath -Algorithm SHA256).Hash.ToLowerInvariant();if($hash -cne ${quote(expected.imageHash)}){throw 'Original native process image changed; termination refused'};[BoundaryBirth]::Stop(${expected.pid},${quote(expected.created)});'terminated'`]);
+ const result=await ctx.command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$p=Get-CimInstance Win32_Process -Filter 'ProcessId=${expected.pid}';if(-not $p){'absent';exit};${processBirth}$sha=[Security.Cryptography.SHA256]::Create();try{$hash=[BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($p.ExecutablePath))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()};if($hash -cne ${quote(expected.imageHash)}){throw 'Original native process image changed; termination refused'};[BoundaryBirth]::Stop(${expected.pid},${quote(expected.created)});'terminated'`]);
  return {...expected,alreadyExited:result.trim()==='absent'};
 }
 export async function prepareOlderComponent(ctx){
@@ -67,7 +67,8 @@ try{
  $result=[OldComponentLease]::CoCreateInstance([ref]$cls,[IntPtr]::Zero,1,[ref]$iid,[ref]$instance);if($result -lt 0 -or $instance -eq [IntPtr]::Zero){throw 'Old production COM instance absent'}
  $canUnload=[Runtime.InteropServices.Marshal]::GetDelegateForFunctionPointer([OldComponentLease]::GetProcAddress($library,'DllCanUnloadNow'),[OldComponentLease+CanUnload])
  do{
-  $reading=@{pid=$PID;module=$Module;sha256=(Get-FileHash -LiteralPath $Module -Algorithm SHA256).Hash.ToLowerInvariant();canUnload=$canUnload.Invoke();comLease=($instance -ne [IntPtr]::Zero)}
+  $sha=[Security.Cryptography.SHA256]::Create();try{$digest=[BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($Module))).Replace('-','').ToLowerInvariant()}finally{$sha.Dispose()}
+  $reading=@{pid=$PID;module=$Module;sha256=$digest;canUnload=$canUnload.Invoke();comLease=($instance -ne [IntPtr]::Zero)}
   [Console]::WriteLine('LEASE '+($reading|ConvertTo-Json -Compress));[Console]::Out.Flush()
   $request=[Console]::ReadLine()
  }while($request -eq 'observe')
