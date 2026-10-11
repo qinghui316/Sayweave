@@ -3,7 +3,7 @@
   "cliVersion": "2.12.1",
   "source": "embedded installer.nsi in installed CLI native binding",
   "bindingSha256": "1e8b1bac3289765d7938583917a6ca44545c9cbe04c0a78525ab0b671ddd0c11",
-  "templateOffset": 10741,
+  "templateOffset": 12311192,
   "templateLength": 33039,
   "templateSha256": "e11345201c25320fd972323456ab33e9c170b0eb662fabfa408f8c40316a7590",
   "adaptation": "data-less begin/check/commit/rollback callbacks and fixed helper extraction; currentUser standard installation retained"

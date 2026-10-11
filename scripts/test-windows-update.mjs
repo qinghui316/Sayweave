@@ -2,7 +2,7 @@
 import {spawn,execFileSync} from 'node:child_process';
 import {randomUUID,createHash} from 'node:crypto';
 import {createServer} from 'node:https';
-import {mkdirSync,readFileSync,writeFileSync,existsSync,symlinkSync,rmSync,rmdirSync,renameSync} from 'node:fs';
+import {mkdirSync,readFileSync,writeFileSync,existsSync,symlinkSync,rmSync,rmdirSync,renameSync,realpathSync} from 'node:fs';
 import path from 'node:path';
 import {chromium,expect} from '@playwright/test';
 import {DatabaseSync} from 'node:sqlite';
@@ -401,7 +401,7 @@ try{
  await close(page);const seedDb=new DatabaseSync(path.join(testData,'dictionary.sqlite'),{readOnly:true});legacySeed=legacySeedRows(seedDb);seedDb.close();
  stage('installer program-copy failure rollback');const beforeExecutable=createHash('sha256').update(readFileSync(testExe)).digest('hex');
  await command(next,['/S'],root,{...process.env,SAYWEAVE_INSTALL_ACCEPTANCE_FAULT:'after-program'},true);
- const receiptFolder=createHash('sha256').update(path.dirname(testExe).replace(/^\\\\\?\\/,'').replace(/\\$/,'').toLowerCase()).digest('hex');
+ const receiptFolder=createHash('sha256').update(realpathSync.native(path.dirname(testExe)).replace(/^\\\\\?\\/,'').replace(/\\$/,'').toLowerCase()).digest('hex');
  const rollbackReceipt=JSON.parse(readFileSync(path.join(process.env.LOCALAPPDATA,'SayweaveInstallTransactions',receiptFolder,'receipt.json'),'utf8'));
  expect(rollbackReceipt).toMatchObject({phase:'rolledBack',lastFailure:{phase:'programInstalled',code:'acceptanceInstallerProgramFailure'},target:{version:'0.1.701',commit,mainHash:packageEntries.next.executableSha256},installer:{imageHash:createHash('sha256').update(readFileSync(next)).digest('hex')}});
  expect(rollbackReceipt.transaction).toMatch(/^[a-f0-9-]{36}$/);report.programCopyRollback={transaction:rollbackReceipt.transaction,phase:rollbackReceipt.lastFailure.phase,code:rollbackReceipt.lastFailure.code,installerSha256:rollbackReceipt.installer.imageHash,executableSha256:rollbackReceipt.target.mainHash};checkpoint();

@@ -264,9 +264,42 @@ pub fn restore(snapshot: &KeyBackup, install_dir: &str) -> Result<()> {
     Ok(())
 }
 pub fn same_path(a: &str, b: &str) -> bool {
-    a.trim_start_matches("\\\\?\\")
-        .trim_end_matches('\\')
-        .eq_ignore_ascii_case(b.trim_start_matches("\\\\?\\").trim_end_matches('\\'))
+    let equal = |a: &str, b: &str| {
+        a.trim_start_matches("\\\\?\\")
+            .trim_end_matches('\\')
+            .eq_ignore_ascii_case(b.trim_start_matches("\\\\?\\").trim_end_matches('\\'))
+    };
+    if equal(a, b) {
+        return true;
+    }
+    // ShellLink can return an 8.3 parent on Windows runner volumes. Resolve
+    // existing directory identities, including when the owned EXE is absent.
+    let normalized = |value: &str| -> Option<PathBuf> {
+        let path = std::path::Path::new(value);
+        super::record::reject_links(path).ok()?;
+        std::fs::canonicalize(path).ok().or_else(|| {
+            Some(
+                std::fs::canonicalize(path.parent()?)
+                    .ok()?
+                    .join(path.file_name()?),
+            )
+        })
+    };
+    match (normalized(a), normalized(b)) {
+        (Some(a), Some(b)) => equal(&a.to_string_lossy(), &b.to_string_lossy()),
+        _ => false,
+    }
+}
+pub fn normalized_directory(path: &std::path::Path) -> Result<PathBuf> {
+    super::record::reject_links(path)?;
+    if path.exists() {
+        if !path.is_dir() {
+            return Err("installerDirectory".into());
+        }
+        return std::fs::canonicalize(path).map_err(|_| "installerDirectory".into());
+    }
+    let parent = normalized_directory(path.parent().ok_or("installerDirectory")?)?;
+    Ok(parent.join(path.file_name().ok_or("installerDirectory")?))
 }
 /// Shortcut bytes are shell-generated. After a crash, bind their semantic target
 /// before removing/restoring only the two enumerated product link paths.
@@ -353,6 +386,25 @@ mod tests {
             link.SetPath(PCWSTR(wide(&executable.to_string_lossy()).as_ptr()))
                 .unwrap();
             let persist: IPersistFile = link.cast().unwrap();
+            persist
+                .Save(PCWSTR(wide(&path.to_string_lossy()).as_ptr()), true)
+                .unwrap();
+            assert!(shortcut_owned(&path, &root.path().to_string_lossy()).unwrap());
+            let mut short = vec![0u16; 32768];
+            let length = windows::Win32::Storage::FileSystem::GetShortPathNameW(
+                PCWSTR(wide(&root.path().to_string_lossy()).as_ptr()),
+                Some(&mut short),
+            );
+            assert!(length > 0 && length < (short.len() as u32));
+            let short_root = PathBuf::from(String::from_utf16(&short[..length as usize]).unwrap());
+            assert_eq!(
+                normalized_directory(&short_root).unwrap(),
+                normalized_directory(root.path()).unwrap()
+            );
+            link.SetPath(PCWSTR(
+                wide(&short_root.join("sayweave.exe").to_string_lossy()).as_ptr(),
+            ))
+            .unwrap();
             persist
                 .Save(PCWSTR(wide(&path.to_string_lossy()).as_ptr()), true)
                 .unwrap();
