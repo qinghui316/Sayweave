@@ -187,6 +187,12 @@ async function awaitRegistrationState(probe,registered,requireEmptyRoots=true){
  }while(Date.now()<deadline);
  throw Error(`TIP registration state did not settle (${registered?'registered':'removed'}): ${JSON.stringify(state)}`);
 }
+async function installedRegistrationReady(probe){
+ const context=report.stage;stage('installed registration readiness');const started=Date.now(),commandStart=report.commands.length;
+ const api=await awaitRegistrationState(probe,true);
+ const detail=JSON.parse((await command(probe,['registration-query-detail'],root,process.env,undefined,30000)).stdout.trim());
+ report.installedRegistrationReadiness={context,elapsedMs:Date.now()-started,api,detail,commandIndexes:report.commands.slice(commandStart).map((_entry,index)=>commandStart+index)};checkpoint();stage(context);
+}
 function moduleKey(value){return (value.startsWith('\\\\?\\')?value.slice(4):value).toLowerCase();}
 async function clearTemporaryRegistration(){
  if(!temporaryRegistration)return;
@@ -380,7 +386,7 @@ try{
  stage('installed startup short verification');await install(old);
  await command(testExe,['--sayweave-text-service=install',`--initiator=${sid}`]);
  const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);
- await command(probe,['installed-fixture',installedComponent.module]);
+ await installedRegistrationReady(probe);await command(probe,['installed-fixture',installedComponent.module]);
  page=await connect(testExe);const buildInfo=(await invoke(page,'update_snapshot')).build;expect(buildInfo).toMatchObject({version:'0.1.700',channel:'test',commit});const installedBytes=readFileSync(testExe);expect(createHash('sha256').update(installedBytes).digest('hex')).toBe(packageEntries.old.executableSha256);for(const value of [commit,identifier,context.url,context.publicKey])if(!installedBytes.includes(Buffer.from(value)))throw Error('Frozen build context absent in installed executable');
  report.startupProof={passed:true,build:buildInfo,executableSha256:packageEntries.old.executableSha256,installerSha256:installerIdentity(old,'0.1.700','test').sha256};await close(page);publishPackages();console.log('Windows installed startup short proof passed: exact process/window/page/CDP/native renderer/build identity.');
  if(priorPackages&&!priorPackages.next&&!startupOnly)throw Error('Reusable package set has no target package; no implicit rebuild');
@@ -426,7 +432,7 @@ try{
  }
  }else{
  stage('formal draft component baseline');const stableData=path.join(process.env.APPDATA,'local.sayweave.skeleton','data');if(existsSync(stableData))throw Error('Stable runner profile is not empty');
- const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');report.installers.push(installerIdentity(stableInstaller,stableVersion,'stable'));await command(stableInstaller,['/S']);await command(stableExe,['--sayweave-text-service=install',`--initiator=${sid}`]);const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);await command(probe,['installed-fixture',installedComponent.module]);
+ const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');report.installers.push(installerIdentity(stableInstaller,stableVersion,'stable'));await command(stableInstaller,['/S']);await command(stableExe,['--sayweave-text-service=install',`--initiator=${sid}`]);const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);await installedRegistrationReady(probe);await command(probe,['installed-fixture',installedComponent.module]);
  stage('old public version and formal draft replacement');const oldAssets=path.join(directory,'old-public');mkdirSync(oldAssets);await command('gh',['release','download','v0.1.6','--repo','qinghui316/Sayweave','--pattern','*setup.exe','--dir',oldAssets]);const publicOld=path.join(oldAssets,'Sayweave_0.1.6_x64-setup.exe');report.installers.push(installerIdentity(publicOld,'0.1.6','old-public'));await command(publicOld,['/S']);
  const oldVersion=await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$v=(Get-Item -LiteralPath ${quote(stableExe)}).VersionInfo;@{fileVersion=$v.FileVersion;productVersion=$v.ProductVersion;fileParts=@($v.FileMajorPart,$v.FileMinorPart,$v.FileBuildPart,$v.FilePrivatePart);productParts=@($v.ProductMajorPart,$v.ProductMinorPart,$v.ProductBuildPart,$v.ProductPrivatePart)}|ConvertTo-Json -Compress`],root,process.env,undefined,30000);
  report.legacyExecutableIdentity={...JSON.parse(oldVersion.stdout.trim()),sha256:createHash('sha256').update(readFileSync(stableExe)).digest('hex')};checkpoint();expect(report.legacyExecutableIdentity.fileParts).toEqual([0,1,6,0]);expect(report.legacyExecutableIdentity.productParts).toEqual([0,1,6,0]);page=await connect(stableExe,true,true);

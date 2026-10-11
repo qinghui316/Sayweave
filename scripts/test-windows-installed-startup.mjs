@@ -73,7 +73,7 @@ async function registeredComparison(module,activation){
  activation.readiness={samples};persist();
  do{
   const reading=await activationReading(Math.max(1,deadline-Date.now())),ready=profileReady(reading);
-  samples.push({elapsedMs:Date.now()-started,ready,...reading});persist();
+  samples.push({...reading,readElapsedMs:reading.elapsedMs,elapsedMs:Date.now()-started,ready});persist();
   stable=ready?stable+1:0;
   if(stable===2&&Date.now()<=deadline){activation.afterReadiness=await installedActivation('after observed registration readiness',module);activation.passed=activation.passed&&activation.afterReadiness.passed;persist();return;}
   await new Promise(resolve=>setTimeout(resolve,Math.max(0,Math.min(250,deadline-Date.now()))));
