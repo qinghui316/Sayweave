@@ -51,6 +51,18 @@ let installerTreeConfirmed=false;
 let installerLaunchAttempted=false;
 let credentialRequests=0;
 let tools,legacySeed,temporaryRegistration,temporaryMachineRegistration,temporaryMachineFiles,unknownPreference,debugPolicy;
+const payloadProofCache=new Map();
+async function candidatePayload(installer){
+ const sha=createHash('sha256').update(readFileSync(installer)).digest('hex');
+ if(payloadProofCache.has(sha))return payloadProofCache.get(sha);
+ const extractor=path.join(process.env.ProgramFiles,'7-Zip','7z.exe');
+ if(!existsSync(extractor))throw Error('Disposable runner lacks the candidate payload extractor');
+ const inventory=nsisPayloadInventory((await command(extractor,['l','-slt',installer])).stdout);
+ const output=path.join(directory,'checked-payload',sha);
+ await command(extractor,['x',installer,`-o${output}`,'sayweave-installer-helper.exe','$PLUGINSDIR\\sayweave-maintenance.exe','-y']);
+ const helper=nsisHelperIdentity(readFileSync(path.join(output,'sayweave-installer-helper.exe')),readFileSync(path.join(output,'$PLUGINSDIR','sayweave-maintenance.exe')));
+ const proof={installerSha256:sha,inventory,...helper};(report.candidatePayloads??=[]).push(proof);payloadProofCache.set(sha,proof);checkpoint();return proof;
+}
 async function cleanup(label,action){
  try{await action();return true;}catch(error){report.passed=false;process.exitCode=1;(report.cleanupErrors??=[]).push({stage:label,error:String(error?.message??error?.code??error).slice(0,1024)});return false;}
 }
@@ -97,7 +109,7 @@ async function restartCurrent(page){
  return restartAndReconnect({original:ownedProcess,invoke:()=>invoke(page,'update_restart'),disconnect:async()=>{await browser.close().catch(()=>{});browser=null;},inspect:()=>processes(testExe),reconnect:()=>connect(testExe,false),current:()=>ownedProcess,record:report.restarts??(report.restarts=[]),persist:checkpoint});
 }
 async function state(page,wanted){await expect.poll(async()=>(await invoke(page,'update_snapshot')).state,{timeout:60000}).toBe(wanted);return invoke(page,'update_snapshot');}
-async function install(installer){try{await command(installer,['/S']);if(!existsSync(testExe))throw Error('NSIS current-user path differs');}finally{(report.deployments??=[]).push({stage:report.stage,installerSha256:createHash('sha256').update(readFileSync(installer)).digest('hex'),records:deploymentReading(path.dirname(testExe))});checkpoint();}}
+async function install(installer){await candidatePayload(installer);try{await command(installer,['/S']);if(!existsSync(testExe))throw Error('NSIS current-user path differs');}finally{(report.deployments??=[]).push({stage:report.stage,installerSha256:createHash('sha256').update(readFileSync(installer)).digest('hex'),records:deploymentReading(path.dirname(testExe))});checkpoint();}}
 const data=page=>invoke(page,'acceptance_update_data');
 async function verifyPackage(file,version,publicKey){
  stage(`signature verification ${version}`);
@@ -277,7 +289,8 @@ async function build(version,channel='test'){
  const helper=nsisHelperIdentity(readFileSync(path.join(extracted,'sayweave-installer-helper.exe')),readFileSync(path.join(extracted,'$PLUGINSDIR','sayweave-maintenance.exe')));
  nsisHelperIdentity(readFileSync(path.join(extracted,'sayweave-installer-helper.exe')),readFileSync(path.join(extracted,'$PLUGINSDIR','sayweave-maintenance.exe')),readFileSync(path.join(source,'.local','installer-helper',helper.helperSha256,'sayweave-installer-helper.exe')));
  const binary=nsisExecutableIdentity(readFileSync(path.join(env.CARGO_TARGET_DIR,'release','nsis','x64','installer.nsi'),'utf8'),path.join(env.CARGO_TARGET_DIR,'release','sayweave.exe'),readFileSync(path.join(env.CARGO_TARGET_DIR,'release','sayweave.exe')),readFileSync(path.join(extracted,'sayweave.exe')));
- report.installers.push({...installerIdentity(copy,version,channel),...binary,...helper,inventory});checkpoint();return copy;
+ const identity=installerIdentity(copy,version,channel);payloadProofCache.set(identity.sha256,{installerSha256:identity.sha256,inventory,...helper});
+ report.installers.push({...identity,...binary,...helper,inventory});checkpoint();return copy;
 }
 try{
  stage('source and build isolation');
@@ -403,7 +416,7 @@ try{
  await invoke(page,'text_service_action',{action:'disable'});const disabledData=await data(page);expect(disabledData.component.enabled).toBe(false);
  await close(page);const seedDb=new DatabaseSync(path.join(testData,'dictionary.sqlite'),{readOnly:true});legacySeed=legacySeedRows(seedDb);seedDb.close();
  stage('installer program-copy failure rollback');const beforeExecutable=createHash('sha256').update(readFileSync(testExe)).digest('hex');
- await command(next,['/S'],root,{...process.env,SAYWEAVE_INSTALL_ACCEPTANCE_FAULT:'after-program'},true);
+ await candidatePayload(next);await command(next,['/S'],root,{...process.env,SAYWEAVE_INSTALL_ACCEPTANCE_FAULT:'after-program'},true);
  const receiptFolder=createHash('sha256').update(realpathSync.native(path.dirname(testExe)).replace(/^\\\\\?\\/,'').replace(/\\$/,'').toLowerCase()).digest('hex');
  const rollbackReceipt=JSON.parse(readFileSync(path.join(process.env.LOCALAPPDATA,'SayweaveInstallTransactions',receiptFolder,'receipt.json'),'utf8'));
  expect(rollbackReceipt).toMatchObject({phase:'rolledBack',lastFailure:{phase:'programInstalled',code:'acceptanceInstallerProgramFailure'},target:{version:'0.1.701',commit,mainHash:packageEntries.next.executableSha256},installer:{imageHash:createHash('sha256').update(readFileSync(next)).digest('hex')}});
@@ -446,14 +459,14 @@ try{
  }
  }else{
  stage('formal draft component baseline');const stableData=path.join(process.env.APPDATA,'local.sayweave.skeleton','data');if(existsSync(stableData))throw Error('Stable runner profile is not empty');
- const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');report.installers.push(installerIdentity(stableInstaller,stableVersion,'stable'));await command(stableInstaller,['/S']);const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);await installedRegistrationReady(probe);await command(probe,['installed-fixture',installedComponent.module]);
+ const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');report.installers.push(installerIdentity(stableInstaller,stableVersion,'stable'));await candidatePayload(stableInstaller);await command(stableInstaller,['/S']);const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);await installedRegistrationReady(probe);await command(probe,['installed-fixture',installedComponent.module]);
  stage('old public version and formal draft replacement');const oldAssets=path.join(directory,'old-public');mkdirSync(oldAssets);await command('gh',['release','download','v0.1.6','--repo','qinghui316/Sayweave','--pattern','*setup.exe','--dir',oldAssets]);const publicOld=path.join(oldAssets,'Sayweave_0.1.6_x64-setup.exe');report.installers.push(installerIdentity(publicOld,'0.1.6','old-public'));await command(publicOld,['/S']);
  const oldVersion=await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$v=(Get-Item -LiteralPath ${quote(stableExe)}).VersionInfo;@{fileVersion=$v.FileVersion;productVersion=$v.ProductVersion;fileParts=@($v.FileMajorPart,$v.FileMinorPart,$v.FileBuildPart,$v.FilePrivatePart);productParts=@($v.ProductMajorPart,$v.ProductMinorPart,$v.ProductBuildPart,$v.ProductPrivatePart)}|ConvertTo-Json -Compress`],root,process.env,undefined,30000);
  report.legacyExecutableIdentity={...JSON.parse(oldVersion.stdout.trim()),sha256:createHash('sha256').update(readFileSync(stableExe)).digest('hex')};checkpoint();expect(report.legacyExecutableIdentity.fileParts).toEqual([0,1,6,0]);expect(report.legacyExecutableIdentity.productParts).toEqual([0,1,6,0]);page=await connect(stableExe,true,true);
  await expect.poll(async()=>(await invoke(page,'model_status',{retry:false})).state).toBe('ready');const saved=await invoke(page,'model_save',{request:{input:{name:'Update synthetic model',protocol:'openai-chat',baseUrl:`https://localhost:${server.address().port}/v1`,modelId:'update-fixture',usages:['text']},key:{action:'replace',value:'isolated-update-test-key'},id:null,revision:null,expectation:null}});await invoke(page,'dictionary_create',{input:{kind:'term',original:'旧版更新验收术语',category:null,replacement:null}});await close(page,false);
  const stablePath=path.join(stableData,'dictionary.sqlite'),stable=new DatabaseSync(stablePath);report.legacySeed=seedLegacyRows(stable,legacySeed,saved.configs[0].id);stable.close();
  page=await connect(stableExe,true,true);const legacyBefore=await legacyData(page,saved.configs[0]);expect(legacyBefore.dictionary.total).toBe(1);expect(legacyBefore.history.count).toBe(10);expect(legacyBefore.detail.preferences[0].rule).toBe('保留完整理由和步骤');await close(page,false);const oldDb=new DatabaseSync(stablePath,{readOnly:true});report.legacyBefore=databaseInventory(oldDb);oldDb.close();
- await command(stableInstaller,['/S']);page=await connect(stableExe);const snapshot=await invoke(page,'update_snapshot');expect(snapshot.build.version).toBe(stableVersion);expect(snapshot.build.updatesEnabled).toBe(true);expect(snapshot.build.channel).toBe('stable');expect(snapshot.build.commit).toBe(commit);expect(await legacyData(page,saved.configs[0])).toEqual(legacyBefore);await page.screenshot({path:path.join(directory,'native-manual-overlay.png')});await close(page,false);const newDb=new DatabaseSync(stablePath,{readOnly:true});report.legacyAfter=databaseInventory(newDb);newDb.close();expect(report.legacyAfter).toEqual(report.legacyBefore);report.componentAfter=componentIdentity();expect(report.componentAfter).toEqual(installedComponent);await command(probe,['installed-fixture',installedComponent.module]);report.checks.push(`actual public0.1.6 database retained in place; old/native-created model and term plus bounded synthetic rows read before/after formal${stableVersion} overlay, exact table hashes/real credential value/installed TSF preserved`);report.passed=true;
+ await candidatePayload(stableInstaller);await command(stableInstaller,['/S']);page=await connect(stableExe);const snapshot=await invoke(page,'update_snapshot');expect(snapshot.build.version).toBe(stableVersion);expect(snapshot.build.updatesEnabled).toBe(true);expect(snapshot.build.channel).toBe('stable');expect(snapshot.build.commit).toBe(commit);expect(await legacyData(page,saved.configs[0])).toEqual(legacyBefore);await page.screenshot({path:path.join(directory,'native-manual-overlay.png')});await close(page,false);const newDb=new DatabaseSync(stablePath,{readOnly:true});report.legacyAfter=databaseInventory(newDb);newDb.close();expect(report.legacyAfter).toEqual(report.legacyBefore);report.componentAfter=componentIdentity();expect(report.componentAfter).toEqual(installedComponent);await command(probe,['installed-fixture',installedComponent.module]);report.checks.push(`actual public0.1.6 database retained in place; old/native-created model and term plus bounded synthetic rows read before/after formal${stableVersion} overlay, exact table hashes/real credential value/installed TSF preserved`);report.passed=true;
  }
  }
 }catch(error){report.passed=false;report.failureStage=report.stage;report.error=String(error?.message??error?.code??error);throw error;}finally{

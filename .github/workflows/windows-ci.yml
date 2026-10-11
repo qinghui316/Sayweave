@@ -344,7 +344,7 @@ jobs:
           path: |
             .local/installed-startup/*/receipt.json
             .local/installed-startup/*/*.log
-            .local/installed-startup/*/native-startup.png
+            .local/installed-startup/*/native-*.png
             .local/update-metadata/*.json
           if-no-files-found: error
   windows-update:

@@ -69,6 +69,17 @@ async function deploymentLifecycle(){
  expect(first.machine).toMatchObject({phase:'committed',target:{commit:candidate,payloadHash:packages.manifest.componentSha256}});
  let page=await connect();
  expect(await invoke(page,'text_service_status')).toMatchObject({enabled:true,deploymentState:'ready',updateAvailable:false,error:null});
+ const visuals=report.nativePersonalization=[];
+ await page.getByRole('link',{name:'个性化',exact:true}).click();
+ for(const [minimum,zoom] of [[false,1],[true,1],[true,1.5]]){
+  await invoke(page,'acceptance_main_size',{minimum,zoom});await page.emulateMedia({reducedMotion:minimum?'reduce':'no-preference'});
+  await expect(page.getByRole('heading',{name:'个性化',exact:true})).toHaveCount(1);
+  const toggle=page.getByRole('switch',{name:'个性化',exact:true});await expect(toggle).toBeVisible();
+  const geometry=await toggle.evaluate(el=>{const r=el.getBoundingClientRect();return {rightGutter:innerWidth-r.right,width:innerWidth,height:innerHeight,ratio:devicePixelRatio};});
+  expect(geometry.rightGutter).toBeGreaterThanOrEqual(0);expect(geometry.rightGutter).toBeLessThanOrEqual(40);
+  const file=`native-personalization-${minimum?'960':'1120'}-${zoom}.png`;await page.screenshot({path:path.join(directory,file)});visuals.push({file,...geometry,headingCount:1});persist();
+ }
+ await invoke(page,'acceptance_main_size',{minimum:false,zoom:1});
  const seeded=await invoke(page,'acceptance_update_seed');expect(seeded.credentialMatches).toBe(true);
  expect(seeded.schema).toBe(9);expect(seeded.history.count).toBe(10);expect(seeded.profile.preferenceCount).toBe(1);
  const cases=report.deploymentLifecycle={first,repeat:[],uninstall:null,reinstall:null,passed:false};persist();
