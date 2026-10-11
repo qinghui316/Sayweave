@@ -4,7 +4,30 @@ on:
   push:
     tags:
       - 'v*'
+      - '!v*-release-check-*'
   workflow_dispatch:
+    inputs:
+      phase:
+        type: choice
+        options: [build, check-access, accept-existing]
+        default: build
+        description: Build a release or resume the exact immutable draft
+      release_tag:
+        type: string
+        default: ''
+        description: Frozen product tag for existing-draft modes
+      release_commit:
+        type: string
+        default: ''
+        description: Exact frozen product commit, independent of this workflow revision
+      release_id:
+        type: string
+        default: ''
+        description: Existing GitHub Release ID
+      checksum_sha256:
+        type: string
+        default: ''
+        description: Frozen SHA256SUMS.txt hash covering all five draft assets
 
 permissions:
   contents: read
@@ -14,13 +37,28 @@ concurrency:
   group: sayweave-windows-release
   cancel-in-progress: false
 
+env:
+  SAYWEAVE_RELEASE_TAG: ${{ (inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_tag || github.ref_name }}
+  SAYWEAVE_RELEASE_COMMIT: ${{ (inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_commit || github.sha }}
+  SAYWEAVE_CONTROLLER_COMMIT: ${{ github.sha }}
+  SAYWEAVE_RELEASE_PHASE: ${{ inputs.phase || 'build' }}
+
 jobs:
   verify:
     if: github.repository == 'qinghui316/Sayweave'
     runs-on: windows-latest
     steps:
+      - name: Validate existing-draft inputs
+        shell: pwsh
+        env:
+          EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
+          EXPECTED_CHECKSUM: ${{ inputs.checksum_sha256 }}
+        run: |
+          if ($env:SAYWEAVE_RELEASE_PHASE -notin @('build','check-access','accept-existing')) { throw 'Unknown release phase.' }
+          if ($env:SAYWEAVE_RELEASE_PHASE -ne 'build' -and ($env:SAYWEAVE_RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$' -or $env:SAYWEAVE_RELEASE_COMMIT -notmatch '^[a-f0-9]{40}$' -or $env:EXPECTED_RELEASE_ID -notmatch '^[1-9]\d*$' -or $env:EXPECTED_CHECKSUM -notmatch '^[a-f0-9]{64}$')) { throw 'Exact existing-draft identities are required.' }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          ref: ${{ (inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_tag || github.ref }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -28,19 +66,43 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
-      - run: npx playwright install chromium
-      - run: npm run check
-      - run: npm run test:e2e
-      - run: npm run check:distribution
+      - name: Verify frozen product and landed controller
+        if: inputs.phase == 'check-access' || inputs.phase == 'accept-existing'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ((git rev-parse HEAD).Trim() -ne $env:SAYWEAVE_RELEASE_COMMIT) { throw 'Product commit differs from the selected tag.' }
+          if ($env:SAYWEAVE_RELEASE_TAG -ne "v$(node -p "require('./package.json').version")") { throw 'Product version differs.' }
+          git merge-base --is-ancestor $env:SAYWEAVE_RELEASE_COMMIT origin/main
+          if ($LASTEXITCODE -ne 0) { throw 'Product is not on main.' }
+          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'accept-existing') {
+            if ('${{ github.ref }}' -notlike 'refs/tags/v*-release-check-*') { throw 'Existing installation requires a reviewed controller tag.' }
+            git merge-base --is-ancestor $env:SAYWEAVE_CONTROLLER_COMMIT origin/main
+            if ($LASTEXITCODE -ne 0) { throw 'Controller is not landed on main.' }
+          }
+          node scripts/reuse-windows-update-evidence.mjs .local/release-mechanism-evidence
+          if ($LASTEXITCODE -ne 0) { throw 'Exact successful product main evidence is required.' }
+      - if: inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+        run: npx playwright install chromium
+      - if: inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+        run: npm run check
+      - if: inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+        run: npm run test:e2e
+      - if: inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+        run: npm run check:distribution
 
   draft:
-    if: startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave'
+    if: startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
     needs: verify
     runs-on: windows-latest
     environment: windows-signing
     permissions:
       contents: write
       actions: read
+    outputs:
+      release_id: ${{ steps.pin.outputs.release_id }}
+      checksum: ${{ steps.pin.outputs.checksum }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -105,19 +167,38 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Draft download failed.' }
           $env:SAYWEAVE_RELEASE_DIR = $download
           node scripts/verify-update-release.mjs
+      - name: Freeze uploaded draft identity
+        id: pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $releases = gh api 'repos/qinghui316/Sayweave/releases?per_page=100' | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Draft inventory unavailable.' }
+          $matching = @($releases | Where-Object { $_.tag_name -eq $env:SAYWEAVE_RELEASE_TAG })
+          if ($matching.Count -ne 1) { throw 'Uploaded draft identity is ambiguous.' }
+          $release = $matching[0]
+          if ($release.draft -ne $true -or $release.tag_name -ne $env:SAYWEAVE_RELEASE_TAG) { throw 'Uploaded draft identity differs.' }
+          "release_id=$($release.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "checksum=$((Get-FileHash -LiteralPath 'release/sayweave/SHA256SUMS.txt' -Algorithm SHA256).Hash.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
   accept-installer:
-    if: startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave'
-    needs: draft
+    if: always() && github.repository == 'qinghui316/Sayweave' && needs.verify.result == 'success' && ((startsWith(github.ref, 'refs/tags/') && needs.draft.result == 'success') || (github.event_name == 'workflow_dispatch' && (inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && needs.draft.result == 'skipped'))
+    needs: [verify, draft]
     runs-on: windows-latest
     timeout-minutes: 90
+    # GitHub hides drafts from a contents:read token, including by-tag lookup.
+    permissions:
+      contents: write
+      actions: read
     env:
       GH_TOKEN: ${{ github.token }}
-      SAYWEAVE_RELEASE_TAG: ${{ github.ref_name }}
-      SAYWEAVE_RELEASE_COMMIT: ${{ github.sha }}
+      EXPECTED_RELEASE_ID: ${{ (inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_id || needs.draft.outputs.release_id }}
+      EXPECTED_CHECKSUM: ${{ (inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.checksum_sha256 || needs.draft.outputs.checksum }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          ref: ${{ (inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_tag || github.ref }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -132,9 +213,20 @@ jobs:
         run: |
           $download = Join-Path $env:RUNNER_TEMP 'sayweave-draft-acceptance'
           New-Item -ItemType Directory -Path $download | Out-Null
-          gh release download '${{ github.ref_name }}' --repo '${{ github.repository }}' --dir $download
+          $controller = @{ controllerCommit=$env:SAYWEAVE_CONTROLLER_COMMIT; productCommit=$env:SAYWEAVE_RELEASE_COMMIT; productTag=$env:SAYWEAVE_RELEASE_TAG; phase=$env:SAYWEAVE_RELEASE_PHASE; releaseId=$env:EXPECTED_RELEASE_ID; checksum=$env:EXPECTED_CHECKSUM }
+          $controller | ConvertTo-Json | Set-Content -LiteralPath '.local/release-controller.json' -Encoding utf8
+          $release = gh api "repos/qinghui316/Sayweave/releases/$env:EXPECTED_RELEASE_ID" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or [string]$release.id -ne $env:EXPECTED_RELEASE_ID -or $release.tag_name -ne $env:SAYWEAVE_RELEASE_TAG -or $release.draft -ne $true -or $release.target_commitish -ne $env:SAYWEAVE_RELEASE_COMMIT) { throw 'Frozen draft identity differs.' }
+          gh release download $env:SAYWEAVE_RELEASE_TAG --repo '${{ github.repository }}' --dir $download
           if ($LASTEXITCODE -ne 0) { throw 'Draft download failed.' }
+          if ((Get-FileHash -LiteralPath (Join-Path $download 'SHA256SUMS.txt') -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:EXPECTED_CHECKSUM) { throw 'Frozen draft asset hashes differ.' }
           $env:SAYWEAVE_RELEASE_DIR = $download
+          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'check-access') {
+            node --input-type=module -e "import {readFileSync,readdirSync} from 'node:fs';import {join} from 'node:path';import {releaseIdentity,validateRelease} from './scripts/release-validation.mjs';const dir=process.env.SAYWEAVE_RELEASE_DIR,assets=new Map(readdirSync(dir).map(n=>[n,readFileSync(join(dir,n))]));validateRelease(releaseIdentity(JSON.parse(readFileSync('package.json')).version,process.env.SAYWEAVE_RELEASE_TAG,process.env.SAYWEAVE_RELEASE_COMMIT),JSON.parse(assets.get('latest.json')),JSON.parse(assets.get('release-receipt.json')),assets)"
+            if ($LASTEXITCODE -ne 0) { throw 'Draft visibility/asset validation failed.' }
+            $controller | ConvertTo-Json | Set-Content -LiteralPath '.local/release-draft-access.json' -Encoding utf8
+            exit 0
+          }
           node scripts/verify-update-release.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Draft identity verification failed.' }
           node scripts/test-windows-update.mjs --stable-installer (Join-Path $download "Sayweave_$(node -p "require('./package.json').version")_x64-setup.exe") --mechanism-evidence .local/release-mechanism-evidence
@@ -145,21 +237,27 @@ jobs:
           name: stable-install-acceptance
           include-hidden-files: true
           path: |
+            .local/release-controller.json
+            .local/release-draft-access.json
             .local/windows-update-acceptance.json
             .local/windows-update/*/acceptance.json
             .local/windows-update/*/native-*.png
             .local/windows-update/*/diagnostics/*.log
           if-no-files-found: error
   publish:
-    if: startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave'
-    needs: accept-installer
+    if: always() && startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave' && needs.accept-installer.result == 'success' && ((needs.draft.result == 'success' && inputs.phase != 'check-access') || (needs.draft.result == 'skipped' && inputs.phase == 'accept-existing'))
+    needs: [draft, accept-installer]
     runs-on: windows-latest
     environment: windows-release
     permissions:
       contents: write
+    env:
+      EXPECTED_RELEASE_ID: ${{ (inputs.phase == 'accept-existing') && inputs.release_id || needs.draft.outputs.release_id }}
+      EXPECTED_CHECKSUM: ${{ (inputs.phase == 'accept-existing') && inputs.checksum_sha256 || needs.draft.outputs.checksum }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
+          ref: ${{ inputs.phase == 'accept-existing' && inputs.release_tag || github.ref }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -171,18 +269,34 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          SAYWEAVE_RELEASE_TAG: ${{ github.ref_name }}
-          SAYWEAVE_RELEASE_COMMIT: ${{ github.sha }}
         run: |
           $download = Join-Path $env:RUNNER_TEMP 'sayweave-approved-release'
           New-Item -ItemType Directory -Force -Path $download | Out-Null
-          gh release download '${{ github.ref_name }}' --repo '${{ github.repository }}' --dir $download
+          $release = gh api "repos/qinghui316/Sayweave/releases/$env:EXPECTED_RELEASE_ID" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or [string]$release.id -ne $env:EXPECTED_RELEASE_ID -or $release.tag_name -ne $env:SAYWEAVE_RELEASE_TAG -or $release.draft -ne $true -or $release.target_commitish -ne $env:SAYWEAVE_RELEASE_COMMIT) { throw 'Approved draft identity differs.' }
+          gh release download $env:SAYWEAVE_RELEASE_TAG --repo '${{ github.repository }}' --dir $download
           if ($LASTEXITCODE -ne 0) { throw 'Approved draft download failed.' }
+          if ((Get-FileHash -LiteralPath (Join-Path $download 'SHA256SUMS.txt') -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:EXPECTED_CHECKSUM) { throw 'Approved asset hashes differ.' }
           $env:SAYWEAVE_RELEASE_DIR = $download
           node scripts/verify-update-release.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Approved draft verification failed.' }
       - name: Publish latest release
+        if: inputs.phase != 'accept-existing'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit '${{ github.ref_name }}' --repo '${{ github.repository }}' --draft=false --latest
+        run: gh release edit $env:SAYWEAVE_RELEASE_TAG --repo '${{ github.repository }}' --draft=false --latest
+      - name: Record protected publication eligibility for an older immutable tag
+        if: inputs.phase == 'accept-existing'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path .local | Out-Null
+          @{controllerCommit=$env:SAYWEAVE_CONTROLLER_COMMIT;productCommit=$env:SAYWEAVE_RELEASE_COMMIT;productTag=$env:SAYWEAVE_RELEASE_TAG;releaseId=$env:EXPECTED_RELEASE_ID;checksum=$env:EXPECTED_CHECKSUM;actualInstall='success';protectedReview='approved';published=$false} | ConvertTo-Json | Set-Content -LiteralPath '.local/release-publication-ready.json' -Encoding utf8
+          Write-Output 'Existing draft is eligible after actual installation and environment review; an owner with workflow scope may now publish the unchanged assets.'
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: inputs.phase == 'accept-existing'
+        with:
+          name: release-publication-ready
+          path: .local/release-publication-ready.json
+          include-hidden-files: true
+          if-no-files-found: error
