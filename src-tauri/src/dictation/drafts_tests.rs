@@ -14,6 +14,129 @@ fn response(text: &str) -> Reply {
             .to_string(),
     )
 }
+
+#[tokio::test]
+async fn ending_a_resumed_empty_range_releases_it_without_an_uncertain_commit() {
+    let (actor, mut state, native) = actor(None);
+    let (reply, _) = oneshot::channel();
+    state.ending = Some(Ending {
+        mode: Finish::Commit,
+        reply,
+        deadline: Instant::now() + Duration::from_secs(5),
+        expired: false,
+    });
+    actor.schedule_final(&mut state).unwrap();
+    let Command::Finish(_, text, mode, _, _, reply) = command(&native).await else {
+        panic!("release empty range expected")
+    };
+    assert!(text.is_empty());
+    assert_eq!(mode, Finish::Handoff("editing".into()));
+    reply
+        .send(FinishOutcome {
+            delivery: Delivery::not_submitted("editing"),
+            committed: false,
+            handed_off: true,
+            cancelled: false,
+            rollback_failed: false,
+        })
+        .ok()
+        .unwrap();
+    let value = SessionDraft::native_value(&mut state.native).await.unwrap();
+    let job = state.native.take().unwrap();
+    let delivery = actor.native_done(&mut state, &job.kind, value).unwrap();
+    assert_eq!(delivery.submission, Submission::NotSubmitted);
+    assert!(!delivery.restore_error);
+    assert!(state.report.raw.is_empty());
+}
+
+#[tokio::test]
+async fn finish_intent_prevents_another_resume_or_late_replacement_before_end_arrives() {
+    let (actor, mut state, native) = actor(None);
+    state.draft = None;
+    state.paused_at = Some(Instant::now() - Duration::from_secs(1));
+    actor.control.request_finish();
+    actor.schedule(&mut state).unwrap();
+    assert!(state.native.is_none());
+    assert!(native.try_recv().is_err());
+    // Even a late transcript cannot arrange another write in the old turn.
+    actor.observe(
+        &mut state,
+        snapshot(99, vec![segment(1, "旧识别全文", false)]),
+    );
+    actor.schedule(&mut state).unwrap();
+    assert!(state.native.is_none());
+    assert!(native.try_recv().is_err());
+}
+
+#[test]
+fn retired_resume_rejection_cannot_replace_the_user_end_but_cleanup_failure_survives() {
+    for ending_received in [false, true] {
+        for code in [
+            "targetReadonlyContext",
+            "targetChanged",
+            "editing",
+            "staleSnapshot",
+        ] {
+            let (actor, mut state, _native) = actor(None);
+            actor.control.request_finish();
+            state.stopping = ending_received;
+            let activity = state.activity;
+            actor.native_done(
+                &mut state,
+                &NativeKind::Begin { turn: 2, activity },
+                NativeValue::Begun(Err(Error::new(code))),
+            );
+            assert!(
+                state.stop_error.is_none(),
+                "{code}, end_received={ending_received}"
+            );
+            assert!(actor.control.stopping());
+        }
+    }
+    let (actor, mut state, _native) = actor(None);
+    actor.control.request_finish();
+    let activity = state.activity;
+    actor.native_done(
+        &mut state,
+        &NativeKind::Begin { turn: 2, activity },
+        NativeValue::Begun(Err(Error::new("compositionCleanup"))),
+    );
+    assert_eq!(state.stop_error.as_deref(), Some("compositionCleanup"));
+}
+
+#[tokio::test]
+async fn late_resume_success_is_released_without_replaying_the_edited_body() {
+    let (actor, mut state, native) = actor(None);
+    let draft = state.draft.take().unwrap();
+    actor.control.request_finish();
+    let activity = state.activity;
+    actor.native_done(
+        &mut state,
+        &NativeKind::Begin { turn: 2, activity },
+        NativeValue::Begun(Ok(draft)),
+    );
+    assert!(state.handoff);
+    actor.schedule(&mut state).unwrap();
+    let Command::Finish(_, text, mode, _, _, reply) = command(&native).await else {
+        panic!("retired lease must hand off, never replace")
+    };
+    assert!(text.is_empty());
+    assert!(matches!(mode, Finish::Handoff(_)));
+    reply
+        .send(FinishOutcome {
+            delivery: Delivery::not_submitted("editing"),
+            committed: false,
+            handed_off: true,
+            cancelled: false,
+            rollback_failed: false,
+        })
+        .ok()
+        .unwrap();
+    acknowledge(&actor, &mut state).await;
+    actor.schedule(&mut state).unwrap();
+    assert!(state.native.is_none());
+    assert!(native.try_recv().is_err());
+}
 fn snapshot(sequence: u64, segments: Vec<SourceSegment>) -> NativeTranscript {
     NativeTranscript {
         task_id: "actor-test".into(),

@@ -4,7 +4,7 @@ for(const reducedMotion of ['no-preference','reduce'] as const)test(`compact ove
  await page.goto('/tests/fixtures/voice-recovery.html?presentation=preparing');
  const shell=page.locator('[data-phase]');
  await page.evaluate(()=>document.fonts.ready);
- await expect.poll(async()=>{const rect=await shell.boundingBox();return rect&&[rect.x+rect.width/2,rect.y+rect.height,rect.width,rect.height];}).toEqual([80,76,72,34]);
+ await expect.poll(async()=>{const rect=await shell.boundingBox();return rect&&[rect.x+rect.width/2,rect.y+rect.height,rect.width,rect.height];}).toEqual([80,78,72,34]);
  for(const [kind,width] of [['preparing',72],['recording',136],['recognizing',72],['completed',34]] as const){
   const samples=await page.evaluate(async(kind)=>{
    window.dispatchEvent(new CustomEvent('fixture:presentation',{detail:kind}));
@@ -13,7 +13,7 @@ for(const reducedMotion of ['no-preference','reduce'] as const)test(`compact ove
    await new Promise<void>(resolve=>{const frame=()=>{const shell=document.querySelector('[data-phase]')!,rect=shell.getBoundingClientRect();const buttonsInside=Array.from(shell.querySelectorAll('button')).every(button=>{const b=button.getBoundingClientRect();return b.left>=rect.left&&b.right<=rect.right&&b.top>=rect.top&&b.bottom<=rect.bottom&&button.contains(document.elementFromPoint(b.x+b.width/2,b.y+b.height/2));});frames.push({center:rect.x+rect.width/2,bottom:rect.bottom,height:rect.height,buttonsInside});if(performance.now()-start<400)requestAnimationFrame(frame);else resolve();};requestAnimationFrame(frame);});
    return frames;
   },kind);
-  for(const frame of samples){expect(frame.center).toBeCloseTo(80,1);expect(frame.bottom).toBeCloseTo(76,1);expect(frame.height).toBe(34);expect(frame.buttonsInside).toBe(true);}
+  for(const frame of samples){expect(frame.center).toBeCloseTo(80,1);expect(frame.bottom).toBeCloseTo(78,1);expect(frame.height).toBe(34);expect(frame.buttonsInside).toBe(true);}
   expect((await shell.boundingBox())!.width).toBe(width);
   for(const button of await shell.getByRole('button').all()){const rect=(await button.boundingBox())!;expect(rect.width).toBeGreaterThanOrEqual(24);expect(rect.height).toBeGreaterThanOrEqual(24);expect(rect.x).toBeGreaterThanOrEqual(0);expect(rect.x+rect.width).toBeLessThanOrEqual(160);}
   await page.screenshot({path:`tests/visual/compact-overlay-${kind}-${reducedMotion}.png`});

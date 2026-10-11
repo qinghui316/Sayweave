@@ -1,4 +1,4 @@
-.surface { position: relative; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px; }
+.surface { position: relative; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 8px; padding: 12px 12px 10px; }
 .result { width: min(360px,100%); min-width: 0; border-radius: var(--radius-card); background: var(--surface-content); padding: 12px; box-shadow: var(--shadow-voice); }
 .result header { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: var(--text-small); line-height: var(--line-small); }
 .result header button { flex: none; }

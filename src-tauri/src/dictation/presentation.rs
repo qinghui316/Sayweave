@@ -39,7 +39,40 @@ pub fn final_presentation(
     text: &str,
     delivery: Option<&Delivery>,
     error: Option<&str>,
+    explicit_end: bool,
 ) -> Presentation {
+    let interruption = |code: &str| {
+        matches!(
+            code,
+            "emptyText"
+                | "cancelled"
+                | "staleSession"
+                | "targetChanged"
+                | "targetLost"
+                | "targetClosed"
+                | "editing"
+                | "targetReadonlyContext"
+                | "inputComposition"
+        )
+    };
+    let safe_delivery = delivery.is_none_or(|d| {
+        !d.restore_error
+            && d.submission != Submission::Uncertain
+            && d.error
+                .as_deref()
+                .is_none_or(|e| interruption(e) || e == "inputUnconfirmed")
+    });
+    if safe_delivery
+        && error.is_none_or(interruption)
+        && (text.trim().is_empty()
+            || explicit_end
+                && (error.is_some_and(interruption)
+                    || delivery.is_some_and(|d| d.error.as_deref().is_some_and(interruption))))
+    {
+        // Projection alone becomes quiet. Delivery/history retain the original
+        // interruption and submission facts, including a user-owned prefix.
+        return Presentation::Idle;
+    }
     let quiet_empty = text.trim().is_empty()
         && error.is_none_or(|e| matches!(e, "emptyText" | "cancelled"))
         && delivery.is_none_or(|d| {
@@ -140,19 +173,62 @@ pub fn final_presentation(
 mod tests {
     use super::*;
     #[test]
+    fn empty_or_user_ended_interruption_is_quiet_but_real_effects_are_not() {
+        for code in [
+            "targetReadonlyContext",
+            "targetChanged",
+            "editing",
+            "inputComposition",
+        ] {
+            let mut delivery = Delivery::not_submitted(code);
+            assert_eq!(
+                final_presentation(false, "", Some(&delivery), Some("emptyText"), false),
+                Presentation::Idle
+            );
+            assert_eq!(
+                final_presentation(false, "用户改好的正文", Some(&delivery), None, true),
+                Presentation::Idle
+            );
+            delivery.restore_error = true;
+            assert_eq!(
+                final_presentation(false, "", Some(&delivery), Some("emptyText"), true),
+                Presentation::Error
+            );
+            delivery.restore_error = false;
+            delivery.submission = Submission::Uncertain;
+            assert_eq!(
+                final_presentation(false, "", Some(&delivery), Some("cancelled"), true),
+                Presentation::Error
+            );
+        }
+        for code in [
+            "saveFailed",
+            "compositionRollback",
+            "compositionCleanup",
+            "credentialMissing",
+            "deviceAccess",
+            "network",
+        ] {
+            assert_eq!(
+                final_presentation(false, "", None, Some(code), true),
+                Presentation::Error
+            );
+        }
+    }
+    #[test]
     fn completed_stream_has_short_feedback_without_claiming_readback() {
         let mut delivery = Delivery::not_submitted("inputUnconfirmed");
         delivery.stage = "composition".into();
         delivery.state = "unconfirmed".into();
         delivery.submission = Submission::Submitted;
         assert_eq!(
-            final_presentation(false, "text", Some(&delivery), None),
+            final_presentation(false, "text", Some(&delivery), None, false),
             Presentation::Completed
         );
         assert_eq!(Presentation::Completed.hide_after(), Some(600));
         delivery.error = Some("compositionRejected".into());
         assert_eq!(
-            final_presentation(false, "text", Some(&delivery), None),
+            final_presentation(false, "text", Some(&delivery), None, false),
             Presentation::Error
         );
     }
@@ -173,28 +249,28 @@ mod tests {
     fn unsubmitted_text_is_recoverable_and_submitted_text_is_never_repeated() {
         let mut delivery = Delivery::not_submitted("targetChanged");
         assert_eq!(
-            final_presentation(false, "文字", Some(&delivery), None),
+            final_presentation(false, "文字", Some(&delivery), None, false),
             Presentation::Idle
         );
         assert_eq!(
-            final_presentation(true, "文字", Some(&delivery), None),
+            final_presentation(true, "文字", Some(&delivery), None, false),
             Presentation::Result
         );
         delivery.state = "unconfirmed".into();
         delivery.submission = Submission::Submitted;
         assert_eq!(
-            final_presentation(true, "文字", Some(&delivery), None),
+            final_presentation(true, "文字", Some(&delivery), None, false),
             Presentation::Idle
         );
         delivery.state = "confirmed".into();
         delivery.error = None;
         assert_eq!(
-            final_presentation(false, "文字", Some(&delivery), None),
+            final_presentation(false, "文字", Some(&delivery), None, false),
             Presentation::Completed
         );
         delivery.restore_error = true;
         assert_eq!(
-            final_presentation(false, "文字", Some(&delivery), None),
+            final_presentation(false, "文字", Some(&delivery), None, false),
             Presentation::Error
         );
     }
@@ -204,22 +280,34 @@ mod tests {
         delivery.state = "unconfirmed".into();
         delivery.submission = Submission::Submitted;
         assert_eq!(
-            final_presentation(false, "部分文字", Some(&delivery), Some("cancelled")),
+            final_presentation(false, "部分文字", Some(&delivery), Some("cancelled"), false),
             Presentation::Error
         );
         delivery.submission = Submission::NotSubmitted;
         delivery.error = Some("cancelled".into());
         assert_eq!(
-            final_presentation(false, "", Some(&delivery), Some("cancelled")),
+            final_presentation(false, "", Some(&delivery), Some("cancelled"), false),
             Presentation::Idle
         );
         delivery.submission = Submission::Submitted;
         assert_eq!(
-            final_presentation(false, "已提交前段", Some(&delivery), Some("cancelled")),
+            final_presentation(
+                false,
+                "已提交前段",
+                Some(&delivery),
+                Some("cancelled"),
+                false
+            ),
             Presentation::Idle
         );
         assert_eq!(
-            final_presentation(false, "已提交前段", Some(&delivery), Some("saveFailed")),
+            final_presentation(
+                false,
+                "已提交前段",
+                Some(&delivery),
+                Some("saveFailed"),
+                false
+            ),
             Presentation::Error
         );
     }
@@ -229,7 +317,7 @@ mod tests {
         assert_eq!(Presentation::Result.hide_after(), None);
         assert_eq!(Presentation::Error.hide_after(), None);
         assert_eq!(
-            final_presentation(true, "", None, Some("cancelled")),
+            final_presentation(true, "", None, Some("cancelled"), false),
             Presentation::Idle
         );
     }

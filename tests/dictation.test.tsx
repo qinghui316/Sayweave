@@ -79,16 +79,14 @@ describe('shortcut settings',()=>{
   await screen.findByText('此快捷键已被占用，请换一个。');expect(screen.getByRole('radio',{name:'点按'})).toBeChecked();expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
  });
 });
-it('keeps external completion pending only for the matching nonempty successful task',()=>{
+it('native terminal identity wins over late speech phases while live settlement stays processing',()=>{
  const result={...initialDictation(),taskId:'A',source:'external' as const,stage:'result' as const,text:'你好',presentationId:'view-A'};
  const speech={taskId:'A',text:'你好'};
- expect(dictationPhase(result,'completed',speech)).toBe('processing');
- expect(dictationPhase({...result,delivery:{state:'confirmed',submission:'submitted',verification:'confirmed',stage:'verify',submittedEvents:4,error:null,restoreError:false,elapsedMs:10}},'completed',speech)).toBe('completed');
- expect(dictationPhase({...result,stage:'delivering'},'completed',speech)).toBe('processing');
- expect(dictationPhase(result,'failed',speech)).toBe('failed');
- expect(dictationPhase(result,'completed',{...speech,taskId:'old'})).toBe('completed');
- expect(dictationPhase(result,'completed',{...speech,text:''})).toBe('completed');
- expect(dictationPhase({...result,error:'interrupted'},'processing',speech)).toBe('failed');
+ for(const phase of ['completed','failed','processing'] as const)expect(dictationPhase(result,phase,speech)).toBe('idle');
+ expect(dictationPhase({...result,presentation:'recognizing'},'completed',speech)).toBe('processing');
+ expect(dictationPhase({...result,presentation:'delivering'},'completed',{...speech,taskId:'old'})).toBe('processing');
+ expect(dictationPhase({...result,presentation:'completed'},'failed',speech)).toBe('completed');
+ expect(dictationPhase({...result,presentation:'error',error:'saveFailed'},'completed',speech)).toBe('failed');
  expect(dictationPhase(initialDictation(),'completed',speech)).toBe('completed');
 });
 

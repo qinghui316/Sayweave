@@ -76,6 +76,7 @@ struct Active {
     epoch: u64,
     origin: Option<TaskStamp>,
     cancel: watch::Sender<u8>,
+    explicit_end: Arc<AtomicBool>,
     gate: Arc<DeliveryGate>,
     overlay_revision: u64,
     began: std::time::Instant,
@@ -379,6 +380,7 @@ impl DictationCoordinator {
                 epoch,
                 origin: event.cloned(),
                 cancel: tx.clone(),
+                explicit_end: Arc::new(AtomicBool::new(false)),
                 gate: gate.clone(),
                 overlay_revision: crate::OVERLAY_VISIBILITY.load(Ordering::Acquire),
                 began: std::time::Instant::now(),
@@ -1105,11 +1107,19 @@ impl DictationCoordinator {
         // Projection can schedule window work. Never retain admission across it;
         // update checks the task identity again if a new task won the boundary.
         self.update(app, id, |s| {
+            let explicit_end = old
+                .as_ref()
+                .is_some_and(|a| a.explicit_end.load(Ordering::Acquire));
+            if s.admission == Admission::Rejected && !explicit_end {
+                s.presentation = Presentation::Error;
+                return;
+            }
             s.presentation = final_presentation(
                 s.input_route == InputRoute::ResultOnly,
                 &s.text,
                 s.delivery.as_ref(),
                 s.error.as_deref(),
+                explicit_end,
             );
         });
         if let Some(old) = old
@@ -1210,21 +1220,20 @@ impl DictationCoordinator {
             .as_ref()
             .filter(|a| a.id == id)
             .ok_or_else(|| Error::new("staleSession"))?;
-        let s = app.state::<SpeechService>().snapshot()?;
-        if s.task_id.as_ref() == Some(&a.id) && s.phase == Phase::Recording {
-            if let Some(flow) = &a.continuous {
-                flow.request_finish();
-            }
-            crate::task_stop::request(&a.cancel, crate::contracts::speech::StopReason::Finish)
-                .map_err(|_| Error::new("staleSession"))?;
-            let elapsed = a.began.elapsed().as_millis();
-            drop(active);
-            self.update(app, id, |s| s.presentation = Presentation::Recognizing);
-            log::info!(target:"sayweave","operation=dictation_phase task_id={} phase=finish_requested elapsed_ms={}",id,elapsed);
-            Ok(())
-        } else {
-            Err(Error::new("busy"))
+        // Task identity is the authority. Editing/resuming can temporarily
+        // change the speech phase while this same gesture is still active.
+        a.explicit_end.store(true, Ordering::Release);
+        if let Some(flow) = &a.continuous {
+            flow.request_finish();
         }
+        // A closed receiver means this active task is already settling. Finish
+        // is idempotent; it must not create a new error during that boundary.
+        let _ = crate::task_stop::request(&a.cancel, crate::contracts::speech::StopReason::Finish);
+        let elapsed = a.began.elapsed().as_millis();
+        drop(active);
+        self.update(app, id, |s| s.presentation = Presentation::Recognizing);
+        log::info!(target:"sayweave","operation=dictation_phase task_id={} phase=finish_requested elapsed_ms={}",id,elapsed);
+        Ok(())
     }
     pub fn cancel_bound(&self, id: Option<&str>) -> Result<(), Error> {
         let active = self.active.lock().map_err(|_| Error::new("unavailable"))?;
@@ -1235,6 +1244,7 @@ impl DictationCoordinator {
         if !a.gate.cancel() {
             return Err(Error::new("inputSubmitted"));
         }
+        a.explicit_end.store(true, Ordering::Release);
         if let Some(flow) = &a.continuous {
             flow.request_finish();
         }

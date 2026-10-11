@@ -18,7 +18,7 @@ export function shortcutLabel(binding:string):string{return binding.split('+').m
 export function inputMessage(code:string|null):string {return ({shortcutConflict:'此快捷键已被占用，请换一个。',shortcutUnavailable:'快捷键监听未就绪，请重新保存。',invalidShortcut:'请选择单键或组合键。',conflict:'设置已变化，请重新打开后修改。',busy:'当前任务结束后再操作。',preparing:'正在准备快捷键。',stopping:'应用正在退出。',targetChanged:'输入位置已改变，请复制结果。',keysHeld:'按键尚未释放，结果可复制。',keyboardStateConflict:'快捷键状态冲突，结果可复制。',targetProbeFailed:'未能确认输入框，结果可复制。',targetEditabilityUnknown:'未能确认输入框是否可编辑。',targetTrackingUnavailable:'输入位置无法确认，结果可复制。',targetSelectionUnavailable:'输入位置无法读取，结果可复制。',targetReadUnavailable:'输入结果无法读取。',inputSubmitFailed:'未能填入，结果可复制。',clipboardBusy:'剪贴板正被其他应用使用，请复制结果。',clipboardUnsupported:'原剪贴板内容需要保留，请手动复制结果。',clipboardRestore:'剪贴板恢复未完成，可重试恢复。',targetPassword:'此输入框需要手动输入。',targetPermission:'此应用不允许自动填入，请复制结果。',inputComposition:'输入法还在组词，请复制结果。',saveFailed:'历史未保存，结果可复制。',cancelled:'已停止自动填入，结果可复制。',inputUnconfirmed:'请确认输入结果，避免重复粘贴。',inputSubmitted:'文字已提交，请确认输入结果。'}[code??'']??'结果可复制后粘贴。');}
 
 export function dictationPhase(snapshot:DictationSnapshot,phase:Phase,speech:Pick<SpeechSnapshot,'taskId'|'text'>):Phase {
- if(snapshot.source==='external'&&snapshot.presentation==='idle'&&snapshot.presentationId===null)return 'idle';
+ if(snapshot.source==='external'&&snapshot.presentation==='idle')return 'idle';
  if(snapshot.source==='external'&&['recording','editing','resuming'].includes(snapshot.presentation))return 'recording';
  if(snapshot.source==='external'&&['recognizing','delivering'].includes(snapshot.presentation))return 'processing';
  if(snapshot.source==='external'&&snapshot.presentation==='completed')return 'completed';

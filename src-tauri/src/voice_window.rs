@@ -359,10 +359,10 @@ pub(crate) fn layout(window: &WebviewWindow, width: f64, height: f64, task: Opti
     reposition(window, task);
 }
 
-// VoiceSurface has12logical pixels of bottom padding. Anchor the visible
-// capsule24logical pixels above the work area, not the transparent canvas.
-const VISIBLE_BOTTOM_GAP: f64 = 24.0;
-const SURFACE_BOTTOM_PADDING: f64 = 12.0;
+// VoiceSurface has10logical pixels of bottom padding. Anchor the visible
+// capsule10logical pixels above the work area, not the transparent canvas.
+const VISIBLE_BOTTOM_GAP: f64 = 10.0;
+const SURFACE_BOTTOM_PADDING: f64 = 10.0;
 fn bottom_position(
     origin: PhysicalPosition<i32>,
     area: PhysicalSize<u32>,
@@ -406,7 +406,7 @@ pub(crate) fn reposition(window: &WebviewWindow, task: Option<&str>) {
 mod geometry_tests {
     use super::*;
     #[test]
-    fn capsule_stays_centered_and24logical_above_work_area_for_every_layout() {
+    fn capsule_stays_centered_and10logical_above_work_area_for_every_layout() {
         for scale in [1.0, 1.25, 1.5, 2.0] {
             for (width, height) in [(160, 88), (384, 112), (384, 232)] {
                 let origin = PhysicalPosition::new(-1920, -120);
@@ -425,7 +425,7 @@ mod geometry_tests {
                 let visible_bottom =
                     p.y as f64 + size.height as f64 - SURFACE_BOTTOM_PADDING * scale;
                 assert!(
-                    ((origin.y as f64 + area.height as f64 - visible_bottom) / scale - 24.0).abs()
+                    ((origin.y as f64 + area.height as f64 - visible_bottom) / scale - 10.0).abs()
                         <= 0.5
                 );
             }

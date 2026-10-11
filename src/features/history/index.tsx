@@ -1,5 +1,5 @@
 import {memo,useCallback,useEffect,useLayoutEffect,useRef,useState,useSyncExternalStore} from 'react';
-import {useNavigate} from 'react-router-dom';
+import {useNavigate,useLocation} from 'react-router-dom';
 import {ActionIcon,Button,EmptyState,IconButton,InlineMessage,TextInput} from '../../ui';
 import {historyVersion,type HistoryPort} from '../../contracts/history';
 import type {SpeechPort,SpeechSnapshot} from '../../contracts/speech';
@@ -18,7 +18,8 @@ const quietSpeech=initialSpeech();
 const day=(at:number)=>new Date(at).toLocaleDateString('zh-CN');
 function dateLabel(at:number){const date=day(at),today=new Date(),yesterday=new Date(today);yesterday.setDate(today.getDate()-1);return date===day(today.getTime())?'今天':date===day(yesterday.getTime())?'昨天':date;}
 export const History=memo(function History({deliveryRevision='',contentRevision=0,port,speech,models,snapshot,reading,visible=true,onChanged,recordingSettings}:{deliveryRevision?:string;contentRevision?:number;port:HistoryPort;speech:SpeechPort;models:ModelConfigPort;snapshot:SpeechSnapshot;reading?:HistoryFeedStore;visible?:boolean;onChanged?:()=>void;recordingSettings:SettingStore<RecordingPreferences>}){
- const navigate=useNavigate();
+ const navigate=useNavigate(),location=useLocation();
+ useEffect(()=>{if(new URLSearchParams(location.search).get('settings')==='save')setSettings(true);},[location.search]);
  const [own]=useState(()=>new HistoryFeedStore(port));const feed=reading??own;const state=useSyncExternalStore(feed.subscribe,feed.getSnapshot);
  const [mode,setMode]=useState<ExpandMode>('text'),[activation,setActivation]=useState(0),[settings,setSettings]=useState(false),[documentVisible,setDocumentVisible]=useState(()=>!document.hidden);
  const scroller=useRef<HTMLDivElement>(null),opening=useRef(0),anchor=useRef<{id:string;offset:number}|null>(null);

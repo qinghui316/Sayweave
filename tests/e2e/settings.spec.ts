@@ -1,5 +1,32 @@
 import {test,expect} from '@playwright/test';
 test.use({deviceScaleFactor:1.5});
+test('planned modes, unknown routes, learning help and history settings have truthful destinations',async({page})=>{
+ for(const [width,height] of [[1120,760],[960,640]] as const){
+  await page.setViewportSize({width,height});await page.goto('/');
+  for(const title of ['翻译','编辑']){
+   const row=page.getByRole('heading',{name:title,exact:true}).locator('..').locator('..');
+   await expect(row.getByText('规划中')).toBeVisible();await expect(row.getByRole('button')).toHaveCount(0);
+  }
+  const start=(await page.getByRole('button',{name:'开始录音',exact:true}).boundingBox())!;
+  expect(start.y+start.height).toBeLessThanOrEqual(height-24);
+  await page.screenshot({path:'.local/terminal-ui/home-'+width+'.png'});
+  await page.getByRole('button',{name:'设置',exact:true}).click();
+  await page.getByRole('button',{name:'外观与历史保存',exact:true}).click();
+  await page.getByRole('button',{name:'打开历史保存设置',exact:true}).click();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.locator('#history-settings')).toBeVisible();
+  await page.getByRole('link',{name:'词典',exact:true}).click();await expect(page.getByText(/分析；关闭后已有词语/)).toBeVisible();
+  await page.screenshot({path:'.local/terminal-ui/dictionary-'+width+'.png'});
+  await page.getByRole('link',{name:'个性化',exact:true}).click();await expect(page.getByText(/学习需配置默认文字模型/)).toBeVisible();
+  await page.screenshot({path:'.local/terminal-ui/personalization-'+width+'.png'});
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+ }
+ for(const [path,title] of [['translation','翻译规划中'],['edit','编辑规划中'],['unknown','页面未找到']]){
+  await page.goto('/#/'+path);await expect(page.getByRole('heading',{name:title})).toBeVisible();
+  await expect(page.getByRole('heading',{name:'历史记录',exact:true})).toHaveCount(0);
+  await page.getByRole('button',{name:'返回首页'}).click();await expect(page.getByRole('heading',{level:1})).toBeVisible();
+ }
+});
 test('personalization and automatic terms are findable at both desktop sizes',async({page})=>{
  for(const [width,height] of [[1120,760],[960,640]] as const){
   await page.setViewportSize({width,height});await page.goto('/#/preferences');

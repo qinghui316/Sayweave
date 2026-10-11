@@ -1,6 +1,6 @@
 .page { display:flex;flex-direction:column;gap:var(--space-16); }
 .heading { display:flex;align-items:center;justify-content:space-between;gap:var(--space-16); }
-.heading h1 { font-size:32px;line-height:44px;font-weight:500; }.heading p { margin-top:var(--space-8); }
+.heading h1 { font-size:var(--text-page);line-height:var(--line-page);font-weight:500; }.heading p { margin-top:var(--space-8); }
 .headerActions { display:flex;align-items:center;gap:var(--space-12); }.add { border-radius:var(--radius-pill); }
 .meta { color:var(--text-secondary);font-size:var(--text-small);line-height:var(--line-small); }
 .filters { display:flex;align-items:center;justify-content:space-between;gap:var(--space-12);min-height:48px; }.filterGroup { display:flex;align-items:center;gap:var(--space-12);min-width:0; }

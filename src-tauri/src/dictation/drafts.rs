@@ -93,12 +93,18 @@ fn ending_after_user_handoff_never_promotes_an_unknown_input_or_adds_normal_noti
     };
     let done = closed_delivery(Some(receipt(true)), false, false, true);
     assert_eq!(
-        super::presentation::final_presentation(false, "text", Some(&done), None),
+        super::presentation::final_presentation(false, "text", Some(&done), None, false),
         Presentation::Completed
     );
     let cancelled = closed_delivery(Some(receipt(true)), true, false, true);
     assert_eq!(
-        super::presentation::final_presentation(false, "text", Some(&cancelled), Some("cancelled")),
+        super::presentation::final_presentation(
+            false,
+            "text",
+            Some(&cancelled),
+            Some("cancelled"),
+            false
+        ),
         Presentation::Idle
     );
     let uncertain = closed_delivery(Some(receipt(false)), false, false, true);
@@ -867,7 +873,7 @@ impl SessionDraft {
             }
             return Ok(());
         }
-        if s.stopping {
+        if s.stopping || self.control.stopping() {
             return Ok(());
         }
         if s.draft.is_none() {
@@ -932,6 +938,12 @@ impl SessionDraft {
             && mode == Finish::Commit
         {
             mode = Finish::Handoff(error.clone());
+        }
+        if mode == Finish::Commit && s.written_raw.is_empty() && s.latest.text.is_empty() {
+            // A resumed insertion lease with no accepted text has nothing to
+            // commit. Handoff releases it without claiming a text submission
+            // or an uncertain effect, and preserves the user's edited prefix.
+            mode = Finish::Handoff("editing".into());
         }
         if let Some(draft) = s.draft.take() {
             let tail = if matches!(mode, Finish::Handoff(_)) {
@@ -1081,6 +1093,26 @@ impl SessionDraft {
                         self.control.resume(*turn, *activity);
                     }
                 }
+                Err(e)
+                    if (s.stopping || self.control.stopping())
+                        && matches!(
+                            e.code.as_str(),
+                            "targetReadonlyContext"
+                                | "targetChanged"
+                                | "targetLost"
+                                | "targetClosed"
+                                | "editing"
+                                | "inputComposition"
+                                | "staleSession"
+                                | "staleSnapshot"
+                        ) =>
+                {
+                    // Begin has not written text. A retired preparation may
+                    // reject its lease after Finish; it cannot restart or fail
+                    // the already-ending gesture. Mutation/cleanup errors do
+                    // not enter this branch.
+                    log::info!(target:"sayweave", "operation=composition_prepare_retired task_id={} turn={} error={}", self.task, turn, e.code);
+                }
                 Err(e) if e.code == "inputComposition" => s.paused_at = Some(Instant::now()),
                 Err(e) if e.code == "editing" => {
                     s.turn += 1;
@@ -1198,6 +1230,9 @@ impl SessionDraft {
             tokio::select! {
                 biased;
                 Some(end)=ends.recv()=>{
+                    // Finish can win the select before the edit notification.
+                    // Retire the user-owned range before considering final ASR.
+                    self.request_handoff(&mut s);
                     self.observe(&mut s,end.latest);s.stopping=true;
                     if s.ending.is_some(){let _=end.reply.send(Delivery::not_submitted("staleSession"));}
                     else{s.ending=Some(Ending {mode:finish_for_signal(end.mode,*cancel.borrow()),reply:end.reply,deadline:tokio::time::Instant::now()+Duration::from_secs(15),expired:false});}

@@ -18,3 +18,5 @@
 .trialActions { display: flex; align-items: center; justify-content: space-between; min-height: 52px; }.trialActions p { font-size: var(--text-meta); color: var(--text-secondary); }.dock { width: 236px; height: 52px; display: grid; place-items: center; }
 .practice {display:block;color:var(--text-primary);white-space:pre-wrap;overflow-wrap:anywhere;max-height:200px;overflow:auto;user-select:text;}
 @media (max-width: 980px) { .top { grid-template-columns: minmax(0,1fr) 232px; }.shortcuts { padding: var(--space-12); }.modeCopy { min-width: 0; }.usage { padding: var(--space-16); }.prepare p { max-width: 350px; } }
+
+@media (max-height:700px) { .home { gap:var(--space-12); }.heading { min-height:44px; }.shortcuts { min-height:244px;gap:var(--space-4); }.usageOffset { height:254px;padding-top:var(--space-8); }.trial { min-height:168px;padding-top:var(--space-12);padding-bottom:var(--space-12); }.practice { min-height:40px;padding-top:var(--space-8);padding-bottom:var(--space-8); } }

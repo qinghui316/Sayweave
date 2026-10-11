@@ -4,8 +4,8 @@ import type {SettingStore} from '../../settings/store';
 import {PersonalizationSettings} from './PersonalizationSettings';
 import s from './preferences.module.css';
 
-export function Preferences({store,port,visible}:{store:SettingStore<ProcessingSettings>;port:LanguageSettingsPort;visible:boolean}) {
+export function Preferences({store,port,visible,onModels}:{store:SettingStore<ProcessingSettings>;port:LanguageSettingsPort;visible:boolean;onModels?:()=>void}) {
   return <section className={s.page} aria-labelledby="personalization-title">
-    <PersonalizationSettings store={store} port={port} visible={visible}/>
+    <PersonalizationSettings store={store} port={port} visible={visible} onModels={onModels}/>
   </section>;
 }

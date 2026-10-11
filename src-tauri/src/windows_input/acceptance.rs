@@ -633,6 +633,146 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             "SAYWEAVE_COMPOSITION_TURNS_PASS rounds=6 final_turn=7 controlled_edit=true actual_handoff=true resumed_range=true old_turn_ignored=true final_single_copy=true"
         );
     }
+    // User edits followed by Finish on the same production actor. Delay cases
+    // exercise real handoff/empty-resume timing; controlled unit replies cover
+    // the exact in-flight Begin success/failure boundaries independently.
+    for (delay, continue_speaking, late_result) in [
+        (0, false, false),
+        (100, false, false),
+        (300, false, false),
+        (800, false, false),
+        (800, true, false),
+        (0, false, true),
+    ] {
+        use crate::{
+            dictation::drafts::SessionDraft,
+            speech::{NativeTranscript, continuous::Control},
+        };
+        fixture.command(serde_json::json!({"action":"focus","text":"abc","start":1,"end":1}))?;
+        thread::sleep(Duration::from_millis(60));
+        let id = uuid::Uuid::new_v4().to_string();
+        let anchor = WindowsInputService::anchor().ok_or("edit-finish target missing")?;
+        bind_watch(&id, &anchor, None).map_err(|e| e.code)?;
+        let draft = runtime
+            .block_on(Draft::begin(
+                id.clone(),
+                1,
+                anchor.clone(),
+                Arc::new(DeliveryGate::default()),
+            ))
+            .map_err(|e| e.code)?;
+        let flow = Control::new(crate::input_state::activity_evidence());
+        flow.resume(1, anchor.activity);
+        let (cancel, _) = tokio::sync::watch::channel(0);
+        let manager = SessionDraft::new(
+            id.clone(),
+            anchor,
+            draft,
+            flow.clone(),
+            cancel.clone(),
+            None,
+            None,
+        );
+        manager.activate();
+        let ongoing = manager.clone();
+        let mut actor = runtime.spawn(async move {
+            ongoing.maintain(|_| {}).await;
+        });
+        let mut latest = NativeTranscript {
+            task_id: id.clone(),
+            turn: 1,
+            sequence: 1,
+            text: "用户你好".into(),
+            ..NativeTranscript::default()
+        };
+        let result = (|| -> Result<(), String> {
+            let wait_text = |fixture: &mut Fixture, expected: &str| -> Result<(), String> {
+                let until = Instant::now() + Duration::from_secs(4);
+                loop {
+                    let read = fixture.command(serde_json::json!({"action":"read"}))?;
+                    if read["text"] == expected {
+                        return Ok(());
+                    }
+                    if Instant::now() >= until {
+                        return Err(format!("edit-finish actual text mismatch: {read}"));
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            };
+            manager.update(&latest);
+            wait_text(&mut fixture, "a用户你好bc")?;
+            crate::input_state::edited();
+            let edited = fixture.command(serde_json::json!({"action":"controlled-edit"}))?;
+            if edited["text"] != "a用户Xbc" {
+                return Err(format!("edit-finish edit missing: {edited}"));
+            }
+            thread::sleep(Duration::from_millis(delay));
+            let mut expected = "a用户Xbc".to_string();
+            if continue_speaking {
+                latest.turn = 2;
+                latest.sequence = 2;
+                latest.text = "继续说话".into();
+                manager.update(&latest);
+                expected = "a用户X继续说话bc".into();
+                wait_text(&mut fixture, &expected)?;
+            }
+            flow.request_finish();
+            cancel.send_replace(1);
+            if late_result {
+                let mut late = latest.clone();
+                late.sequence += 100;
+                late.text = "旧结果不得覆盖用户正文".into();
+                manager.update(&late);
+            }
+            let delivery = runtime
+                .block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        manager.finish(&latest, Finish::Commit),
+                    )
+                    .await
+                })
+                .map_err(|_| "edit-finish settlement timeout")?;
+            runtime
+                .block_on(async { tokio::time::timeout(Duration::from_secs(5), &mut actor).await })
+                .map_err(|_| "edit-finish actor timeout")?
+                .map_err(|e| e.to_string())?;
+            let read = fixture.command(serde_json::json!({"action":"read"}))?;
+            let report = manager.report().ok_or("edit-finish report missing")?;
+            if read["text"] != expected
+                || delivery.restore_error
+                || delivery.submission == Submission::Uncertain
+                || report.error.is_some()
+            {
+                return Err(format!(
+                    "edit-finish failed delay={delay} continuation={continue_speaking} late={late_result} delivery={:?} report={:?} read={read}",
+                    delivery.error, report.error
+                ));
+            }
+            println!(
+                "SAYWEAVE_EDIT_FINISH_PASS delay_ms={delay} continued={continue_speaking} late_result={late_result} actual={expected:?} user_text_preserved=true actor_settled=true"
+            );
+            Ok(())
+        })();
+        if result.is_err() && !actor.is_finished() {
+            flow.request_finish();
+            cancel.send_replace(2);
+            let _ = runtime.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    manager.finish(&latest, Finish::Abort),
+                )
+                .await
+            });
+            if !actor.is_finished() {
+                actor.abort();
+            }
+            let _ = runtime
+                .block_on(async { tokio::time::timeout(Duration::from_secs(1), &mut actor).await });
+        }
+        release_watch(&id);
+        result?;
+    }
     // The same styled helper is still a real external window if explicitly
     // activated. This uses actual foreground, not a synthetic notice, and must
     // remain invalidating after the original window regains foreground.

@@ -32,11 +32,11 @@ export const zh = {
   settings: {
     title: '设置', close: '关闭设置', description: '调整设备、模型和应用偏好。',
     tabs: { device: '设备与快捷键', models: '模型', language: '语言与翻译', appearance: '外观与历史保存', about: '关于' },
-    notImplemented: '此项功能稍后提供。',
+    notImplemented: '规划中',
     deviceHeading: '设备与快捷键', microphone: '麦克风', microphoneHelp: '真实设备检测在系统能力阶段接入。', notConfigured: '未配置',
     modelsHeading: '模型', modelsBody: '模型配置会直接在当前面板展开，API 与本地来源同属模型。完整表单在下一阶段接入。',
     languageHeading: '语言与翻译', languageBody: '当前使用简体中文。语言选择与翻译设置稍后提供。',
-    appearanceHeading: '外观与历史保存', appearanceBody: '录音保留和历史保存可在“历史记录”页面调整。外观设置稍后提供。',
+    appearanceHeading: '外观与历史保存', appearanceBody: '录音保留和历史保存可在“历史记录”页面调整。',
     aboutHeading: '关于', version: '版本', versionValue: '0.1.0', privacy: '隐私政策', terms: '服务条款', license: '开源许可证', pending: '待确定',
   },
   placeholder: { description: '模块入口已建立，完整界面和业务将在后续阶段实现。', back: '返回首页' },
