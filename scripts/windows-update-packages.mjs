@@ -4,6 +4,21 @@ import path from 'node:path';
 
 const limit=128*1024*1024;
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
+export function nsisPayloadInventory(listing){
+ if(typeof listing!=='string'||listing.length>2*1024*1024||!/^Type = Nsis\r?$/m.test(listing))throw Error('NSIS inventory format differs');
+ const normalized=listing.replaceAll('\r\n','\n'),marker='\n----------\n',start=normalized.indexOf(marker);
+ if(start<0)throw Error('NSIS inventory records missing');
+ const paths=[...normalized.slice(start+marker.length).matchAll(/^Path = ([^\r\n]+)$/gm)].map(match=>match[1]);
+ if(paths.length<6||paths.length>64||paths.some(value=>value.length>2048||value.includes('\0')||value.split(/[\\/]/).some(part=>part==='..'||part==='.'||part==='')))throw Error('NSIS inventory path exceeds contract');
+ const installed=paths.filter(value=>!value.startsWith('$PLUGINSDIR\\')).sort();
+ if(JSON.stringify(installed)!==JSON.stringify(['sayweave-installer-helper.exe','sayweave.exe','uninstall.exe']))throw Error('NSIS installed payload expands or duplicates the owned file manifest');
+ for(const name of ['sayweave-main.exe','sayweave-maintenance.exe','sayweave-uninstall.exe'])if(paths.filter(value=>value===`$PLUGINSDIR\\${name}`).length!==1)throw Error('NSIS transaction payload missing or duplicated');
+ return {installed,temporaryCount:paths.length-installed.length};
+}
+export function nsisHelperIdentity(installed,maintenance,frozen=installed){
+ if(!Buffer.isBuffer(installed)||!Buffer.isBuffer(maintenance)||!Buffer.isBuffer(frozen)||installed.length<2||installed.length>limit||!installed.subarray(0,2).equals(Buffer.from('MZ'))||!installed.equals(maintenance)||!installed.equals(frozen))throw Error('NSIS installed, transaction and frozen helpers differ');
+ return {helperSha256:hash(installed),helperSize:installed.length};
+}
 // Tauri 2.12.1 patches the NSIS payload token, then restores the build output.
 // Bind the generated NSIS input, actual signed payload and restored source bytes.
 export function nsisExecutableIdentity(script,expectedSource,buildOutput,payload){

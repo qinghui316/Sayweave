@@ -10,7 +10,7 @@ import {databaseInventory,seedLegacyRows,legacySeedRows} from './windows-update-
 import {readTools,writeTools,readMechanismEvidence,writeMechanismEvidence,proofMarkers} from './windows-update-artifacts.mjs';
 import {temporaryPreferenceCleanup} from './windows-update-registration.mjs';
 import {installedStartup,restartAndReconnect,aclPrelude,aclSnapshotScript,aclRestoreScript,deploymentReading} from './windows-update-startup.mjs';
-import {readPackages,writePackages,nsisExecutableIdentity} from './windows-update-packages.mjs';
+import {readPackages,writePackages,nsisExecutableIdentity,nsisPayloadInventory,nsisHelperIdentity} from './windows-update-packages.mjs';
 import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'&&process.env.SAYWEAVE_DISPOSABLE_WINDOWS!=='1')throw Error('Use an elevated disposable Windows VM; never an owner machine.');
 const root=process.cwd(),id=randomUUID(),directory=path.join(root,'.local','windows-update',id),source=path.join(directory,'source');mkdirSync(source,{recursive:true});
@@ -272,9 +272,12 @@ async function build(version,channel='test'){
  stage(`signed NSIS payload identity ${version}`);
  const extracted=path.join(directory,`payload-${channel}-${version}`),sevenZip=path.join(process.env.ProgramFiles,'7-Zip','7z.exe');
  if(!existsSync(sevenZip))throw Error('Disposable runner lacks the static signed-payload extractor');
- await command(sevenZip,['x',copy,`-o${extracted}`,'sayweave.exe','-y']);
+ const inventory=nsisPayloadInventory((await command(sevenZip,['l','-slt',copy])).stdout);
+ await command(sevenZip,['x',copy,`-o${extracted}`,'sayweave.exe','sayweave-installer-helper.exe','$PLUGINSDIR\\sayweave-maintenance.exe','-y']);
+ const helper=nsisHelperIdentity(readFileSync(path.join(extracted,'sayweave-installer-helper.exe')),readFileSync(path.join(extracted,'$PLUGINSDIR','sayweave-maintenance.exe')));
+ nsisHelperIdentity(readFileSync(path.join(extracted,'sayweave-installer-helper.exe')),readFileSync(path.join(extracted,'$PLUGINSDIR','sayweave-maintenance.exe')),readFileSync(path.join(source,'.local','installer-helper',helper.helperSha256,'sayweave-installer-helper.exe')));
  const binary=nsisExecutableIdentity(readFileSync(path.join(env.CARGO_TARGET_DIR,'release','nsis','x64','installer.nsi'),'utf8'),path.join(env.CARGO_TARGET_DIR,'release','sayweave.exe'),readFileSync(path.join(env.CARGO_TARGET_DIR,'release','sayweave.exe')),readFileSync(path.join(extracted,'sayweave.exe')));
- report.installers.push({...installerIdentity(copy,version,channel),...binary});checkpoint();return copy;
+ report.installers.push({...installerIdentity(copy,version,channel),...binary,...helper,inventory});checkpoint();return copy;
 }
 try{
  stage('source and build isolation');

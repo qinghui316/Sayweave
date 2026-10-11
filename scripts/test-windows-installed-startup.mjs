@@ -4,7 +4,7 @@ import {createHash,randomUUID} from 'node:crypto';
 import {mkdirSync,readFileSync,writeFileSync,renameSync,existsSync,unlinkSync} from 'node:fs';
 import path from 'node:path';
 import {chromium,expect} from '@playwright/test';
-import {readPackages} from './windows-update-packages.mjs';
+import {readPackages,nsisPayloadInventory,nsisHelperIdentity} from './windows-update-packages.mjs';
 import {readTools} from './windows-update-artifacts.mjs';
 import {boundedTail,safeStartupText,installedStartup,installedState,restartAndReconnect,aclPrelude,aclSnapshotScript,aclRestoreScript,deploymentReading as readDeployment} from './windows-update-startup.mjs';
 import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
@@ -13,7 +13,7 @@ if(process.platform!=='win32'||process.arch!=='x64'||process.env.GITHUB_ACTIONS!
 const root=process.cwd(),candidate=process.env.STARTUP_CANDIDATE;
 const harness=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
 if(!/^[a-f0-9]{40}$/.test(candidate??''))throw Error('Exact product candidate required.');
-const permitted=new Set(['.github/workflows/windows-ci.yml','scripts/windows-update-startup.mjs','scripts/windows-update-debug-policy.mjs','scripts/windows-update-metadata.ps1','scripts/windows-update-metadata.cs','scripts/test-windows-installed-startup.mjs','scripts/check-distribution.mjs','scripts/test-windows-update.mjs','docs/release.md','docs/testing.md','tests/windows-update-startup.test.ts']);
+ const permitted=new Set(['.github/workflows/windows-ci.yml','scripts/windows-update-startup.mjs','scripts/windows-update-packages.mjs','scripts/windows-update-debug-policy.mjs','scripts/windows-update-metadata.ps1','scripts/windows-update-metadata.cs','scripts/test-windows-installed-startup.mjs','scripts/check-distribution.mjs','scripts/test-windows-update.mjs','docs/release.md','docs/testing.md','tests/windows-update-startup.test.ts']);
 const changed=execFileSync('git',['diff','--name-only',candidate,harness],{encoding:'utf8'}).trim().split('\n').filter(Boolean);
 if(changed.some(file=>!permitted.has(file)))throw Error(`Candidate product sources differ: ${changed.filter(file=>!permitted.has(file)).join(', ')}`);
 if(execFileSync('git',['status','--porcelain','--untracked-files=no'],{encoding:'utf8'}).trim())throw Error('Diagnostic source tree is dirty.');
@@ -209,7 +209,9 @@ try{
  const sevenZip=path.join(process.env.ProgramFiles,'7-Zip','7z.exe');
  if(!existsSync(sevenZip))throw Error('Disposable runner lacks the static 7-Zip extractor; no installation was attempted.');
  const extracted=path.join(directory,'payload');
- await command(sevenZip,['x',packages.old,`-o${extracted}`,'sayweave.exe','-y']);
+ report.payloadInventory=nsisPayloadInventory(await command(sevenZip,['l','-slt',packages.old]));persist();
+ await command(sevenZip,['x',packages.old,`-o${extracted}`,'sayweave.exe','sayweave-installer-helper.exe','$PLUGINSDIR\\sayweave-maintenance.exe','-y']);
+ report.helperIdentity=nsisHelperIdentity(readFileSync(path.join(extracted,'sayweave-installer-helper.exe')),readFileSync(path.join(extracted,'$PLUGINSDIR','sayweave-maintenance.exe')));persist();
  const payload=readFileSync(path.join(extracted,'sayweave.exe'));
  if(payload.length<1||payload.length>128*1024*1024)throw Error('Signed executable payload exceeds bound.');
  const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
