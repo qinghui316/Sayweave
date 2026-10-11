@@ -77,7 +77,14 @@ async function deploymentLifecycle(){
   const toggle=page.getByRole('switch',{name:'个性化',exact:true});await expect(toggle).toBeVisible();
   const geometry=await toggle.evaluate(el=>{const r=el.getBoundingClientRect();return {rightGutter:innerWidth-r.right,width:innerWidth,height:innerHeight,ratio:devicePixelRatio};});
   expect(geometry.rightGutter).toBeGreaterThanOrEqual(0);expect(geometry.rightGutter).toBeLessThanOrEqual(40);
-  const file=`native-personalization-${minimum?'960':'1120'}-${zoom}.png`;await page.screenshot({path:path.join(directory,file)});visuals.push({file,...geometry,headingCount:1});persist();
+  const file=`native-personalization-${minimum?'960':'1120'}-${zoom}.png`;
+  // Wry zoom changes CSS viewport metrics. Capture the surface without a CSS
+  // clip so the right edge and footer remain in the native viewport image.
+  const session=await page.context().newCDPSession(page);
+  let pixels;try{pixels=Buffer.from((await session.send('Page.captureScreenshot',{format:'png',fromSurface:true,captureBeyondViewport:false})).data,'base64');}finally{await session.detach();}
+  const imageWidth=pixels.readUInt32BE(16),imageHeight=pixels.readUInt32BE(20);
+  expect(imageWidth).toBeGreaterThanOrEqual(Math.floor(geometry.width*geometry.ratio)-1);expect(imageHeight).toBeGreaterThanOrEqual(Math.floor(geometry.height*geometry.ratio)-1);
+  writeFileSync(path.join(directory,file),pixels);visuals.push({file,...geometry,imageWidth,imageHeight,headingCount:1});persist();
  }
  await invoke(page,'acceptance_main_size',{minimum:false,zoom:1});
  const seeded=await invoke(page,'acceptance_update_seed');expect(seeded.credentialMatches).toBe(true);
