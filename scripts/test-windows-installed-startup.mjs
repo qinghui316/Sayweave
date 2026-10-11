@@ -21,6 +21,8 @@ const packages=readPackages('.local/prior-update-packages',candidate);
 const recovery=process.argv.includes('--restart-recovery');
 const metadata=process.argv.includes('--metadata');
 const aclDiagnostic=process.argv.includes('--acl');
+const lifecycle=process.argv.includes('--deployment-lifecycle');
+if(lifecycle&&(metadata||recovery||aclDiagnostic))throw Error('Deployment lifecycle requires isolated automatic deployment, without manual component preparation or other diagnoses.');
 const tools=metadata?readTools('.local/prior-update-tools',candidate):null;
 if(recovery&&!packages.next)throw Error('Recovery diagnosis requires both frozen signed packages.');
 const directory=path.join(root,'.local','installed-startup',randomUUID());mkdirSync(directory,{recursive:true});
@@ -33,6 +35,16 @@ const dataRoot=path.join(process.env.APPDATA,packages.manifest.identifier,'data'
 function stage(value){report.stage=value;persist();console.log(`Installed startup diagnostic: ${value}`);}
 function deploymentReading(){
  return readDeployment(path.dirname(exe));
+}
+async function attemptInstallation(file){
+ const attempt={stage:report.stage,installerSha256:createHash('sha256').update(readFileSync(file)).digest('hex'),observations:[]};
+ (report.deploymentAttempts??=[]).push(attempt);const seen=new Set();
+ const sample=()=>{
+  const reading=deploymentReading(),identity=JSON.stringify(reading);
+  if(!seen.has(identity)&&attempt.observations.length<64){seen.add(identity);attempt.observations.push({at:new Date().toISOString(),records:reading});persist();}
+ };
+ sample();const timer=setInterval(sample,200);
+ try{await command(file,['/S']);}finally{clearInterval(timer);sample();report.deployment=deploymentReading();persist();}
 }
 const invoke=(page,command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
 async function connect(launch=true){
@@ -49,6 +61,46 @@ async function closeCurrent(page){
  await browser.close();browser=null;
  for(let n=0;n<20;n++){if(!installedState(exe).applications.some(app=>app.CreationDate===owned.CreationDate))break;await new Promise(resolve=>setTimeout(resolve,250));}
  if(installedState(exe).applications.some(app=>app.CreationDate===owned.CreationDate))throw Error('Native application exit did not complete.');
+}
+async function deploymentLifecycle(){
+ stage('same-package deployment lifecycle');
+ const first=deploymentReading();
+ expect(first.user).toMatchObject({phase:'committed',userChoice:null,userInitialized:true,target:{commit:candidate,mainHash:report.payload.sha256,payloadHash:packages.manifest.componentSha256}});
+ expect(first.machine).toMatchObject({phase:'committed',target:{commit:candidate,payloadHash:packages.manifest.componentSha256}});
+ let page=await connect();
+ expect(await invoke(page,'text_service_status')).toMatchObject({enabled:true,deploymentState:'ready',updateAvailable:false,error:null});
+ const seeded=await invoke(page,'acceptance_update_seed');expect(seeded.credentialMatches).toBe(true);
+ expect(seeded.schema).toBe(9);expect(seeded.history.count).toBe(10);expect(seeded.profile.preferenceCount).toBe(1);
+ const cases=report.deploymentLifecycle={first,repeat:[],uninstall:null,reinstall:null,passed:false};persist();
+ for(const enabled of [false,true]){
+  await invoke(page,'text_service_action',{action:enabled?'enable':'disable'});
+  const before=await invoke(page,'acceptance_update_data');expect(before.component.enabled).toBe(enabled);
+  await closeCurrent(page);
+  try{await attemptInstallation(packages.old);}finally{cases.repeat.push({enabled,records:deploymentReading()});persist();}
+  const records=cases.repeat.at(-1).records;
+  expect(records.user).toMatchObject({phase:'committed',userChoice:enabled,userInitialized:true,target:{commit:candidate,mainHash:report.payload.sha256}});
+  page=await connect();expect(await invoke(page,'acceptance_update_data')).toEqual(before);
+  cases.repeat.at(-1).passed=true;persist();
+ }
+ const before=await invoke(page,'acceptance_update_data');await closeCurrent(page);
+ const database=path.join(dataRoot,'dictionary.sqlite'),databaseHash=createHash('sha256').update(readFileSync(database)).digest('hex');
+ const original=deploymentReading(),uninstaller=path.join(path.dirname(exe),'uninstall.exe');
+ expect(createHash('sha256').update(readFileSync(uninstaller)).digest('hex')).toBe(original.user.target.uninstallHash);
+ stage('owned true uninstall retains data, credentials and shared component');
+ try{await attemptInstallation(uninstaller);}finally{cases.uninstall={records:deploymentReading()};persist();}
+ expect(cases.uninstall.records.user.phase).toBe('uninstalled');
+ expect(existsSync(exe)).toBe(false);expect(existsSync(uninstaller)).toBe(false);expect(existsSync(path.join(path.dirname(exe),'sayweave-installer-helper.exe'))).toBe(false);
+ for(const file of original.user.files)expect(existsSync(file.path)).toBe(false);
+ const keys=JSON.stringify(original.user.keys.map(key=>key.path));
+ const inventory=await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$keys=ConvertFrom-Json '${keys.replaceAll("'","''")}';foreach($key in $keys){if(Test-Path -LiteralPath ('Registry::HKEY_CURRENT_USER\\'+$key)){throw 'Owned install namespace remains'}};'removed'`]);
+ expect(inventory.trim()).toBe('removed');
+ expect(createHash('sha256').update(readFileSync(database)).digest('hex')).toBe(databaseHash);
+ expect(cases.uninstall.records.machine).toEqual(original.machine);cases.uninstall.databaseHash=databaseHash;cases.uninstall.passed=true;persist();
+ stage('same-package reinstall verifies retained data and credential identity');
+ try{await attemptInstallation(packages.old);}finally{cases.reinstall={records:deploymentReading()};persist();}
+ expect(cases.reinstall.records.user).toMatchObject({phase:'committed',userChoice:true});
+ page=await connect();expect(await invoke(page,'acceptance_update_data')).toEqual(before);await closeCurrent(page);
+ cases.reinstall.passed=true;cases.passed=true;persist();
 }
 async function componentInventory(timeout=180000){
  const inventory=JSON.parse(await command('powershell',['-NoProfile','-Command',"$ErrorActionPreference='Stop';$items=@{};foreach($scope in @('HKEY_CURRENT_USER','HKEY_LOCAL_MACHINE')){$base='Registry::'+$scope;$com=$base+'\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$tip=$base+'\\Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$item=@{com=(Test-Path -LiteralPath $com);tip=(Test-Path -LiteralPath $tip);module=$null;owner=$null;tipEntries=@()};if(Test-Path -LiteralPath ($com+'\\InprocServer32')){$key=Get-Item -LiteralPath ($com+'\\InprocServer32');$item.module=$key.GetValue('');$item.owner=$key.GetValue('SayweaveOwner')};if($item.tip){$queue=@($tip);for($n=0;$n -lt $queue.Count;$n++){if($queue.Count -gt 64){throw 'Owned TIP registry inventory exceeded bound'};$key=Get-Item -LiteralPath $queue[$n];$values=@{};$names=@($key.GetValueNames());if($names.Count -gt 32){throw 'Owned TIP value inventory exceeded bound'};foreach($name in $names){$value=$key.GetValue($name);if(($value -isnot [string] -and $value -isnot [int]) -or ([string]$value).Length -gt 1024){throw 'Owned TIP value exceeded bound'};$values[$name]=@{kind=([string]$key.GetValueKind($name));value=$value}};$item.tipEntries+=@{path=$queue[$n].Substring($tip.Length);values=$values};foreach($child in @($key.GetSubKeyNames())){$queue+=($queue[$n]+'\\'+$child)}}};$items[$scope]=$item};ConvertTo-Json -InputObject $items -Compress -Depth 9"],timeout));
@@ -159,7 +211,7 @@ try{
  const policy=await command('powershell',['-NoProfile','-Command',"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$items=@();foreach($scope in @('HKLM:','HKCU:')){foreach($suffix in @('Software\\Policies\\Microsoft\\Edge','Software\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments')){$key=$scope+'\\'+$suffix;if(Test-Path -LiteralPath $key){$entry=Get-Item -LiteralPath $key;foreach($name in @('RemoteDebuggingAllowed','sayweave.exe','*')){if($entry.GetValueNames() -contains $name){$value=$entry.GetValue($name);$items+=@{scope=$scope;key=$suffix;name=$name;kind=[string]$entry.GetValueKind($name);debugAllowed=if($name -eq 'RemoteDebuggingAllowed'){$value -eq 1}else{$null};hasDebugPort=([string]$value -match '--remote-debugging-port');hasLoopback=([string]$value -match '--remote-debugging-address=127.0.0.1')}}}}}};ConvertTo-Json -InputObject $items -Compress"]);
  report.debugPolicy=JSON.parse(policy);persist();
  if(metadata)await frozenToolingPrelude();
- stage('same candidate installation');try{await command(packages.old,['/S']);}finally{report.deployment=deploymentReading();persist();}
+ stage('same candidate installation');await attemptInstallation(packages.old);
  if(hash(readFileSync(exe))!==report.payload.sha256)throw Error('Installed executable differs from signed payload.');
  if(metadata){
   stage('frozen installed component preparation');
@@ -185,6 +237,7 @@ try{
  let page=await connect();
  await page.screenshot({path:path.join(directory,'native-startup.png')});
  await closeCurrent(page);
+ if(lifecycle)await deploymentLifecycle();
  if(aclDiagnostic){
   stage('PowerShell ACL module comparison');
   const literal="'"+path.dirname(exe).replaceAll("'","''")+"'";

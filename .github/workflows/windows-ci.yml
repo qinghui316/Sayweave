@@ -33,6 +33,10 @@ on:
         description: Compare ACL module loading and exact restoration using the frozen package
         type: boolean
         default: false
+      deployment_lifecycle:
+        description: Same-package first choice, repeat and owned uninstall acceptance
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: read
@@ -323,11 +327,13 @@ jobs:
           DIAGNOSE_RECOVERY: ${{ inputs.diagnose_recovery }}
           DIAGNOSE_METADATA: ${{ inputs.diagnose_metadata }}
           DIAGNOSE_ACL: ${{ inputs.diagnose_acl }}
+          DEPLOYMENT_LIFECYCLE: ${{ inputs.deployment_lifecycle }}
         run: |
           $arguments = @()
           if ($env:DIAGNOSE_RECOVERY -eq 'true') { $arguments += '--restart-recovery' }
           if ($env:DIAGNOSE_METADATA -eq 'true') { $arguments += '--metadata' }
           if ($env:DIAGNOSE_ACL -eq 'true') { $arguments += '--acl' }
+          if ($env:DEPLOYMENT_LIFECYCLE -eq 'true') { $arguments += '--deployment-lifecycle' }
           node scripts/test-windows-installed-startup.mjs @arguments
           if ($LASTEXITCODE -ne 0) { throw 'Installed startup diagnosis failed; full validation remains blocked.' }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
