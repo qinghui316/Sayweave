@@ -63,10 +63,23 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
-      - run: npx playwright install chromium
-      - run: npm run check
-      - run: npm run test:e2e
-      - run: npm run test:desktop
+      - name: Check workflow-only controller contracts
+        if: needs.windows-tooling.outputs.product_commit != ''
+        run: |
+          npm run typecheck
+          if ($LASTEXITCODE -ne 0) { throw 'Controller type check failed.' }
+          npm run lint
+          if ($LASTEXITCODE -ne 0) { throw 'Controller lint failed.' }
+          npx vitest run tests/release-validation.test.ts tests/windows-update-artifacts.test.ts
+          if ($LASTEXITCODE -ne 0) { throw 'Controller release contracts failed.' }
+      - if: needs.windows-tooling.outputs.product_commit == ''
+        run: npx playwright install chromium
+      - if: needs.windows-tooling.outputs.product_commit == ''
+        run: npm run check
+      - if: needs.windows-tooling.outputs.product_commit == ''
+        run: npm run test:e2e
+      - if: needs.windows-tooling.outputs.product_commit == ''
+        run: npm run test:desktop
       - run: npm run check:distribution
   windows-tooling:
     name: Windows update tooling
