@@ -2,5 +2,3 @@
 .page h1 { font-size:var(--text-page); line-height:var(--line-page); font-weight:500; }
 .page header p { margin-top:var(--space-8); font-size:var(--text-small); color:var(--text-secondary); }
 .page h3 { font-size:var(--text-mode); line-height:var(--line-mode); font-weight:500; }
-
-.page>p { font-size:var(--text-small);line-height:var(--line-small);color:var(--text-secondary);max-width:70ch; }
