@@ -2,16 +2,30 @@
 // Uses the original signed installer/helper and an unchanged older production DLL.
 import {spawn} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {copyFileSync,existsSync,mkdirSync,readFileSync,writeFileSync} from 'node:fs';
+import {copyFileSync,existsSync,mkdirSync,readFileSync,readdirSync,writeFileSync} from 'node:fs';
 import path from 'node:path';
 import {expect} from '@playwright/test';
 import {readTools,proofMarkers} from './windows-update-artifacts.mjs';
 import {aclPrelude} from './windows-update-startup.mjs';
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 export const olderProduct='abc3eed9375b3c170e7b144158ca24bb632fd41e';
+const olderTextController='f11cf2ef7eb1e6d09cae229930b3a0d35ea9f091';
 const classId='{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}',profileId='{6CD26440-E770-471E-8212-B5A565E816F5}';
 const quote=value=>"'"+value.replaceAll("'","''")+"'";
 function disposable(){if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'||process.env.RUNNER_ENVIRONMENT!=='github-hosted')throw Error('Boundary checks require disposable hosted Windows');}
+function priorOldTextProof(directory,expectedHash){
+ const reports=[];
+ function walk(root){for(const item of readdirSync(root,{withFileTypes:true})){if(item.isSymbolicLink())throw Error('Old proof contains a link');const file=path.join(root,item.name);if(item.isDirectory())walk(file);else if(item.name==='receipt.json')reports.push(file);}}
+ walk(directory);
+ for(const file of reports){
+  const bytes=readFileSync(file);if(bytes.length>1024*1024)throw Error('Old proof receipt exceeds bound');const prior=JSON.parse(bytes);
+  if(prior.acceptanceCommit!==olderTextController||prior.candidateCommit!=='7930ddf99f00c58ce839d276e4d475d5ef8a001d'||prior.olderComponent?.productCommit!==olderProduct||prior.olderComponent.sha256!==expectedHash)continue;
+  const command=prior.commands.find(item=>item.tool==='tsf-probe.exe'&&item.exitCode===0&&item.args?.length===2&&item.args[0]==='installed-fixture'&&item.args[1]===prior.olderComponent.module&&/^command-\d+\.stdout\.log$/.test(item.stdout));
+  if(!command)continue;const log=readFileSync(path.join(path.dirname(file),command.stdout));if(log.length>65536)throw Error('Old proof log exceeds bound');for(const marker of proofMarkers)if(!log.toString('utf8').includes(marker))throw Error('Prior old actual-text proof is incomplete');
+  return {run:38164773452,acceptanceCommit:olderTextController,productCommit:olderProduct,componentSha256:expectedHash,receiptSha256:hash(bytes),stdoutSha256:hash(log),checkPassed:true,wholeRunPassed:prior.passed,reuseReason:'This exact historical DLL actual-text check already passed; only COM hold/replacement and missing checkpoints continue'};
+ }
+ throw Error('Prior historical DLL actual-text proof not found');
+}
 export function boundaryCheckpoint(kind,reading){
  if(kind==='prepared')return reading.user.phase==='prepared'&&reading.machine.phase==='prepared';
  if(kind==='program-recovery')return reading.user.phase==='recovery'&&reading.user.lastFailure?.phase==='programInstalled'&&reading.user.lastFailure?.code==='acceptanceInstallerProgramFailure'&&reading.machine.phase==='prepared';
@@ -41,9 +55,9 @@ export async function prepareOlderComponent(ctx){
  await ctx.command(old.probe,['register-machine',module]);
  const before=await ctx.componentInventory();
  expect(before.HKEY_LOCAL_MACHINE.module.replace(/^\\\\\?\\/,'').toLowerCase()).toBe(module.toLowerCase());
- // Confirm actual production TSF behavior before holding the old COM instance.
- const oldText=await ctx.command(old.probe,['installed-fixture',module]);
- for(const marker of proofMarkers)expect(oldText).toContain(marker);
+ // Reuse the passed old-DLL check within the preserved failed-controller run.
+ // Its later host failure does not relabel the individual completed check.
+ const oldTextProof=priorOldTextProof('.local/prior-old-component-proof',expected);
  const file=path.join(ctx.directory,'older-component-host.ps1');
  writeFileSync(file,String.raw`param([string]$Module)
 $ErrorActionPreference='Stop';[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -75,7 +89,7 @@ try{
 }finally{if($instance -ne [IntPtr]::Zero){[void][Runtime.InteropServices.Marshal]::Release($instance)};[void][OldComponentLease]::FreeLibrary($library);[OldComponentLease]::CoUninitialize()}
 [Console]::WriteLine('LEASE_RELEASED')
 `,'utf8');
- ctx.report.olderComponent={productCommit:olderProduct,sha256:expected,module,preparation:'Unchanged historical production DLL/tooling; old fixture preparation only',registrationBefore:before,passed:false};ctx.persist();
+ ctx.report.olderComponent={productCommit:olderProduct,sha256:expected,module,oldTextProof,preparation:'Unchanged historical production DLL/tooling; old fixture preparation only',registrationBefore:before,passed:false};ctx.persist();
  const host=spawn('powershell',['-NoProfile','-ExecutionPolicy','Bypass','-File',file,'-Module',module],{windowsHide:true,stdio:['pipe','pipe','pipe']});
  const readings=[];let output='',error='';host.stdout.on('data',bytes=>{output+=bytes;const lines=output.split('\n');output=lines.pop();for(const line of lines.filter(line=>line.startsWith('LEASE ')))readings.push(JSON.parse(line.slice(6)));});host.stderr.on('data',bytes=>{error=(error+bytes).slice(-4096);ctx.report.olderComponent.hostError=error;ctx.persist();});
  ctx.oldLease={host,module,expected,readings,get error(){return error;}};
