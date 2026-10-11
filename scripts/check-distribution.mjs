@@ -16,6 +16,7 @@ const testRoots = new Set(['contracts', 'e2e']);
 scripts.add('windows-update-metadata.cs');
 scripts.add('windows-update-metadata.ps1');
 for(const script of ['storage.mjs','storage-policy.mjs','storage-safety.ps1','storage-cargo.mjs'])scripts.add(script);
+for(const script of ['frozen-product-scope.mjs','windows-product-boundaries.mjs'])scripts.add(script);
 const testFixtures = new Set(['voice-recovery.html', 'voice-recovery.tsx', 'input-target.ts', 'faithful-v1.txt']);
 const generated = /(?:^|\/)(?:node_modules|target|gen|dist|coverage|test-results|playwright-report|\.local|\.git)(?:\/|$)|^tests\/visual\//i;
 const ownerLocal = /(?:^|\/)(?:\.agents|\.claude|\.codex|\.impeccable)(?:\/|$)|(?:^|\/)(?:AGENTS\.md|CLAUDE\.md|\.env[^/]*|dev\.ps1|doctor\.mjs|environment\.ps1|setup-tools\.ps1|harness-skill-link\.(?:mjs|ps1|py))$|\.cmd$/i;
