@@ -1,7 +1,7 @@
 // Diagnostic-only installation of an existing signed candidate. Never an owner host.
 import {spawn,execFileSync} from 'node:child_process';
 import {createHash,randomUUID} from 'node:crypto';
-import {mkdirSync,readFileSync,writeFileSync,renameSync,existsSync,unlinkSync} from 'node:fs';
+import {mkdirSync,readFileSync,writeFileSync,renameSync,existsSync,unlinkSync,statSync,realpathSync} from 'node:fs';
 import path from 'node:path';
 import {chromium,expect} from '@playwright/test';
 import {readPackages} from './windows-update-packages.mjs';
@@ -31,6 +31,21 @@ let browser,owned,child,debugPolicy,componentPreparation;
 const exe=path.join(process.env.LOCALAPPDATA,packages.manifest.product,'sayweave.exe');
 const dataRoot=path.join(process.env.APPDATA,packages.manifest.identifier,'data');
 function stage(value){report.stage=value;persist();console.log(`Installed startup diagnostic: ${value}`);}
+function deploymentReading(){
+ const installDirectory=path.dirname(exe);
+ const canonical=existsSync(installDirectory)?realpathSync.native(installDirectory):path.join(realpathSync.native(path.dirname(installDirectory)),path.basename(installDirectory));
+ const name=createHash('sha256').update(canonical.replace(/^\\\\\?\\/,'').replace(/\\$/,'').toLowerCase()).digest('hex');
+ const paths={user:path.join(process.env.LOCALAPPDATA,'SayweaveInstallTransactions',name,'receipt.json'),machine:path.join(process.env.ProgramFiles,'Sayweave','TextService','installer.json')};
+ const readings={};
+ for(const [role,file] of Object.entries(paths)){
+  if(!existsSync(file)){readings[role]={exists:false};continue;}
+  const info=statSync(file);if(!info.isFile()||info.size>128*1024)throw Error('Deployment diagnostic record exceeds fixed bound');
+  const bytes=readFileSync(file),value=JSON.parse(bytes);
+  const code=value=>typeof value==='string'&&/^[a-zA-Z][a-zA-Z0-9]{0,127}$/.test(value)?value:null;
+  readings[role]={exists:true,file,sha256:createHash('sha256').update(bytes).digest('hex'),schemaVersion:value.schemaVersion,transaction:value.transaction,phase:value.phase,target:value.target,installer:value.installer,server:value.server,language:value.language,userChoice:value.userChoice,userInitializationStarted:value.userInitializationStarted,userInitialized:value.userInitialized,module:value.module,oldModule:value.old?.module,oldHash:value.oldHash,error:code(value.error),lastFailure:value.lastFailure?{phase:value.lastFailure.phase,code:code(value.lastFailure.code)}:null,files:value.files?.map(item=>({path:item.path,backup:item.backup,beforeHash:item.beforeHash,installedHash:item.installedHash})),keys:value.keys?.map(item=>({path:item.path,existed:item.existed,valueNames:item.values?.map(value=>value.name)}))};
+ }
+ return readings;
+}
 const invoke=(page,command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
 async function connect(launch=true){
  const result=await installedStartup({exe,dataRoot,directory,port:9291,launch,previous:owned,record:report.startups,persist,onOwned:value=>{owned=value;},onSpawn:value=>{child=value;}});
@@ -156,7 +171,7 @@ try{
  const policy=await command('powershell',['-NoProfile','-Command',"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$items=@();foreach($scope in @('HKLM:','HKCU:')){foreach($suffix in @('Software\\Policies\\Microsoft\\Edge','Software\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments')){$key=$scope+'\\'+$suffix;if(Test-Path -LiteralPath $key){$entry=Get-Item -LiteralPath $key;foreach($name in @('RemoteDebuggingAllowed','sayweave.exe','*')){if($entry.GetValueNames() -contains $name){$value=$entry.GetValue($name);$items+=@{scope=$scope;key=$suffix;name=$name;kind=[string]$entry.GetValueKind($name);debugAllowed=if($name -eq 'RemoteDebuggingAllowed'){$value -eq 1}else{$null};hasDebugPort=([string]$value -match '--remote-debugging-port');hasLoopback=([string]$value -match '--remote-debugging-address=127.0.0.1')}}}}}};ConvertTo-Json -InputObject $items -Compress"]);
  report.debugPolicy=JSON.parse(policy);persist();
  if(metadata)await frozenToolingPrelude();
- stage('same candidate installation');await command(packages.old,['/S']);
+ stage('same candidate installation');try{await command(packages.old,['/S']);}finally{report.deployment=deploymentReading();persist();}
  if(hash(readFileSync(exe))!==report.payload.sha256)throw Error('Installed executable differs from signed payload.');
  if(metadata){
   stage('frozen installed component preparation');
