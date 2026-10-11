@@ -85,6 +85,11 @@ async function deploymentLifecycle(){
  const before=await invoke(page,'acceptance_update_data');await closeCurrent(page);
  const database=path.join(dataRoot,'dictionary.sqlite'),databaseHash=createHash('sha256').update(readFileSync(database)).digest('hex');
  const original=deploymentReading(),uninstaller=path.join(path.dirname(exe),'uninstall.exe');
+ const registrationBefore=await componentInventory();
+ const module=path.join(process.env.ProgramFiles,'Sayweave','TextService',packages.manifest.componentSha256,'sayweave_text_service.dll');
+ expect(registrationBefore.HKEY_LOCAL_MACHINE).toMatchObject({com:true,tip:true});
+ expect(registrationBefore.HKEY_LOCAL_MACHINE.module.replace(/^\\\\\?\\/,'').toLowerCase()).toBe(module.toLowerCase());
+ expect(createHash('sha256').update(readFileSync(module)).digest('hex')).toBe(packages.manifest.componentSha256);
  expect(createHash('sha256').update(readFileSync(uninstaller)).digest('hex')).toBe(original.user.target.uninstallHash);
  stage('owned true uninstall retains data, credentials and shared component');
  try{await attemptInstallation(uninstaller);}finally{cases.uninstall={records:deploymentReading()};persist();}
@@ -95,6 +100,10 @@ async function deploymentLifecycle(){
  const inventory=await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$keys=ConvertFrom-Json '${keys.replaceAll("'","''")}';foreach($key in $keys){if(Test-Path -LiteralPath ('Registry::HKEY_CURRENT_USER\\'+$key)){throw 'Owned install namespace remains'}};'removed'`]);
  expect(inventory.trim()).toBe('removed');
  expect(createHash('sha256').update(readFileSync(database)).digest('hex')).toBe(databaseHash);
+ const registrationAfter=await componentInventory();expect(registrationAfter).toEqual(registrationBefore);
+ expect(createHash('sha256').update(readFileSync(module)).digest('hex')).toBe(packages.manifest.componentSha256);
+ const canonical=value=>Array.isArray(value)?value.map(canonical):value&&typeof value==='object'?Object.fromEntries(Object.keys(value).sort().map(key=>[key,canonical(value[key])])):value;
+ cases.uninstall.registrationDigest=createHash('sha256').update(JSON.stringify(canonical(registrationAfter))).digest('hex');cases.uninstall.componentSha256=packages.manifest.componentSha256;
  expect(cases.uninstall.records.machine).toEqual(original.machine);cases.uninstall.databaseHash=databaseHash;cases.uninstall.passed=true;persist();
  stage('same-package reinstall verifies retained data and credential identity');
  try{await attemptInstallation(packages.old);}finally{cases.reinstall={records:deploymentReading()};persist();}
