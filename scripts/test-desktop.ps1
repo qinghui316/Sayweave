@@ -18,12 +18,16 @@ $ErrorActionPreference='Stop'
 if ($buildExit -ne 0) { throw 'Acceptance build failed. See .local/desktop-acceptance-build.log.' }
 $oldFlag=$env:SAYWEAVE_DESKTOP_ACCEPTANCE
 $oldDataId=$env:SAYWEAVE_DATA_ACCEPTANCE_ID
-$env:SAYWEAVE_DATA_ACCEPTANCE_ID=[guid]::NewGuid().ToString()
+$acceptanceId=[guid]::NewGuid().ToString()
+& node scripts/storage.mjs begin-desktop $acceptanceId | Out-Null
+if($LASTEXITCODE -ne 0){throw 'Storage reservation failed before desktop launch.'}
+$env:SAYWEAVE_DATA_ACCEPTANCE_ID=$acceptanceId
 try { $env:SAYWEAVE_DESKTOP_ACCEPTANCE='1'; $app=Start-Process $exe -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $projectRoot '.local/desktop-acceptance.log') -RedirectStandardError (Join-Path $projectRoot '.local/desktop-acceptance-errors.log') } finally { $env:SAYWEAVE_DESKTOP_ACCEPTANCE=$oldFlag; $env:SAYWEAVE_DATA_ACCEPTANCE_ID=$oldDataId }
 $started=$app.StartTime
 $null=$app.Handle
 $children=@{}
 $deadline=[DateTime]::UtcNow.AddSeconds(45)
+$acceptancePassed=$false
 try {
   while (-not $app.WaitForExit(300) -and [DateTime]::UtcNow -lt $deadline) {
     foreach ($child in @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($app.Id)")) { $children[$child.ProcessId]=$child.CreationDate }
@@ -37,7 +41,11 @@ try {
   foreach ($id in $children.Keys) { $child=Get-Process -Id $id -ErrorAction SilentlyContinue; if ($child -and $child.StartTime -eq $children[$id]) { throw "Owned WebView child still exists after exit: $id" } }
   $log
   Write-Output 'Desktop acceptance and process cleanup passed.'
+  $acceptancePassed=$true
 } finally {
   $remaining=Get-Process -Id $app.Id -ErrorAction SilentlyContinue
   if ($remaining -and $remaining.StartTime -eq $started -and $remaining.Path -eq $exe) { Stop-Process -Id $remaining.Id }
+  $storageResult=if($acceptancePassed){'passed'}else{'failed'}
+  & node scripts/storage.mjs finish-desktop $acceptanceId $storageResult
+  if($LASTEXITCODE -ne 0){throw 'Validation storage settlement failed; inspect the retained context.'}
 }

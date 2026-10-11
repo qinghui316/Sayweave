@@ -80,7 +80,7 @@ export function planStorage(root,{now=Date.now(),limits=storageLimits}={}){
  for(const record of records){
   if(!contextPattern.test(record.relative)||record.owner!=='sayweave-validation-v1')throw Error('Invalid owned context');
   try{
-   const entry=storageTree(root,record.relative);scratchBytes+=record.status==='active'?Math.max(entry.bytes,record.reservationBytes||0):entry.bytes;
+   const entry=storageTree(root,record.relative);if(entry.absent&&record.status!=='active')continue;scratchBytes+=record.status==='active'?Math.max(entry.bytes,record.reservationBytes||0):entry.bytes;
    const active=record.status==='active';
    if(active&&!ownerAlive(record.pid))plan.blocked.push({relative:record.relative,reason:'Interrupted owner; cleanup and credential settlement require reconciliation',id:record.id});
    if(active||record.pin||!record.cleanupConfirmed||protectedBy(record.relative,pins))plan.keep.push({...entry,id:record.id,reason:active?'active owner':record.pin||'unsettled cleanup or pinned reference'});
@@ -106,13 +106,14 @@ export function assertStorageCapacity(root,requestedBytes=0,{allocation='scratch
  if(plan.incremental.observedBytes>storageLimits.incrementalBytes||plan.scratchBytes+(allocation==='scratch'?requestedBytes:0)>storageLimits.scratchBytes||installers+(allocation==='installer'?requestedBytes:0)>storageLimits.installerBytes||reports>storageLimits.reportsBytes||free-requestedBytes<storageLimits.reserveBytes||plan.blocked.length)throw Error('Storage budget requires safe cleanup; large allocation refused. Run npm run storage:plan and inspect blocked/pinned entries.');
  return plan;
 }
-export function beginValidation(root,{id=randomUUID(),relative=`.local/data-acceptance/${id}`,kind,reservationBytes=64*1024**2}={}){
+export function beginValidation(root,{id=randomUUID(),relative=`.local/data-acceptance/${id}`,kind,reservationBytes=64*1024**2,ownerPid=process.pid}={}){
  if(!kind||!contextPattern.test(relative)||!relative.endsWith('/'+id))throw Error('Validation context must be an owned isolated UUID');
+ if(ownerPid!==process.pid&&ownerPid!==process.ppid)throw Error('External context owner must be the calling parent');
  return storageLock(root,()=>{
  reconcileStorage(root);assertStorageCapacity(root,reservationBytes);
  const manifest=`.local/storage/contexts/${id}.json`;
  if(existsSync(storagePath(root,manifest))||existsSync(storagePath(root,relative)))throw Error('Existing context requires explicit reconciliation');
- const record={schemaVersion:1,owner:'sayweave-validation-v1',id,relative,kind,pid:process.pid,createdAt:Date.now(),reservationBytes,status:'active',cleanupConfirmed:false,pin:null};
+ const record={schemaVersion:1,owner:'sayweave-validation-v1',id,relative,kind,pid:ownerPid,externalOwner:ownerPid!==process.pid,createdAt:Date.now(),reservationBytes,status:'active',cleanupConfirmed:false,pin:null};
  writeStorageJson(root,manifest,record);mkdirSync(storagePath(root,relative),{recursive:true});return record;
  });
 }
@@ -136,10 +137,11 @@ export function applyStoragePlan(root,plan){
  return JSON.parse(output.trim());
 }
 export function finishValidation(root,record,report,{processesClosed=false,credentialsCleared=false,pin=null,apply=true}={}){
- if(record.owner!=='sayweave-validation-v1'||record.pid!==process.pid)throw Error('Foreign context settlement refused');
+ if(record.owner!=='sayweave-validation-v1'||record.pid!==process.pid&&!(record.externalOwner&&record.pid===process.ppid))throw Error('Foreign context settlement refused');
  const saved=readJson(root,`.local/storage/contexts/${record.id}.json`);
- if(saved.status!=='active'||saved.relative!==record.relative)throw Error('Stale context settlement');
+ if(saved.status!=='active'||saved.relative!==record.relative||saved.pid!==record.pid||saved.externalOwner!==record.externalOwner)throw Error('Stale context settlement');
  const destination=`.local/storage/reports/${record.id}`;
+ if(Buffer.byteLength(JSON.stringify(report))>storageLimits.reportBytes)throw Error('Compact report budget exceeded; context retained');
  writeStorageJson(root,destination+'/report.json',report);
  let retained=Buffer.byteLength(JSON.stringify(report));
  const directory=storagePath(root,record.relative);
