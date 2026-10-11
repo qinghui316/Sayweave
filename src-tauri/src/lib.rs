@@ -21,6 +21,7 @@ mod speech;
 mod speech_projection;
 mod task_stop;
 mod text_service;
+mod tls;
 mod update;
 #[cfg(feature = "desktop-acceptance")]
 mod update_acceptance;
@@ -555,6 +556,7 @@ fn already_running() {
     }
 }
 pub fn run() {
+    tls::initialize();
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_opener::init())

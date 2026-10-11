@@ -36,10 +36,10 @@ tauri-build = { version = "=2.7.1", features = [] }
 serde_json = "1"
 
 [features]
-desktop-acceptance = ["dep:rustls"]
+desktop-acceptance = []
 
 [dependencies]
-rustls = { version = "0.23", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 tauri = { version = "=2.12.1", features = ["tray-icon", "image-png"] }

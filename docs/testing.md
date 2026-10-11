@@ -17,6 +17,8 @@
 
 E2E前运行 `npx playwright install chromium`。截图、报告、运行数据不跟踪到Git。浏览器内存词典不证明磁盘持久化。
 
+冷启动 TLS 回归：`cargo test --locked --manifest-path src-tauri/Cargo.toml --lib cold_process_tls -- --nocapture`。测试分别启动独立子进程，先确认没有全局加密实现，再执行应用初始化；覆盖 WSS 优先、HTTPS 客户端优先和重复初始化。WSS 使用生产库的默认系统证书连接器，访问有界本机 TCP 夹具，确认发出 TLS ClientHello 后正常处理握手中断。测试不使用验收专用信任、供应商凭据或用户资料，不替代真实识别服务验收。
+
 发布更新验收使用 `node scripts/test-windows-update.mjs`，仅允许已提权的一次性 Windows runner／虚拟机。先用 --startup-only 安装第一份隔离包，分别确认进程、主窗口、页面就绪、调试端口和原生界面，保留精确身份及有界启动日志；成功后构建第二份包供同一候选复用。它构建同一候选的两个隔离版本，执行真实 HTTPS、临时签名、NSIS 覆盖安装与自动重启，核对凭据、历史、词典、偏好和组件状态，并检查中断、错误签名、版本冒充、保存屏障超时、停止超时及安装器启动失败。正式发布工作流另外回下载并实际安装正式草稿。具体约束与收尾顺序见 [release.md](release.md)；浏览器模拟不能替代真实安装记录。
 
 ## Windows 桌面检查
