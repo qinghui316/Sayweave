@@ -14,7 +14,7 @@ on:
         type: string
         default: ''
       candidate_sha:
-        description: Frozen product SHA for diagnostic-only package reuse
+        description: Frozen product SHA for diagnostic or full immutable-package reuse
         type: string
         default: ''
       product_commit:
@@ -40,6 +40,8 @@ on:
 permissions:
   contents: read
   actions: read
+env:
+  FROZEN_ACCEPTANCE_PRODUCT: ${{ inputs.phase == 'full' && inputs.candidate_sha || '' }}
 concurrency:
   # Preserve installer diagnostics when a corrected candidate is pushed.
   # Only duplicate runs of this exact ref/commit supersede one another.
@@ -168,7 +170,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_REUSE: ${{ inputs.reuse_run }}
-          EXPECTED_COMMIT: ${{ github.sha }}
+          EXPECTED_COMMIT: ${{ inputs.phase == 'full' && inputs.candidate_sha || github.sha }}
           AUTO_REUSE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           $resolvedReuse = $env:REQUESTED_REUSE
@@ -195,7 +197,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REUSE_RUN: ${{ steps.reuse.outputs.run_id }}
-          EXPECTED_COMMIT: ${{ github.sha }}
+          EXPECTED_COMMIT: ${{ inputs.phase == 'full' && inputs.candidate_sha || github.sha }}
         run: |
           if ($env:REUSE_RUN -notmatch '^\d+$') { throw 'Invalid reuse run.' }
           $run = gh api "repos/qinghui316/Sayweave/actions/runs/$env:REUSE_RUN" | ConvertFrom-Json
@@ -255,7 +257,7 @@ jobs:
         if: needs.windows-tooling.outputs.reuse_run != ''
         env:
           REUSE_RUN: ${{ needs.windows-tooling.outputs.reuse_run }}
-          EXPECTED_COMMIT: ${{ github.sha }}
+          EXPECTED_COMMIT: ${{ inputs.phase == 'full' && inputs.candidate_sha || github.sha }}
         run: |
           if ($env:REUSE_RUN -notmatch '^\d+$') { throw 'Invalid reuse run.' }
           $run = gh api "repos/qinghui316/Sayweave/actions/runs/$env:REUSE_RUN" | ConvertFrom-Json
@@ -391,7 +393,7 @@ jobs:
         if: needs.windows-tooling.outputs.product_commit == '' && needs.windows-tooling.outputs.reuse_run != ''
         env:
           REUSE_RUN: ${{ needs.windows-tooling.outputs.reuse_run }}
-          EXPECTED_COMMIT: ${{ github.sha }}
+          EXPECTED_COMMIT: ${{ inputs.phase == 'full' && inputs.candidate_sha || github.sha }}
         run: |
           if ($env:REUSE_RUN -notmatch '^\d+$') { throw 'Invalid reuse run.' }
           $run = gh api "repos/qinghui316/Sayweave/actions/runs/$env:REUSE_RUN" | ConvertFrom-Json

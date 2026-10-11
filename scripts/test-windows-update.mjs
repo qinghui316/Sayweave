@@ -15,12 +15,20 @@ import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'&&process.env.SAYWEAVE_DISPOSABLE_WINDOWS!=='1')throw Error('Use an elevated disposable Windows VM; never an owner machine.');
 const root=process.cwd(),id=randomUUID(),directory=path.join(root,'.local','windows-update',id),source=path.join(directory,'source');mkdirSync(source,{recursive:true});
 const stableVersion=JSON.parse(readFileSync(path.join(root,'package.json'),'utf8')).version;
-const commit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),report={schemaVersion:1,commit,environment:process.env.RUNNER_NAME??'explicit disposable Windows',id,checks:[],installers:[],commands:[],passed:false};
+const acceptanceCommit=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),frozenProduct=process.env.FROZEN_ACCEPTANCE_PRODUCT||null,commit=frozenProduct??acceptanceCommit;
+if(frozenProduct){
+ if(!/^[a-f0-9]{40}$/.test(frozenProduct))throw Error('Exact frozen acceptance product required');
+ const allowed=new Set(['.github/workflows/windows-ci.yml','scripts/test-windows-update.mjs','scripts/test-windows-installed-startup.mjs','scripts/windows-update-startup.mjs','scripts/windows-update-packages.mjs','scripts/windows-update-debug-policy.mjs','tests/windows-update-startup.test.ts','tests/release-validation.test.ts','docs/testing.md','docs/release.md']);
+ const changed=execFileSync('git',['diff','--name-only',frozenProduct,acceptanceCommit],{encoding:'utf8'}).trim().split('\n').filter(Boolean);
+ if(changed.some(file=>!allowed.has(file))||execFileSync('git',['status','--porcelain','--untracked-files=no'],{encoding:'utf8'}).trim())throw Error('Frozen product differs outside clean acceptance-controller scope');
+}
+const report={schemaVersion:1,commit,acceptanceCommit,frozenProductReuse:Boolean(frozenProduct),environment:process.env.RUNNER_NAME??'explicit disposable Windows',id,checks:[],installers:[],commands:[],passed:false};
 const argument=name=>{const n=process.argv.indexOf(name);if(n<0)return null;if(!process.argv[n+1]||process.argv[n+1].startsWith('--'))throw Error(`Missing ${name} value`);return path.resolve(process.argv[n+1]);};
 const toolsOnly=process.argv.includes('--tools-only'),startupOnly=process.argv.includes('--startup-only'),packagesDirectory=argument('--packages-dir'),stableInstaller=argument('--stable-installer'),evidenceDirectory=argument('--mechanism-evidence'),toolsDirectory=argument('--tools-dir');
 if(toolsOnly&&(stableInstaller||evidenceDirectory)||Boolean(stableInstaller)!==Boolean(evidenceDirectory))throw Error('Formal acceptance requires a draft installer and passed same-commit mechanism evidence');
 if(startupOnly&&(toolsOnly||stableInstaller)||packagesDirectory&&(toolsOnly||stableInstaller))throw Error('Startup packages are isolated from tooling-only and formal acceptance');
 const priorPackages=packagesDirectory?readPackages(packagesDirectory,commit):null;
+if(frozenProduct&&!toolsOnly&&(!priorPackages?.next||stableInstaller))throw Error('Frozen acceptance requires the complete immutable test pair; no product rebuild');
 report.kind=toolsOnly?'tools':stableInstaller?'formal-installer':startupOnly?'startup':'mechanism';
 const log=path.join(directory,'build.log'),keyPath=path.join(directory,'fixture-signing.key'),cli=path.join(root,'node_modules','@tauri-apps','cli','tauri.js');
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -50,7 +58,7 @@ let installerDescendants=[];
 let installerTreeConfirmed=false;
 let installerLaunchAttempted=false;
 let credentialRequests=0;
-let tools,legacySeed,temporaryRegistration,temporaryMachineRegistration,temporaryMachineFiles,unknownPreference,debugPolicy;
+let tools,legacySeed,temporaryRegistration,temporaryMachineRegistration,temporaryMachineFiles,unknownPreference,debugPolicy,signatureProject,certificatePrivateKey;
 const payloadProofCache=new Map();
 async function candidatePayload(installer){
  const sha=createHash('sha256').update(readFileSync(installer)).digest('hex');
@@ -113,7 +121,15 @@ async function install(installer){await candidatePayload(installer);try{await co
 const data=page=>invoke(page,'acceptance_update_data');
 async function verifyPackage(file,version,publicKey){
  stage(`signature verification ${version}`);
- await command('cargo',['run','--quiet','--manifest-path','src-tauri/Cargo.toml','--bin','verify-update-signature','--',publicKey,file,`${file}.sig`,version]);
+ if(frozenProduct){
+  if(!signatureProject){
+   signatureProject=path.join(directory,'signature-verifier');mkdirSync(signatureProject);
+   writeFileSync(path.join(signatureProject,'Cargo.toml'),'[package]\nname="frozen-acceptance-signature"\nversion="0.0.0"\nedition="2024"\n[dependencies]\nbase64="=0.22.1"\nminisign-verify="=0.2.5"\n[[bin]]\nname="verify"\npath="main.rs"\n');
+   const signatureSource=path.join(source,'src-tauri/src/update_signature.rs').replaceAll('\\','/'),mainSource=path.join(source,'src-tauri/src/bin/verify_update_signature.rs').replaceAll('\\','/');
+   writeFileSync(path.join(signatureProject,'main.rs'),`#[path=${JSON.stringify(signatureSource)}] pub mod update_signature;\nmod sayweave_lib {pub use crate::update_signature;}\ninclude!(${JSON.stringify(mainSource)});\n`);
+  }
+  await command('cargo',['run','--quiet','--manifest-path',path.join(signatureProject,'Cargo.toml'),'--',publicKey,file,`${file}.sig`,version]);
+ }else await command('cargo',['run','--quiet','--manifest-path','src-tauri/Cargo.toml','--bin','verify-update-signature','--',publicKey,file,`${file}.sig`,version]);
 }
 function installerIdentity(file,version,channel){
  const bytes=readFileSync(file);
@@ -259,10 +275,12 @@ async function ready(page){await invoke(page,'update_check',{manual:true});retur
 async function nativeLayout(page,label){
  for(const [minimum,zoom,motion] of [[false,1,'no-preference'],[true,1,'reduce'],[true,1.5,'reduce']]){
   await invoke(page,'acceptance_main_size',{minimum,zoom});await page.emulateMedia({reducedMotion:motion});
+  await expect.poll(()=>page.evaluate(()=>({width:innerWidth,height:innerHeight})),{timeout:5000}).toEqual({width:Math.round((minimum?960:1120)/zoom),height:Math.round((minimum?640:760)/zoom)});
   const update=await invoke(page,'update_snapshot');
   await (update.version||update.recovery?page.locator('aside button[aria-haspopup="dialog"]'):page.getByRole('button',{name:'关于',exact:true})).click();const dialog=page.getByRole('dialog');await expect(dialog).toBeVisible();
   const panel=dialog.locator('section[aria-label="软件更新"]');await expect(panel).toBeVisible();
-  const geometry=await dialog.evaluate(el=>{const r=el.getBoundingClientRect();return{x:r.x,y:r.y,right:r.right,bottom:r.bottom,width:innerWidth,height:innerHeight,ratio:devicePixelRatio};});
+  const samples=[];let geometry,previous,stable=0;
+  try{await expect.poll(async()=>{geometry=await dialog.evaluate(el=>{const r=el.getBoundingClientRect(),button=[...document.querySelectorAll('button[aria-controls]')].find(b=>b.getAttribute('aria-controls')===el.id),anchor=button?.getBoundingClientRect();return{x:r.x,y:r.y,right:r.right,bottom:r.bottom,width:innerWidth,height:innerHeight,ratio:devicePixelRatio,anchor:anchor?{x:anchor.x,y:anchor.y,right:anchor.right,bottom:anchor.bottom}:null};});if(samples.length<32)samples.push({at:Date.now(),state:update.state,...geometry});const bounded=geometry.x>=0&&geometry.y>=0&&geometry.right<=geometry.width+1&&geometry.bottom<=geometry.height+1,unchanged=previous&&['x','y','right','bottom','width','height','ratio'].every(key=>Math.abs(geometry[key]-previous[key])<0.5);stable=bounded&&unchanged?stable+1:0;previous=geometry;return stable>=1;},{timeout:5000,intervals:[50,100,200]}).toBe(true);}finally{(report.layoutSamples??=[]).push({label,minimum,zoom,samples});checkpoint();}
   expect(geometry.x).toBeGreaterThanOrEqual(0);expect(geometry.y).toBeGreaterThanOrEqual(0);expect(geometry.right).toBeLessThanOrEqual(geometry.width+1);expect(geometry.bottom).toBeLessThanOrEqual(geometry.height+1);
   for(const button of await panel.getByRole('button').all()){await button.scrollIntoViewIfNeeded();expect(await button.evaluate(el=>{const r=el.getBoundingClientRect();return el.contains(document.elementFromPoint(r.left+r.width/2,r.top+r.height/2));})).toBe(true);}
   const button=panel.getByRole('button').first();await button.focus();await expect(button).toBeFocused();await page.keyboard.press('Tab');expect(await dialog.evaluate(el=>el.contains(document.activeElement))).toBe(true);
@@ -272,6 +290,7 @@ async function nativeLayout(page,label){
  await invoke(page,'acceptance_main_size',{minimum:false,zoom:1});await page.emulateMedia({reducedMotion:'no-preference'});
 }
 async function build(version,channel='test'){
+ if(frozenProduct)throw Error('Product build forbidden in frozen acceptance');
  stage(`building ${channel} ${version}`);
  tools=readTools(tools.directory,commit);
  const config={version,identifier:channel==='test'?identifier:'local.sayweave.skeleton',productName:channel==='test'?product:'Sayweave',bundle:{windows:{nsis:{installMode:'currentUser'}}}},file=path.join(directory,`config-${version}-${channel}.json`);writeFileSync(file,JSON.stringify(config));
@@ -372,9 +391,13 @@ try{
  report.checks.push('separate production DLL/acceptance probe; capabilities, actual protocol/control text, absent fault export and final COM unload passed');
  if(toolsOnly){report.passed=true;}
  else{
- if(!stableInstaller){stage('stable feature isolation');await command('cargo',['check','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance'],root,{...process.env,SAYWEAVE_BUILD_CHANNEL:'stable'},'acceptance feature in stable build');report.checks.push('actual stable build rejects the desktop-acceptance feature');}
- stage('HTTPS certificate fixture');await command('cargo',['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_fixture','--','--ignored'],root,{...process.env,SAYWEAVE_DATA_ACCEPTANCE_ID:id});
- const certRoot=path.join(root,'.local','data-acceptance',id,'data'),certificateFile=path.join(certRoot,'fixture-ca.der');
+ if(!stableInstaller&&!frozenProduct){stage('stable feature isolation');await command('cargo',['check','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance'],root,{...process.env,SAYWEAVE_BUILD_CHANNEL:'stable'},'acceptance feature in stable build');report.checks.push('actual stable build rejects the desktop-acceptance feature');}
+ const certRoot=frozenProduct?path.join(directory,'tls'):path.join(root,'.local','data-acceptance',id,'data'),certificateFile=path.join(certRoot,'fixture-ca.der');
+ certificatePrivateKey=path.join(certRoot,'fixture-key.pem');stage('HTTPS certificate fixture');
+ if(frozenProduct){
+  mkdirSync(certRoot,{recursive:true});
+  await command('pwsh',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$rsa=[Security.Cryptography.RSA]::Create(2048);$request=[Security.Cryptography.X509Certificates.CertificateRequest]::new('CN=localhost',$rsa,[Security.Cryptography.HashAlgorithmName]::SHA256,[Security.Cryptography.RSASignaturePadding]::Pkcs1);$san=[Security.Cryptography.X509Certificates.SubjectAlternativeNameBuilder]::new();$san.AddDnsName('localhost');$request.CertificateExtensions.Add($san.Build());$request.CertificateExtensions.Add([Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($true,$false,0,$true));$usage=[Security.Cryptography.X509Certificates.X509KeyUsageFlags]::DigitalSignature -bor [Security.Cryptography.X509Certificates.X509KeyUsageFlags]::KeyEncipherment -bor [Security.Cryptography.X509Certificates.X509KeyUsageFlags]::KeyCertSign;$request.CertificateExtensions.Add([Security.Cryptography.X509Certificates.X509KeyUsageExtension]::new($usage,$true));$cert=$request.CreateSelfSigned([DateTimeOffset]::UtcNow.AddMinutes(-5),[DateTimeOffset]::UtcNow.AddDays(1));try{$encoding=[Text.UTF8Encoding]::new($false);[IO.File]::WriteAllBytes(${quote(certificateFile)},$cert.RawData);[IO.File]::WriteAllText(${quote(path.join(certRoot,'fixture-ca.pem'))},$cert.ExportCertificatePem(),$encoding);[IO.File]::WriteAllText(${quote(certificatePrivateKey)},$rsa.ExportPkcs8PrivateKeyPem(),$encoding)}finally{$cert.Dispose();$rsa.Dispose()}`],root,process.env,undefined,60000);
+ }else await command('cargo',['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_fixture','--','--ignored'],root,{...process.env,SAYWEAVE_DATA_ACCEPTANCE_ID:id});
  thumbprint=execFileSync('powershell',['-NoProfile','-Command',`(New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(${quote(certificateFile)})).Thumbprint`],{encoding:'utf8',timeout:30000}).trim();
  stage('isolated HTTPS trust import');
  await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$cert=New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(${quote(certificateFile)});$store=New-Object System.Security.Cryptography.X509Certificates.X509Store('Root','LocalMachine');try{$store.Open('ReadWrite');$store.Add($cert);if($store.Certificates.Find('FindByThumbprint',${quote(thumbprint)},$false).Count -ne 1){throw 'Isolated root import not confirmed'}}finally{$store.Close();$cert.Dispose()}`],root,process.env,undefined,60000);
@@ -489,6 +512,7 @@ try{
  await cleanup('HTTPS server',async()=>{if(server){server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}});
  await cleanup('temporary root certificate',async()=>{if(thumbprint)await command('certutil',['-delstore','Root',thumbprint],root,process.env,undefined,60000);});
  await cleanup('temporary signing key',()=>rmSync(keyPath,{force:true}));
+ await cleanup('temporary TLS key',()=>{if(certificatePrivateKey)rmSync(certificatePrivateKey,{force:true});});
  // A reusable pass includes successful cleanup; never publish it before finally.
  if(report.passed&&report.kind==='mechanism')await cleanup('mechanism evidence',()=>writeMechanismEvidence(path.join(root,'.local/windows-update-evidence'),commit,tools,legacySeed,report));
  checkpoint();console.log(JSON.stringify({passed:report.passed,commit,checks:report.checks.length,receipt:path.join(directory,'acceptance.json')}));
