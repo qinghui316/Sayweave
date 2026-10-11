@@ -125,6 +125,14 @@ pub struct UserRecord {
     pub files: Vec<FileBackup>,
     pub keys: Vec<KeyBackup>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub last_failure: Option<Failure>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Failure {
+    pub phase: Phase,
+    pub code: String,
 }
 pub fn hex(value: &str, len: usize) -> bool {
     value.len() == len && value.bytes().all(|b| b.is_ascii_hexdigit())

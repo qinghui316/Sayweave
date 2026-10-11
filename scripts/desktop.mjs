@@ -38,13 +38,17 @@ if(mode==='package'){
  }
  const features=rest.indexOf('--features'),target=rest.indexOf('--target'),debug=rest.includes('--debug');
  const helperEnv={...env,TAURI_CONFIG:JSON.stringify(config)};
+ // This package's library also compiles its GUI context. Produce the same
+ // standard frontend before compiling the helper in a fresh source archive.
+ run(process.execPath,[path.join(root,'node_modules/typescript/bin/tsc'),'--noEmit'],env);
+ run(process.execPath,[path.join(root,'node_modules/vite/bin/vite.js'),'build'],env);
  run('cargo',['build','--manifest-path','src-tauri/Cargo.toml','--bin','sayweave-installer-helper',...(debug?[]:['--release']),...(features>=0?['--features',rest[features+1]]:[]),...(target>=0?['--target',rest[target+1]]:[])],helperEnv);
  const output=path.resolve(root,env.CARGO_TARGET_DIR??'src-tauri/target',...(target>=0?[rest[target+1]]:[]),debug?'debug':'release','sayweave-installer-helper.exe');
  const bytes=readFileSync(output),sha=createHash('sha256').update(bytes).digest('hex');
  const directory=path.join(root,'.local','installer-helper',sha);mkdirSync(directory,{recursive:true});
  const helper=path.join(directory,'sayweave-installer-helper.exe');
  if(existsSync(helper)){if(!readFileSync(helper).equals(bytes))throw Error('Installer helper cache identity differs.');}else writeFileSync(helper,bytes,{flag:'wx'});
- const combined={...config,bundle:{...config.bundle,resources:{[helper]:'sayweave-installer-helper.exe'}}};
+ const combined={...config,build:{...config.build,beforeBuildCommand:''},bundle:{...config.bundle,resources:{[helper]:'sayweave-installer-helper.exe'}}};
  const configFile=path.join(directory,'package-config.json');writeFileSync(configFile,JSON.stringify(combined));
  extra=[...rest,'--config',configFile];
 }
