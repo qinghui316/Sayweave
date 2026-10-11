@@ -1,7 +1,5 @@
 name: Sayweave Windows validation
 on:
-  push:
-    branches: [main, 'codex/sayweave-release-update-repair-v01']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -47,7 +45,7 @@ jobs:
   ci:
     name: CI
     needs: windows-tooling
-    if: always() && !cancelled() && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request' || inputs.phase == 'ci' || inputs.phase == 'full' || needs.windows-tooling.outputs.product_commit != '')
+    if: always() && !cancelled() && (github.event_name == 'pull_request' || inputs.phase == 'ci' || inputs.phase == 'full' || needs.windows-tooling.outputs.product_commit != '')
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
