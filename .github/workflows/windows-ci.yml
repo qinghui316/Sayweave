@@ -68,7 +68,7 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Check workflow-only controller contracts
-        if: needs.windows-tooling.outputs.product_commit != ''
+        if: needs.windows-tooling.outputs.product_commit != '' || env.FROZEN_ACCEPTANCE_PRODUCT != ''
         run: |
           npm run typecheck
           if ($LASTEXITCODE -ne 0) { throw 'Controller type check failed.' }
@@ -76,13 +76,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Controller lint failed.' }
           npx vitest run tests/release-validation.test.ts tests/windows-update-artifacts.test.ts
           if ($LASTEXITCODE -ne 0) { throw 'Controller release contracts failed.' }
-      - if: needs.windows-tooling.outputs.product_commit == ''
+      - if: needs.windows-tooling.outputs.product_commit == '' && env.FROZEN_ACCEPTANCE_PRODUCT == ''
         run: npx playwright install chromium
-      - if: needs.windows-tooling.outputs.product_commit == ''
+      - if: needs.windows-tooling.outputs.product_commit == '' && env.FROZEN_ACCEPTANCE_PRODUCT == ''
         run: npm run check
-      - if: needs.windows-tooling.outputs.product_commit == ''
+      - if: needs.windows-tooling.outputs.product_commit == '' && env.FROZEN_ACCEPTANCE_PRODUCT == ''
         run: npm run test:e2e
-      - if: needs.windows-tooling.outputs.product_commit == ''
+      - if: needs.windows-tooling.outputs.product_commit == '' && env.FROZEN_ACCEPTANCE_PRODUCT == ''
         run: npm run test:desktop
       - run: npm run check:distribution
   windows-tooling:
@@ -174,6 +174,7 @@ jobs:
           AUTO_REUSE: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         run: |
           $resolvedReuse = $env:REQUESTED_REUSE
+          if ($env:FROZEN_ACCEPTANCE_PRODUCT -and -not $resolvedReuse) { throw 'Frozen full acceptance requires an explicit immutable reuse run; fallback compilation forbidden.' }
           if ($resolvedReuse -and $resolvedReuse -notmatch '^\d+$') { throw 'Invalid reuse run.' }
           if (-not $resolvedReuse -and $env:AUTO_REUSE -eq 'true') {
             $runs = gh run list --repo qinghui316/Sayweave --workflow windows-ci.yml --commit $env:EXPECTED_COMMIT --event workflow_dispatch --status success --limit 20 --json databaseId,headSha | ConvertFrom-Json
@@ -207,6 +208,7 @@ jobs:
       - if: steps.scope.outputs.product_commit == ''
         run: |
           if (Test-Path .local/prior-update-tools) { node scripts/test-windows-update.mjs --tools-only --tools-dir .local/prior-update-tools }
+          elseif ($env:FROZEN_ACCEPTANCE_PRODUCT) { throw 'Verified frozen tools are missing; fallback compilation forbidden.' }
           else { node scripts/test-windows-update.mjs --tools-only }
           if ($LASTEXITCODE -ne 0) { throw 'Short tooling validation failed.' }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

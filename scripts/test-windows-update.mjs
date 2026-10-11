@@ -25,6 +25,7 @@ if(frozenProduct){
 const report={schemaVersion:1,commit,acceptanceCommit,frozenProductReuse:Boolean(frozenProduct),environment:process.env.RUNNER_NAME??'explicit disposable Windows',id,checks:[],installers:[],commands:[],passed:false};
 const argument=name=>{const n=process.argv.indexOf(name);if(n<0)return null;if(!process.argv[n+1]||process.argv[n+1].startsWith('--'))throw Error(`Missing ${name} value`);return path.resolve(process.argv[n+1]);};
 const toolsOnly=process.argv.includes('--tools-only'),startupOnly=process.argv.includes('--startup-only'),packagesDirectory=argument('--packages-dir'),stableInstaller=argument('--stable-installer'),evidenceDirectory=argument('--mechanism-evidence'),toolsDirectory=argument('--tools-dir');
+if(frozenProduct&&!toolsDirectory&&!evidenceDirectory)throw Error('Frozen acceptance requires verified immutable tools; fallback compilation forbidden');
 if(toolsOnly&&(stableInstaller||evidenceDirectory)||Boolean(stableInstaller)!==Boolean(evidenceDirectory))throw Error('Formal acceptance requires a draft installer and passed same-commit mechanism evidence');
 if(startupOnly&&(toolsOnly||stableInstaller)||packagesDirectory&&(toolsOnly||stableInstaller))throw Error('Startup packages are isolated from tooling-only and formal acceptance');
 const priorPackages=packagesDirectory?readPackages(packagesDirectory,commit):null;
@@ -147,7 +148,7 @@ async function registrationInventory(timeoutMs=30000){
 }
 const registrationEmpty=info=>Object.values(info).every(item=>!item.com&&!item.tip);
 async function characterizeComponent(module,sha256){
- const result=await command('powershell',['-NoProfile','-ExecutionPolicy','Bypass','-File','scripts/windows-update-metadata.ps1','-ExpectedCommit',commit,'-ProductCommit',commit,'-ExpectedModulePath',module,'-ExpectedComponentSha256',sha256],root,process.env,undefined,30000);
+ const result=await command('powershell',['-NoProfile','-ExecutionPolicy','Bypass','-File','scripts/windows-update-metadata.ps1','-ExpectedCommit',acceptanceCommit,'-ProductCommit',commit,'-ExpectedModulePath',module,'-ExpectedComponentSha256',sha256],root,process.env,undefined,30000);
  const end=result.stdout.indexOf('Read-only metadata receipt:');if(end<0)throw Error('Metadata receipt output missing');
  const receipt=JSON.parse(result.stdout.slice(0,end).trim());(report.metadataReadings??=[]).push(receipt);checkpoint();expect(receipt.characterization.readComplete).toBe(true);expect(receipt.metadataExpected).toBe(true);return receipt;
 }
@@ -316,7 +317,7 @@ try{
  if(execFileSync('git',['status','--porcelain','--untracked-files=no'],{encoding:'utf8'}).trim())throw Error('Acceptance requires a clean tracked source tree');
  report.compiler={rustc:execFileSync('rustc',['--version'],{encoding:'utf8'}).trim(),cargo:execFileSync('cargo',['--version'],{encoding:'utf8'}).trim()};
  await command('powershell',['-NoProfile','-Command',"$identity=[Security.Principal.WindowsIdentity]::GetCurrent();$principal=New-Object Security.Principal.WindowsPrincipal($identity);if(-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Disposable VM must be elevated; no interactive elevation is attempted'}"],root,process.env,undefined,30000);
- execFileSync('git',['archive','HEAD','--format=tar','-o',path.join(directory,'source.tar')]);execFileSync('tar',['-xf',path.join(directory,'source.tar'),'-C',source]);symlinkSync(path.join(root,'node_modules'),path.join(source,'node_modules'),'junction');
+ execFileSync('git',['archive',commit,'--format=tar','-o',path.join(directory,'source.tar')]);execFileSync('tar',['-xf',path.join(directory,'source.tar'),'-C',source]);symlinkSync(path.join(root,'node_modules'),path.join(source,'node_modules'),'junction');
  const prior=evidenceDirectory?readMechanismEvidence(evidenceDirectory,commit):null;
  if(prior){tools=prior.tools;legacySeed=prior.seed;report.mechanismReceipt={commit:prior.receipt.commit,passed:prior.receipt.passed};}
  else if(toolsDirectory)tools=readTools(toolsDirectory,commit);
