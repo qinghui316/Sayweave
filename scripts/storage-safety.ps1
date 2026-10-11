@@ -19,6 +19,7 @@ $now=([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
 if($now-[double]$plan.createdAt -gt 900000 -or $now -lt [double]$plan.createdAt){throw 'Stale or future cleanup plan'}
 $audit=[ordered]@{schemaVersion=1;apply=[bool]$Apply;startedAt=[DateTime]::UtcNow.ToString('o');root=$workspace;deleted=@();skipped=@();planned=@();releasedBytes=[int64]0}
 $auditFile=Join-Path $workspace ('.local/storage/cleanup-'+[IO.Path]::GetFileName($planPath))
+$controllerProcess=(Get-CimInstance Win32_Process -Filter "ProcessId=$PID").ParentProcessId
 function Save-Audit {$audit | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $auditFile -Encoding UTF8}
 function Tree([string]$value){
   Assert-NoLink $value
@@ -31,7 +32,7 @@ function Tree([string]$value){
 }
 function Assert-Pins([string]$relative){
   $pinsFile=Join-Path $workspace '.local/storage/pins.json';Assert-NoLink $pinsFile
-  if(Test-Path -LiteralPath $pinsFile){foreach($pin in @(Get-Content -LiteralPath $pinsFile -Raw -Encoding UTF8 | ConvertFrom-Json)){
+  if(Test-Path -LiteralPath $pinsFile){$pins=Get-Content -LiteralPath $pinsFile -Raw -Encoding UTF8 | ConvertFrom-Json;foreach($pin in $pins){
     if(-not $pin.relative -or -not $pin.reason){throw 'Invalid protection pin'}
     if($relative -eq $pin.relative -or $relative.StartsWith($pin.relative+'/',[StringComparison]::OrdinalIgnoreCase) -or $pin.relative.StartsWith($relative+'/',[StringComparison]::OrdinalIgnoreCase)){throw ('Pinned: '+$pin.reason)}
   }}
@@ -53,7 +54,7 @@ foreach($candidate in $plan.delete){
       $manifestPath=Join-Path $workspace ('.local/storage/contexts/'+$id+'.json');Assert-NoLink $manifestPath
       $record=Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
       if($record.owner -cne 'sayweave-validation-v1' -or $record.relative -cne $relative -or $record.status -eq 'active' -or -not $record.cleanupConfirmed -or $record.pin){throw 'Context is active, unowned, pinned or cleanup unconfirmed'}
-      $processes=@(Get-CimInstance Win32_Process | Where-Object {($_.ExecutablePath -and $_.ExecutablePath.StartsWith($absolute+'\',[StringComparison]::OrdinalIgnoreCase)) -or ($_.CommandLine -and $_.CommandLine.Contains($id))})
+      $processes=@(Get-CimInstance Win32_Process | Where-Object {$_.ProcessId -ne $controllerProcess -and (($_.ExecutablePath -and $_.ExecutablePath.StartsWith($absolute+'\',[StringComparison]::OrdinalIgnoreCase)) -or ($_.CommandLine -and $_.CommandLine.Contains($id)))})
       if($processes.Count){throw 'Context still referenced by a process'}
       if($record.status -ne 'succeeded'){
         $records=@(Get-ChildItem -LiteralPath (Join-Path $workspace '.local/storage/contexts') -Filter '*.json' | ForEach-Object {Get-Content -LiteralPath $_.FullName -Raw -Encoding UTF8 | ConvertFrom-Json} | Where-Object {$_.status -in @('failed','cancelled','interrupted')} | Sort-Object finishedAt -Descending)
