@@ -65,7 +65,6 @@ futures-util = { version = "0.3", features = ["sink"] }
 flate2 = "=1.1.10"
 tauri-plugin-clipboard-manager = "=2.4.1"
 tauri-plugin-opener = "=2.7.0"
-tauri-plugin-updater = "=2.13.2"
 
 [target.'cfg(windows)'.dependencies]
 sayweave-text-service = { path = "text-service", default-features = false }
@@ -77,7 +76,8 @@ windows = { version = "=0.62.2", features = ["Win32_Foundation", "Win32_System_C
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 rcgen = "0.14"
-rustls = "0.23"
+# Exercise explicit initialization even when a future dependency enables ring.
+rustls = { version = "0.23", features = ["ring"] }
 
 
 
