@@ -1231,7 +1231,9 @@ impl DictationCoordinator {
         let _ = crate::task_stop::request(&a.cancel, crate::contracts::speech::StopReason::Finish);
         let elapsed = a.began.elapsed().as_millis();
         drop(active);
-        self.update(app, id, |s| s.presentation = Presentation::Recognizing);
+        self.update(app, id, |s| {
+            s.presentation = s.presentation.finish_requested()
+        });
         log::info!(target:"sayweave","operation=dictation_phase task_id={} phase=finish_requested elapsed_ms={}",id,elapsed);
         Ok(())
     }

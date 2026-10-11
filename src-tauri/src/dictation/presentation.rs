@@ -18,6 +18,15 @@ pub enum Presentation {
     Error,
 }
 impl Presentation {
+    pub fn finish_requested(self) -> Self {
+        match self {
+            Self::Preparing | Self::Recording | Self::Editing | Self::Resuming => Self::Recognizing,
+            // Cleanup may have completed between releasing admission and
+            // acquiring the snapshot. Never reopen a terminal presentation or
+            // move delivery backwards because a redundant Finish arrived.
+            other => other,
+        }
+    }
     pub fn hide_after(self) -> Option<u64> {
         match self {
             Self::Completed => Some(600),
@@ -172,6 +181,32 @@ pub fn final_presentation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn finish_projection_is_idempotent_and_cannot_reopen_a_released_task() {
+        for live in [
+            Presentation::Preparing,
+            Presentation::Recording,
+            Presentation::Editing,
+            Presentation::Resuming,
+        ] {
+            assert_eq!(live.finish_requested(), Presentation::Recognizing);
+            assert_eq!(
+                live.finish_requested().finish_requested(),
+                Presentation::Recognizing
+            );
+        }
+        for terminal in [
+            Presentation::Idle,
+            Presentation::Completed,
+            Presentation::Error,
+            Presentation::Result,
+            Presentation::Delivering,
+        ] {
+            // Release before late Finish and Finish before Release settle to
+            // the same terminal value, without reversing delivery progress.
+            assert_eq!(terminal.finish_requested(), terminal);
+        }
+    }
     #[test]
     fn empty_or_user_ended_interruption_is_quiet_but_real_effects_are_not() {
         for code in [
