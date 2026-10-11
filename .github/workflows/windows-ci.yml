@@ -340,6 +340,10 @@ jobs:
             if ($LASTEXITCODE -ne 0 -or $old.head_sha -ne 'abc3eed9375b3c170e7b144158ca24bb632fd41e' -or $old.conclusion -ne 'success' -or $old.path -ne '.github/workflows/windows-ci.yml') { throw 'Historical production component origin differs.' }
             gh run download 38109598818 --name windows-update-tools --dir .local/prior-old-component-tools
             if ($LASTEXITCODE -ne 0) { throw 'Historical production component download failed.' }
+            $partial = gh api repos/qinghui316/Sayweave/actions/runs/38164773452 | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0 -or $partial.head_sha -ne 'f11cf2ef7eb1e6d09cae229930b3a0d35ea9f091' -or $partial.path -ne '.github/workflows/windows-ci.yml') { throw 'Completed old-DLL check origin differs.' }
+            gh run download 38164773452 --name installed-startup-diagnostic --dir .local/prior-old-component-proof
+            if ($LASTEXITCODE -ne 0) { throw 'Completed old-DLL check download failed.' }
           }
       - name: Short startup with the same signed installer
         env:
