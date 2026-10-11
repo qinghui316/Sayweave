@@ -159,6 +159,7 @@ jobs:
         if: steps.scope.outputs.product_commit != ''
         with:
           name: workflow-product-evidence
+          retention-days: 30
           include-hidden-files: true
           path: |
             .local/reused-product-evidence/
@@ -215,6 +216,7 @@ jobs:
         if: steps.scope.outputs.product_commit == ''
         with:
           name: windows-update-tools
+          retention-days: 14
           include-hidden-files: true
           path: .local/windows-update-tools/
           if-no-files-found: error
@@ -222,6 +224,7 @@ jobs:
         if: always() && steps.scope.outputs.product_commit == ''
         with:
           name: windows-tooling-diagnostics
+          retention-days: 7
           include-hidden-files: true
           path: |
             .local/windows-update-acceptance.json
@@ -281,6 +284,7 @@ jobs:
         if: always()
         with:
           name: windows-update-packages
+          retention-days: 14
           include-hidden-files: true
           path: .local/windows-update-packages/
           if-no-files-found: warn
@@ -288,6 +292,7 @@ jobs:
         if: always()
         with:
           name: windows-startup-receipt
+          retention-days: 30
           include-hidden-files: true
           path: |
             .local/windows-update-acceptance.json
@@ -344,6 +349,7 @@ jobs:
         if: always()
         with:
           name: installed-startup-diagnostic
+          retention-days: 7
           include-hidden-files: true
           path: |
             .local/installed-startup/*/receipt.json
@@ -418,6 +424,7 @@ jobs:
         if: needs.windows-tooling.outputs.product_commit == ''
         with:
           name: windows-update-evidence
+          retention-days: 30
           include-hidden-files: true
           path: .local/windows-update-evidence/
           if-no-files-found: error
@@ -425,6 +432,7 @@ jobs:
         if: always() && needs.windows-tooling.outputs.product_commit == ''
         with:
           name: windows-update-packages
+          retention-days: 14
           include-hidden-files: true
           path: .local/windows-update-packages/
           if-no-files-found: warn
@@ -432,6 +440,7 @@ jobs:
         if: always() && needs.windows-tooling.outputs.product_commit == ''
         with:
           name: windows-update-receipt
+          retention-days: 30
           include-hidden-files: true
           path: |
             .local/windows-update-acceptance.json

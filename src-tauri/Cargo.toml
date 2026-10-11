@@ -83,6 +83,16 @@ rcgen = "0.14"
 # Exercise explicit initialization even when a future dependency enables ring.
 rustls = { version = "0.23", features = ["ring"] }
 
+# Retain incremental compilation and line/module diagnostics. Opt into local
+# variable/type inspection with CARGO_PROFILE_DEV_DEBUG=2 / TEST_DEBUG=2.
+[profile.dev]
+debug = 1
+incremental = true
+
+[profile.test]
+debug = 1
+incremental = true
+
 
 
 
