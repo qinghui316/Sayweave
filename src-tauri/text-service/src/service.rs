@@ -102,6 +102,7 @@ struct State {
     version: DraftVersion,
     context: Option<ITfContext>,
     composition: Option<ITfComposition>,
+    prefix_end: Option<PrefixEnd>,
     // An original selection is observed but is not composing until the first
     // actual replacement. This is distinct from an already-submitted empty tail.
     prepared: Option<PreparedSelection>,
@@ -136,6 +137,73 @@ struct ObservationCandidate {
     completed_tick: u64,
     field: initial_selection::FocusIdentity,
     original: Option<Rc<str>>,
+}
+struct PrefixEnd {
+    composition: ITfComposition,
+    request: Request,
+    generation: u64,
+    epoch: u64,
+}
+impl PrefixEnd {
+    fn matches(&self, state: &State, composition: &ITfComposition) -> bool {
+        state.active
+            && !state.cleanup
+            && state.epoch == self.epoch
+            && state.generation == self.generation
+            && state.capability.as_ref() == Some(&self.request.capability)
+            && state.version.accepts(&self.request)
+            && state.composition.as_ref() == Some(composition)
+            && self.composition == *composition
+            && state.pending.as_ref().is_some_and(|pending| {
+                pending.task == self.request.task
+                    && pending.turn == self.request.turn
+                    && pending.operation == self.request.operation
+                    && pending.revision == self.request.revision
+                    && pending.capability == self.request.capability
+                    && pending.connection == state.connection
+            })
+    }
+}
+// The call can synchronously notify the composition sink before the empty-tail
+// lease is published. Only this pending prefix operation owns that notification.
+fn end_settled_composition(
+    shared: &Shared,
+    composition: &ITfComposition,
+    request: &Request,
+    generation: u64,
+    epoch: u64,
+    ec: u32,
+) -> windows::core::Result<()> {
+    edit_identity(shared, request, generation, epoch)?;
+    {
+        let mut state = shared.borrow_mut();
+        if state.prefix_end.is_some() || state.composition.as_ref() != Some(composition) {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        state.prefix_end = Some(PrefixEnd {
+            composition: composition.clone(),
+            request: request.clone(),
+            generation,
+            epoch,
+        });
+    }
+    let result = unsafe { composition.EndComposition(ec) };
+    let retired = {
+        let mut state = shared.borrow_mut();
+        if state.prefix_end.as_ref().is_some_and(|end| {
+            end.epoch == epoch
+                && end.generation == generation
+                && end.request.operation == request.operation
+                && end.composition == *composition
+        }) {
+            state.prefix_end.take()
+        } else {
+            None
+        }
+    };
+    drop(retired);
+    result?;
+    edit_identity(shared, request, generation, epoch)
 }
 #[derive(Clone, Copy)]
 struct ObservationAdmission {
@@ -1715,6 +1783,7 @@ fn release_composition_with_failure(
                 .cloned(),
             s.observation_tail.take(),
             s.observation_original.take(),
+            s.prefix_end.take(),
         )
     };
     // Settle must terminate when editing retires its gap, even if its queued
@@ -2187,6 +2256,11 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
         ec: u32,
         composition: Ref<ITfComposition>,
     ) -> windows::core::Result<()> {
+        let Some(composition) = composition.as_ref() else {
+            // No object is not evidence that the current empty/prepared lease
+            // ended. In particular None must never compare equal to None here.
+            return Ok(());
+        };
         #[cfg(feature = "acceptance")]
         eprintln!(
             "composition terminated: epoch={} generation={} owned={}",
@@ -2196,14 +2270,20 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
         );
         let binding = {
             let s = self.state.borrow();
-            (s.epoch == self.epoch && s.composition.as_ref() == composition.as_ref())
+            if s.prefix_end
+                .as_ref()
+                .is_some_and(|end| end.epoch == self.epoch && end.matches(&s, composition))
+            {
+                return Ok(());
+            }
+            (s.epoch == self.epoch && s.composition.as_ref() == Some(composition))
                 .then(|| (s.context.clone(), s.generation))
         };
-        let owned = binding.is_some();
+        let Some((context, generation)) = binding else {
+            return Ok(());
+        };
         let mut semantic = Ok(());
-        if let Some((Some(context), generation)) = binding
-            && let Some(composition) = composition.as_ref()
-        {
+        if let Some(context) = context {
             let guard = || {
                 let s = self.state.borrow();
                 if s.epoch != self.epoch
@@ -2227,11 +2307,26 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
                 &mut Mutation::NotAttempted,
             );
         }
+        let current = {
+            let mut state = self.state.borrow_mut();
+            let current = state.epoch == self.epoch
+                && state.generation == generation
+                && state.composition.as_ref() == Some(composition);
+            if current && state.version.owned {
+                state
+                    .ownership_loss
+                    .get_or_insert("draftOwnershipTerminated");
+            }
+            current
+        };
+        if !current {
+            return semantic;
+        }
         release_composition_with_failure(
             &self.state,
             self.epoch,
-            composition.as_ref(),
-            owned && semantic.is_err(),
+            Some(composition),
+            semantic.is_err(),
         );
         semantic
     }
@@ -2832,7 +2927,7 @@ fn settle_prefix(
             let empty = range.Clone()?;
             empty.Collapse(ec, TF_ANCHOR_END)?;
             edit_identity(shared, r, generation, epoch)?;
-            composition.EndComposition(ec)?;
+            end_settled_composition(shared, composition, r, generation, epoch, ec)?;
             empty
         } else {
             composition.ShiftStart(ec, &boundary)?;
@@ -4362,6 +4457,152 @@ mod tests {
                 Ok(())
             }
         }
+    }
+    #[test]
+    fn null_termination_cannot_retire_an_owned_draft_between_compositions() {
+        let state = Rc::new(RefCell::new(State {
+            active: true,
+            epoch: 7,
+            generation: 12,
+            version: DraftVersion {
+                task: "current".into(),
+                turn: 1,
+                operation: 2,
+                revision: 1,
+                owned: true,
+            },
+            ..Default::default()
+        }));
+        let sink: ITfCompositionSink = CompositionSink {
+            state: state.clone(),
+            epoch: 7,
+            _lease: Lease::new(),
+        }
+        .into();
+        unsafe { sink.OnCompositionTerminated(0, None).unwrap() };
+        let current = state.borrow();
+        assert!(current.version.owned);
+        assert_eq!(current.generation, 12);
+        assert_eq!(current.version.revision, 1);
+    }
+    #[implement(ITfComposition)]
+    struct ReentrantPrefixComposition {
+        state: Shared,
+    }
+    impl ITfComposition_Impl for ReentrantPrefixComposition_Impl {
+        fn GetRange(&self) -> windows::core::Result<ITfRange> {
+            Err(failure(E_NOTIMPL))
+        }
+        fn ShiftStart(&self, _: u32, _: Ref<ITfRange>) -> windows::core::Result<()> {
+            Err(failure(E_NOTIMPL))
+        }
+        fn ShiftEnd(&self, _: u32, _: Ref<ITfRange>) -> windows::core::Result<()> {
+            Err(failure(E_NOTIMPL))
+        }
+        fn EndComposition(&self, ec: u32) -> windows::core::Result<()> {
+            let composition = self.state.borrow().composition.clone().unwrap();
+            let sink: ITfCompositionSink = CompositionSink {
+                state: self.state.clone(),
+                epoch: self.state.borrow().epoch,
+                _lease: Lease::new(),
+            }
+            .into();
+            unsafe { sink.OnCompositionTerminated(ec, &composition) }
+        }
+    }
+    #[test]
+    fn reentrant_prefix_end_preserves_the_same_draft_for_next_update() {
+        let capability = uuid::Uuid::new_v4().to_string();
+        let task = uuid::Uuid::new_v4().to_string();
+        let request = Request {
+            protocol: PROTOCOL,
+            capability: capability.clone(),
+            task: task.clone(),
+            turn: 1,
+            operation: 3,
+            revision: 2,
+            action: Action::Settle,
+            text: String::new(),
+            prefix: Some(crate::wire::Prefix {
+                text: "前段。".into(),
+                range_epoch: 7,
+                expected_revision: 1,
+            }),
+            deadline_tick: unsafe { GetTickCount64() } + 1000,
+        };
+        let state = Rc::new(RefCell::new(State {
+            active: true,
+            capability: Some(capability.clone()),
+            epoch: 7,
+            generation: 12,
+            version: DraftVersion {
+                task: task.clone(),
+                turn: 1,
+                operation: 2,
+                revision: 1,
+                owned: true,
+            },
+            pending: Some(Pending {
+                task,
+                capability,
+                turn: 1,
+                operation: 3,
+                revision: 2,
+                connection: 0,
+                settlement: None,
+            }),
+            ..Default::default()
+        }));
+        let composition: ITfComposition = ReentrantPrefixComposition {
+            state: state.clone(),
+        }
+        .into();
+        state.borrow_mut().composition = Some(composition.clone());
+        end_settled_composition(&state, &composition, &request, 12, 7, 0).unwrap();
+        let mut current = state.borrow_mut();
+        assert!(current.version.owned);
+        assert_eq!(current.generation, 12);
+        assert!(current.prefix_end.is_none());
+        current.version.applied(&request);
+        assert!(current.version.accepts(&Request {
+            action: Action::Update,
+            operation: 4,
+            revision: 3,
+            text: "继续".into(),
+            prefix: None,
+            ..request
+        }));
+        current.composition = None;
+    }
+    #[test]
+    fn foreign_termination_is_ignored_and_real_current_termination_is_retired() {
+        let composition: ITfComposition = TestComposition { refuse_end: false }.into();
+        let foreign: ITfComposition = TestComposition { refuse_end: false }.into();
+        let state = Rc::new(RefCell::new(State {
+            active: true,
+            epoch: 7,
+            generation: 12,
+            composition: Some(composition.clone()),
+            version: DraftVersion {
+                owned: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let sink: ITfCompositionSink = CompositionSink {
+            state: state.clone(),
+            epoch: 7,
+            _lease: Lease::new(),
+        }
+        .into();
+        unsafe { sink.OnCompositionTerminated(0, &foreign).unwrap() };
+        assert!(state.borrow().version.owned);
+        unsafe { sink.OnCompositionTerminated(0, &composition).unwrap() };
+        assert!(!state.borrow().version.owned);
+        assert_eq!(
+            state.borrow().ownership_loss,
+            Some("draftOwnershipTerminated")
+        );
     }
     #[test]
     fn external_edit_revokes_conversion_but_not_range_cleanup() {

@@ -12,7 +12,7 @@ use crate::{
     },
     speech::{NativeTranscript, continuous::Control},
     windows_input::{
-        self, Anchor, Delivery,
+        self, Anchor, Delivery, Submission,
         composition::{Connection, Draft, Finish, FinishOutcome, PrefixOutcome},
     },
 };
@@ -292,11 +292,46 @@ struct State {
     handoff: bool,
     last_handoff: Option<FinishOutcome>,
     stop_error: Option<String>,
+    secondary_errors: Vec<String>,
     model_disabled: bool,
     unit: Option<UnitSlot>,
     native: Option<NativeJob>,
     ending: Option<Ending>,
     report: Report,
+}
+impl State {
+    fn record_failure(&mut self, task: &str, error: String) {
+        if let Some(first) = &self.stop_error {
+            if first != &error
+                && self.secondary_errors.len() < 8
+                && !self.secondary_errors.contains(&error)
+            {
+                log::info!(target:"sayweave", "operation=dictation_secondary_error task_id={task} turn={} first={first} secondary={error}", self.turn);
+                self.secondary_errors.push(error);
+            }
+        } else {
+            log::info!(target:"sayweave", "operation=dictation_first_error task_id={task} turn={} error={error}", self.turn);
+            self.stop_error = Some(error);
+        }
+    }
+    fn terminal_failure(&mut self, task: &str, delivery: &mut Delivery) {
+        if let Some(first) = self.stop_error.clone() {
+            if let Some(secondary) = delivery.error.clone()
+                && !matches!(secondary.as_str(), "inputUnconfirmed" | "cancelled")
+            {
+                self.record_failure(task, secondary);
+            }
+            self.report.error = Some(first.clone());
+            // Keep actual rollback/uncertain effects and a winning cancellation.
+            // Ordinary teardown refusal is secondary to the failed live update.
+            if !self.report.cancelled
+                && !delivery.restore_error
+                && delivery.submission != Submission::Uncertain
+            {
+                delivery.error = Some(first);
+            }
+        }
+    }
 }
 #[derive(Default)]
 struct View {
@@ -358,6 +393,7 @@ impl SessionDraft {
                     handoff: false,
                     last_handoff: None,
                     stop_error: None,
+                    secondary_errors: Vec::new(),
                     model_disabled: false,
                     unit: None,
                     native: None,
@@ -434,7 +470,7 @@ impl SessionDraft {
             return;
         }
         if value.text.chars().count() < s.consumed {
-            s.stop_error = Some("sourceChanged".into());
+            s.record_failure(&self.task, "sourceChanged".into());
             return;
         }
         // Keep the frozen source identity of every irreversible prefix, not
@@ -446,7 +482,7 @@ impl SessionDraft {
             .filter(|u| u.application == "applied" && u.unit.turn == s.turn)
             .any(|u| !u.unit.matches_in(s.turn, &source))
         {
-            s.stop_error = Some("sourceChanged".into());
+            s.record_failure(&self.task, "sourceChanged".into());
             return;
         }
         if s.unit
@@ -962,7 +998,7 @@ impl SessionDraft {
                         s.written_raw = raw.clone();
                         s.last_write = Some(Instant::now());
                     }
-                    Err(e) => s.stop_error = Some(e.code),
+                    Err(e) => s.record_failure(&self.task, e.code),
                 }
             }
             (
@@ -977,7 +1013,7 @@ impl SessionDraft {
                 NativeValue::Settled(outcome),
             ) => {
                 if record.unit.chars.start != s.consumed || record.unit.turn != s.turn {
-                    s.stop_error = Some("compositionProtocol".into());
+                    s.record_failure(&self.task, "compositionProtocol".into());
                 }
                 if outcome.prefix != Mutation::Changed || !outcome.tail_owned {
                     self.cancel_generation(s);
@@ -1001,7 +1037,7 @@ impl SessionDraft {
                     s.separator = boundary.retained_separator.clone();
                     s.written_raw = raw.clone();
                     if !record.unit.matches(s.turn, &s.latest.segments) {
-                        s.stop_error = Some("sourceChanged".into());
+                        s.record_failure(&self.task, "sourceChanged".into());
                     }
                     self.control.handoff_started();
                 } else {
@@ -1028,8 +1064,10 @@ impl SessionDraft {
                     // This source operation was revoked before IPC; refreeze it.
                     s.merge_at = Some(Instant::now());
                 } else {
-                    s.stop_error =
-                        Some(outcome.error.unwrap_or_else(|| "compositionPartial".into()));
+                    s.record_failure(
+                        &self.task,
+                        outcome.error.unwrap_or_else(|| "compositionPartial".into()),
+                    );
                 }
             }
             (NativeKind::Begin { turn, activity }, NativeValue::Begun(result)) => match result {
@@ -1049,7 +1087,7 @@ impl SessionDraft {
                     s.activity = input_state::activity();
                     s.paused_at = Some(Instant::now());
                 }
-                Err(e) => s.stop_error = Some(e.code),
+                Err(e) => s.record_failure(&self.task, e.code),
             },
             (NativeKind::Handoff, NativeValue::HandedOff(outcome)) => {
                 if outcome.handed_off {
@@ -1069,7 +1107,7 @@ impl SessionDraft {
                     }
                 }
                 if !outcome.handed_off {
-                    s.stop_error = Some("compositionHandoffFailed".into());
+                    s.record_failure(&self.task, "compositionHandoffFailed".into());
                 }
                 let raw = s.written_raw.clone();
                 let text = format!(
@@ -1126,7 +1164,7 @@ impl SessionDraft {
                 );
                 return Some(delivery);
             }
-            _ => s.stop_error = Some("compositionProtocol".into()),
+            _ => s.record_failure(&self.task, "compositionProtocol".into()),
         }
         None
     }
@@ -1175,11 +1213,11 @@ impl SessionDraft {
                     let native=s.native.take().unwrap();
                     if let Some(value)=value{
                         if let Some(mut delivery)=self.native_done(&mut s,&native.kind,value){
-                            if let Some(error)=&s.stop_error{delivery.error=Some(error.clone());s.report.error=Some(error.clone());}
+                            s.terminal_failure(&self.task, &mut delivery);
                             if let Ok(mut view)=self.view.lock(){view.report=Some(s.report.clone());}
                             if let Some(ending)=s.ending.take(){let _=ending.reply.send(delivery);}return;
                         }
-                    }else{s.stop_error=Some("compositionWorker".into());}
+                    }else{s.record_failure(&self.task, "compositionWorker".into());}
                 },
                 result=Self::generation_value(&mut s.unit),if matches!(s.unit,Some(UnitSlot::Generating(_)))=>{
                     if let Some(UnitSlot::Generating(generating))=s.unit.take(){s.unit=Some(UnitSlot::Ready(generating.unit.clone(),result));}
@@ -1187,7 +1225,7 @@ impl SessionDraft {
                 _=readiness.changed()=>{let _=readiness.borrow_and_update();if !s.stopping{publish(self.presentation());}},
                 _=tick.tick()=>{
                     self.request_handoff(&mut s);
-                    if !s.stopping&&let Err(error)=windows_input::composition_target(&self.task,&self.anchor){s.stop_error=Some(error.code);}
+                    if !s.stopping&&let Err(error)=windows_input::composition_target(&self.task,&self.anchor){s.record_failure(&self.task, error.code);}
                 },
             }
             if s.ending
@@ -1211,10 +1249,10 @@ impl SessionDraft {
             }
             if !s.stopping || s.ending.is_some() {
                 if let Err(error) = self.start_generation(&mut s) {
-                    s.stop_error = Some(error.code);
+                    s.record_failure(&self.task, error.code);
                 }
                 if let Err(error) = self.schedule(&mut s) {
-                    s.stop_error = Some(error.code);
+                    s.record_failure(&self.task, error.code);
                 }
             }
             if s.stop_error.is_some() && !s.stopping {

@@ -445,3 +445,44 @@ fn rollback_and_cleanup_failure_preserve_uncommitted_recovery_text() {
     assert_eq!(state.report.recovery_raw, "仍可能存在的尾部");
     assert_eq!(state.report.cancellation_raw(), "仍可能存在的尾部");
 }
+
+#[test]
+fn first_live_failure_survives_secondary_teardown_but_keeps_uncertain_effects() {
+    let (_actor, mut state, _native) = actor(None);
+    state.record_failure("actor-test", "compositionRejected".into());
+    state.record_failure("actor-test", "staleSnapshot".into());
+    let mut delivery = Delivery::not_submitted("staleSnapshot");
+    state.terminal_failure("actor-test", &mut delivery);
+    assert_eq!(state.stop_error.as_deref(), Some("compositionRejected"));
+    assert_eq!(state.report.error.as_deref(), Some("compositionRejected"));
+    assert_eq!(delivery.error.as_deref(), Some("compositionRejected"));
+    assert_eq!(state.secondary_errors, vec!["staleSnapshot"]);
+
+    delivery.submission = Submission::Uncertain;
+    delivery.restore_error = true;
+    delivery.error = Some("compositionCleanup".into());
+    state.terminal_failure("actor-test", &mut delivery);
+    assert_eq!(delivery.error.as_deref(), Some("compositionCleanup"));
+    assert!(delivery.restore_error);
+    assert_eq!(delivery.submission, Submission::Uncertain);
+    assert_eq!(state.report.error.as_deref(), Some("compositionRejected"));
+    assert_eq!(
+        state.secondary_errors,
+        vec!["staleSnapshot", "compositionCleanup"]
+    );
+}
+
+#[test]
+fn failure_diagnostics_are_bounded_and_cancel_keeps_its_terminal_result() {
+    let (_actor, mut state, _native) = actor(None);
+    state.record_failure("actor-test", "compositionRejected".into());
+    for n in 0..20 {
+        state.record_failure("actor-test", format!("secondary{n}"));
+    }
+    assert_eq!(state.secondary_errors.len(), 8);
+    state.report.cancelled = true;
+    let mut delivery = Delivery::not_submitted("cancelled");
+    state.terminal_failure("actor-test", &mut delivery);
+    assert_eq!(delivery.error.as_deref(), Some("cancelled"));
+    assert_eq!(state.stop_error.as_deref(), Some("compositionRejected"));
+}

@@ -846,15 +846,7 @@ pub fn run() {
                     log::warn!(target:"sayweave","operation=shortcut_initialize error={}",e.code);
                 }
             });
-            if let Some(monitor) = overlay.primary_monitor()? {
-                let scale = monitor.scale_factor();
-                let size = monitor.work_area().size.to_logical::<f64>(scale);
-                let pos = monitor.work_area().position.to_logical::<f64>(scale);
-                overlay.set_position(LogicalPosition::new(
-                    pos.x + size.width / 2.0 - 80.0,
-                    pos.y + size.height - 140.0,
-                ))?;
-            }
+            voice_window::reposition(&overlay, None);
             let open = MenuItem::with_id(app, "open", "打开 Sayweave", true, None::<&str>)?;
             let voice = MenuItem::with_id(app, "voice", "显示语音控件", true, None::<&str>)?;
             let hide = MenuItem::with_id(app, "hide", "隐藏语音控件", true, None::<&str>)?;
@@ -902,6 +894,12 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() == "voice-overlay"
+                && matches!(event, tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_) | tauri::WindowEvent::ScaleFactorChanged { .. })
+                && let Some(overlay) = window.app_handle().get_webview_window("voice-overlay")
+            {
+                voice_window::reposition(&overlay, None);
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 let _ = window_action(

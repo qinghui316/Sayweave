@@ -1,6 +1,6 @@
 //! Native voice-window identity and nonactivating interaction. Target proof lives in windows_input.
 use std::sync::atomic::{AtomicU64, Ordering};
-use tauri::{LogicalPosition, LogicalSize, WebviewWindow};
+use tauri::{LogicalSize, PhysicalPosition, PhysicalSize, WebviewWindow};
 static VISIBILITY_OPERATION: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -313,12 +313,16 @@ pub(crate) fn visibility(
             return Ok(());
         };
         let operation = VISIBILITY_OPERATION.fetch_add(1, Ordering::AcqRel) + 1;
+        let positioning_window = window.clone();
         window.run_on_main_thread(move || unsafe {
             use windows::Win32::{Foundation::HWND, UI::WindowsAndMessaging::*};
             if native::instance(handle) != Some(instance)
                 || VISIBILITY_OPERATION.load(Ordering::Acquire) != operation
             {
                 return;
+            }
+            if visible {
+                reposition(&positioning_window, task.as_deref());
             }
             trace(
                 if visible {
@@ -352,25 +356,101 @@ pub(crate) fn layout(window: &WebviewWindow, width: f64, height: f64, task: Opti
             let _ = window.set_size(LogicalSize::new(width, height));
         }
     }
-    if let (Ok(Some(monitor)), Ok(position), Ok(size), Ok(scale)) = (
-        window.current_monitor(),
-        window.outer_position(),
-        window.outer_size(),
-        window.scale_factor(),
-    ) {
-        let origin = monitor.work_area().position.to_logical::<f64>(scale);
-        let area = monitor.work_area().size.to_logical::<f64>(scale);
-        let p = position.to_logical::<f64>(scale);
-        let size = size.to_logical::<f64>(scale);
-        let x =
-            p.x.clamp(origin.x, (origin.x + area.width - size.width).max(origin.x));
-        let y = p.y.clamp(
-            origin.y,
-            (origin.y + area.height - size.height).max(origin.y),
+    reposition(window, task);
+}
+
+// VoiceSurface has12logical pixels of bottom padding. Anchor the visible
+// capsule24logical pixels above the work area, not the transparent canvas.
+const VISIBLE_BOTTOM_GAP: f64 = 24.0;
+const SURFACE_BOTTOM_PADDING: f64 = 12.0;
+fn bottom_position(
+    origin: PhysicalPosition<i32>,
+    area: PhysicalSize<u32>,
+    size: PhysicalSize<u32>,
+    scale: f64,
+) -> PhysicalPosition<i32> {
+    let x = origin.x as f64 + ((area.width as f64 - size.width as f64) / 2.0).max(0.0);
+    let y = origin.y as f64
+        + (area.height as f64
+            - size.height as f64
+            - (VISIBLE_BOTTOM_GAP - SURFACE_BOTTOM_PADDING) * scale)
+            .max(0.0);
+    PhysicalPosition::new(x.round() as i32, y.round() as i32)
+}
+
+/// Window thread only. Geometry is read again after resize/DPI notifications;
+/// it never carries a delayed target size from an older Runtime snapshot.
+pub(crate) fn reposition(window: &WebviewWindow, task: Option<&str>) {
+    let monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten());
+    if let (Some(monitor), Ok(position), Ok(size)) =
+        (monitor, window.outer_position(), window.outer_size())
+    {
+        let next = bottom_position(
+            monitor.work_area().position,
+            monitor.work_area().size,
+            size,
+            monitor.scale_factor(),
         );
-        if x != p.x || y != p.y {
+        if next != position {
             trace("position_execute", task);
-            let _ = window.set_position(LogicalPosition::new(x, y));
+            let _ = window.set_position(next);
         }
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    #[test]
+    fn capsule_stays_centered_and24logical_above_work_area_for_every_layout() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for (width, height) in [(160, 88), (384, 112), (384, 232)] {
+                let origin = PhysicalPosition::new(-1920, -120);
+                let area = PhysicalSize::new(1920, 1040);
+                let size = PhysicalSize::new(
+                    (width as f64 * scale) as u32,
+                    (height as f64 * scale) as u32,
+                );
+                let p = bottom_position(origin, area, size, scale);
+                assert!(
+                    (p.x as f64 + size.width as f64 / 2.0
+                        - (origin.x as f64 + area.width as f64 / 2.0))
+                        .abs()
+                        <= 0.5
+                );
+                let visible_bottom =
+                    p.y as f64 + size.height as f64 - SURFACE_BOTTOM_PADDING * scale;
+                assert!(
+                    ((origin.y as f64 + area.height as f64 - visible_bottom) / scale - 24.0).abs()
+                        <= 0.5
+                );
+            }
+        }
+    }
+    #[test]
+    fn expanding_and_shrinking_preserve_the_visible_bottom_anchor() {
+        let origin = PhysicalPosition::new(100, 80);
+        let area = PhysicalSize::new(1280, 720);
+        let compact = bottom_position(origin, area, PhysicalSize::new(160, 88), 1.0);
+        let expanded = bottom_position(origin, area, PhysicalSize::new(384, 232), 1.0);
+        assert_eq!(compact.y + 88, expanded.y + 232);
+        assert_eq!(compact.x + 80, expanded.x + 192);
+    }
+    #[test]
+    fn tiny_work_area_clamps_to_its_origin() {
+        let origin = PhysicalPosition::new(-300, 12);
+        assert_eq!(
+            bottom_position(
+                origin,
+                PhysicalSize::new(120, 60),
+                PhysicalSize::new(384, 232),
+                2.0
+            ),
+            origin
+        );
     }
 }

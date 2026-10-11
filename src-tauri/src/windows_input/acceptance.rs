@@ -208,6 +208,10 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         runtime
             .block_on(draft.replace(1, prefix.into()))
             .map_err(|e| e.code)?;
+        println!(
+            "SAYWEAVE_COMPOSITION_TARGET pid={} phase=first_applied",
+            fixture.child.id()
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         loop {
             let value = fixture.command(serde_json::json!({"action":"read"}))?;
@@ -300,7 +304,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         {
             return Err(format!("empty-tail settlement failed: {:?}", settled.error));
         }
-        thread::sleep(Duration::from_millis(80));
+        thread::sleep(Duration::from_millis(if resume_tail { 1500 } else { 80 }));
         if move_caret {
             fixture.command(serde_json::json!({"action":"caret-home"}))?;
         }

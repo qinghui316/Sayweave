@@ -79,8 +79,30 @@ pub fn final_presentation(
     {
         return Presentation::Completed;
     }
-    // Terminal failures remain in Delivery/history. Close the overlay without
-    // interpreting them as success or showing explanatory banners.
+    // Real failure uses the existing error surface even when a prefix was
+    // submitted. It never offers another paste of already-visible input.
+    let failed = |code: &str| {
+        !matches!(
+            code,
+            "inputUnconfirmed"
+                | "cancelled"
+                | "staleSession"
+                | "targetChanged"
+                | "targetLost"
+                | "targetClosed"
+                | "editing"
+        )
+    };
+    if error.is_some_and(failed)
+        || delivery.is_some_and(|d| {
+            d.restore_error
+                || d.submission == Submission::Uncertain
+                || d.error.as_deref().is_some_and(failed)
+        })
+    {
+        return Presentation::Error;
+    }
+    // Normal target interruption closes without presenting a duplicate result.
     if delivery.is_some_and(|d| {
         d.submission != Submission::NotSubmitted
             && (d.state != "confirmed" || d.error.is_some() || d.restore_error)
@@ -131,7 +153,7 @@ mod tests {
         delivery.error = Some("compositionRejected".into());
         assert_eq!(
             final_presentation(false, "text", Some(&delivery), None),
-            Presentation::Idle
+            Presentation::Error
         );
     }
     #[test]
@@ -173,17 +195,17 @@ mod tests {
         delivery.restore_error = true;
         assert_eq!(
             final_presentation(false, "文字", Some(&delivery), None),
-            Presentation::Idle
+            Presentation::Error
         );
     }
     #[test]
-    fn terminal_feedback_closes_without_changing_internal_failure() {
+    fn terminal_failure_is_visible_and_successful_cancel_stays_quiet() {
         let mut delivery = Delivery::not_submitted("compositionRollback");
         delivery.state = "unconfirmed".into();
         delivery.submission = Submission::Submitted;
         assert_eq!(
             final_presentation(false, "部分文字", Some(&delivery), Some("cancelled")),
-            Presentation::Idle
+            Presentation::Error
         );
         delivery.submission = Submission::NotSubmitted;
         delivery.error = Some("cancelled".into());
@@ -198,7 +220,7 @@ mod tests {
         );
         assert_eq!(
             final_presentation(false, "已提交前段", Some(&delivery), Some("saveFailed")),
-            Presentation::Idle
+            Presentation::Error
         );
     }
     #[test]
