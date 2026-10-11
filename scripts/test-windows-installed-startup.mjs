@@ -47,21 +47,36 @@ async function closeCurrent(page){
  for(let n=0;n<20;n++){if(!installedState(exe).applications.some(app=>app.CreationDate===owned.CreationDate))break;await new Promise(resolve=>setTimeout(resolve,250));}
  if(installedState(exe).applications.some(app=>app.CreationDate===owned.CreationDate))throw Error('Native application exit did not complete.');
 }
+async function componentInventory(timeout=180000){
+ const inventory=JSON.parse(await command('powershell',['-NoProfile','-Command',"$ErrorActionPreference='Stop';$items=@{};foreach($scope in @('HKEY_CURRENT_USER','HKEY_LOCAL_MACHINE')){$base='Registry::'+$scope;$com=$base+'\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$tip=$base+'\\Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$item=@{com=(Test-Path -LiteralPath $com);tip=(Test-Path -LiteralPath $tip);module=$null;owner=$null;tipEntries=@()};if(Test-Path -LiteralPath ($com+'\\InprocServer32')){$key=Get-Item -LiteralPath ($com+'\\InprocServer32');$item.module=$key.GetValue('');$item.owner=$key.GetValue('SayweaveOwner')};if($item.tip){$queue=@($tip);for($n=0;$n -lt $queue.Count;$n++){if($queue.Count -gt 64){throw 'Owned TIP registry inventory exceeded bound'};$key=Get-Item -LiteralPath $queue[$n];$values=@{};$names=@($key.GetValueNames());if($names.Count -gt 32){throw 'Owned TIP value inventory exceeded bound'};foreach($name in $names){$value=$key.GetValue($name);if(($value -isnot [string] -and $value -isnot [int]) -or ([string]$value).Length -gt 1024){throw 'Owned TIP value exceeded bound'};$values[$name]=@{kind=([string]$key.GetValueKind($name));value=$value}};$item.tipEntries+=@{path=$queue[$n].Substring($tip.Length);values=$values};foreach($child in @($key.GetSubKeyNames())){$queue+=($queue[$n]+'\\'+$child)}}};$items[$scope]=$item};ConvertTo-Json -InputObject $items -Compress -Depth 9"],timeout));
+ if(Object.keys(inventory).sort().join(',')!=='HKEY_CURRENT_USER,HKEY_LOCAL_MACHINE'||Object.values(inventory).some(item=>typeof item.com!=='boolean'||typeof item.tip!=='boolean'))throw Error('Fixed-class inventory shape differs');
+ return inventory;
+}
 async function cleanupComponent(){
  const registered=execFileSync('powershell',['-NoProfile','-Command',"$key=Get-Item -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}\\InprocServer32' -ErrorAction Stop;@{module=$key.GetValue('');owner=$key.GetValue('SayweaveOwner')}|ConvertTo-Json -Compress"],{encoding:'utf8'});
  const identity=JSON.parse(registered),expected=path.join(process.env.ProgramFiles,'Sayweave','TextService',tools.manifest.artifacts.component.sha256,'sayweave_text_service.dll');
  if(identity.owner!=='SayweaveStageA-v1'||path.normalize(identity.module.replace(/^\\\\\?\\/,'')).toLowerCase()!==path.normalize(expected).toLowerCase()||createHash('sha256').update(readFileSync(identity.module)).digest('hex')!==tools.manifest.artifacts.component.sha256)throw Error('Refusing cleanup of changed component identity');
  await command(exe,['--sayweave-text-service=remove',`--initiator=${componentPreparation.sid}`]);
- const inventory=JSON.parse(await command('powershell',['-NoProfile','-Command',"$ErrorActionPreference='Stop';$items=@{};foreach($scope in @('HKEY_CURRENT_USER','HKEY_LOCAL_MACHINE')){$base='Registry::'+$scope;$com=$base+'\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$tip=$base+'\\Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$item=@{com=(Test-Path -LiteralPath $com);tip=(Test-Path -LiteralPath $tip);module=$null;owner=$null;tipEntries=@()};if(Test-Path -LiteralPath ($com+'\\InprocServer32')){$key=Get-Item -LiteralPath ($com+'\\InprocServer32');$item.module=$key.GetValue('');$item.owner=$key.GetValue('SayweaveOwner')};if($item.tip){$queue=@($tip);for($n=0;$n -lt $queue.Count;$n++){if($queue.Count -gt 64){throw 'Owned TIP registry inventory exceeded bound'};$key=Get-Item -LiteralPath $queue[$n];$values=@{};$names=@($key.GetValueNames());if($names.Count -gt 32){throw 'Owned TIP value inventory exceeded bound'};foreach($name in $names){$value=$key.GetValue($name);if(($value -isnot [string] -and $value -isnot [int]) -or ([string]$value).Length -gt 1024){throw 'Owned TIP value exceeded bound'};$values[$name]=@{kind=([string]$key.GetValueKind($name));value=$value}};$item.tipEntries+=@{path=$queue[$n].Substring($tip.Length);values=$values};foreach($child in @($key.GetSubKeyNames())){$queue+=($queue[$n]+'\\'+$child)}}};$items[$scope]=$item};ConvertTo-Json -InputObject $items -Compress -Depth 9"]));
- const profiles=JSON.parse(await command(tools.probe,['registration-state']));
- componentPreparation.cleanup={inventory,profiles};persist();
- if(Object.values(inventory).some(item=>item.com||item.tip)||profiles.profiles!==0||profiles.categories!==0||profiles.speechCategory!==false)throw Error('Prepared component cleanup incomplete; see recorded fixed-class inventory and API state');
- componentPreparation.removed=true;
+ const started=Date.now(),deadline=started+10000,samples=[];let stable=0;
+ componentPreparation.cleanup={samples,removed:false};persist();
+ do{
+  const profiles=JSON.parse(await command(tools.probe,['registration-state'],Math.max(1,deadline-Date.now())));
+  const inventory=await componentInventory(Math.max(1,deadline-Date.now()));
+  samples.push({elapsedMs:Date.now()-started,inventory,profiles});persist();
+  if(Object.values(inventory).some(item=>item.com||item.tip))throw Error('Native removal left fixed-class registry roots; no diagnostic deletion attempted');
+  const matches=profiles.profiles===0&&profiles.categories===0&&profiles.speechCategory===false;
+  stable=matches?stable+1:0;
+  if(stable===2&&Date.now()<=deadline){componentPreparation.cleanup.removed=true;componentPreparation.removed=true;return;}
+  await new Promise(resolve=>setTimeout(resolve,Math.max(0,Math.min(250,deadline-Date.now()))));
+ }while(Date.now()<deadline);
+ throw Error('Prepared component cleanup did not settle; see bounded independent-process samples');
 }
-async function command(file,args){
+async function command(file,args,timeout=180000){
+ if(!Number.isSafeInteger(timeout)||timeout<1||timeout>180000)throw Error('Diagnostic command timeout exceeds bound');
  const entry={tool:path.basename(file),args,stage:report.stage,startedAt:new Date().toISOString()};report.commands.push(entry);persist();
  let stdout=Buffer.alloc(0),stderr=Buffer.alloc(0),error;
- const processChild=spawn(file,args,{cwd:root,windowsHide:true,stdio:['ignore','pipe','pipe'],timeout:180000});
+ const processChild=spawn(file,args,{cwd:root,windowsHide:true,stdio:['ignore','pipe','pipe'],timeout});
+ entry.pid=processChild.pid;entry.timeoutMs=timeout;persist();
  processChild.stdout.on('data',bytes=>{stdout=boundedTail(stdout,bytes);});processChild.stderr.on('data',bytes=>{stderr=boundedTail(stderr,bytes);});processChild.once('error',value=>{error=value;});
  const started=Date.now();entry.exitCode=await new Promise(resolve=>processChild.once('close',resolve));entry.elapsedMs=Date.now()-started;
  for(const [name,bytes] of [['stdout',stdout],['stderr',stderr]]){const fileName=`command-${report.commands.length}.${name}.log`;writeFileSync(path.join(directory,fileName),safeStartupText(bytes.toString('utf8')));entry[name]=fileName;}
@@ -109,6 +124,11 @@ try{
   componentPreparation.module=module;componentPreparation.sha256=hash(readFileSync(module));if(componentPreparation.sha256!==tools.manifest.artifacts.component.sha256)throw Error('Prepared module differs from frozen tooling');persist();
   await command('powershell',['-NoProfile','-ExecutionPolicy','Bypass','-File','scripts/windows-update-metadata.ps1','-ExpectedCommit',harness,'-ProductCommit',candidate,'-ExpectedModulePath',module,'-ExpectedComponentSha256',tools.manifest.artifacts.component.sha256]);
   report.metadataCharacterized=true;persist();
+  stage('frozen installed component activation characterization');
+  const activation=report.componentActivation={passed:false,before:{inventory:await componentInventory(),query:JSON.parse(await command(tools.probe,['registration-query-detail']))}};persist();
+  try{await command(tools.probe,['installed-fixture',module],30000);activation.passed=true;}
+  catch(error){activation.error=safeStartupText(error.message).slice(0,2048);}
+  finally{activation.after={inventory:await componentInventory(),query:JSON.parse(await command(tools.probe,['registration-query-detail']))};persist();}
  }
  stage('temporary elevated WebView debug policy');
  debugPolicy=prepareDisposableDebugPolicy(9291);report.debugPolicyLease=debugPolicy.receipt;persist();debugPolicy.install();persist();
@@ -155,6 +175,7 @@ try{
   const after=await invoke(page,'update_snapshot');expect(after.state).toBe('readyToInstall');expect(after.build.version).toBe('0.1.700');expect(await invoke(page,'acceptance_update_data')).toEqual(before);
   report.recoveryPassed=true;persist();await closeCurrent(page);
  }
+ if(metadata&&!report.componentActivation.passed)throw Error('Frozen installed component activation failed; native UI proof is separate; see preserved probe streams');
  report.passed=true;
 }catch(error){report.error=safeStartupText(error?.message??error?.code??String(error)).slice(0,2048);process.exitCode=1;}
 finally{
