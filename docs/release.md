@@ -2,6 +2,8 @@
 
 Sayweave 的源码开发使用 `main` 和短期功能分支；正式发布使用不可变的 `v<version>` tag。源码构建和安装包是同一提交的两种交付方式，不维护两套长期分支。
 
+日常工作从本地 `main` 新建短期开发分支，本地验证和独立审查后按 Harness 合入本地 `main`，再直接 `git push origin main`。开发与审查候选默认只在本地保存；已完成的远端临时分支在主线同步和内容保留核对后清理。具体约定见 [开发说明](development.md)。
+
 ## 构建身份
 
 普通源码及日常构建默认使用开发渠道，不接收公开自动更新。正式构建编译固定仓库、公钥、版本、完整提交和目标平台；隔离验收使用独立应用身份和临时签名，测试信任不能进入正式构建，运行时参数不能切换正式更新源。正式构建禁止 `desktop-acceptance` feature，编译时即拒绝混入验收能力。
@@ -25,6 +27,8 @@ npm run desktop:release:verify
 `desktop:package` 生成 Windows x64 NSIS 安装程序和 Tauri updater 签名。`desktop:release:manifest` 生成 GitHub Releases 使用的 `latest.json`、校验清单和 release receipt；`desktop:release:verify` 会重新核对版本、tag、下载地址、签名、安装包大小和 SHA-512。
 
 ## GitHub 发布
+
+面向 `main` 的独立 CI ruleset 要求 GitHub Actions 的 `CI` 检查通过，并为仓库所有者保留日常直推例外。现有对管理员生效的线性历史、禁止强推和禁止删除保护继续执行。所有者例外仅用于主线直推；外部 PR 合入前仍须等待 CI 通过。正式 `v*` 标签触发独立发布流程，`v*-release-check-*` 诊断标签仍从自动发布中排除。
 
 日常本地 I2 合入复用已通过的同一代码验证与精确审查；直接同步 `main` 不触发 CI，主线保留禁止强推、禁止删除等基础保护。PR 和手动 `phase=ci` 执行 CI。更新机制改动或准备发布时，在精确 `main` 提交手动运行 `windows-ci.yml` 的 `phase=full`；同一候选有已验证产物时传入 `reuse_run`。发布再从已验证的 `main` 提交创建 `v<version>` tag。Actions 核验同一完整 SHA 的成功主线 CI 和 Windows 更新机制证据，复用其中按哈希绑定的正式组件，在 `windows-signing` Environment 构建签名安装包并创建 Draft Release。Draft 资产会重新下载并校验，实际安装正式草稿包通过后，由 `windows-release` Environment 审核公开并标记 Latest。两个环境仅允许 `v*` 标签。
 
