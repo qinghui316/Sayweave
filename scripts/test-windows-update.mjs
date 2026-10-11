@@ -9,7 +9,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {databaseInventory,seedLegacyRows,legacySeedRows} from './windows-update-fixtures.mjs';
 import {readTools,writeTools,readMechanismEvidence,writeMechanismEvidence,proofMarkers} from './windows-update-artifacts.mjs';
 import {temporaryPreferenceCleanup} from './windows-update-registration.mjs';
-import {installedStartup,restartAndReconnect,aclPrelude,aclSnapshotScript,aclRestoreScript} from './windows-update-startup.mjs';
+import {installedStartup,restartAndReconnect,aclPrelude,aclSnapshotScript,aclRestoreScript,deploymentReading} from './windows-update-startup.mjs';
 import {readPackages,writePackages,nsisExecutableIdentity} from './windows-update-packages.mjs';
 import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'&&process.env.SAYWEAVE_DISPOSABLE_WINDOWS!=='1')throw Error('Use an elevated disposable Windows VM; never an owner machine.');
@@ -97,7 +97,7 @@ async function restartCurrent(page){
  return restartAndReconnect({original:ownedProcess,invoke:()=>invoke(page,'update_restart'),disconnect:async()=>{await browser.close().catch(()=>{});browser=null;},inspect:()=>processes(testExe),reconnect:()=>connect(testExe,false),current:()=>ownedProcess,record:report.restarts??(report.restarts=[]),persist:checkpoint});
 }
 async function state(page,wanted){await expect.poll(async()=>(await invoke(page,'update_snapshot')).state,{timeout:60000}).toBe(wanted);return invoke(page,'update_snapshot');}
-async function install(installer){await command(installer,['/S']);if(!existsSync(testExe))throw Error('NSIS current-user path differs');}
+async function install(installer){try{await command(installer,['/S']);if(!existsSync(testExe))throw Error('NSIS current-user path differs');}finally{(report.deployments??=[]).push({stage:report.stage,installerSha256:createHash('sha256').update(readFileSync(installer)).digest('hex'),records:deploymentReading(path.dirname(testExe))});checkpoint();}}
 const data=page=>invoke(page,'acceptance_update_data');
 async function verifyPackage(file,version,publicKey){
  stage(`signature verification ${version}`);

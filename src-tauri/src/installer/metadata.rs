@@ -164,6 +164,31 @@ pub fn install_location(key: &KeyBackup) -> Result<Option<String>> {
             .into(),
     ))
 }
+pub fn validate_main_binary(key: &KeyBackup) -> Result<()> {
+    let Some(value) = key
+        .values
+        .iter()
+        .find(|v| v.name.eq_ignore_ascii_case("MainBinaryName"))
+    else {
+        return Ok(());
+    };
+    if value.kind != REG_SZ.0 || value.bytes.len() % 2 != 0 {
+        return Err("installerRegistryValue".into());
+    }
+    let chars = value
+        .bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|v| u16::from_le_bytes([v[0], v[1]]))
+        .collect::<Vec<_>>();
+    let name = String::from_utf16(&chars).map_err(|_| "installerRegistryValue")?;
+    let name = name.trim_end_matches('\0');
+    if !name.is_empty() && !name.eq_ignore_ascii_case("sayweave.exe") {
+        return Err("installerMainBinaryConflict".into());
+    }
+    Ok(())
+}
 pub fn restore(snapshot: &KeyBackup, install_dir: &str) -> Result<()> {
     let current = self::snapshot(&snapshot.path)?;
     let before_names = snapshot
@@ -372,6 +397,46 @@ pub fn uninstall_owned_location(product: &str) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn main_binary_metadata_cannot_expand_the_owned_file_manifest() {
+        let mut key = KeyBackup {
+            path: "Software\\owned".into(),
+            existed: true,
+            values: vec![],
+        };
+        assert!(validate_main_binary(&key).is_ok());
+        for name in ["", "sayweave.exe", "SAYWEAVE.EXE"] {
+            key.values = vec![Value {
+                name: "mainbinaryname".into(),
+                kind: REG_SZ.0,
+                bytes: wide(name).iter().flat_map(|v| v.to_le_bytes()).collect(),
+            }];
+            assert!(validate_main_binary(&key).is_ok());
+        }
+        for name in [
+            "notes.txt",
+            "..\\sentinel",
+            "C:\\sentinel",
+            "sayweave.exe\0other",
+        ] {
+            key.values[0].bytes = wide(name).iter().flat_map(|v| v.to_le_bytes()).collect();
+            assert_eq!(
+                validate_main_binary(&key).unwrap_err(),
+                "installerMainBinaryConflict"
+            );
+        }
+        key.values[0].bytes = vec![0];
+        assert_eq!(
+            validate_main_binary(&key).unwrap_err(),
+            "installerRegistryValue"
+        );
+        key.values[0].bytes = vec![0, 0];
+        key.values[0].kind = REG_DWORD.0;
+        assert_eq!(
+            validate_main_binary(&key).unwrap_err(),
+            "installerRegistryValue"
+        );
+    }
     #[test]
     fn shell_generated_shortcut_requires_the_owned_target_and_no_arguments() {
         use windows::{Win32::System::Com::*, core::Interface};
