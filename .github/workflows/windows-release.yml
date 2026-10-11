@@ -41,6 +41,7 @@ env:
   SAYWEAVE_RELEASE_TAG: ${{ (inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_tag || github.ref_name }}
   SAYWEAVE_RELEASE_COMMIT: ${{ (inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_commit || github.sha }}
   SAYWEAVE_CONTROLLER_COMMIT: ${{ github.sha }}
+  SAYWEAVE_CONTROLLER_REF: ${{ github.ref }}
   SAYWEAVE_RELEASE_PHASE: ${{ inputs.phase || 'build' }}
 
 jobs:
@@ -77,7 +78,7 @@ jobs:
           git merge-base --is-ancestor $env:SAYWEAVE_RELEASE_COMMIT origin/main
           if ($LASTEXITCODE -ne 0) { throw 'Product is not on main.' }
           if ($env:SAYWEAVE_RELEASE_PHASE -eq 'accept-existing') {
-            if ('${{ github.ref }}' -notlike 'refs/tags/v*-release-check-*') { throw 'Existing installation requires a reviewed controller tag.' }
+            if ($env:SAYWEAVE_CONTROLLER_REF -notlike 'refs/tags/v*-release-check-*') { throw 'Existing installation requires a reviewed controller tag.' }
             git merge-base --is-ancestor $env:SAYWEAVE_CONTROLLER_COMMIT origin/main
             if ($LASTEXITCODE -ne 0) { throw 'Controller is not landed on main.' }
           }
@@ -183,7 +184,7 @@ jobs:
           "checksum=$((Get-FileHash -LiteralPath 'release/sayweave/SHA256SUMS.txt' -Algorithm SHA256).Hash.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
   accept-installer:
-    if: always() && github.repository == 'qinghui316/Sayweave' && needs.verify.result == 'success' && ((startsWith(github.ref, 'refs/tags/') && needs.draft.result == 'success') || (github.event_name == 'workflow_dispatch' && (inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && needs.draft.result == 'skipped'))
+    if: always() && !cancelled() && github.repository == 'qinghui316/Sayweave' && needs.verify.result == 'success' && ((startsWith(github.ref, 'refs/tags/') && needs.draft.result == 'success') || (github.event_name == 'workflow_dispatch' && (inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && needs.draft.result == 'skipped'))
     needs: [verify, draft]
     runs-on: windows-latest
     timeout-minutes: 90
@@ -245,7 +246,7 @@ jobs:
             .local/windows-update/*/diagnostics/*.log
           if-no-files-found: error
   publish:
-    if: always() && startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave' && needs.accept-installer.result == 'success' && ((needs.draft.result == 'success' && inputs.phase != 'check-access') || (needs.draft.result == 'skipped' && inputs.phase == 'accept-existing'))
+    if: always() && !cancelled() && startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave' && needs.accept-installer.result == 'success' && ((needs.draft.result == 'success' && inputs.phase != 'check-access') || (needs.draft.result == 'skipped' && inputs.phase == 'accept-existing'))
     needs: [draft, accept-installer]
     runs-on: windows-latest
     environment: windows-release
