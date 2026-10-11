@@ -25,7 +25,7 @@ E2E前运行 `npx playwright install chromium`。截图、报告、运行数据�
 
 测试构建刻意同时启用 AWS-LC 和 ring，以保持对原冲突的检测能力；普通产品移除了闲置更新插件，不为这项回归启用第二种加密实现。
 
-发布更新验收使用 `node scripts/test-windows-update.mjs`，仅允许已提权的一次性 Windows runner／虚拟机。先用 --startup-only 安装第一份隔离包，分别确认进程、主窗口、页面就绪、调试端口和原生界面，保留精确身份及有界启动日志；成功后构建第二份包供同一候选复用。它构建同一候选的两个隔离版本，执行真实 HTTPS、临时签名、NSIS 覆盖安装与自动重启，核对凭据、历史、词典、偏好和组件状态，并检查中断、错误签名、版本冒充、保存屏障超时、停止超时及安装器启动失败。正式发布工作流另外回下载并实际安装正式草稿。具体约束与收尾顺序见 [release.md](release.md)；浏览器模拟不能替代真实安装记录。
+更新专项工具的选择和执行范围以 [本地 Harness Verify 工作流](../.agents/skills/beaver-4a20fc43577a-harness/references/workflows/verify.md) 为准。下述历史工具仅供明确请求的固定专项使用，既有记录保留原身份；当前未覆盖的实际更新场景待人工试用。
 
 ## Windows 桌面检查
 

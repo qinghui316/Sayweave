@@ -12,15 +12,7 @@ Sayweave 的源码开发使用 `main` 和短期功能分支；正式发布使用
 
 ## 本地发布检查
 
-```powershell
-npm ci
-npm run check
-npm run test:e2e
-npm run check:distribution
-npm run desktop:package
-npm run desktop:release:manifest
-npm run desktop:release:verify
-```
+检查分层及更新专项的授权范围见 [本地 Harness Verify 工作流](../.agents/skills/beaver-4a20fc43577a-harness/references/workflows/verify.md)。包构建、清单和签名工具仍使用现有 desktop:package、desktop:release:manifest 和 desktop:release:verify 入口。
 
 发布构建需要 `TAURI_SIGNING_PRIVATE_KEY` 和 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。私钥只放在受保护的 GitHub Environment 或本机受控目录，不能提交到仓库。
 
@@ -30,7 +22,7 @@ npm run desktop:release:verify
 
 面向 `main` 的独立 CI ruleset 要求 GitHub Actions 的 `CI` 检查通过，并为仓库所有者保留日常直推例外。现有对管理员生效的线性历史、禁止强推和禁止删除保护继续执行。所有者例外仅用于主线直推；外部 PR 合入前仍须等待 CI 通过。正式 `v*` 标签触发独立发布流程，`v*-release-check-*` 诊断标签仍从自动发布中排除。
 
-日常本地 I2 合入复用已通过的同一代码验证与精确审查；直接同步 `main` 不触发 CI，主线保留禁止强推、禁止删除等基础保护。PR 和手动 `phase=ci` 执行 CI。更新机制改动或准备发布时，在精确 `main` 提交手动运行 `windows-ci.yml` 的 `phase=full`；同一候选有已验证产物时传入 `reuse_run`。发布再从已验证的 `main` 提交创建 `v<version>` tag。Actions 核验同一完整 SHA 的成功主线 CI 和 Windows 更新机制证据，复用其中按哈希绑定的正式组件，在 `windows-signing` Environment 构建签名安装包并创建 Draft Release。Draft 资产会重新下载并校验，实际安装正式草稿包通过后，由 `windows-release` Environment 审核公开并标记 Latest。两个环境仅允许 `v*` 标签。
+日常源码合入与同步按已有 Harness 执行。当前普通 CI 由 PR 或明确手动请求触发，main 推送不运行普通 CI。正式标签流程核对源码、构建签名包并创建不可变草稿，回下载后校验资产身份与完整签名。windows-signing 和 windows-release 两处环境授权保持；后者由所有者在人工试用后审核。默认发布不执行实际安装；已有 accept-existing 模式仅用于明确请求的固定草稿安装专项。
 
 资产恰好为安装器、`.sig`、`latest.json`、`release-receipt.json` 和 `SHA256SUMS.txt`。校验清单必须覆盖前四份资产，缺项、重复、额外文件、越界路径、错误提交和外部下载 URL 均拒绝。客户端与发布验证器共用完整 minisign 签名及受签名版本校验。发布说明由结构化文件生成可读 Markdown，与应用内说明一致。
 
@@ -50,23 +42,11 @@ npm run desktop:release:verify
 
 原生适配器以参数数组启动已验证 NSIS 包，确认子进程创建后才退出。原子更新记录只保存包身份和阶段，不含正文。新进程实际运行目标版本才确认更新完成；重启旧版不算成功，不自动重复安装。上次未完成的安装可重试，损坏缓存需重新下载。
 
-## 真实 Windows 验收
+## 更新专项工具与历史记录
 
-验收分为工具、安装后启动、更新机制和正式安装包四个独立阶段。先运行 `node scripts/test-windows-update.mjs --tools-only`：从精确提交归档分别在 `component-target` 和 `probe-target` 构建正式 DLL 与启用 `acceptance` 的探针，验证 `capabilities` 及 `installed-fixture`。短检查在一次性机器临时注册正式 TIP，经进程范围的真实 TSF 激活加载明确指定的 DLL，检查实际 EDIT 文字、协议8、故障注入导出缺失及 COM 最终卸载。注册前检查 HKCU/HKLM 的本组件 COM/TIP 和 TSF 资料均为空；收尾只移除路径与所有者匹配的本次注册，有界轮询资料状态并记录身份明细，连续确认两处注册及资料均已移除后才通过。TSF 注册 API 可能修改机器元数据，不能称为只写 HKCU。原生组件完成固定 PROFILE 的禁用、移除与取消注册，严格核验 Enable DWORD0/1 并非递归清理自有空键；未知值、额外子键、类别或身份均拒绝，失败保留原状态或可重试锚点。原生清理要求机器与用户 TIP 注册根均不存在，再核对冻结的 COM 所有者和模块原始字节后移除锚点。测试不代替产品删除注册；最终由独立新进程连续确认 API 配置／类别为零和所有注册根为空，避免把卸载进程的旧查询视图当作残留。短回归覆盖正常及禁用后卸载、未知状态拒绝、注册失败回滚、替换保留关联和替换失败恢复。短检查失败时不会导入证书、签名或构建安装包。
+专项的授权、停止条件及范围以 [本地 Harness Verify 工作流](../.agents/skills/beaver-4a20fc43577a-harness/references/workflows/verify.md) 为准。现有 Windows 工具支持 tooling、startup、full、diagnose 和 accept-existing 等历史模式；其结果分别保留实际提交、包、组件、账户与执行范围。旧的模拟、安装后启动、完整机制、草稿安装和公开发行记录保持各自身份，不能互相代替，也不能把未执行场景写成通过。
 
-工具通过后使用 `--startup-only --tools-dir <工具目录>` 做安装后启动检查：构建第一份隔离包并实际安装，记录安装器和程序哈希、PID／创建时间、窗口、WebView 进程、退出码及有界标准输出／错误输出。确认原生页面就绪日志后才连接调试端口；再核对实际界面、版本、渠道和提交。程序提前退出立即失败，日志保存在 diagnostics；旧公开版本缺少就绪日志时单独标记旧版检查，候选不使用此兼容路径。第一份包启动通过后才构建第二份，保留不含私钥的 windows-update-packages，绑定提交、隔离身份、HTTPS 端口、公钥、组件及安装器／签名／程序哈希。完整机制验收通过 `--packages-dir <安装包目录>` 复用同一候选产物，仍重新核验实装启动；启动通过不能作为升级通过。GitHub 的 PR 和 phase=ci 运行 CI；普通 push 不触发检查，phase=startup/full/diagnose/controller 为明确手动操作。完整升级验收使用 phase=full 和 reuse_run；发布复用已有成功主线 push 或手动 full 的精确提交证据，只有 CI 的记录不能替代机制结果。每次打包前后重新核对工具哈希，包内组件只来自正式 DLL 目录。所有清理成功后才生成可复用的 `windows-update-evidence`，绑定完整提交、工具哈希、成功机制记录和有界合成数据；不上传签名私钥、证书私钥或凭据值。
-
-正式验收使用 `--stable-installer <草稿回下载包> --mechanism-evidence <同SHA成功证据目录>`，不重建或重跑两份隔离版本。发布流程先严格验签和核对资产身份，再实际安装正式草稿包，覆盖实际旧版并核对原生界面、稳定渠道、完整提交、数据及组件身份。不同候选的工具或机制证据不能互用。
-
-每次执行保存阶段、失败阶段、退出码、信号、超时与工具身份。探针 stdout/stderr 和无密钥的组件／探针 Cargo 构建日志分别有界保存到 `diagnostics` 并上传；涉及签名、证书和模型的完整日志只留在一次性环境的私有 `build.log`，不进入公开验收资产。进程标准流关闭后才结算命令结果。
-
-`node scripts/test-windows-update.mjs` 仅允许已提权的一次性 Windows runner 或明确标记的一次性虚拟机，不能在日常机器仅新建账户后运行。脚本先核验管理员权限，不发起交互提权；合成 HTTPS 根证书有界导入该虚拟机的 LocalMachine/Root，以精确指纹核验并在收尾移除。它从同一候选构建两个隔离版本，经真实 HTTPS、临时签名、NSIS、自动重启核对凭据值与数据。安装启动后的中断由测试主动终止已确认身份的 NSIS 进程树注入，验证旧版重开、资料保持及不自动重试；这与安装器自行报错退出分别记录。测试恢复原安装目录 ACL 后，通过界面再次安装。
-
-旧公开版覆盖检查保留原 SQLite 文件、迁移账本及旧程序创建的模型、默认项、凭据引用和词条，仅按冻结结构追加有界的合成历史／偏好来源。旧程序先读取这些资料，覆盖后再核对内容哈希；已保存密钥通过真实 HTTPS 模型测试验证，报告只保存匹配结果。输入组件在一次性账户实际安装，以注册路径、DLL 哈希和原生输入探针核对保持。所有实际安装包，包括下载的旧版和外部传入的正式草稿包，都记录哈希。正式发行再次回下载并实际安装正式草稿包。不要在日常账户设置一次性标志。
-
-ACL 故障注入固定加载当前 Windows PowerShell 自带的安全模块，采集原始二进制描述符，并在修改前校验恢复命令的容量。恢复后严格比较完整描述符、资源管理控制字节及实际写入能力。Windows 可能增加 `DACL_AUTO_INHERITED`（0x400）；仅允许该位从0变1并单独记录，其他控制位、所有者、组、权限条目和顺序必须一致。原始前后描述符均保留，模块搜索路径或字符串表示差异不能被当成产品安装失败。
-
-记录绑定具体提交、安装器哈希、环境与实际检查项；模拟 UI、原生窗口和真实安装分别留证。数据库009、TSF8及已有资料保持；日常机器不执行此安装验收。
+工具仅用于原先约定的一次性 Windows 环境，不能通过在日常账户设置一次性标志来绕过边界。真实用户数据库、凭据、录音、学习资料及共享组件不进入临时清理范围。正式资产保持不可变。
 
 首发不配置 Windows Authenticode，因此 Windows 可能显示未知发布者；updater 产物签名仍然是强制的信任边界。
 
@@ -76,4 +56,4 @@ ACL 故障注入固定加载当前 Windows PowerShell 自带的安全模块，�
 
 首次安装默认启用，覆盖升级保留启停选择。安装取消、中断或必要维护失败先恢复旧程序及已拥有登记；不能确认时保留待恢复状态和备份。全机组件是共享资源，真正卸载仅删除已核实属于该安装的程序与元数据，用户资料、共享登记/DLL 与启停选择保留。
 
-本段描述新候选的发布契约，不代表安装验收、正式标签或公开发行已经完成。0.1.8 标签与资产保持不可变；新正式版本仍需精确候选的机制证据、独立审查、I2、本地 main 同步，以及草稿回下载/验签/实际安装和发行环境授权。
+本段描述新候选的发布契约，不代表安装验收、正式标签或公开发行已经完成。0.1.8 标签与资产保持不可变；新正式版本仍需精确候选的有效证据、独立审查、I2、本地 main 同步，以及草稿回下载/验签、人工试用和发行环境授权。未覆盖的实际更新场景保持待人工试用。

@@ -34,13 +34,7 @@ Vite 使用 127.0.0.1 的固定端口；端口占用时报错。前端修改热�
 
 ## 检查
 
-```powershell
-npm run check
-npx playwright install chromium
-npm run test:e2e
-```
-
-单项命令及桌面测试见 [测试说明](testing.md)。npm 与 Cargo 锁文件固定依赖；不为每次启动重复安装。
+项目代理的检查分层、范围选择与证据复用见 [本地 Harness Verify 工作流](../.agents/skills/beaver-4a20fc43577a-harness/references/workflows/verify.md)；现有单项命令及桌面工具见 [测试说明](testing.md)。npm 与 Cargo 锁文件固定依赖；不为每次启动重复安装。
 
 ## 构建
 

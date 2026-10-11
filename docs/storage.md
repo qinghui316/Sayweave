@@ -26,8 +26,6 @@ Installer retention uses `.local/storage/installers/<SHA256>/installer.exe`, its
 
 Temporary CI diagnostics retain seven days, reusable tools/packages fourteen days, and compact receipts/evidence thirty days. Download unresolved failure artifacts before runner destruction or expiry. Formal Release assets keep their separate lifecycle.
 
-Controller, documentation or storage changes do not invalidate a signed product merely because the commit changed. Compare affected product files/configuration, retain the original commit and hashes, and record which check actually changed. A native installer, component or release-profile change requires affected product proof. The present dev/test profile change leaves release settings unchanged.
+Validation scope, evidence reuse and trend observation follow the existing [Harness Verify workflow](../.agents/skills/beaver-4a20fc43577a-harness/references/workflows/verify.md). This document records the storage mechanism and configured limits.
 
 Dev/test use `debug=1` and `incremental=true`; full local variable/type debugging is available with `CARGO_PROFILE_DEV_DEBUG=2` and `CARGO_PROFILE_TEST_DEBUG=2`. Cargo documents the debug levels and profile inheritance in the [official profile reference](https://doc.rust-lang.org/cargo/reference/profiles.html). Changing a development profile may cause a one-time cache rebuild; it does not rebuild an existing signed release package.
-
-Space trends and warm compile timings are observed during normal subsequent development. Storage validation uses small isolated fixtures and source/configuration checks; it does not launch an additional large installation or update acceptance solely to measure growth.

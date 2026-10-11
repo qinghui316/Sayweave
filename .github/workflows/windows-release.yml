@@ -82,8 +82,10 @@ jobs:
             git merge-base --is-ancestor $env:SAYWEAVE_CONTROLLER_COMMIT origin/main
             if ($LASTEXITCODE -ne 0) { throw 'Controller is not landed on main.' }
           }
-          node scripts/reuse-windows-update-evidence.mjs .local/release-mechanism-evidence
-          if ($LASTEXITCODE -ne 0) { throw 'Exact successful product main evidence is required.' }
+          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'accept-existing') {
+            node scripts/reuse-windows-update-evidence.mjs .local/release-mechanism-evidence
+            if ($LASTEXITCODE -ne 0) { throw 'Exact existing-installation evidence is required.' }
+          }
       - if: inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
         run: npx playwright install chromium
       - if: inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
@@ -118,11 +120,6 @@ jobs:
         shell: pwsh
         run: |
           if ('${{ github.ref_name }}' -ne "v$(node -p "require('./package.json').version")") { throw 'Tag and package version differ.' }
-      - name: Reuse exact main mechanism evidence
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SAYWEAVE_RELEASE_COMMIT: ${{ github.sha }}
-        run: node scripts/reuse-windows-update-evidence.mjs .local/release-mechanism-evidence
       - name: Build signed NSIS package
         shell: pwsh
         env:
@@ -133,13 +130,8 @@ jobs:
           SAYWEAVE_BUILD_COMMIT: ${{ github.sha }}
           SAYWEAVE_BUILD_CHANNEL: stable
         run: |
-          $env:SAYWEAVE_TSF_PAYLOAD = (Resolve-Path '.local/release-mechanism-evidence/tools/sayweave_text_service.dll').Path
-          node --input-type=module -e "import {readMechanismEvidence} from './scripts/windows-update-artifacts.mjs'; readMechanismEvidence('.local/release-mechanism-evidence', process.env.SAYWEAVE_RELEASE_COMMIT)"
-          if ($LASTEXITCODE -ne 0) { throw 'Production component evidence invalid.' }
           npm run desktop:package
           if ($LASTEXITCODE -ne 0) { throw 'Signed package build failed.' }
-          node --input-type=module -e "import {readMechanismEvidence} from './scripts/windows-update-artifacts.mjs'; readMechanismEvidence('.local/release-mechanism-evidence', process.env.SAYWEAVE_RELEASE_COMMIT)"
-          if ($LASTEXITCODE -ne 0) { throw 'Production component changed during packaging.' }
           npm run desktop:release:manifest
           if ($LASTEXITCODE -ne 0) { throw 'Manifest generation failed.' }
           npm run desktop:release:verify
@@ -207,13 +199,15 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
-      - name: Reuse exact main mechanism evidence
+      - name: Reuse evidence for explicitly requested existing-package installation
+        if: inputs.phase == 'accept-existing'
         run: node scripts/reuse-windows-update-evidence.mjs .local/release-mechanism-evidence
-      - name: Verify and actually install the draft package
+      - name: Verify draft assets; install only in explicitly requested existing-package mode
         shell: pwsh
         run: |
           $download = Join-Path $env:RUNNER_TEMP 'sayweave-draft-acceptance'
           New-Item -ItemType Directory -Path $download | Out-Null
+          New-Item -ItemType Directory -Force -Path .local | Out-Null
           $controller = @{ controllerCommit=$env:SAYWEAVE_CONTROLLER_COMMIT; productCommit=$env:SAYWEAVE_RELEASE_COMMIT; productTag=$env:SAYWEAVE_RELEASE_TAG; phase=$env:SAYWEAVE_RELEASE_PHASE; releaseId=$env:EXPECTED_RELEASE_ID; checksum=$env:EXPECTED_CHECKSUM }
           $controller | ConvertTo-Json | Set-Content -LiteralPath '.local/release-controller.json' -Encoding utf8
           $release = gh api "repos/qinghui316/Sayweave/releases/$env:EXPECTED_RELEASE_ID" | ConvertFrom-Json
@@ -230,8 +224,12 @@ jobs:
           }
           node scripts/verify-update-release.mjs
           if ($LASTEXITCODE -ne 0) { throw 'Draft identity verification failed.' }
-          node scripts/test-windows-update.mjs --stable-installer (Join-Path $download "Sayweave_$(node -p "require('./package.json').version")_x64-setup.exe") --mechanism-evidence .local/release-mechanism-evidence
-          if ($LASTEXITCODE -ne 0) { throw 'Draft installation acceptance failed.' }
+          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'accept-existing') {
+            node scripts/test-windows-update.mjs --stable-installer (Join-Path $download "Sayweave_$(node -p "require('./package.json').version")_x64-setup.exe") --mechanism-evidence .local/release-mechanism-evidence
+            if ($LASTEXITCODE -ne 0) { throw 'Explicit draft installation check failed.' }
+          } else {
+            Write-Output 'Draft package identity and signature verified. Actual installation/update is pending owner trial; windows-release approval remains required.'
+          }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

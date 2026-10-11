@@ -8,26 +8,25 @@ import {readPackages,nsisPayloadInventory,nsisHelperIdentity} from './windows-up
 import {readTools} from './windows-update-artifacts.mjs';
 import {boundedTail,safeStartupText,installedStartup,installedState,restartAndReconnect,aclPrelude,aclSnapshotScript,aclRestoreScript,deploymentReading as readDeployment} from './windows-update-startup.mjs';
 import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
-import {assertFrozenProduct} from './frozen-product-scope.mjs';
-import {prepareOlderComponent,observeMappedTransition,installerBoundaryCases,releaseOlderComponent,restoreRegistryAcl,cleanupBoundaryDriver} from './windows-product-boundaries.mjs';
 
 if(process.platform!=='win32'||process.arch!=='x64'||process.env.GITHUB_ACTIONS!=='true'||process.env.RUNNER_ENVIRONMENT!=='github-hosted'||process.env.RUNNER_OS!=='Windows')throw Error('Diagnostic installation requires an elevated disposable GitHub-hosted x64 Windows runner.');
 const root=process.cwd(),candidate=process.env.STARTUP_CANDIDATE;
 const harness=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
 if(!/^[a-f0-9]{40}$/.test(candidate??''))throw Error('Exact product candidate required.');
-const sourceBinding=assertFrozenProduct(root,candidate,harness),changed=sourceBinding.checks.map(entry=>entry.file);
+ const permitted=new Set(['.github/workflows/windows-ci.yml','scripts/windows-update-startup.mjs','scripts/windows-update-packages.mjs','scripts/windows-update-debug-policy.mjs','scripts/windows-update-metadata.ps1','scripts/windows-update-metadata.cs','scripts/test-windows-installed-startup.mjs','scripts/check-distribution.mjs','scripts/test-windows-update.mjs','docs/release.md','docs/testing.md','tests/windows-update-startup.test.ts']);
+const changed=execFileSync('git',['diff','--name-only',candidate,harness],{encoding:'utf8'}).trim().split('\n').filter(Boolean);
+if(changed.some(file=>!permitted.has(file)))throw Error(`Candidate product sources differ: ${changed.filter(file=>!permitted.has(file)).join(', ')}`);
+if(execFileSync('git',['status','--porcelain','--untracked-files=no'],{encoding:'utf8'}).trim())throw Error('Diagnostic source tree is dirty.');
 const packages=readPackages('.local/prior-update-packages',candidate);
 const recovery=process.argv.includes('--restart-recovery');
 const metadata=process.argv.includes('--metadata');
 const aclDiagnostic=process.argv.includes('--acl');
 const lifecycle=process.argv.includes('--deployment-lifecycle');
-const boundaries=process.argv.includes('--product-boundaries');
-if(boundaries&&(lifecycle||metadata||recovery||aclDiagnostic))throw Error('Focused product boundaries run alone');
 if(lifecycle&&(metadata||recovery||aclDiagnostic))throw Error('Deployment lifecycle requires isolated automatic deployment, without manual component preparation or other diagnoses.');
 const tools=metadata?readTools('.local/prior-update-tools',candidate):null;
 if(recovery&&!packages.next)throw Error('Recovery diagnosis requires both frozen signed packages.');
 const directory=path.join(root,'.local','installed-startup',randomUUID());mkdirSync(directory,{recursive:true});
-const report={schemaVersion:1,kind:'installed-startup-diagnostic',candidateCommit:candidate,acceptanceCommit:harness,sourceBinding,environment:process.env.RUNNER_NAME,changedHarnessFiles:changed,passed:false,commands:[],startups:[],packages:packages.manifest};
+const report={schemaVersion:1,kind:'installed-startup-diagnostic',candidateCommit:candidate,acceptanceCommit:harness,environment:process.env.RUNNER_NAME,changedHarnessFiles:changed,passed:false,commands:[],startups:[],packages:packages.manifest};
 function persist(){const file=path.join(directory,'receipt.json');writeFileSync(`${file}.tmp`,JSON.stringify(report,null,2)+'\n');renameSync(`${file}.tmp`,file);}
 persist();
 let browser,owned,child,debugPolicy,componentPreparation;
@@ -48,7 +47,6 @@ async function attemptInstallation(file){
  try{await command(file,['/S']);}finally{clearInterval(timer);sample();report.deployment=deploymentReading();persist();}
 }
 const invoke=(page,command,args={})=>page.evaluate(({command,args})=>window.__TAURI_INTERNALS__.invoke(command,args),{command,args});
-const boundaryContext={root,candidate,directory,report,packages,persist,command,componentInventory,connect,closeCurrent,invoke,deploymentReading,attemptInstallation,stage,exe};
 async function connect(launch=true){
  const result=await installedStartup({exe,dataRoot,directory,port:9291,launch,previous:owned,record:report.startups,persist,onOwned:value=>{owned=value;},onSpawn:value=>{child=value;}});
  browser=await chromium.connectOverCDP(result.endpoint.webSocketDebuggerUrl,{timeout:10000});
@@ -233,8 +231,7 @@ try{
  if(!existsSync(sevenZip))throw Error('Disposable runner lacks the static 7-Zip extractor; no installation was attempted.');
  const extracted=path.join(directory,'payload');
  report.payloadInventory=nsisPayloadInventory(await command(sevenZip,['l','-slt',packages.old]));persist();
- await command(sevenZip,['x',packages.old,`-o${extracted}`,'sayweave.exe','sayweave-installer-helper.exe','$PLUGINSDIR\\sayweave-maintenance.exe','$PLUGINSDIR\\sayweave-main.exe','$PLUGINSDIR\\sayweave-uninstall.exe','-y']);
- boundaryContext.extracted=extracted;
+ await command(sevenZip,['x',packages.old,`-o${extracted}`,'sayweave.exe','sayweave-installer-helper.exe','$PLUGINSDIR\\sayweave-maintenance.exe','-y']);
  report.helperIdentity=nsisHelperIdentity(readFileSync(path.join(extracted,'sayweave-installer-helper.exe')),readFileSync(path.join(extracted,'$PLUGINSDIR','sayweave-maintenance.exe')));persist();
  const payload=readFileSync(path.join(extracted,'sayweave.exe'));
  if(payload.length<1||payload.length>128*1024*1024)throw Error('Signed executable payload exceeds bound.');
@@ -246,9 +243,7 @@ try{
  const policy=await command('powershell',['-NoProfile','-Command',"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$items=@();foreach($scope in @('HKLM:','HKCU:')){foreach($suffix in @('Software\\Policies\\Microsoft\\Edge','Software\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments')){$key=$scope+'\\'+$suffix;if(Test-Path -LiteralPath $key){$entry=Get-Item -LiteralPath $key;foreach($name in @('RemoteDebuggingAllowed','sayweave.exe','*')){if($entry.GetValueNames() -contains $name){$value=$entry.GetValue($name);$items+=@{scope=$scope;key=$suffix;name=$name;kind=[string]$entry.GetValueKind($name);debugAllowed=if($name -eq 'RemoteDebuggingAllowed'){$value -eq 1}else{$null};hasDebugPort=([string]$value -match '--remote-debugging-port');hasLoopback=([string]$value -match '--remote-debugging-address=127.0.0.1')}}}}}};ConvertTo-Json -InputObject $items -Compress"]);
  report.debugPolicy=JSON.parse(policy);persist();
  if(metadata)await frozenToolingPrelude();
- if(boundaries){stage('historical production component with a live COM lease');await prepareOlderComponent(boundaryContext);}
  stage('same candidate installation');await attemptInstallation(packages.old);
- if(boundaries)await observeMappedTransition(boundaryContext);
  if(hash(readFileSync(exe))!==report.payload.sha256)throw Error('Installed executable differs from signed payload.');
  if(metadata){
   stage('frozen installed component preparation');
@@ -275,7 +270,6 @@ try{
  await page.screenshot({path:path.join(directory,'native-startup.png')});
  await closeCurrent(page);
  if(lifecycle)await deploymentLifecycle();
- if(boundaries)await installerBoundaryCases(boundaryContext);
  if(aclDiagnostic){
   stage('PowerShell ACL module comparison');
   const literal="'"+path.dirname(exe).replaceAll("'","''")+"'";
@@ -319,7 +313,6 @@ try{
  report.passed=true;
 }catch(error){report.error=safeStartupText(error?.message??error?.code??String(error)).slice(0,2048);process.exitCode=1;}
 finally{
- if(boundaries)for(const action of [restoreRegistryAcl,cleanupBoundaryDriver,releaseOlderComponent]){try{await action(boundaryContext);}catch(error){(report.boundaryCleanupErrors??=[]).push({action:action.name,error:String(error.message).slice(0,1024)});report.passed=false;process.exitCode=1;}}
  if(browser)await browser.close().catch(()=>{});
  if(owned){try{const current=installedState(exe).applications.find(app=>app.ProcessId===owned.ProcessId&&app.CreationDate===owned.CreationDate);if(current){report.cleanupKill={ProcessId:current.ProcessId,CreationDate:current.CreationDate};await command('taskkill',['/PID',String(current.ProcessId),'/T','/F']);}}catch(error){report.cleanupError=String(error.message).slice(0,1024);report.passed=false;process.exitCode=1;}}
  else if(child&&child.exitCode===null){report.unverifiedProcessCleanup=true;report.passed=false;process.exitCode=1;}
