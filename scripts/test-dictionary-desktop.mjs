@@ -5,8 +5,9 @@ import {randomUUID} from 'node:crypto';
 import {createWriteStream,existsSync,mkdirSync,writeFileSync,readFileSync,copyFileSync} from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {beginValidation,finishValidation} from './storage-policy.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
-const id=randomUUID();const directory=path.join(root,'.local','data-acceptance',id);mkdirSync(directory,{recursive:true});
+const id=randomUUID(),storageContext=beginValidation(root,{id,kind:'dictionary-desktop'});const directory=path.join(root,'.local','data-acceptance',id);mkdirSync(directory,{recursive:true});
 const exe=path.join(root,'src-tauri','target','release','sayweave.exe');const report={id,checks:[],ipc:[],viewport:null};
 const port=9237;
 const regular=process.argv.includes('--regular');
@@ -76,5 +77,5 @@ try{
   expect(report.largeData.ipcP95Ms).toBeLessThan(100);
   report.checks.push('10000-row actual desktop search: database, queue, IPC and rendered UI timings');report.passed=true;
   }
-}catch(error){report.passed=false;report.error=String(error);process.exitCode=1;}finally{await stop();writeFileSync(path.join(root,'.local',regular?'dictionary-release-report.json':'dictionary-desktop-report.json'),JSON.stringify(report,null,2));}
+}catch(error){report.passed=false;report.error=String(error);process.exitCode=1;}finally{await stop();writeFileSync(path.join(root,'.local',regular?'dictionary-release-report.json':'dictionary-desktop-report.json'),JSON.stringify(report,null,2));report.storage=finishValidation(root,storageContext,report,{processesClosed:!child,credentialsCleared:true});}
 console.log(JSON.stringify(report,null,2));

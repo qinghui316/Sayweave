@@ -9,7 +9,9 @@ import {gzipSync,gunzipSync} from 'node:zlib';
 import {createWriteStream,mkdirSync,readFileSync,writeFileSync,unlinkSync,existsSync} from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {beginValidation,finishValidation} from './storage-policy.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),id=randomUUID();
+const storageContext=beginValidation(root,{id,kind:'speech-desktop'});
 const directory=path.join(root,'.local','data-acceptance',id),data=path.join(directory,'data');mkdirSync(data,{recursive:true});
 const exe=path.join(root,'src-tauri','target','release','desktop-acceptance.exe'),port=9241,key='fixture-'+randomUUID();
 const polishCase=process.argv.find(value=>value.startsWith('--polish-case='))?.slice('--polish-case='.length);
@@ -574,6 +576,7 @@ for(const r of (await invoke(page,'history_list',{query:{search:'',page:1}})).re
  if(browser){const page=browser.contexts().flatMap(c=>c.pages()).find(p=>!p.url().includes('surface=overlay'));await stop(page).catch(()=>stop(null,false));}else await stop(null,false);for(const socket of sockets)socket.destroy();if(server)await new Promise(r=>server.close(r));
  try{await command(['test','--manifest-path','src-tauri/Cargo.toml','--lib','model_desktop_cleanup','--','--ignored']);report.credentialCleanup=true;}catch{report.credentialCleanup=false;report.passed=false;process.exitCode=1;}
  for(const name of ['fixture-ca.der','fixture-ca.pem','fixture-key.pem'])if(existsSync(path.join(data,name)))unlinkSync(path.join(data,name));writeFileSync(path.join(directory,'report.json'),JSON.stringify(report,null,2));writeFileSync(path.join(root,'.local','speech-desktop-report.json'),JSON.stringify(report,null,2));
+ report.storage=finishValidation(root,storageContext,report,{processesClosed:!app,credentialsCleared:report.credentialCleanup===true});
 }
 }
 await run();

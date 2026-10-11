@@ -1,6 +1,7 @@
 import {createHash} from 'node:crypto';
 import {mkdirSync,readFileSync,writeFileSync,lstatSync,realpathSync,existsSync} from 'node:fs';
 import path from 'node:path';
+import {retainInstaller} from './storage-policy.mjs';
 
 const limit=128*1024*1024;
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
@@ -56,6 +57,7 @@ export function writePackages(directory,commit,build,entries,startupProof){
   const bytes=readFileSync(entry.installer),signature=readFileSync(`${entry.installer}.sig`);if(!bytes.length||bytes.length>limit||!signature.length||signature.length>16384)throw Error('Package output exceeds bound');
   for(const [name,data] of [[names[key],bytes],[`${names[key]}.sig`,signature]]){const file=path.join(directory,name);if(existsSync(file)&&lstatSync(file).isSymbolicLink())throw Error('Package output contains a link');writeFileSync(file,data);}
   manifest.artifacts[key]={file:names[key],size:bytes.length,sha256:hash(bytes),signatureSha256:hash(signature),executableSha256:entry.executableSha256};
+  if(directory===path.join(process.cwd(),'.local','windows-update-packages'))manifest.artifacts[key].storage=retainInstaller(process.cwd(),path.join(directory,names[key]),{productCommit:commit,purpose:'immutable acceptance '+key,expectedSha256:hash(bytes)});
  }
  context(manifest,commit);const file=path.join(directory,'packages.json');if(existsSync(file)&&lstatSync(file).isSymbolicLink())throw Error('Package output contains a link');writeFileSync(file,JSON.stringify(manifest,null,2)+'\n');return readPackages(directory,commit);
 }

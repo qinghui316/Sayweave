@@ -6,11 +6,13 @@ import {randomUUID} from 'node:crypto';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {chromium,expect} from '@playwright/test';
+import {beginValidation,finishValidation} from './storage-policy.mjs';
 
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..');
 const local=path.join(root,'.local');
 const resultFile=path.join(local,'language-actor-acceptance.json');
 const report={passed:false,isolatedProfileId:randomUUID()};
+const storageContext=beginValidation(root,{id:report.isolatedProfileId,kind:'language-actor'});
 const port=9254;
 let browser,child,exitCode,stdout='',stderr='';
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
@@ -65,10 +67,8 @@ try {
   expect(report.native.overview).toEqual(actor.overview);
   expect(report.native.details.version).toBe(actor.automaticProfile.version);
   expect(report.native.details.preferences.length).toBe(actor.automaticProfile.rules);
-  await page.getByRole('button',{name:'设置',exact:true}).click();
-  const settings=page.getByRole('dialog',{name:'设置',exact:true});
-  await settings.getByRole('button',{name:'个性化',exact:true}).click();
-  const dashboard=settings.getByRole('region',{name:'个性化数据'});
+  await page.getByRole('link',{name:'个性化',exact:true}).click();
+  const dashboard=page.getByRole('region',{name:'个性化数据'});
   for(const [label,value] of [['已学表达习惯',actor.overview.preferenceCount],['已记录应用',1],['学习记录',3]]){
     await expect(dashboard.getByText(label,{exact:true}).locator('..').locator('strong')).toHaveText(String(value));
   }
@@ -80,7 +80,6 @@ try {
     expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
   }
   report.renderedNativeDashboard=true;
-  await settings.getByRole('button',{name:'关闭',exact:true}).click();
   await page.getByRole('link',{name:'词典',exact:true}).click();
   await expect(page.getByRole('button',{name:'编辑词语 绮蓝',exact:true})).toBeVisible();
   await page.getByRole('button',{name:'更多操作 绮蓝',exact:true}).click();
@@ -109,5 +108,6 @@ finally{
   writeFileSync(path.join(local,'language-actor-desktop.log'),stdout,'utf8');
   writeFileSync(path.join(local,'language-actor-desktop-errors.log'),stderr,'utf8');
   writeFileSync(path.join(local,'language-actor-webview.json'),JSON.stringify(report,null,2),'utf8');
+  report.storage=finishValidation(root,storageContext,report,{processesClosed:exitCode!==undefined,credentialsCleared:report.actor?.temporaryCredentialCleaned===true});
 }
 console.log(JSON.stringify({passed:report.passed,error:report.error,renderedNativeDashboard:report.renderedNativeDashboard,nativeDictionaryDelete:report.nativeDictionaryDelete}));

@@ -6,7 +6,9 @@ import {createServer} from 'node:https';
 import {createWriteStream,mkdirSync,readFileSync,writeFileSync,unlinkSync,existsSync} from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
+import {beginValidation,finishValidation} from './storage-policy.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),id=randomUUID();
+const storageContext=beginValidation(root,{id,kind:'models-desktop'});
 const directory=path.join(root,'.local','data-acceptance',id),data=path.join(directory,'data');
 mkdirSync(data,{recursive:true});
 const exe=path.join(root,'src-tauri','target','release','sayweave.exe'),port=9239;
@@ -150,6 +152,7 @@ try{
  if(server){server.closeAllConnections();await new Promise(r=>server.close(r));}
  for(const name of ['fixture-ca.der','fixture-ca.pem','fixture-key.pem'])if(existsSync(path.join(data,name)))unlinkSync(path.join(data,name));
  writeFileSync(path.join(directory,'report.json'),JSON.stringify(report,null,2));writeFileSync(path.join(root,'.local',regular?'models-release-report.json':'models-desktop-report.json'),JSON.stringify(report,null,2));
+ report.storage=finishValidation(root,storageContext,report,{processesClosed:!app,credentialsCleared:regular||report.credentialCleanup===true});
 }
 
 console.log(JSON.stringify(report,null,2));
