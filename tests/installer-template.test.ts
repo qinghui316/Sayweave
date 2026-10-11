@@ -23,6 +23,9 @@ describe('installer ownership and ordering',()=>{
   expect(install.indexOf('--sayweave-installer=commit')).toBeGreaterThan(install.indexOf('WriteRegStr SHCTX "${UNINSTKEY}" "DisplayVersion"'));
   expect(install).not.toContain('CheckIfAppIsRunning');
   expect(install).not.toContain('Delete "$INSTDIR\\$OldMainBinaryName"');
+  expect(install).not.toContain('File /a "/oname={{this}}"');
+  expect(install).toContain('Additional Cargo binaries require an explicit installer ownership contract.');
+  expect(template).toContain('owns the fixed sayweave.exe main binary.');
   expect(template).not.toContain("ExecWait '$R1'");
  });
  it('routes true uninstall through the locked controller with no second destructive pass',()=>{

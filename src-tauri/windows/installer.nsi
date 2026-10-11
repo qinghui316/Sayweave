@@ -52,6 +52,9 @@ ${StrLoc}
 !define UNINSTALLERHEADERIMAGE "{{uninstaller_header_image}}"
 !define MAINBINARYNAME "{{main_binary_name}}"
 !define MAINBINARYSRCPATH "{{main_binary_path}}"
+!if "${MAINBINARYNAME}" != "sayweave"
+  !error "Sayweave transaction owns the fixed sayweave.exe main binary."
+!endif
 !define BUNDLEID "{{bundle_id}}"
 !define COPYRIGHT "{{copyright}}"
 !define OUTFILE "{{out_file}}"
@@ -531,9 +534,20 @@ Section Install
     File /a "/oname={{this.[1]}}" "{{no-escape @key}}"
   {{/each}}
 
-  ; Copy external binaries
+  ; Cargo tool binaries are build inputs, outside the owned install manifest.
+  ; The maintenance resource above is the sole installed helper.
   {{#each binaries}}
-    File /a "/oname={{this}}" "{{no-escape @key}}"
+    !if "{{this}}" != "sayweave-installer-helper.exe"
+    !if "{{this}}" != "verify-update-signature.exe"
+    !if "{{this}}" != "desktop-acceptance.exe"
+    !if "{{this}}" != "input-acceptance.exe"
+    !if "{{this}}" != "input-fixture.exe"
+      !error "Additional Cargo binaries require an explicit installer ownership contract."
+    !endif
+    !endif
+    !endif
+    !endif
+    !endif
   {{/each}}
 
   ; Create file associations

@@ -7,7 +7,7 @@ import {afterEach,describe,expect,it,vi} from 'vitest';
 // @ts-expect-error JavaScript acceptance module has no declaration file.
 import {boundedTail,safeStartupText,pageReady,validateEndpoint,installedStartup,launchEnvironment,restartAndReconnect,aclPrelude,aclRestoreScript,deploymentSummary} from '../scripts/windows-update-startup.mjs';
 // @ts-expect-error JavaScript acceptance module has no declaration file.
-import {readPackages,writePackages,nsisExecutableIdentity} from '../scripts/windows-update-packages.mjs';
+import {readPackages,writePackages,nsisExecutableIdentity,nsisPayloadInventory,nsisHelperIdentity} from '../scripts/windows-update-packages.mjs';
 // @ts-expect-error JavaScript acceptance module has no declaration file.
 import {validateDebugPolicyState,debugPolicyScript,prepareDisposableDebugPolicy} from '../scripts/windows-update-debug-policy.mjs';
 
@@ -17,6 +17,16 @@ function directory(){const dir=mkdtempSync(path.join(os.tmpdir(),'sayweave-start
 function packages(){const input=directory(),file=path.join(input,'setup.exe');writeFileSync(file,'same installer');writeFileSync(`${file}.sig`,'same signature');const output=directory();writePackages(output,commit,context,{old:{installer:file,executableSha256:'c'.repeat(64)}},{passed:true});return output;}
 afterEach(()=>{for(const dir of directories.splice(0))rmSync(dir,{recursive:true,force:true});});
 describe('installed startup diagnostics and immutable package reuse',()=>{
+ it('refuses duplicate or unrelated installed NSIS binaries before any installation',()=>{
+  const paths=['sayweave.exe','sayweave-installer-helper.exe','uninstall.exe','$PLUGINSDIR\\sayweave-main.exe','$PLUGINSDIR\\sayweave-maintenance.exe','$PLUGINSDIR\\sayweave-uninstall.exe'];
+  const listing=(names:string[])=>'Path = C:\\setup.exe\nType = Nsis\n\n----------\n'+names.map(name=>'Path = '+name+'\nSize = 1\n').join('\n');
+  expect(nsisPayloadInventory(listing(paths)).installed).toEqual(['sayweave-installer-helper.exe','sayweave.exe','uninstall.exe']);
+  for(const names of [[...paths,'sayweave-installer-helper.exe'],[...paths,'verify-update-signature.exe'],[...paths,'$PLUGINSDIR\\..\\outside'],paths.slice(0,5)])expect(()=>nsisPayloadInventory(listing(names))).toThrow();
+  expect(()=>nsisPayloadInventory(listing(paths).replace('----------','other'))).toThrow();
+  const helper=Buffer.from('MZfixed helper');expect(nsisHelperIdentity(helper,Buffer.from(helper)).helperSize).toBe(helper.length);
+  expect(()=>nsisHelperIdentity(helper,Buffer.from('MZrebuilt helper'))).toThrow('differ');
+  expect(()=>nsisHelperIdentity(helper,helper,Buffer.from('MZdifferent frozen helper'))).toThrow('differ');
+ });
  it('projects bounded deployment metadata and excludes nested secrets and registry values',()=>{
   const result=deploymentSummary({schemaVersion:1,transaction:uuid,phase:'recovery',target:{version:'0.1.700',commit,payloadHash:'b'.repeat(64),credential:'hidden'},installer:{pid:42,session:1,created:1000,sid:'S-1-5-21-123',imageHash:'c'.repeat(64),credential:'hidden'},server:{pid:'hidden'},userChoice:false,error:'password=hidden',lastFailure:{phase:'programInstalled',code:'installerCommitFailed',extra:'hidden'},files:[{path:'C:\\owned\\sayweave.exe',backup:'main',bytes:'hidden'}],keys:[{path:'Software\\owned',existed:true,values:[{name:'hidden',bytes:'hidden'}]}]});
   expect(result).toMatchObject({phase:'recovery',userChoice:false,error:null,target:{version:'0.1.700',commit},installer:{pid:42},server:{pid:null},keys:[{valueCount:1}],lastFailure:{phase:'programInstalled',code:'installerCommitFailed'}});
