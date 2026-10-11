@@ -52,6 +52,50 @@ async function componentInventory(timeout=180000){
  if(Object.keys(inventory).sort().join(',')!=='HKEY_CURRENT_USER,HKEY_LOCAL_MACHINE'||Object.values(inventory).some(item=>typeof item.com!=='boolean'||typeof item.tip!=='boolean'))throw Error('Fixed-class inventory shape differs');
  return inventory;
 }
+// Windows SDK TF_IPP_FLAG_ENABLED=2; active=1 is not required for readiness.
+function profileReady(reading){
+ const q=reading.query,p=q.managerProfiles;
+ return q.class==='CB473CF0-9B4C-482C-BFC2-5527D2379ACA'&&q.expectedProfile==='6CD26440-E770-471E-8212-B5A565E816F5'&&p.length===1&&p[0].clsid===q.class&&p[0].profile===q.expectedProfile&&p[0].category==='B5A73CD1-8355-426B-A161-259808F26B14'&&p[0].type===1&&p[0].language===q.legacyLanguage&&(p[0].flags&2)===2&&q.categories.length===1&&q.categories[0]===p[0].category&&reading.inventory.HKEY_LOCAL_MACHINE.com&&reading.inventory.HKEY_LOCAL_MACHINE.tip&&!reading.inventory.HKEY_CURRENT_USER.com;
+}
+async function activationReading(timeout=180000){
+ const started=Date.now(),query=JSON.parse(await command(tools.probe,['registration-query-detail'],timeout));
+ const inventory=await componentInventory(Math.max(1,timeout-(Date.now()-started)));
+ return {startedAt:new Date(started).toISOString(),elapsedMs:Date.now()-started,query,inventory};
+}
+async function installedActivation(label,module){
+ const started=Date.now(),result={label,passed:false,startedAt:new Date().toISOString()};
+ try{await command(tools.probe,['installed-fixture',module],30000);result.passed=true;}
+ catch(error){result.error=safeStartupText(error.message).slice(0,2048);}
+ result.elapsedMs=Date.now()-started;return result;
+}
+async function registeredComparison(module,activation){
+ const started=Date.now(),deadline=started+10000,samples=[];let stable=0;
+ activation.readiness={samples};persist();
+ do{
+  const reading=await activationReading(Math.max(1,deadline-Date.now())),ready=profileReady(reading);
+  samples.push({elapsedMs:Date.now()-started,ready,...reading});persist();
+  stable=ready?stable+1:0;
+  if(stable===2&&Date.now()<=deadline){activation.afterReadiness=await installedActivation('after observed registration readiness',module);activation.passed=activation.passed&&activation.afterReadiness.passed;persist();return;}
+  await new Promise(resolve=>setTimeout(resolve,Math.max(0,Math.min(250,deadline-Date.now()))));
+ }while(Date.now()<deadline);
+ throw Error('Registered profile readiness did not settle; see fixed identity samples');
+}
+async function frozenToolingPrelude(){
+ stage('same VM frozen product six-case prelude');
+ const productRoot=path.join(directory,'product-prelude');
+ if(path.relative(directory,productRoot)!=='product-prelude'||existsSync(productRoot))throw Error('Disposable prelude path differs');
+ await command('git',['worktree','add','--detach',productRoot,candidate]);
+ if((await command('git',['-C',productRoot,'rev-parse','HEAD'])).trim()!==candidate)throw Error('Prelude checkout differs from frozen product');
+ const proofFile=path.join(productRoot,'.local/windows-update-acceptance.json'),prelude=report.toolingPrelude={commit:candidate,componentSha256:tools.manifest.artifacts.component.sha256,passed:false};persist();
+ let failure;
+ try{await command(process.execPath,[path.join(productRoot,'scripts/test-windows-update.mjs'),'--tools-only','--tools-dir',path.resolve('.local/prior-update-tools')],180000,productRoot);}
+ catch(error){failure=error;prelude.error=safeStartupText(error.message).slice(0,2048);persist();}
+ try{if(existsSync(proofFile)){const bytes=readFileSync(proofFile);if(bytes.length>4*1024*1024)throw Error('Prelude receipt exceeds bound');const proof=JSON.parse(bytes);writeFileSync(path.join(directory,'tooling-prelude.receipt.log'),bytes);prelude.receipt={file:'tooling-prelude.receipt.log',sha256:createHash('sha256').update(bytes).digest('hex'),size:bytes.length};prelude.checks=proof.checks;prelude.passed=proof.commit===candidate&&proof.kind==='tools'&&proof.passed&&proof.checks.length===6&&!(proof.cleanupErrors??[]).length;persist();}}
+ catch(error){prelude.receiptError=safeStartupText(error.message).slice(0,2048);persist();if(!failure)throw error;}
+ if(failure)throw failure;
+ if(!prelude.passed)throw Error('Frozen same-VM tooling prelude failed');
+ // Retain this disposable checkout and its evidence until the runner is discarded.
+}
 async function cleanupComponent(){
  const registered=execFileSync('powershell',['-NoProfile','-Command',"$key=Get-Item -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}\\InprocServer32' -ErrorAction Stop;@{module=$key.GetValue('');owner=$key.GetValue('SayweaveOwner')}|ConvertTo-Json -Compress"],{encoding:'utf8'});
  const identity=JSON.parse(registered),expected=path.join(process.env.ProgramFiles,'Sayweave','TextService',tools.manifest.artifacts.component.sha256,'sayweave_text_service.dll');
@@ -71,11 +115,11 @@ async function cleanupComponent(){
  }while(Date.now()<deadline);
  throw Error('Prepared component cleanup did not settle; see bounded independent-process samples');
 }
-async function command(file,args,timeout=180000){
+async function command(file,args,timeout=180000,cwd=root){
  if(!Number.isSafeInteger(timeout)||timeout<1||timeout>180000)throw Error('Diagnostic command timeout exceeds bound');
  const entry={tool:path.basename(file),args,stage:report.stage,startedAt:new Date().toISOString()};report.commands.push(entry);persist();
  let stdout=Buffer.alloc(0),stderr=Buffer.alloc(0),error;
- const processChild=spawn(file,args,{cwd:root,windowsHide:true,stdio:['ignore','pipe','pipe'],timeout});
+ const processChild=spawn(file,args,{cwd,windowsHide:true,stdio:['ignore','pipe','pipe'],timeout});
  entry.pid=processChild.pid;entry.timeoutMs=timeout;persist();
  processChild.stdout.on('data',bytes=>{stdout=boundedTail(stdout,bytes);});processChild.stderr.on('data',bytes=>{stderr=boundedTail(stderr,bytes);});processChild.once('error',value=>{error=value;});
  const started=Date.now();entry.exitCode=await new Promise(resolve=>processChild.once('close',resolve));entry.elapsedMs=Date.now()-started;
@@ -111,10 +155,11 @@ try{
  stage('read-only WebView policy diagnostic');
  const policy=await command('powershell',['-NoProfile','-Command',"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$items=@();foreach($scope in @('HKLM:','HKCU:')){foreach($suffix in @('Software\\Policies\\Microsoft\\Edge','Software\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments')){$key=$scope+'\\'+$suffix;if(Test-Path -LiteralPath $key){$entry=Get-Item -LiteralPath $key;foreach($name in @('RemoteDebuggingAllowed','sayweave.exe','*')){if($entry.GetValueNames() -contains $name){$value=$entry.GetValue($name);$items+=@{scope=$scope;key=$suffix;name=$name;kind=[string]$entry.GetValueKind($name);debugAllowed=if($name -eq 'RemoteDebuggingAllowed'){$value -eq 1}else{$null};hasDebugPort=([string]$value -match '--remote-debugging-port');hasLoopback=([string]$value -match '--remote-debugging-address=127.0.0.1')}}}}}};ConvertTo-Json -InputObject $items -Compress"]);
  report.debugPolicy=JSON.parse(policy);persist();
+ if(metadata)await frozenToolingPrelude();
  stage('same candidate installation');await command(packages.old,['/S']);
  if(hash(readFileSync(exe))!==report.payload.sha256)throw Error('Installed executable differs from signed payload.');
  if(metadata){
-  stage('frozen ordinary component metadata characterization');
+  stage('frozen installed component preparation');
   const sid=execFileSync('powershell',['-NoProfile','-Command','[Security.Principal.WindowsIdentity]::GetCurrent().User.Value'],{encoding:'utf8'}).trim();
   const prestate=execFileSync('powershell',['-NoProfile','-Command',"$ErrorActionPreference='Stop';foreach($root in @('HKCU:','HKLM:')){foreach($key in @('Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}','Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}')){if(Test-Path -LiteralPath ($root+'\\'+$key)){throw 'Existing component registration'}}};'empty'"],{encoding:'utf8'}).trim();
   if(prestate!=='empty'||tools.manifest.artifacts.component.sha256!==packages.manifest.componentSha256)throw Error('Metadata component prestate/identity differs');
@@ -122,13 +167,14 @@ try{
   await command(exe,['--sayweave-text-service=install',`--initiator=${sid}`]);
   const module=execFileSync('powershell',['-NoProfile','-Command',"(Get-Item -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}\\InprocServer32').GetValue('')"],{encoding:'utf8'}).trim();
   componentPreparation.module=module;componentPreparation.sha256=hash(readFileSync(module));if(componentPreparation.sha256!==tools.manifest.artifacts.component.sha256)throw Error('Prepared module differs from frozen tooling');persist();
+  stage('frozen installed component activation characterization');
+  const activation=report.componentActivation={passed:false,before:await activationReading()};activation.before.ready=profileReady(activation.before);persist();
+  activation.immediate=await installedActivation('first activation after minimal fixed identity sample',module);activation.passed=activation.immediate.passed;persist();
+  activation.after=await activationReading();persist();
+  if(!activation.before.ready||!activation.immediate.passed)await registeredComparison(module,activation);
+  stage('frozen ordinary component metadata characterization after activation');
   await command('powershell',['-NoProfile','-ExecutionPolicy','Bypass','-File','scripts/windows-update-metadata.ps1','-ExpectedCommit',harness,'-ProductCommit',candidate,'-ExpectedModulePath',module,'-ExpectedComponentSha256',tools.manifest.artifacts.component.sha256]);
   report.metadataCharacterized=true;persist();
-  stage('frozen installed component activation characterization');
-  const activation=report.componentActivation={passed:false,before:{inventory:await componentInventory(),query:JSON.parse(await command(tools.probe,['registration-query-detail']))}};persist();
-  try{await command(tools.probe,['installed-fixture',module],30000);activation.passed=true;}
-  catch(error){activation.error=safeStartupText(error.message).slice(0,2048);}
-  finally{activation.after={inventory:await componentInventory(),query:JSON.parse(await command(tools.probe,['registration-query-detail']))};persist();}
  }
  stage('temporary elevated WebView debug policy');
  debugPolicy=prepareDisposableDebugPolicy(9291);report.debugPolicyLease=debugPolicy.receipt;persist();debugPolicy.install();persist();
