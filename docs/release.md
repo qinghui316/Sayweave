@@ -36,7 +36,7 @@ Sayweave 的源码开发使用 `main` 和短期功能分支；正式发布使用
 
 同一 release 控制标签中的检查、签名构建及失败续跑复用 Cargo 热缓存。注册表缓存只含公开 crates.io 的 index/cache/src；编译缓存只含主程序与输入组件 target 中分别位于 debug/release 的 deps、build、.fingerprint、incremental。不缓存 Cargo 凭据或配置、用户目录、.local、录音、数据库、安装包及整个工程。
 
-编译兼容前缀绑定实际 rustc/cargo、Windows x64 MSVC、runner 镜像、Cargo 配置及构建 flags/profile；精确键追加两个 Cargo.lock、原生源码与构建渠道身份。工具链、平台或编译配置变化隔离缓存；锁文件或源码变化可恢复兼容依赖，但仍由 Cargo 指纹和 locked 依赖解析决定重编译。控制提交 SHA 本身不影响键。缓存保存安排在 Release API 失败也能收尾的位置，且不清空本地热缓存。GitHub 缓存按 ref 与默认分支隔离：不同发布标签之间不保证命中，不为预热新建普通 main CI；实际命中、恢复键及耗时记录于必要发布日志。[GitHub 缓存边界](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
+编译兼容前缀绑定实际 rustc/cargo、Windows x64 MSVC、runner 镜像、Cargo 配置及构建 flags/profile；精确键追加两个 Cargo.lock、原生源码与构建渠道身份。工具链、平台或编译配置变化隔离缓存；锁文件或源码变化可恢复兼容依赖，但仍由 Cargo 指纹决定重编译。主程序在包装前用 metadata --locked 核对锁文件，组件和验签工具用 build --locked；包装沿用冻结产品原入口，完成后强制回读干净源码及锁文件，不能把解析结果变化当缓存命中跳过。控制提交 SHA 本身不影响键。缓存保存安排在 Release API 失败也能收尾的位置，且不清空本地热缓存。GitHub 缓存按 ref 与默认分支隔离：不同发布标签之间不保证命中，不为预热新建普通 main CI；实际命中、恢复键及耗时记录于必要发布日志。[GitHub 缓存边界](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
 
 签名构建后只编译一次现有完整 Rust/minisign 验证器，使用同一 release 依赖缓存。工具及独立版本化回执作为 `release-verifier-<tag>-<完整产品提交>` CI artifact 保存十四天。回执绑定原产品提交、原生 Git 源码身份、工具链、平台、profile、features、构建配置、可信 workflow 生产 run 与工具大小/SHA-256。后续上传前、草稿回下载、资产检查及发行审核阶段复用该工具；来源、配置、哈希或资产异常时拒绝执行，不退回冷编译。工具及回执不进入正式五项 Release 资产。
 
