@@ -16,13 +16,13 @@ Sayweave 的源码开发使用 `main` 和短期功能分支；正式发布使用
 
 发布构建需要 `TAURI_SIGNING_PRIVATE_KEY` 和 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。私钥只放在受保护的 GitHub Environment 或本机受控目录，不能提交到仓库。
 
-`desktop:package` 生成 Windows x64 NSIS 安装程序和 Tauri updater 签名。`desktop:release:manifest` 生成 GitHub Releases 使用的 `latest.json`、校验清单和 release receipt；`desktop:release:verify` 会重新核对版本、tag、下载地址、签名、安装包大小和 SHA-512。
+`desktop:package` 生成 Windows x64 NSIS 安装程序和 Tauri updater 签名。`desktop:release:manifest` 生成 GitHub Releases 使用的 `latest.json`、校验清单和 release receipt；`desktop:release:verify` 会重新核对版本、tag、下载地址、签名、安装包大小和 SHA-512。它直接调用已记录的 `verify-update-signature.exe`，不再通过 `cargo run` 编译应用。首次使用先在同一干净正式源码及 stable 环境中执行 `node scripts/verify-update-release.mjs build-tool`，后续复用 `SAYWEAVE_VERIFIER_DIR`（默认 `release/verifier`）中的工具及回执。
 
 ## GitHub 发布
 
 面向 `main` 的独立 CI ruleset 要求 GitHub Actions 的 `CI` 检查通过，并为仓库所有者保留日常直推例外。现有对管理员生效的线性历史、禁止强推和禁止删除保护继续执行。所有者例外仅用于主线直推；外部 PR 合入前仍须等待 CI 通过。正式 `v*` 标签触发独立发布流程，`v*-release-check-*` 诊断标签仍从自动发布中排除。
 
-日常源码合入与同步按已有 Harness 执行。当前普通 CI 由 PR 或明确手动请求触发，main 推送不运行普通 CI。正式标签流程核对源码、构建签名包并创建不可变草稿，回下载后校验资产身份与完整签名。windows-signing 和 windows-release 两处环境授权保持；后者由所有者在人工试用后审核。默认发布不执行实际安装；已有 accept-existing 模式仅用于明确请求的固定草稿安装专项。
+日常源码合入与同步按已有 Harness 执行。当前普通 CI 由 PR 或明确手动请求触发，main 推送不运行普通 CI。正式标签流程核对源码，先核对 owner 已创建的精确草稿及发布权限，再构建签名包；包保全后上传至该草稿，回下载校验资产身份与完整签名。windows-signing 和 windows-release 两处环境授权保持；后者由所有者在人工试用后审核。默认发布不执行实际安装；已有 accept-existing 模式仅用于明确请求的固定草稿安装专项。
 
 资产恰好为安装器、`.sig`、`latest.json`、`release-receipt.json` 和 `SHA256SUMS.txt`。校验清单必须覆盖前四份资产，缺项、重复、额外文件、越界路径、错误提交和外部下载 URL 均拒绝。客户端与发布验证器共用完整 minisign 签名及受签名版本校验。发布说明由结构化文件生成可读 Markdown，与应用内说明一致。
 
@@ -30,7 +30,23 @@ Sayweave 的源码开发使用 `main` 和短期功能分支；正式发布使用
 
 已发布的 tag 和 Release 资产不覆盖。发现问题时撤回 Latest，并从新的更高 patch 版本发布修复，不自动降级用户。
 
-`build-frozen` 的草稿由现有 owner 发布授权预先创建，传入精确 `release_id`；CI 在构建前及上传前核对同一标签、完整产品提交、未公开状态及空资产，上传不使用 clobber。GitHub 对相对默认分支修改工作流的目标提交要求 workflow 权限，CI 的 GITHUB_TOKEN 不支持此权限；owner 创建草稿解决这一边界，不把 owner 凭据交给 CI。签名资产在 Release 操作前保全十四天，失败包诊断保留七天。
+草稿由现有 owner 发布授权预先创建；`build-frozen` 传入精确 `release_id`，普通标签构建可按标签发现唯一草稿。CI 用具备 contents:write 的发布 job 在构建前读取并核对同一标签、完整产品提交、未公开状态及空资产，缺少权限或已有保全包时拒绝构建。GitHub 对相对默认分支修改工作流的目标提交要求 workflow 权限，CI 的 GITHUB_TOKEN 不支持此权限；owner 创建草稿解决这一边界，不把 owner 凭据交给 CI。
+
+### Cargo 与验签工具复用
+
+同一 release 控制标签中的检查、签名构建及失败续跑复用 Cargo 热缓存。注册表缓存只含公开 crates.io 的 index/cache/src；编译缓存只含主程序与输入组件 target 中分别位于 debug/release 的 deps、build、.fingerprint、incremental。不缓存 Cargo 凭据或配置、用户目录、.local、录音、数据库、安装包及整个工程。
+
+编译兼容前缀绑定实际 rustc/cargo、Windows x64 MSVC、runner 镜像、Cargo 配置及构建 flags/profile；精确键追加两个 Cargo.lock、原生源码与构建渠道身份。工具链、平台或编译配置变化隔离缓存；锁文件或源码变化可恢复兼容依赖，但仍由 Cargo 指纹和 locked 依赖解析决定重编译。控制提交 SHA 本身不影响键。缓存保存安排在 Release API 失败也能收尾的位置，且不清空本地热缓存。GitHub 缓存按 ref 与默认分支隔离：不同发布标签之间不保证命中，不为预热新建普通 main CI；实际命中、恢复键及耗时记录于必要发布日志。[GitHub 缓存边界](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
+
+签名构建后只编译一次现有完整 Rust/minisign 验证器，使用同一 release 依赖缓存。工具及独立版本化回执作为 `release-verifier-<tag>-<完整产品提交>` CI artifact 保存十四天。回执绑定原产品提交、原生 Git 源码身份、工具链、平台、profile、features、构建配置、可信 workflow 生产 run 与工具大小/SHA-256。后续上传前、草稿回下载、资产检查及发行审核阶段复用该工具；来源、配置、哈希或资产异常时拒绝执行，不退回冷编译。工具及回执不进入正式五项 Release 资产。
+
+### 包保全与同包续发
+
+签名包及清单生成后立即保全为 `release-package-<tag>-<完整产品提交>` artifact，保存十四天；构建失败的现有 bundle 诊断保留七天。保全失败阻止 Release 操作。包已存在时，任何上传、权限、回下载或公开失败都继续使用这些原始字节，不重新打包。预构建只读权限/草稿查询发生在包产生前；包产生后的 Release 读写均排在持久保全之后。完整签名检查仍在上传前及每次回下载执行。
+
+`resume-package` 提供原 `release_tag`、`release_commit`、`release_id`、`checksum_sha256`、`package_run_id` 和有效 `verification_run_id`，从已审、合入的匹配诊断控制标签运行。生产 run 必须属于本仓库本 release 工作流，确实成功构建并保全包/工具，且控制源码在主线上；两份 artifact 必须存在且未过期。恢复模式不安装依赖、编译程序、构建工具或重新打包，只核对来源、完整签名及所有资产后续传缺项。已经上传的每份资产须名称、大小和 GitHub SHA-256 digest 完全匹配；重复、外来、损坏、半上传或已公开资产拒绝处理，绝不 clobber。
+
+本次 `v0.1.9` 原产品 `784e43172780255e83d5b652507c7bec666ff859` 的 run `38251026083` 已完成签名及完整验签，但保全缺失、runner 已结束、artifact 为零、owner 草稿为空。其包确实丢失，完整五项流水线修复审查/I2 后允许替代构建一次；后续重试复用这份替代包。历史同版本或其他提交包不充当该候选。
 
 明确指定 `verification_run_id` 时，只复用同仓库、已完成、准确诊断控制标签的成功 verify job；原产品、本地及远端控制提交必须匹配，完整 check、已审全套 E2E 和分发步骤都须成功，两个已审 E2E 文件的 Git 字节必须相同。任一事实变化或缺失均拒绝复用；未指定时仍执行现有完整检查。后续创建草稿或权限失败不会改写此前独立通过的产品检查，也不触发仅因控制 SHA 变化的重复验收。
 

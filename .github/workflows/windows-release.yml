@@ -9,7 +9,7 @@ on:
     inputs:
       phase:
         type: choice
-        options: [build, build-frozen, check-access, accept-existing]
+        options: [build, build-frozen, resume-package, check-access, accept-existing]
         default: build
         description: Build a release or resume the exact immutable draft
       release_tag:
@@ -32,6 +32,10 @@ on:
         type: string
         default: ''
         description: Successful exact-product verify job to reuse for a frozen build
+      package_run_id:
+        type: string
+        default: ''
+        description: Exact retained signed package and verifier producer for resume-package
 
 permissions:
   contents: read
@@ -42,11 +46,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SAYWEAVE_RELEASE_TAG: ${{ (inputs.phase == 'build-frozen' || inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_tag || github.ref_name }}
-  SAYWEAVE_RELEASE_COMMIT: ${{ (inputs.phase == 'build-frozen' || inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_commit || github.sha }}
+  SAYWEAVE_RELEASE_TAG: ${{ (inputs.phase == 'build-frozen' || inputs.phase == 'resume-package' || inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_tag || github.ref_name }}
+  SAYWEAVE_RELEASE_COMMIT: ${{ (inputs.phase == 'build-frozen' || inputs.phase == 'resume-package' || inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_commit || github.sha }}
   SAYWEAVE_CONTROLLER_COMMIT: ${{ github.sha }}
   SAYWEAVE_CONTROLLER_REF: ${{ github.ref }}
   SAYWEAVE_RELEASE_PHASE: ${{ inputs.phase || 'build' }}
+  SAYWEAVE_PACKAGE_RUN: ${{ inputs.package_run_id }}
 
 jobs:
   verify:
@@ -59,23 +64,41 @@ jobs:
           EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
           EXPECTED_CHECKSUM: ${{ inputs.checksum_sha256 }}
           VERIFICATION_RUN: ${{ inputs.verification_run_id }}
+          PACKAGE_RUN: ${{ inputs.package_run_id }}
         run: |
-          if ($env:SAYWEAVE_RELEASE_PHASE -notin @('build','build-frozen','check-access','accept-existing')) { throw 'Unknown release phase.' }
+          if ($env:SAYWEAVE_RELEASE_PHASE -notin @('build','build-frozen','resume-package','check-access','accept-existing')) { throw 'Unknown release phase.' }
           if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen' -and ($env:SAYWEAVE_RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$' -or $env:SAYWEAVE_RELEASE_COMMIT -notmatch '^[a-f0-9]{40}$' -or $env:SAYWEAVE_CONTROLLER_REF -notmatch "^refs/tags/$([regex]::Escape($env:SAYWEAVE_RELEASE_TAG))-release-check-[a-z0-9][a-z0-9.-]*$" -or $env:EXPECTED_RELEASE_ID -notmatch '^[1-9]\d*$' -or $env:EXPECTED_CHECKSUM)) { throw 'Exact frozen product, empty owner draft and diagnostic controller identities are required.' }
-          if ($env:VERIFICATION_RUN -and ($env:SAYWEAVE_RELEASE_PHASE -ne 'build-frozen' -or $env:VERIFICATION_RUN -notmatch '^[1-9]\d*$')) { throw 'Verification reuse is restricted to an exact frozen build.' }
+          if ($env:VERIFICATION_RUN -and ($env:SAYWEAVE_RELEASE_PHASE -notin @('build-frozen','resume-package') -or $env:VERIFICATION_RUN -notmatch '^[1-9]\d*$')) { throw 'Verification reuse is restricted to an exact frozen build.' }
           if ($env:SAYWEAVE_RELEASE_PHASE -in @('check-access','accept-existing') -and ($env:SAYWEAVE_RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$' -or $env:SAYWEAVE_RELEASE_COMMIT -notmatch '^[a-f0-9]{40}$' -or $env:EXPECTED_RELEASE_ID -notmatch '^[1-9]\d*$' -or $env:EXPECTED_CHECKSUM -notmatch '^[a-f0-9]{64}$')) { throw 'Exact existing-draft identities are required.' }
+          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'resume-package' -and ($env:SAYWEAVE_RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$' -or $env:SAYWEAVE_RELEASE_COMMIT -notmatch '^[a-f0-9]{40}$' -or $env:SAYWEAVE_CONTROLLER_REF -notmatch "^refs/tags/$([regex]::Escape($env:SAYWEAVE_RELEASE_TAG))-release-check-[a-z0-9][a-z0-9.-]*$" -or $env:EXPECTED_RELEASE_ID -notmatch '^[1-9]\d*$' -or $env:EXPECTED_CHECKSUM -notmatch '^[a-f0-9]{64}$' -or $env:PACKAGE_RUN -notmatch '^[1-9]\d*$' -or $env:VERIFICATION_RUN -notmatch '^[1-9]\d*$')) { throw 'Exact retained package/tool and verification identities required.' }
+          if ($env:SAYWEAVE_RELEASE_PHASE -in @('check-access','accept-existing') -and $env:PACKAGE_RUN -notmatch '^[1-9]\d*$') { throw 'Existing assets require their retained full verifier producer.' }
+          if ($env:SAYWEAVE_RELEASE_PHASE -notin @('resume-package','check-access','accept-existing') -and $env:PACKAGE_RUN) { throw 'Build cannot substitute a retained package producer.' }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ (inputs.phase == 'build-frozen' || inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_tag || github.ref }}
+          ref: ${{ (inputs.phase == 'build-frozen' || inputs.phase == 'resume-package' || inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_tag || github.ref }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '24'
           cache: npm
-      - run: npm ci
+      - if: inputs.verification_run_id == '' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+        run: npm ci
+      - name: Load reviewed release controller
+        shell: pwsh
+        run: |
+          $directory = Join-Path $env:RUNNER_TEMP 'sayweave-controller'
+          New-Item -ItemType Directory -Force -Path $directory | Out-Null
+          foreach ($name in @('release-validation.mjs','verify-update-release.mjs')) {
+            $source = git show "$($env:SAYWEAVE_CONTROLLER_COMMIT):scripts/$name"
+            if ($LASTEXITCODE -ne 0) { throw 'Reviewed release controller missing.' }
+            $source | Set-Content -LiteralPath (Join-Path $directory $name) -Encoding utf8
+          }
+          "SAYWEAVE_RELEASE_HELPER=$(Join-Path $directory 'release-validation.mjs')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SAYWEAVE_VERIFIER_HELPER=$(Join-Path $directory 'verify-update-release.mjs')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SAYWEAVE_VERIFIER_DIR=$(Join-Path $env:RUNNER_TEMP 'release-verifier')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Verify frozen product and landed controller
-        if: inputs.phase == 'build-frozen' || inputs.phase == 'check-access' || inputs.phase == 'accept-existing'
+        if: inputs.phase == 'build-frozen' || inputs.phase == 'resume-package' || inputs.phase == 'check-access' || inputs.phase == 'accept-existing'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -84,7 +107,7 @@ jobs:
           if ($env:SAYWEAVE_RELEASE_TAG -ne "v$(node -p "require('./package.json').version")") { throw 'Product version differs.' }
           git merge-base --is-ancestor $env:SAYWEAVE_RELEASE_COMMIT origin/main
           if ($LASTEXITCODE -ne 0) { throw 'Product is not on main.' }
-          if ($env:SAYWEAVE_RELEASE_PHASE -in @('build-frozen','accept-existing')) {
+          if ($env:SAYWEAVE_RELEASE_PHASE -in @('build-frozen','resume-package','accept-existing')) {
             if ($env:SAYWEAVE_CONTROLLER_REF -notlike 'refs/tags/v*-release-check-*') { throw 'Frozen continuation requires a reviewed controller tag.' }
             git merge-base --is-ancestor $env:SAYWEAVE_CONTROLLER_COMMIT origin/main
             if ($LASTEXITCODE -ne 0) { throw 'Controller is not landed on main.' }
@@ -106,11 +129,57 @@ jobs:
           $source | Set-Content -LiteralPath $helper -Encoding utf8
           node $helper reuse-verification
           if ($LASTEXITCODE -ne 0) { throw 'Existing exact-product evidence is invalid.' }
-      - if: inputs.verification_run_id == '' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+      - name: Calculate Cargo compatibility and exact source keys
+        if: inputs.verification_run_id == '' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+        id: cargo-keys
+        shell: pwsh
+        run: |
+          node $env:SAYWEAVE_RELEASE_HELPER cargo-cache
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo cache context incomplete.' }
+      - name: Restore public Cargo dependencies
+        if: inputs.verification_run_id == '' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+        id: cargo-registry
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: ${{ steps.cargo-keys.outputs.registryKey }}
+          restore-keys: ${{ steps.cargo-keys.outputs.registryPrefix }}
+          path: |
+            ~/.cargo/registry/index/index.crates.io-*
+            ~/.cargo/registry/cache/index.crates.io-*
+            ~/.cargo/registry/src/index.crates.io-*
+      - name: Restore compatible main and component compiler caches
+        if: inputs.verification_run_id == '' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+        id: cargo-compiled
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: ${{ steps.cargo-keys.outputs.compileKey }}
+          restore-keys: ${{ steps.cargo-keys.outputs.compilePrefix }}
+          path: |
+            src-tauri/target/debug/deps
+            src-tauri/target/debug/build
+            src-tauri/target/debug/.fingerprint
+            src-tauri/target/debug/incremental
+            src-tauri/target/release/deps
+            src-tauri/target/release/build
+            src-tauri/target/release/.fingerprint
+            src-tauri/target/release/incremental
+            src-tauri/text-service/target/debug/deps
+            src-tauri/text-service/target/debug/build
+            src-tauri/text-service/target/debug/.fingerprint
+            src-tauri/text-service/target/debug/incremental
+            src-tauri/text-service/target/release/deps
+            src-tauri/text-service/target/release/build
+            src-tauri/text-service/target/release/.fingerprint
+            src-tauri/text-service/target/release/incremental
+      - name: Record Cargo restore results
+        if: inputs.verification_run_id == '' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+        shell: pwsh
+        run: Write-Output 'Cargo registry exact=${{ steps.cargo-registry.outputs.cache-hit }} compiler exact=${{ steps.cargo-compiled.outputs.cache-hit }}; restored key=${{ steps.cargo-compiled.outputs.cache-matched-key }}'
+      - if: inputs.verification_run_id == '' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
         run: npx playwright install chromium
-      - if: inputs.verification_run_id == '' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+      - if: inputs.verification_run_id == '' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
         run: npm run check
-      - if: inputs.verification_run_id == '' && inputs.phase != 'build-frozen' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+      - if: inputs.verification_run_id == '' && inputs.phase != 'build-frozen' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
         run: npm run test:e2e
       - name: Run reviewed E2E against the frozen product and restore its checkout
         if: inputs.verification_run_id == '' && inputs.phase == 'build-frozen'
@@ -122,8 +191,40 @@ jobs:
           $source | Set-Content -LiteralPath $helper -Encoding utf8
           node $helper
           if ($LASTEXITCODE -ne 0) { throw 'Frozen product E2E verification failed.' }
-      - if: inputs.verification_run_id == '' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+      - if: inputs.verification_run_id == '' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
         run: npm run check:distribution
+
+      - name: Save public Cargo dependencies
+        if: always() && (inputs.verification_run_id == '' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing') && steps.cargo-keys.outcome == 'success' && steps.cargo-registry.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: ${{ steps.cargo-keys.outputs.registryKey }}
+          path: |
+            ~/.cargo/registry/index/index.crates.io-*
+            ~/.cargo/registry/cache/index.crates.io-*
+            ~/.cargo/registry/src/index.crates.io-*
+      - name: Save main and component hot compiler caches
+        if: always() && (inputs.verification_run_id == '' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing') && steps.cargo-keys.outcome == 'success' && steps.cargo-compiled.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: ${{ steps.cargo-keys.outputs.compileKey }}
+          path: |
+            src-tauri/target/debug/deps
+            src-tauri/target/debug/build
+            src-tauri/target/debug/.fingerprint
+            src-tauri/target/debug/incremental
+            src-tauri/target/release/deps
+            src-tauri/target/release/build
+            src-tauri/target/release/.fingerprint
+            src-tauri/target/release/incremental
+            src-tauri/text-service/target/debug/deps
+            src-tauri/text-service/target/debug/build
+            src-tauri/text-service/target/debug/.fingerprint
+            src-tauri/text-service/target/debug/incremental
+            src-tauri/text-service/target/release/deps
+            src-tauri/text-service/target/release/build
+            src-tauri/text-service/target/release/.fingerprint
+            src-tauri/text-service/target/release/incremental
 
   draft:
     if: startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
@@ -133,136 +234,263 @@ jobs:
     permissions:
       contents: write
       actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SAYWEAVE_BUILD_CHANNEL: stable
+      EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
+      EXPECTED_CHECKSUM: ${{ inputs.checksum_sha256 }}
     outputs:
       release_id: ${{ steps.pin.outputs.release_id }}
       checksum: ${{ steps.pin.outputs.checksum }}
+      package_run: ${{ steps.pin.outputs.package_run }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ inputs.phase == 'build-frozen' && inputs.release_tag || github.ref }}
+          ref: ${{ inputs.release_tag || github.ref }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '24'
-          cache: npm
-      - run: npm ci
-      - name: Verify tag identity
+      - name: Load reviewed release controller
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
         run: |
-          if ($env:SAYWEAVE_RELEASE_TAG -ne "v$(node -p "require('./package.json').version")") { throw 'Tag and package version differ.' }
-          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen') {
-            $helper = Join-Path $env:RUNNER_TEMP 'owner-draft-validator.mjs'
-            $source = git show "$($env:SAYWEAVE_CONTROLLER_COMMIT):scripts/release-validation.mjs"
-            if ($LASTEXITCODE -ne 0) { throw 'Reviewed draft verifier missing.' }
-            $source | Set-Content -LiteralPath $helper -Encoding utf8
-            $draft = Join-Path $env:RUNNER_TEMP 'owner-draft.json'
-            gh api "repos/qinghui316/Sayweave/releases/$env:EXPECTED_RELEASE_ID" | Set-Content -LiteralPath $draft -Encoding utf8
-            if ($LASTEXITCODE -ne 0) { throw 'Owner draft unavailable.' }
-            node $helper draft-check $draft
-            if ($LASTEXITCODE -ne 0) { throw 'Owner draft identity/empty state differs.' }
+          $directory = Join-Path $env:RUNNER_TEMP 'sayweave-controller'
+          New-Item -ItemType Directory -Force -Path $directory | Out-Null
+          foreach ($name in @('release-validation.mjs','verify-update-release.mjs')) {
+            $source = git show "$($env:SAYWEAVE_CONTROLLER_COMMIT):scripts/$name"
+            if ($LASTEXITCODE -ne 0) { throw 'Reviewed release controller missing.' }
+            $source | Set-Content -LiteralPath (Join-Path $directory $name) -Encoding utf8
           }
+          "SAYWEAVE_RELEASE_HELPER=$(Join-Path $directory 'release-validation.mjs')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SAYWEAVE_VERIFIER_HELPER=$(Join-Path $directory 'verify-update-release.mjs')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SAYWEAVE_VERIFIER_DIR=$(Join-Path $env:RUNNER_TEMP 'release-verifier')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Preflight owner permissions, draft and retained package before building
+        id: owner
+        shell: pwsh
+        run: |
+          node $env:SAYWEAVE_RELEASE_HELPER package-preflight
+          if ($LASTEXITCODE -ne 0) { throw 'Owner draft/package preflight failed before build.' }
+      - name: Bind preflight draft identity
+        shell: pwsh
+        run: '"EXPECTED_RELEASE_ID=${{ steps.owner.outputs.release_id }}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+      - if: inputs.phase != 'resume-package'
+        run: npm ci
+      - name: Calculate Cargo compatibility and exact source keys
+        if: inputs.phase != 'resume-package'
+        id: cargo-keys
+        shell: pwsh
+        run: |
+          node $env:SAYWEAVE_RELEASE_HELPER cargo-cache
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo cache context incomplete.' }
+      - name: Restore public Cargo dependencies
+        if: inputs.phase != 'resume-package'
+        id: cargo-registry
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: ${{ steps.cargo-keys.outputs.registryKey }}
+          restore-keys: ${{ steps.cargo-keys.outputs.registryPrefix }}
+          path: |
+            ~/.cargo/registry/index/index.crates.io-*
+            ~/.cargo/registry/cache/index.crates.io-*
+            ~/.cargo/registry/src/index.crates.io-*
+      - name: Restore compatible main and component compiler caches
+        if: inputs.phase != 'resume-package'
+        id: cargo-compiled
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: ${{ steps.cargo-keys.outputs.compileKey }}
+          restore-keys: ${{ steps.cargo-keys.outputs.compilePrefix }}
+          path: |
+            src-tauri/target/debug/deps
+            src-tauri/target/debug/build
+            src-tauri/target/debug/.fingerprint
+            src-tauri/target/debug/incremental
+            src-tauri/target/release/deps
+            src-tauri/target/release/build
+            src-tauri/target/release/.fingerprint
+            src-tauri/target/release/incremental
+            src-tauri/text-service/target/debug/deps
+            src-tauri/text-service/target/debug/build
+            src-tauri/text-service/target/debug/.fingerprint
+            src-tauri/text-service/target/debug/incremental
+            src-tauri/text-service/target/release/deps
+            src-tauri/text-service/target/release/build
+            src-tauri/text-service/target/release/.fingerprint
+            src-tauri/text-service/target/release/incremental
+      - name: Record Cargo restore results
+        if: inputs.phase != 'resume-package'
+        shell: pwsh
+        run: Write-Output 'Cargo registry exact=${{ steps.cargo-registry.outputs.cache-hit }} compiler exact=${{ steps.cargo-compiled.outputs.cache-hit }}; restored key=${{ steps.cargo-compiled.outputs.cache-matched-key }}'
+      - name: Build ordinary component with locked dependencies
+        if: inputs.phase != 'resume-package'
+        shell: pwsh
+        run: |
+          cargo metadata --locked --no-deps --manifest-path src-tauri/Cargo.toml > $null
+          if ($LASTEXITCODE -ne 0) { throw 'Application lock differs.' }
+          cargo build --locked --release --manifest-path src-tauri/text-service/Cargo.toml --lib
+          if ($LASTEXITCODE -ne 0) { throw 'Ordinary component build failed.' }
+          "SAYWEAVE_TSF_PAYLOAD=$(Join-Path $env:GITHUB_WORKSPACE 'src-tauri/text-service/target/release/sayweave_text_service.dll')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build signed NSIS package
         id: signed
+        if: inputs.phase != 'resume-package'
         shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          SAYWEAVE_BUILD_COMMIT: ${{ env.SAYWEAVE_RELEASE_COMMIT }}
-          SAYWEAVE_BUILD_CHANNEL: stable
         run: |
-          npm run desktop:package
+          npm run desktop:package -- -- --locked
           if ($LASTEXITCODE -ne 0) { throw 'Signed package build failed.' }
           npm run desktop:release:manifest
           if ($LASTEXITCODE -ne 0) { throw 'Manifest generation failed.' }
-          npm run desktop:release:verify
-          if ($LASTEXITCODE -ne 0) { throw 'Release verification failed.' }
-      - name: Preserve signed assets or failed bundle diagnostics before Release operations
+          Write-Output 'Package builds in this run: 1. These exact bytes must survive every later API failure.'
+      - name: Preserve signed release bytes before Release operations
+        if: always() && steps.signed.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always()
         with:
-          name: release-package-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}-${{ steps.signed.outcome }}
-          retention-days: ${{ steps.signed.outcome == 'success' && 14 || 7 }}
+          name: release-package-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
+          retention-days: 14
+          path: release/sayweave/*
+          if-no-files-found: error
+      - name: Preserve failed bundle diagnostics
+        if: always() && steps.signed.outcome == 'failure'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-build-failure-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
+          retention-days: 7
           path: |
-            ${{ steps.signed.outcome == 'success' && 'release/sayweave/*' || 'src-tauri/target/release/bundle/nsis/*.exe' }}
-            ${{ steps.signed.outcome == 'success' && 'release/release-notes.md' || 'src-tauri/target/release/bundle/nsis/*.sig' }}
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.sig
           if-no-files-found: warn
-      - name: Create immutable draft
+      - name: Build full signature verifier once
+        if: inputs.phase != 'resume-package'
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
         run: |
-          $notes = 'release/release-notes.md'
-          if (-not (Test-Path -LiteralPath $notes)) { throw "Release notes are missing: $notes" }
-          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen') {
-            $draft = Join-Path $env:RUNNER_TEMP 'owner-draft.json'
-            gh api "repos/qinghui316/Sayweave/releases/$env:EXPECTED_RELEASE_ID" | Set-Content -LiteralPath $draft -Encoding utf8
-            if ($LASTEXITCODE -ne 0) { throw 'Owner draft unavailable.' }
-            node (Join-Path $env:RUNNER_TEMP 'owner-draft-validator.mjs') draft-check $draft
-            if ($LASTEXITCODE -ne 0) { throw 'Owner draft changed during build.' }
-            gh release upload $env:SAYWEAVE_RELEASE_TAG --repo '${{ github.repository }}' release/sayweave/*
-          } else {
-            gh release view $env:SAYWEAVE_RELEASE_TAG --repo '${{ github.repository }}' 2>$null
-            if ($LASTEXITCODE -eq 0) { throw 'Release tag already exists.' }
-            gh release create $env:SAYWEAVE_RELEASE_TAG --repo '${{ github.repository }}' --draft --verify-tag --target $env:SAYWEAVE_RELEASE_COMMIT --title "Sayweave $env:SAYWEAVE_RELEASE_TAG" --notes-file $notes release/sayweave/*
-          }
-          if ($LASTEXITCODE -ne 0) { throw 'Immutable draft creation failed.' }
-      - name: Re-download and verify draft
+          node $env:SAYWEAVE_VERIFIER_HELPER build-tool
+          if ($LASTEXITCODE -ne 0) { throw 'Full verifier build failed; signed package is already retained.' }
+      - name: Preserve full signature verifier
+        if: inputs.phase != 'resume-package'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-verifier-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
+          retention-days: 14
+          path: ${{ runner.temp }}/release-verifier/*
+          if-no-files-found: error
+      - name: Download exact retained signed package
+        if: inputs.phase == 'resume-package'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-package-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
+          run-id: ${{ inputs.package_run_id }}
+          github-token: ${{ github.token }}
+          path: release/sayweave
+      - name: Download retained full signature verifier
+        if: inputs.phase == 'resume-package'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-verifier-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
+          run-id: ${{ inputs.package_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/release-verifier
+      - name: Verify retained package with recorded full verifier
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
+        run: |
+          node $env:SAYWEAVE_VERIFIER_HELPER
+          if ($LASTEXITCODE -ne 0) { throw 'Native signature/tool identity verification failed.' }
+      - name: Upload missing exact assets and freeze draft identity
+        id: pin
+        shell: pwsh
+        run: |
+          node $env:SAYWEAVE_RELEASE_HELPER upload-package
+          if ($LASTEXITCODE -ne 0) { throw 'Draft upload failed; resume the retained package without rebuilding.' }
+      - name: Re-download and fully verify uploaded draft
+        shell: pwsh
         run: |
           $download = Join-Path $env:RUNNER_TEMP 'sayweave-release'
           New-Item -ItemType Directory -Force -Path $download | Out-Null
           gh release download $env:SAYWEAVE_RELEASE_TAG --repo '${{ github.repository }}' --dir $download
-          if ($LASTEXITCODE -ne 0) { throw 'Draft download failed.' }
+          if ($LASTEXITCODE -ne 0) { throw 'Draft download failed; retained package remains available.' }
+          if ((Get-FileHash -LiteralPath (Join-Path $download 'SHA256SUMS.txt') -Algorithm SHA256).Hash.ToLowerInvariant() -ne '${{ steps.pin.outputs.checksum }}') { throw 'Uploaded draft changed after its identity was frozen.' }
           $env:SAYWEAVE_RELEASE_DIR = $download
-          node scripts/verify-update-release.mjs
-      - name: Freeze uploaded draft identity
-        id: pin
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
-        shell: pwsh
-        run: |
-          $releases = gh api 'repos/qinghui316/Sayweave/releases?per_page=100' | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) { throw 'Draft inventory unavailable.' }
-          $matching = @($releases | Where-Object { $_.tag_name -eq $env:SAYWEAVE_RELEASE_TAG })
-          if ($matching.Count -ne 1) { throw 'Uploaded draft identity is ambiguous.' }
-          $release = $matching[0]
-          if ($release.draft -ne $true -or $release.tag_name -ne $env:SAYWEAVE_RELEASE_TAG) { throw 'Uploaded draft identity differs.' }
-          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen' -and ([string]$release.id -ne $env:EXPECTED_RELEASE_ID -or $release.target_commitish -ne $env:SAYWEAVE_RELEASE_COMMIT)) { throw 'Owner draft identity changed.' }
-          "release_id=$($release.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "checksum=$((Get-FileHash -LiteralPath 'release/sayweave/SHA256SUMS.txt' -Algorithm SHA256).Hash.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          node $env:SAYWEAVE_VERIFIER_HELPER
+          if ($LASTEXITCODE -ne 0) { throw 'Draft full signature verification failed.' }
+      - name: Save public Cargo dependencies
+        if: always() && steps.cargo-keys.outcome == 'success' && steps.cargo-registry.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: ${{ steps.cargo-keys.outputs.registryKey }}
+          path: |
+            ~/.cargo/registry/index/index.crates.io-*
+            ~/.cargo/registry/cache/index.crates.io-*
+            ~/.cargo/registry/src/index.crates.io-*
+      - name: Save main and component hot compiler caches
+        if: always() && steps.cargo-keys.outcome == 'success' && steps.cargo-compiled.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: ${{ steps.cargo-keys.outputs.compileKey }}
+          path: |
+            src-tauri/target/debug/deps
+            src-tauri/target/debug/build
+            src-tauri/target/debug/.fingerprint
+            src-tauri/target/debug/incremental
+            src-tauri/target/release/deps
+            src-tauri/target/release/build
+            src-tauri/target/release/.fingerprint
+            src-tauri/target/release/incremental
+            src-tauri/text-service/target/debug/deps
+            src-tauri/text-service/target/debug/build
+            src-tauri/text-service/target/debug/.fingerprint
+            src-tauri/text-service/target/debug/incremental
+            src-tauri/text-service/target/release/deps
+            src-tauri/text-service/target/release/build
+            src-tauri/text-service/target/release/.fingerprint
+            src-tauri/text-service/target/release/incremental
 
   accept-installer:
     if: always() && !cancelled() && github.repository == 'qinghui316/Sayweave' && needs.verify.result == 'success' && ((startsWith(github.ref, 'refs/tags/') && needs.draft.result == 'success') || (github.event_name == 'workflow_dispatch' && (inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && needs.draft.result == 'skipped'))
     needs: [verify, draft]
     runs-on: windows-latest
     timeout-minutes: 90
-    # GitHub hides drafts from a contents:read token, including by-tag lookup.
     permissions:
       contents: write
       actions: read
     env:
       GH_TOKEN: ${{ github.token }}
+      SAYWEAVE_BUILD_CHANNEL: stable
       EXPECTED_RELEASE_ID: ${{ (inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_id || needs.draft.outputs.release_id }}
       EXPECTED_CHECKSUM: ${{ (inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.checksum_sha256 || needs.draft.outputs.checksum }}
+      SAYWEAVE_PACKAGE_RUN: ${{ inputs.package_run_id || needs.draft.outputs.package_run }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ (inputs.phase == 'build-frozen' || inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_tag || github.ref }}
+          ref: ${{ inputs.release_tag || github.ref }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '24'
-          cache: npm
-      - run: npm ci
+      - name: Load reviewed release controller
+        shell: pwsh
+        run: |
+          $directory = Join-Path $env:RUNNER_TEMP 'sayweave-controller'
+          New-Item -ItemType Directory -Force -Path $directory | Out-Null
+          foreach ($name in @('release-validation.mjs','verify-update-release.mjs')) {
+            $source = git show "$($env:SAYWEAVE_CONTROLLER_COMMIT):scripts/$name"
+            if ($LASTEXITCODE -ne 0) { throw 'Reviewed release controller missing.' }
+            $source | Set-Content -LiteralPath (Join-Path $directory $name) -Encoding utf8
+          }
+          "SAYWEAVE_RELEASE_HELPER=$(Join-Path $directory 'release-validation.mjs')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SAYWEAVE_VERIFIER_HELPER=$(Join-Path $directory 'verify-update-release.mjs')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SAYWEAVE_VERIFIER_DIR=$(Join-Path $env:RUNNER_TEMP 'release-verifier')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Download retained full signature verifier
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-verifier-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
+          run-id: ${{ inputs.package_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/release-verifier
+      - if: inputs.phase == 'accept-existing'
+        run: npm ci
       - name: Reuse evidence for explicitly requested existing-package installation
         if: inputs.phase == 'accept-existing'
         run: node scripts/reuse-windows-update-evidence.mjs .local/release-mechanism-evidence
@@ -272,7 +500,7 @@ jobs:
           $download = Join-Path $env:RUNNER_TEMP 'sayweave-draft-acceptance'
           New-Item -ItemType Directory -Path $download | Out-Null
           New-Item -ItemType Directory -Force -Path .local | Out-Null
-          $controller = @{ controllerCommit=$env:SAYWEAVE_CONTROLLER_COMMIT; productCommit=$env:SAYWEAVE_RELEASE_COMMIT; productTag=$env:SAYWEAVE_RELEASE_TAG; phase=$env:SAYWEAVE_RELEASE_PHASE; releaseId=$env:EXPECTED_RELEASE_ID; checksum=$env:EXPECTED_CHECKSUM }
+          $controller = @{ controllerCommit=$env:SAYWEAVE_CONTROLLER_COMMIT; productCommit=$env:SAYWEAVE_RELEASE_COMMIT; productTag=$env:SAYWEAVE_RELEASE_TAG; phase=$env:SAYWEAVE_RELEASE_PHASE; releaseId=$env:EXPECTED_RELEASE_ID; checksum=$env:EXPECTED_CHECKSUM; packageRun=$env:SAYWEAVE_PACKAGE_RUN }
           $controller | ConvertTo-Json | Set-Content -LiteralPath '.local/release-controller.json' -Encoding utf8
           $release = gh api "repos/qinghui316/Sayweave/releases/$env:EXPECTED_RELEASE_ID" | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0 -or [string]$release.id -ne $env:EXPECTED_RELEASE_ID -or $release.tag_name -ne $env:SAYWEAVE_RELEASE_TAG -or $release.draft -ne $true -or $release.target_commitish -ne $env:SAYWEAVE_RELEASE_COMMIT) { throw 'Frozen draft identity differs.' }
@@ -280,24 +508,21 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Draft download failed.' }
           if ((Get-FileHash -LiteralPath (Join-Path $download 'SHA256SUMS.txt') -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:EXPECTED_CHECKSUM) { throw 'Frozen draft asset hashes differ.' }
           $env:SAYWEAVE_RELEASE_DIR = $download
+          node $env:SAYWEAVE_VERIFIER_HELPER
+          if ($LASTEXITCODE -ne 0) { throw 'Draft full signature verification failed.' }
           if ($env:SAYWEAVE_RELEASE_PHASE -eq 'check-access') {
-            node --input-type=module -e "import {readFileSync,readdirSync} from 'node:fs';import {join} from 'node:path';import {releaseIdentity,validateRelease} from './scripts/release-validation.mjs';const dir=process.env.SAYWEAVE_RELEASE_DIR,assets=new Map(readdirSync(dir).map(n=>[n,readFileSync(join(dir,n))]));validateRelease(releaseIdentity(JSON.parse(readFileSync('package.json')).version,process.env.SAYWEAVE_RELEASE_TAG,process.env.SAYWEAVE_RELEASE_COMMIT),JSON.parse(assets.get('latest.json')),JSON.parse(assets.get('release-receipt.json')),assets)"
-            if ($LASTEXITCODE -ne 0) { throw 'Draft visibility/asset validation failed.' }
             $controller | ConvertTo-Json | Set-Content -LiteralPath '.local/release-draft-access.json' -Encoding utf8
-            exit 0
-          }
-          node scripts/verify-update-release.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'Draft identity verification failed.' }
-          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'accept-existing') {
+          } elseif ($env:SAYWEAVE_RELEASE_PHASE -eq 'accept-existing') {
             node scripts/test-windows-update.mjs --stable-installer (Join-Path $download "Sayweave_$(node -p "require('./package.json').version")_x64-setup.exe") --mechanism-evidence .local/release-mechanism-evidence
             if ($LASTEXITCODE -ne 0) { throw 'Explicit draft installation check failed.' }
           } else {
-            Write-Output 'Draft package identity and signature verified. Actual installation/update is pending owner trial; windows-release approval remains required.'
+            Write-Output 'Same package and full verifier reused; actual installation/update remains owner trial. No Cargo build here.'
           }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
           name: stable-install-acceptance
+          retention-days: 7
           include-hidden-files: true
           path: |
             .local/release-controller.json
@@ -306,7 +531,7 @@ jobs:
             .local/windows-update/*/acceptance.json
             .local/windows-update/*/native-*.png
             .local/windows-update/*/diagnostics/*.log
-          if-no-files-found: error
+          if-no-files-found: warn
   publish:
     if: always() && !cancelled() && startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave' && needs.accept-installer.result == 'success' && ((needs.draft.result == 'success' && inputs.phase != 'check-access') || (needs.draft.result == 'skipped' && inputs.phase == 'accept-existing'))
     needs: [draft, accept-installer]
@@ -314,24 +539,44 @@ jobs:
     environment: windows-release
     permissions:
       contents: write
+      actions: read
     env:
-      EXPECTED_RELEASE_ID: ${{ (inputs.phase == 'accept-existing') && inputs.release_id || needs.draft.outputs.release_id }}
-      EXPECTED_CHECKSUM: ${{ (inputs.phase == 'accept-existing') && inputs.checksum_sha256 || needs.draft.outputs.checksum }}
+      GH_TOKEN: ${{ github.token }}
+      SAYWEAVE_BUILD_CHANNEL: stable
+      EXPECTED_RELEASE_ID: ${{ inputs.phase == 'accept-existing' && inputs.release_id || needs.draft.outputs.release_id }}
+      EXPECTED_CHECKSUM: ${{ inputs.phase == 'accept-existing' && inputs.checksum_sha256 || needs.draft.outputs.checksum }}
+      SAYWEAVE_PACKAGE_RUN: ${{ inputs.package_run_id || needs.draft.outputs.package_run }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: ${{ (inputs.phase == 'build-frozen' || inputs.phase == 'accept-existing') && inputs.release_tag || github.ref }}
+          ref: ${{ inputs.release_tag || github.ref }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '24'
-          cache: npm
-      - run: npm ci
-      - name: Re-download and verify approved draft
+      - name: Load reviewed release controller
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
+        run: |
+          $directory = Join-Path $env:RUNNER_TEMP 'sayweave-controller'
+          New-Item -ItemType Directory -Force -Path $directory | Out-Null
+          foreach ($name in @('release-validation.mjs','verify-update-release.mjs')) {
+            $source = git show "$($env:SAYWEAVE_CONTROLLER_COMMIT):scripts/$name"
+            if ($LASTEXITCODE -ne 0) { throw 'Reviewed release controller missing.' }
+            $source | Set-Content -LiteralPath (Join-Path $directory $name) -Encoding utf8
+          }
+          "SAYWEAVE_RELEASE_HELPER=$(Join-Path $directory 'release-validation.mjs')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SAYWEAVE_VERIFIER_HELPER=$(Join-Path $directory 'verify-update-release.mjs')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SAYWEAVE_VERIFIER_DIR=$(Join-Path $env:RUNNER_TEMP 'release-verifier')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Download retained full signature verifier
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-verifier-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
+          run-id: ${{ inputs.package_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/release-verifier
+      - name: Re-download and verify approved draft with the same verifier
+        shell: pwsh
         run: |
           $download = Join-Path $env:RUNNER_TEMP 'sayweave-approved-release'
           New-Item -ItemType Directory -Force -Path $download | Out-Null
@@ -341,25 +586,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Approved draft download failed.' }
           if ((Get-FileHash -LiteralPath (Join-Path $download 'SHA256SUMS.txt') -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:EXPECTED_CHECKSUM) { throw 'Approved asset hashes differ.' }
           $env:SAYWEAVE_RELEASE_DIR = $download
-          node scripts/verify-update-release.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'Approved draft verification failed.' }
+          node $env:SAYWEAVE_VERIFIER_HELPER
+          if ($LASTEXITCODE -ne 0) { throw 'Approved draft full verification failed.' }
       - name: Publish latest release
         if: inputs.phase != 'accept-existing'
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release edit $env:SAYWEAVE_RELEASE_TAG --repo '${{ github.repository }}' --draft=false --latest
+        run: |
+          gh release edit $env:SAYWEAVE_RELEASE_TAG --repo '${{ github.repository }}' --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Publication failed; keep the same retained package for resume-package.' }
       - name: Record protected publication eligibility for an older immutable tag
         if: inputs.phase == 'accept-existing'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path .local | Out-Null
           @{controllerCommit=$env:SAYWEAVE_CONTROLLER_COMMIT;productCommit=$env:SAYWEAVE_RELEASE_COMMIT;productTag=$env:SAYWEAVE_RELEASE_TAG;releaseId=$env:EXPECTED_RELEASE_ID;checksum=$env:EXPECTED_CHECKSUM;actualInstall='success';protectedReview='approved';published=$false} | ConvertTo-Json | Set-Content -LiteralPath '.local/release-publication-ready.json' -Encoding utf8
-          Write-Output 'Existing draft is eligible after actual installation and environment review; an owner with workflow scope may now publish the unchanged assets.'
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: inputs.phase == 'accept-existing'
         with:
           name: release-publication-ready
+          retention-days: 14
           path: .local/release-publication-ready.json
           include-hidden-files: true
           if-no-files-found: error

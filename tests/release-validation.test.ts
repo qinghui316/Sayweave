@@ -6,7 +6,7 @@ import {join,resolve,sep} from 'node:path';
 import {describe,expect,it} from 'vitest';
 // The public release tools are JavaScript entry points with separately exercised inputs.
 // @ts-expect-error JavaScript release validator has no declaration file.
-import {releaseIdentity,validateRelease,releaseNotes,validateFrozenController,runFrozenReleaseTests,validateOwnedDraft,validateVerificationRun} from '../scripts/release-validation.mjs';
+import {releaseIdentity,validateRelease,releaseNotes,validateFrozenController,runFrozenReleaseTests,validateOwnedDraft,validateVerificationRun,cargoCacheKeys,validateVerifierTool,validateProducerRun,validateRetainedArtifacts,validateUploadInventory,packageArtifactName,verifierArtifactName} from '../scripts/release-validation.mjs';
 function fixture(){
  const identity=releaseIdentity('0.1.7','v0.1.7','a'.repeat(40)),bytes=Buffer.from('synthetic installer'),signature='synthetic signature';
  const sha512=createHash('sha512').update(bytes).digest('base64');
@@ -23,6 +23,58 @@ describe('public release identity and inventory',()=>{
  it.each(['https://evil.example/releases/download/v0.1.7/Sayweave_0.1.7_x64-setup.exe','https://github.com/qinghui316/Sayweave/releases/download/v0.1.7/wrong.exe'])('rejects an ambiguous URL %s',url=>{const f=fixture();f.manifest.platforms['windows-x86_64'].url=url;expect(()=>validateRelease(f.identity,f.manifest,f.receipt,f.assets)).toThrow();});
  it.each(['missing','duplicate','traversal','extra'])('rejects %s checksum entries',kind=>{const f=fixture(),lines=f.sums().split('\n');if(kind==='missing')lines.pop();if(kind==='duplicate')lines[3]=lines[0]!;if(kind==='traversal')lines[0]=lines[0]!.replace(f.identity.installer,'../bad.exe');if(kind==='extra')lines.push(lines[0]!);f.assets.set('SHA256SUMS.txt',Buffer.from(lines.join('\n')));expect(()=>validateRelease(f.identity,f.manifest,f.receipt,f.assets)).toThrow();});
  it('rejects extra assets and a version without an exact commit',()=>{const f=fixture();f.assets.set('extra.exe',Buffer.from('extra'));expect(()=>validateRelease(f.identity,f.manifest,f.receipt,f.assets)).toThrow();expect(()=>releaseIdentity('0.1.7','v0.1.7','unknown')).toThrow();});
+});
+
+describe('Cargo reuse identity',()=>{
+ const context={platform:'win32',arch:'x64',toolchain:'rustc 1.99.0 msvc',cargo:'cargo 1.99.0',image:'windows2025:20261011',config:'default profiles and flags',locks:'main and component locks',source:'native source and channel'};
+ it('keeps controller revisions and credentials outside cache identity',()=>{
+  expect(cargoCacheKeys({...context,controllerCommit:'a'.repeat(40),TAURI_SIGNING_PRIVATE_KEY:'private'})).toEqual(cargoCacheKeys({...context,controllerCommit:'b'.repeat(40),TAURI_SIGNING_PRIVATE_KEY:'another'}));
+ });
+ it.each(['toolchain','cargo','image','config'])('isolates incompatible %s compilation caches',field=>{
+  expect(cargoCacheKeys({...context,[field]:'changed'}).compilePrefix).not.toBe(cargoCacheKeys(context).compilePrefix);
+ });
+ it.each(['locks','source'])('changes the exact %s key but preserves compatible dependencies',field=>{
+  const next=cargoCacheKeys({...context,[field]:'changed'}),old=cargoCacheKeys(context);
+  expect(next.compileKey).not.toBe(old.compileKey);expect(next.compilePrefix).toBe(old.compilePrefix);
+  expect(next.registryKey===old.registryKey).toBe(field==='source');
+ });
+ it('refuses non-Windows or incomplete contexts',()=>{
+  for(const change of [{platform:'linux'},{arch:'arm64'},{toolchain:''},{locks:''}])expect(()=>cargoCacheKeys({...context,...change})).toThrow();
+ });
+});
+
+describe('recorded full native verifier',()=>{
+ const identity=releaseIdentity('0.1.9','v0.1.9','a'.repeat(40)),bytes=Buffer.from('tiny synthetic verifier fixture');
+ const producer={runId:'99',controllerCommit:'b'.repeat(40),ref:'refs/tags/v0.1.9-release-check-five',repository:'qinghui316/Sayweave'};
+ const receipt=()=>({schemaVersion:1,productTag:identity.tag,productCommit:identity.commit,sourceSha256:'c'.repeat(64),buildConfigSha256:'d'.repeat(64),file:'verify-update-signature.exe',platform:'windows-x86_64-msvc',profile:'release',features:'default',buildChannel:'stable',toolchain:'1.99.0',rustc:'rustc 1.99.0 (fixture)\nhost: x86_64-pc-windows-msvc',size:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex'),producer});
+ const validate=(value:unknown,data=bytes)=>validateVerifierTool(identity,'c'.repeat(64),'1.99.0','d'.repeat(64),value,data,producer);
+ it('accepts exact source, configuration, producer and tool bytes',()=>expect(()=>validate(receipt())).not.toThrow());
+ it.each(['commit','source','config','file','platform','profile','features','channel','toolchain','rustc','size','hash','producer'])('refuses changed %s before executable invocation',field=>{
+  const value=receipt();
+  if(field==='commit')value.productCommit='f'.repeat(40);if(field==='source')value.sourceSha256='f'.repeat(64);if(field==='config')value.buildConfigSha256='f'.repeat(64);if(field==='file')value.file='../other.exe';if(field==='platform')value.platform='linux';if(field==='profile')value.profile='debug';if(field==='features')value.features='acceptance';if(field==='channel')value.buildChannel='test';if(field==='toolchain')value.toolchain='1.98.0';if(field==='rustc')value.rustc='rustc 1.99.0\nhost: x86_64-pc-windows-gnu';if(field==='size')value.size++;if(field==='hash')value.sha256='f'.repeat(64);if(field==='producer')value.producer={...producer,runId:'100'};
+  expect(()=>validate(value)).toThrow();
+ });
+ it('refuses corrupt bytes even with an unchanged receipt',()=>expect(()=>validate(receipt(),Buffer.from('corrupt'))).toThrow());
+});
+
+describe('retained package resume and partial upload',()=>{
+ const f=fixture(),producerId='99';
+ const run=()=>({id:99,repository:{full_name:'qinghui316/Sayweave'},path:'.github/workflows/windows-release.yml',event:'workflow_dispatch',head_sha:'b'.repeat(40),head_branch:`${f.identity.tag}-release-check-five`,status:'completed',conclusion:'failure'});
+ const jobs=()=>[{name:'draft',steps:['Build signed NSIS package','Build full signature verifier once','Preserve full signature verifier','Preserve signed release bytes before Release operations'].map(name=>({name,conclusion:'success'}))}];
+ it('allows a later upload failure to reuse a complete preserved build',()=>expect(validateProducerRun(f.identity,run(),jobs(),producerId).runId).toBe(producerId));
+ it.each(['repo','controller','tag','unfinished','build','tool','preserve','duplicate'])('refuses %s producer',kind=>{
+  const r=run(),j=jobs();if(kind==='repo')r.repository.full_name='another/repo';if(kind==='controller')r.head_sha='unknown';if(kind==='tag')r.head_branch='v0.1.8';if(kind==='unfinished')r.status='in_progress';if(kind==='build')j[0]!.steps[0]!.conclusion='failure';if(kind==='tool')j[0]!.steps[1]!.conclusion='skipped';if(kind==='preserve')j[0]!.steps[3]!.conclusion='failure';if(kind==='duplicate')j.push(j[0]!);expect(()=>validateProducerRun(f.identity,r,j,producerId)).toThrow();
+ });
+ const artifacts=()=>[packageArtifactName(f.identity),verifierArtifactName(f.identity)].map((name,index)=>({name,id:index+1,expired:false,workflow_run:{id:99}}));
+ it('requires both exact retained artifacts',()=>expect(()=>validateRetainedArtifacts(f.identity,artifacts(),producerId)).not.toThrow());
+ it.each(['missing','expired','foreign','duplicate'])('refuses %s retained data',kind=>{
+  const a=artifacts();if(kind==='missing')a.pop();if(kind==='expired')a[0]!.expired=true;if(kind==='foreign')a[0]!.workflow_run.id=100;if(kind==='duplicate')a.push(a[0]!);expect(()=>validateRetainedArtifacts(f.identity,a,producerId)).toThrow();
+ });
+ const draft=()=>({id:42,tag_name:f.identity.tag,target_commitish:f.identity.commit,draft:true,prerelease:false,assets:[...f.assets].slice(0,2).map(([name,bytes])=>({name,size:bytes.length,digest:`sha256:${createHash('sha256').update(bytes).digest('hex')}`,state:'uploaded'}))});
+ it('resumes only missing exact assets, retaining already uploaded bytes',()=>expect(validateUploadInventory(f.identity,draft(),'42',f.assets)).toEqual(['latest.json','release-receipt.json','SHA256SUMS.txt']));
+ it.each(['hash','size','unknown','duplicate','unfinished','published','commit'])('never overwrites a %s draft asset',kind=>{
+  const d=draft();if(kind==='hash')d.assets[0]!.digest='sha256:'+'f'.repeat(64);if(kind==='size')d.assets[0]!.size++;if(kind==='unknown')d.assets[0]!.name='foreign.exe';if(kind==='duplicate')d.assets.push(d.assets[0]!);if(kind==='unfinished')d.assets[0]!.state='new';if(kind==='published')d.draft=false;if(kind==='commit')d.target_commitish='f'.repeat(40);expect(()=>validateUploadInventory(f.identity,d,'42',f.assets)).toThrow();
+ });
 });
 
 describe('frozen product release controller boundaries',()=>{
