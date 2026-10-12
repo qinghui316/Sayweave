@@ -206,7 +206,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             }
         }
         Err(error) if error.code == "targetChanged" => {
-            println!("SAYWEAVE_EDITOR_INITIALIZATION admission=rejected_before_Begin");
+            println!("SAYWEAVE_EDITOR_INITIALIZATION admission=rejected_target_changed");
         }
         Err(error) => return Err(error.code),
     }
