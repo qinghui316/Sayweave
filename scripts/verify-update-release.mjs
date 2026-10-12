@@ -36,16 +36,21 @@ export function buildVerifier(root=process.cwd(),env=process.env){
  writeFileSync(join(dir,'verifier-receipt.json'),JSON.stringify(receipt,null,2)+'\n',{flag:'wx'});
  console.log(JSON.stringify({verifierBuilds:1,...receipt}));
 }
-export function verifyUpdateRelease(root=process.cwd(),env=process.env){
- const {identity,config,toolchain}=buildIdentity(root,env),dir=resolve(root,env.SAYWEAVE_RELEASE_DIR??'release/sayweave');
- const assets=releaseAssets(dir),manifest=JSON.parse(assets.get('latest.json')),receipt=JSON.parse(assets.get('release-receipt.json'));
- validateRelease(identity,manifest,receipt,assets);
+export function checkVerifier(root=process.cwd(),env=process.env){
+ const {identity,toolchain}=buildIdentity(root,env);
  const toolDir=resolve(root,env.SAYWEAVE_VERIFIER_DIR??'release/verifier');
  if(!existsSync(join(toolDir,'verifier-receipt.json')))throw Error('Recorded native verifier is required; build-tool once, then reuse its verified CI artifact');
  const toolFiles=releaseAssets(toolDir);
  if(toolFiles.size!==2||!toolFiles.has('verify-update-signature.exe')||!toolFiles.has('verifier-receipt.json'))throw Error('Native verifier artifact inventory differs');
  const toolReceipt=JSON.parse(toolFiles.get('verifier-receipt.json'));
  validateVerifierTool(identity,nativeSourceHash(root),toolchain,verifierBuildConfig(root,env),toolReceipt,toolFiles.get('verify-update-signature.exe'),producer(identity,root,env));
+ return {toolDir,toolReceipt};
+}
+export function verifyUpdateRelease(root=process.cwd(),env=process.env){
+ const {identity,config}=buildIdentity(root,env),dir=resolve(root,env.SAYWEAVE_RELEASE_DIR??'release/sayweave');
+ const assets=releaseAssets(dir),manifest=JSON.parse(assets.get('latest.json')),receipt=JSON.parse(assets.get('release-receipt.json'));
+ validateRelease(identity,manifest,receipt,assets);
+ const {toolDir,toolReceipt}=checkVerifier(root,env);
  const publicKey=config.plugins?.updater?.pubkey;if(typeof publicKey!=='string'||!publicKey)throw Error('Updater public key missing');
  // The same complete Rust/minisign implementation as the client, without Cargo.
  const verification=spawnSync(join(toolDir,'verify-update-signature.exe'),[publicKey,join(dir,identity.installer),join(dir,`${identity.installer}.sig`),identity.version],{cwd:root,encoding:'utf8',stdio:['ignore','pipe','pipe'],windowsHide:true});
@@ -54,6 +59,7 @@ export function verifyUpdateRelease(root=process.cwd(),env=process.env){
 }
 if(process.argv[1]&&pathToFileURL(resolve(process.argv[1])).href===import.meta.url){
  if(process.argv[2]==='build-tool')buildVerifier();
+ else if(process.argv[2]==='check-tool')console.log(JSON.stringify(checkVerifier().toolReceipt));
  else if(process.argv[2]===undefined)verifyUpdateRelease();
- else throw Error('Use verify-update-release.mjs [build-tool]');
+ else throw Error('Use verify-update-release.mjs [build-tool|check-tool]');
 }

@@ -331,6 +331,37 @@ jobs:
           cargo build --locked --release --manifest-path src-tauri/text-service/Cargo.toml --lib
           if ($LASTEXITCODE -ne 0) { throw 'Ordinary component build failed.' }
           "SAYWEAVE_TSF_PAYLOAD=$(Join-Path $env:GITHUB_WORKSPACE 'src-tauri/text-service/target/release/sayweave_text_service.dll')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Build frontend assets required by the existing native verifier
+        if: inputs.phase != 'resume-package' && steps.owner.outputs.reuse_tool != 'true'
+        run: npm run build
+      - name: Build full signature verifier once
+        if: inputs.phase != 'resume-package' && steps.owner.outputs.reuse_tool != 'true'
+        shell: pwsh
+        run: |
+          node $env:SAYWEAVE_VERIFIER_HELPER build-tool
+          if ($LASTEXITCODE -ne 0) { throw 'Full verifier build failed before packaging.' }
+      - name: Preserve full signature verifier
+        if: inputs.phase != 'resume-package' && steps.owner.outputs.reuse_tool != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-verifier-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
+          retention-days: 14
+          path: ${{ runner.temp }}/release-verifier/*
+          if-no-files-found: error
+      - name: Download retained full signature verifier
+        if: inputs.phase == 'resume-package' || steps.owner.outputs.reuse_tool == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-verifier-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
+          run-id: ${{ inputs.package_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/release-verifier
+      - name: Check preserved verifier before signing
+        if: inputs.phase != 'resume-package'
+        shell: pwsh
+        run: |
+          node $env:SAYWEAVE_VERIFIER_HELPER check-tool
+          if ($LASTEXITCODE -ne 0) { throw 'Preserved verifier differs; no signed package will be built.' }
       - name: Build signed NSIS package
         id: signed
         if: inputs.phase != 'resume-package'
@@ -364,20 +395,6 @@ jobs:
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/nsis/*.sig
           if-no-files-found: warn
-      - name: Build full signature verifier once
-        if: inputs.phase != 'resume-package'
-        shell: pwsh
-        run: |
-          node $env:SAYWEAVE_VERIFIER_HELPER build-tool
-          if ($LASTEXITCODE -ne 0) { throw 'Full verifier build failed; signed package is already retained.' }
-      - name: Preserve full signature verifier
-        if: inputs.phase != 'resume-package'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        with:
-          name: release-verifier-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
-          retention-days: 14
-          path: ${{ runner.temp }}/release-verifier/*
-          if-no-files-found: error
       - name: Download exact retained signed package
         if: inputs.phase == 'resume-package'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
@@ -386,14 +403,6 @@ jobs:
           run-id: ${{ inputs.package_run_id }}
           github-token: ${{ github.token }}
           path: release/sayweave
-      - name: Download retained full signature verifier
-        if: inputs.phase == 'resume-package'
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-        with:
-          name: release-verifier-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
-          run-id: ${{ inputs.package_run_id || github.run_id }}
-          github-token: ${{ github.token }}
-          path: ${{ runner.temp }}/release-verifier
       - name: Verify retained package with recorded full verifier
         shell: pwsh
         run: |

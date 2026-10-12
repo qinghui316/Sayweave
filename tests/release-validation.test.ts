@@ -6,7 +6,7 @@ import {join,resolve,sep} from 'node:path';
 import {describe,expect,it} from 'vitest';
 // The public release tools are JavaScript entry points with separately exercised inputs.
 // @ts-expect-error JavaScript release validator has no declaration file.
-import {releaseIdentity,validateRelease,releaseNotes,validateFrozenController,runFrozenReleaseTests,validateOwnedDraft,validateVerificationRun,cargoCacheKeys,validateVerifierTool,validateProducerRun,validateRetainedArtifacts,validateUploadInventory,packageArtifactName,verifierArtifactName} from '../scripts/release-validation.mjs';
+import {releaseIdentity,validateRelease,releaseNotes,validateFrozenController,runFrozenReleaseTests,validateOwnedDraft,validateVerificationRun,cargoCacheKeys,validateVerifierTool,validateProducerRun,validateRetainedArtifacts,validateUploadInventory,packageArtifactName,verifierArtifactName,assertNoRetainedPackage} from '../scripts/release-validation.mjs';
 function fixture(){
  const identity=releaseIdentity('0.1.7','v0.1.7','a'.repeat(40)),bytes=Buffer.from('synthetic installer'),signature='synthetic signature';
  const sha512=createHash('sha512').update(bytes).digest('base64');
@@ -60,12 +60,22 @@ describe('recorded full native verifier',()=>{
 describe('retained package resume and partial upload',()=>{
  const f=fixture(),producerId='99';
  const run=()=>({id:99,repository:{full_name:'qinghui316/Sayweave'},path:'.github/workflows/windows-release.yml',event:'workflow_dispatch',head_sha:'b'.repeat(40),head_branch:`${f.identity.tag}-release-check-five`,status:'completed',conclusion:'failure'});
- const jobs=()=>[{name:'draft',steps:['Build signed NSIS package','Build full signature verifier once','Preserve full signature verifier','Preserve signed release bytes before Release operations'].map(name=>({name,conclusion:'success'}))}];
+ const jobs=()=>[{name:'draft',steps:['Build signed NSIS package','Build full signature verifier once','Preserve full signature verifier','Preserve signed release bytes before Release operations','Verify retained package with recorded full verifier'].map(name=>({name,conclusion:'success'}))}];
  it('allows a later upload failure to reuse a complete preserved build',()=>expect(validateProducerRun(f.identity,run(),jobs(),producerId).runId).toBe(producerId));
+ it('keeps original producer proof when a later rerun was rejected before build',()=>{
+  const j=jobs();j.push({name:'draft',steps:[]});expect(validateProducerRun(f.identity,run(),j,producerId).runId).toBe(producerId);
+ });
+ it('reuses a tool from an earlier attempt without another tool build',()=>{
+  const all=jobs()[0]!.steps;
+  const attempts=[{name:'draft',steps:all.filter(s=>s.name==='Build full signature verifier once'||s.name==='Preserve full signature verifier')},{name:'draft',steps:all.filter(s=>s.name!=='Build full signature verifier once'&&s.name!=='Preserve full signature verifier')}];
+  expect(validateProducerRun(f.identity,run(),attempts,producerId).runId).toBe(producerId);
+ });
  it.each(['repo','controller','tag','unfinished','build','tool','preserve','duplicate'])('refuses %s producer',kind=>{
   const r=run(),j=jobs();if(kind==='repo')r.repository.full_name='another/repo';if(kind==='controller')r.head_sha='unknown';if(kind==='tag')r.head_branch='v0.1.8';if(kind==='unfinished')r.status='in_progress';if(kind==='build')j[0]!.steps[0]!.conclusion='failure';if(kind==='tool')j[0]!.steps[1]!.conclusion='skipped';if(kind==='preserve')j[0]!.steps[3]!.conclusion='failure';if(kind==='duplicate')j.push(j[0]!);expect(()=>validateProducerRun(f.identity,r,j,producerId)).toThrow();
  });
  const artifacts=()=>[packageArtifactName(f.identity),verifierArtifactName(f.identity)].map((name,index)=>({name,id:index+1,expired:false,workflow_run:{id:99}}));
+ it('rejects rebuild even when the preserved package belongs to this same run',()=>expect(()=>assertNoRetainedPackage(f.identity,artifacts())).toThrow());
+ it('does not turn artifact expiry into automatic repackaging',()=>{const a=artifacts();a[0]!.expired=true;expect(()=>assertNoRetainedPackage(f.identity,a)).toThrow();});
  it('requires both exact retained artifacts',()=>expect(()=>validateRetainedArtifacts(f.identity,artifacts(),producerId)).not.toThrow());
  it.each(['missing','expired','foreign','duplicate'])('refuses %s retained data',kind=>{
   const a=artifacts();if(kind==='missing')a.pop();if(kind==='expired')a[0]!.expired=true;if(kind==='foreign')a[0]!.workflow_run.id=100;if(kind==='duplicate')a.push(a[0]!);expect(()=>validateRetainedArtifacts(f.identity,a,producerId)).toThrow();

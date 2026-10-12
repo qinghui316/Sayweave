@@ -129,8 +129,10 @@ export function validateProducerRun(identity,run,jobs,id,current=false){
  if(!exactId(id)||String(run?.id)!==String(id)||run.repository?.full_name!==repository||run.path!=='.github/workflows/windows-release.yml'||!['push','workflow_dispatch'].includes(run.event)||! /^[a-f0-9]{40}$/.test(run.head_sha)||!(run.head_branch===identity.tag||run.head_branch?.startsWith(`${identity.tag}-release-check-`)))throw Error('Package/tool producer identity differs');
  if(!current){
   const draft=jobs.filter(j=>j.name==='draft');
-  const required=['Build signed NSIS package','Build full signature verifier once','Preserve full signature verifier','Preserve signed release bytes before Release operations'];
-  if(run.status!=='completed'||draft.length!==1||required.some(name=>draft[0].steps.filter(s=>s.name===name&&s.conclusion==='success').length!==1))throw Error('Package/tool producer did not preserve a complete build');
+  const passed=(job,names)=>names.every(name=>job.steps.filter(s=>s.name===name&&s.conclusion==='success').length===1);
+  const tools=draft.filter(j=>passed(j,['Build full signature verifier once','Preserve full signature verifier']));
+  const packages=draft.filter(j=>passed(j,['Build signed NSIS package','Preserve signed release bytes before Release operations','Verify retained package with recorded full verifier']));
+  if(run.status!=='completed'||tools.length!==1||packages.length!==1)throw Error('Package/tool producer did not preserve a complete build');
  }
  return {runId:String(id),controllerCommit:run.head_sha,ref:`refs/tags/${run.head_branch}`,repository};
 }
@@ -139,7 +141,8 @@ export function trustedProducer(identity,root,env=process.env){
  if(!exactId(id))throw Error('Exact package/tool producer run required');
  const current=String(id)===env.GITHUB_RUN_ID;
  const api=endpoint=>JSON.parse(execFileSync('gh',['api',`repos/${repository}/${endpoint}`],{cwd:root,env,encoding:'utf8'}));
- const run=api(`actions/runs/${id}`),jobs=current?[]:api(`actions/runs/${id}/jobs?per_page=100`).jobs;
+ const run=api(`actions/runs/${id}`),jobs=[];
+ if(!current)for(let page=1;;page++){const batch=api(`actions/runs/${id}/jobs?filter=all&per_page=100&page=${page}`).jobs;jobs.push(...batch);if(batch.length<100)break;}
  const producer=validateProducerRun(identity,run,jobs,id,current);
  const git=args=>execFileSync('git',args,{cwd:root,encoding:'utf8'}).trim();
  if(current&&producer.controllerCommit!==env.SAYWEAVE_CONTROLLER_COMMIT)throw Error('Current workflow source differs');
@@ -173,6 +176,9 @@ export function validateRetainedArtifacts(identity,artifacts,id){
   if(found.length!==1||found[0].expired!==false||!Number.isSafeInteger(found[0].id)||String(found[0].workflow_run?.id)!==String(id))throw Error('Exact retained package/tool artifacts are unavailable');
  }
 }
+export function assertNoRetainedPackage(identity,artifacts){
+ if(artifacts.some(a=>a.name===packageArtifactName(identity)))throw Error('A product package was already preserved; resume or recover its same bytes, including rerun of this same run');
+}
 export function validateUploadInventory(identity,release,id,assets){
  validateDraftIdentity(identity,release,id);
  const seen=new Set();
@@ -194,6 +200,7 @@ export function preflightPackage(root=process.cwd(),env=process.env){
  const releases=env.EXPECTED_RELEASE_ID?[releaseApi(root,env,`releases/${env.EXPECTED_RELEASE_ID}`)]:releaseApi(root,env,'releases?per_page=100').filter(r=>r.tag_name===identity.tag);
  if(releases.length!==1)throw Error('Owner must first create one exact draft with publication permissions');
  const release=releases[0],id=String(release.id);
+ let reuseTool=false;
  if(env.SAYWEAVE_RELEASE_PHASE==='resume-package'){
   const producer=trustedProducer(identity,root,env);
   validateRetainedArtifacts(identity,releaseApi(root,env,`actions/runs/${producer.runId}/artifacts?per_page=100`).artifacts,producer.runId);
@@ -203,11 +210,12 @@ export function preflightPackage(root=process.cwd(),env=process.env){
   validateOwnedDraft(identity,release,id);
   for(let page=1;;page++){
    const list=releaseApi(root,env,`actions/artifacts?per_page=100&page=${page}`).artifacts;
-   if(list.some(a=>a.name===packageArtifactName(identity)&&a.expired===false&&String(a.workflow_run?.id)!==env.GITHUB_RUN_ID))throw Error('A retained product package already exists; resume-package is required');
+   assertNoRetainedPackage(identity,list);
+   if(list.some(a=>a.name===verifierArtifactName(identity)&&a.expired===false&&String(a.workflow_run?.id)===env.GITHUB_RUN_ID))reuseTool=true;
    if(list.length<100)break;
   }
  }
- output({release_id:id,package_run:env.SAYWEAVE_PACKAGE_RUN||env.GITHUB_RUN_ID},env);
+ output({release_id:id,package_run:env.SAYWEAVE_PACKAGE_RUN||env.GITHUB_RUN_ID,reuse_tool:String(reuseTool)},env);
 }
 export function uploadRetainedPackage(root=process.cwd(),env=process.env){
  const identity=currentIdentity(root,env),dir=resolve(root,env.SAYWEAVE_RELEASE_DIR??'release/sayweave'),assets=releaseAssets(dir);

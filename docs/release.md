@@ -38,13 +38,13 @@ Sayweave 的源码开发使用 `main` 和短期功能分支；正式发布使用
 
 编译兼容前缀绑定实际 rustc/cargo、Windows x64 MSVC、runner 镜像、Cargo 配置及构建 flags/profile；精确键追加两个 Cargo.lock、原生源码与构建渠道身份。工具链、平台或编译配置变化隔离缓存；锁文件或源码变化可恢复兼容依赖，但仍由 Cargo 指纹决定重编译。主程序在包装前用 metadata --locked 核对锁文件，组件和验签工具用 build --locked；包装沿用冻结产品原入口，完成后强制回读干净源码及锁文件，不能把解析结果变化当缓存命中跳过。控制提交 SHA 本身不影响键。缓存保存安排在 Release API 失败也能收尾的位置，且不清空本地热缓存。GitHub 缓存按 ref 与默认分支隔离：不同发布标签之间不保证命中，不为预热新建普通 main CI；实际命中、恢复键及耗时记录于必要发布日志。[GitHub 缓存边界](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)
 
-签名构建后只编译一次现有完整 Rust/minisign 验证器，使用同一 release 依赖缓存。工具及独立版本化回执作为 `release-verifier-<tag>-<完整产品提交>` CI artifact 保存十四天。回执绑定原产品提交、原生 Git 源码身份、工具链、平台、profile、features、构建配置、可信 workflow 生产 run 与工具大小/SHA-256。后续上传前、草稿回下载、资产检查及发行审核阶段复用该工具；来源、配置、哈希或资产异常时拒绝执行，不退回冷编译。工具及回执不进入正式五项 Release 资产。
+先准备普通组件和工具需要的现有前端资源，只编译一次现有完整 Rust/minisign 验证器，使用同一 release 依赖缓存。工具及独立版本化回执作为 `release-verifier-<tag>-<完整产品提交>` CI artifact 保存十四天。工具保全及来源检查成功后，才允许构建签名包，避免留下有包却没有验签工具的恢复死路。同 run 的失败 job 重跑发现已保全工具时直接下载核对，不再次编译或覆盖 artifact。回执绑定原产品提交、原生 Git 源码身份、工具链、平台、profile、features、构建配置、可信 workflow 生产 run 与工具大小/SHA-256。后续上传前、草稿回下载、资产检查及发行审核阶段复用该工具；来源、配置、哈希或资产异常时拒绝执行，不退回冷编译。工具及回执不进入正式五项 Release 资产。
 
 ### 包保全与同包续发
 
 签名包及清单生成后立即保全为 `release-package-<tag>-<完整产品提交>` artifact，保存十四天；构建失败的现有 bundle 诊断保留七天。保全失败阻止 Release 操作。包已存在时，任何上传、权限、回下载或公开失败都继续使用这些原始字节，不重新打包。预构建只读权限/草稿查询发生在包产生前；包产生后的 Release 读写均排在持久保全之后。完整签名检查仍在上传前及每次回下载执行。
 
-`resume-package` 提供原 `release_tag`、`release_commit`、`release_id`、`checksum_sha256`、`package_run_id` 和有效 `verification_run_id`，从已审、合入的匹配诊断控制标签运行。生产 run 必须属于本仓库本 release 工作流，确实成功构建并保全包/工具，且控制源码在主线上；两份 artifact 必须存在且未过期。恢复模式不安装依赖、编译程序、构建工具或重新打包，只核对来源、完整签名及所有资产后续传缺项。已经上传的每份资产须名称、大小和 GitHub SHA-256 digest 完全匹配；重复、外来、损坏、半上传或已公开资产拒绝处理，绝不 clobber。
+`resume-package` 提供原 `release_tag`、`release_commit`、`release_id`、`checksum_sha256`、`package_run_id` 和有效 `verification_run_id`，从已审、合入的匹配诊断控制标签运行。生产 run 必须属于本仓库本 release 工作流，确实成功构建并保全包/工具及完整验签，且控制源码在主线上；查询该 run 全部 attempts，后来的失败重跑不能遮掉原生产证据。两份 artifact 必须存在且未过期。已有保全包时，包括同 run 的失败 job 重跑和 artifact 过期，都不自动重新打包；过期资料需找回原资产。恢复模式不安装依赖、编译程序、构建工具或重新打包，只核对来源、完整签名及所有资产后续传缺项。已经上传的每份资产须名称、大小和 GitHub SHA-256 digest 完全匹配；重复、外来、损坏、半上传或已公开资产拒绝处理，绝不 clobber。
 
 本次 `v0.1.9` 原产品 `784e43172780255e83d5b652507c7bec666ff859` 的 run `38251026083` 已完成签名及完整验签，但保全缺失、runner 已结束、artifact 为零、owner 草稿为空。其包确实丢失，完整五项流水线修复审查/I2 后允许替代构建一次；后续重试复用这份替代包。历史同版本或其他提交包不充当该候选。
 
