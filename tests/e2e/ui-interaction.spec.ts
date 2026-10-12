@@ -20,7 +20,7 @@ test('shared controls retain geometry, keyboard semantics and latest controlled 
 test('waveform moves independent bars without changing its capsule layout',async({page},info)=>{
  await page.setViewportSize({width:1120,height:760});await page.goto('/');
  await page.getByRole('button',{name:'开始录音',exact:true}).click();const wave=page.locator('[data-live="true"]');await expect(wave).toBeVisible();
- const capsule=page.locator('[data-phase="recording"]');await expect(capsule).toHaveCSS('width','216px');await expect(capsule).toHaveCSS('height','52px');const bounds=await capsule.boundingBox();
+ const capsule=page.locator('[data-phase="recording"]');await expect(capsule).toHaveCSS('width','136px');await expect(capsule).toHaveCSS('height','34px');const bounds=await capsule.boundingBox();
  const values=()=>wave.locator('i').evaluateAll(nodes=>nodes.map(n=>getComputedStyle(n).transform));
  const first=await values();await expect.poll(values).not.toEqual(first);expect(new Set(await values()).size).toBeGreaterThan(5);expect(await capsule.boundingBox()).toEqual(bounds);
  await page.screenshot({path:info.outputPath('waveform.png')});

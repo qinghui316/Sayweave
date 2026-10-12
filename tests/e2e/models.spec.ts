@@ -69,13 +69,19 @@ test('long model summaries, menus and delete confirmation stay within a small wi
 });
 
 
-test('model category tabs use shared jelly motion with stable group and keyboard semantics',async({page})=>{
+test('model category tabs move a shared indicator with stable buttons and keyboard semantics',async({page})=>{
  const dialog=await open(page), speech=dialog.getByRole('tab',{name:'语音识别'}), text=dialog.getByRole('tab',{name:'文字处理'});
  const group=dialog.getByRole('tablist',{name:'模型类别'}),before=await group.boundingBox();
- await speech.focus();await page.keyboard.press('ArrowRight');await expect(text).toBeFocused();await expect(speech).toHaveAttribute('aria-selected','true');await page.keyboard.press('Enter');await expect(text).toHaveAttribute('aria-selected','true');
+ const indicator=group.locator('[data-rubber-indicator]'),buttonBounds=await text.boundingBox();
+ await speech.focus();await page.keyboard.press('ArrowRight');await expect(text).toBeFocused();await expect(speech).toHaveAttribute('aria-selected','true');
+ const movement=indicator.evaluate(async el=>{const samples=[el.getBoundingClientRect().x];for(let i=0;i<40;i++){await new Promise<void>(resolve=>requestAnimationFrame(()=>resolve()));samples.push(el.getBoundingClientRect().x);}return samples;});
+ await page.keyboard.press('Enter');await expect(text).toHaveAttribute('aria-selected','true');
+ const samples=await movement;expect(Math.max(...samples)-Math.min(...samples)).toBeGreaterThan(8);
  expect(await group.boundingBox()).toEqual(before);
- await expect.poll(()=>text.evaluate(el=>new DOMMatrix(getComputedStyle(el).transform).a)).toBeGreaterThan(1.15);
- await expect(text.locator('[data-choice-face]')).toHaveCSS('background-color','rgb(0, 0, 0)');
+ expect(await text.boundingBox()).toEqual(buttonBounds);
+ await expect.poll(async()=>{const a=await indicator.boundingBox(),b=await text.boundingBox();return !!a&&!!b&&Math.abs(a.x-b.x)<1&&Math.abs(a.y-b.y)<1&&Math.abs(a.width-b.width)<1&&Math.abs(a.height-b.height)<1;}).toBe(true);
+ await expect(indicator).toHaveCSS('background-color','rgb(0, 0, 0)');await expect(indicator).toHaveCSS('opacity','1');
+ await expect(text.locator('[data-choice-face]')).toHaveCSS('background-color','rgba(0, 0, 0, 0)');
  await expect(text).toHaveCSS('color','rgb(246, 246, 246)');
  expect(await text.evaluate(el=>getComputedStyle(el).backgroundColor)).toBe('rgba(0, 0, 0, 0)');
  await hitVisible(dialog.getByLabel('服务地址（URL）'));await expect(dialog.getByLabel('模型',{exact:true})).toHaveText('选择文字模型');
@@ -86,9 +92,10 @@ test('compact actions, selected surface and reduced motion remain clear',async({
  await page.setViewportSize({width:960,height:640});await page.emulateMedia({reducedMotion:'reduce'});
  const dialog=await open(page),tabs=dialog.getByRole('tablist',{name:'模型类别'});
  await expect(tabs.getByRole('tab').first()).toHaveCSS('transition-duration','0s');
- await expect(tabs.locator('[data-choice-face][data-current="true"]')).toHaveCSS('background-color','rgb(0, 0, 0)');
+ const indicator=tabs.locator('[data-rubber-indicator]');await expect(indicator).toHaveCSS('background-color','rgb(0, 0, 0)');await expect(indicator).toHaveCSS('opacity','1');
  await dialog.getByRole('tab',{name:'文字处理'}).click();
- await expect(dialog.getByRole('tab',{name:'文字处理'})).toHaveCSS('transform','matrix(1, 0, 0, 1, 0, 0)');
+ const selected=dialog.getByRole('tab',{name:'文字处理'});expect(await selected.evaluate(el=>new DOMMatrix(getComputedStyle(el).transform).isIdentity)).toBe(true);
+ await expect.poll(async()=>{const a=await indicator.boundingBox(),b=await selected.boundingBox();return !!a&&!!b&&Math.abs(a.x-b.x)<1&&Math.abs(a.width-b.width)<1;}).toBe(true);
  const more=(await dialog.getByRole('button',{name:'更多设置'}).boundingBox())!,save=(await dialog.getByRole('button',{name:'保存',exact:true}).boundingBox())!;
  expect(save.y-(more.y+more.height)).toBeLessThan(80);await hitVisible(dialog.getByLabel('模型',{exact:true}));
  await page.screenshot({path:'tests/visual/settings-compact-960.png'});
