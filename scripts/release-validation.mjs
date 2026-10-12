@@ -75,4 +75,35 @@ export async function runFrozenReleaseTests(root=process.cwd(),env=process.env,r
  }catch(error){throw new AggregateError(failure?[failure,error]:[error],'Frozen product restoration failed',{cause:error});}
  if(failure)throw failure;
 }
-if(process.argv[1]&&pathToFileURL(resolve(process.argv[1])).href===import.meta.url)runFrozenReleaseTests().catch(error=>{console.error(error);process.exitCode=1;});
+export function validateOwnedDraft(identity,release,id){
+ if(!/^[1-9]\d*$/.test(id)||!Number.isSafeInteger(release?.id)||String(release.id)!==id||release.tag_name!==identity.tag||release.target_commitish!==identity.commit||release.draft!==true||release.prerelease!==false||!Array.isArray(release.assets)||release.assets.length!==0)throw Error('Exact empty owner draft required; existing assets are protected');
+}
+export function validateVerificationRun(identity,run,jobs,id){
+ if(!/^[1-9]\d*$/.test(id)||String(run?.id)!==id||run.repository?.full_name!==repository||run.path!=='.github/workflows/windows-release.yml'||run.event!=='workflow_dispatch'||run.status!=='completed'||! /^[a-f0-9]{40}$/.test(run.head_sha)||!run.head_branch?.startsWith(`${identity.tag}-release-check-`))throw Error('Verification run identity differs');
+ const selected=jobs.filter(job=>job.name==='verify');
+ const required=['Verify frozen product and landed controller','Run npm run check','Run reviewed E2E against the frozen product and restore its checkout','Run npm run check:distribution'];
+ if(selected.length!==1||selected[0].status!=='completed'||selected[0].conclusion!=='success'||required.some(name=>selected[0].steps.filter(step=>step.name===name&&step.conclusion==='success').length!==1))throw Error('Prior product verification is incomplete');
+}
+export function verifyReusedChecks(root=process.cwd(),env=process.env){
+ const id=env.SAYWEAVE_VERIFICATION_RUN;if(!/^[1-9]\d*$/.test(id))throw Error('Exact verification run required');
+ const api=endpoint=>JSON.parse(execFileSync('gh',['api',`repos/${repository}/${endpoint}`],{cwd:root,env,encoding:'utf8'}));
+ const git=(args,encoding='utf8')=>execFileSync('git',args,{cwd:root,encoding});
+ const identity=releaseIdentity(JSON.parse(readFileSync(join(root,'package.json'),'utf8')).version,env.SAYWEAVE_RELEASE_TAG,env.SAYWEAVE_RELEASE_COMMIT);
+ const original=createRequire(import.meta.url)(join(root,'scripts/release-validation.mjs'));original.verifyBuild(identity,root,[identity.version]);
+ const run=api(`actions/runs/${id}`),jobs=api(`actions/runs/${id}/jobs?per_page=100`).jobs;
+ validateVerificationRun(identity,run,jobs,id);
+ for(const [commit,ref] of [[run.head_sha,`refs/tags/${run.head_branch}`],[env.SAYWEAVE_CONTROLLER_COMMIT,env.SAYWEAVE_CONTROLLER_REF]]){
+  validateFrozenController(identity.tag,identity.commit,commit,ref,git(['diff','--name-only',identity.commit,commit]).trim().split(/\r?\n/).filter(Boolean));
+  if(git(['rev-parse',`${ref}^{commit}`]).trim()!==commit)throw Error('Verification controller tag differs');
+  git(['merge-base','--is-ancestor',commit,'origin/main']);git(['merge-base','--is-ancestor',identity.commit,commit]);
+ }
+ for(const path of frozenTestPaths)if(!git(['show',`${run.head_sha}:${path}`],null).equals(git(['show',`${env.SAYWEAVE_CONTROLLER_COMMIT}:${path}`],null)))throw Error('Reviewed E2E source changed; fresh checks required');
+ console.log(JSON.stringify({reusedVerificationRun:id,verifyJob:jobs.find(job=>job.name==='verify').id,productCommit:identity.commit,sourceController:run.head_sha,controllerCommit:env.SAYWEAVE_CONTROLLER_COMMIT,scope:'full check, reviewed full E2E and distribution; identical frozen product/tests'}));
+}
+if(process.argv[1]&&pathToFileURL(resolve(process.argv[1])).href===import.meta.url){
+ const mode=process.argv[2];
+ if(mode==='draft-check')validateOwnedDraft(releaseIdentity(JSON.parse(readFileSync('package.json','utf8')).version,process.env.SAYWEAVE_RELEASE_TAG,process.env.SAYWEAVE_RELEASE_COMMIT),JSON.parse(readFileSync(process.argv[3],'utf8').replace(/^\uFEFF/,'')),process.env.EXPECTED_RELEASE_ID);
+ else if(mode==='reuse-verification')verifyReusedChecks();
+ else if(mode===undefined)runFrozenReleaseTests().catch(error=>{console.error(error);process.exitCode=1;});
+ else throw Error('Unknown frozen release validation mode');
+}

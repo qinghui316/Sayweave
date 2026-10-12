@@ -28,6 +28,10 @@ on:
         type: string
         default: ''
         description: Frozen SHA256SUMS.txt hash covering all five draft assets
+      verification_run_id:
+        type: string
+        default: ''
+        description: Successful exact-product verify job to reuse for a frozen build
 
 permissions:
   contents: read
@@ -54,9 +58,11 @@ jobs:
         env:
           EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
           EXPECTED_CHECKSUM: ${{ inputs.checksum_sha256 }}
+          VERIFICATION_RUN: ${{ inputs.verification_run_id }}
         run: |
           if ($env:SAYWEAVE_RELEASE_PHASE -notin @('build','build-frozen','check-access','accept-existing')) { throw 'Unknown release phase.' }
-          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen' -and ($env:SAYWEAVE_RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$' -or $env:SAYWEAVE_RELEASE_COMMIT -notmatch '^[a-f0-9]{40}$' -or $env:SAYWEAVE_CONTROLLER_REF -notmatch "^refs/tags/$([regex]::Escape($env:SAYWEAVE_RELEASE_TAG))-release-check-[a-z0-9][a-z0-9.-]*$" -or $env:EXPECTED_RELEASE_ID -or $env:EXPECTED_CHECKSUM)) { throw 'Exact frozen product and diagnostic controller identities are required.' }
+          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen' -and ($env:SAYWEAVE_RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$' -or $env:SAYWEAVE_RELEASE_COMMIT -notmatch '^[a-f0-9]{40}$' -or $env:SAYWEAVE_CONTROLLER_REF -notmatch "^refs/tags/$([regex]::Escape($env:SAYWEAVE_RELEASE_TAG))-release-check-[a-z0-9][a-z0-9.-]*$" -or $env:EXPECTED_RELEASE_ID -notmatch '^[1-9]\d*$' -or $env:EXPECTED_CHECKSUM)) { throw 'Exact frozen product, empty owner draft and diagnostic controller identities are required.' }
+          if ($env:VERIFICATION_RUN -and ($env:SAYWEAVE_RELEASE_PHASE -ne 'build-frozen' -or $env:VERIFICATION_RUN -notmatch '^[1-9]\d*$')) { throw 'Verification reuse is restricted to an exact frozen build.' }
           if ($env:SAYWEAVE_RELEASE_PHASE -in @('check-access','accept-existing') -and ($env:SAYWEAVE_RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$' -or $env:SAYWEAVE_RELEASE_COMMIT -notmatch '^[a-f0-9]{40}$' -or $env:EXPECTED_RELEASE_ID -notmatch '^[1-9]\d*$' -or $env:EXPECTED_CHECKSUM -notmatch '^[a-f0-9]{64}$')) { throw 'Exact existing-draft identities are required.' }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -87,14 +93,27 @@ jobs:
             node scripts/reuse-windows-update-evidence.mjs .local/release-mechanism-evidence
             if ($LASTEXITCODE -ne 0) { throw 'Exact existing-installation evidence is required.' }
           }
-      - if: inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+      - name: Reuse passed exact-product checks with unchanged reviewed tests
+        if: inputs.verification_run_id != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SAYWEAVE_VERIFICATION_RUN: ${{ inputs.verification_run_id }}
+        run: |
+          $helper = Join-Path $env:RUNNER_TEMP 'reuse-release-verification.mjs'
+          $source = git show "$($env:SAYWEAVE_CONTROLLER_COMMIT):scripts/release-validation.mjs"
+          if ($LASTEXITCODE -ne 0) { throw 'Reviewed verifier missing.' }
+          $source | Set-Content -LiteralPath $helper -Encoding utf8
+          node $helper reuse-verification
+          if ($LASTEXITCODE -ne 0) { throw 'Existing exact-product evidence is invalid.' }
+      - if: inputs.verification_run_id == '' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
         run: npx playwright install chromium
-      - if: inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+      - if: inputs.verification_run_id == '' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
         run: npm run check
-      - if: inputs.phase != 'build-frozen' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+      - if: inputs.verification_run_id == '' && inputs.phase != 'build-frozen' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
         run: npm run test:e2e
       - name: Run reviewed E2E against the frozen product and restore its checkout
-        if: inputs.phase == 'build-frozen'
+        if: inputs.verification_run_id == '' && inputs.phase == 'build-frozen'
         shell: pwsh
         run: |
           $helper = Join-Path $env:RUNNER_TEMP 'prepare-frozen-release.mjs'
@@ -103,7 +122,7 @@ jobs:
           $source | Set-Content -LiteralPath $helper -Encoding utf8
           node $helper
           if ($LASTEXITCODE -ne 0) { throw 'Frozen product E2E verification failed.' }
-      - if: inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+      - if: inputs.verification_run_id == '' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
         run: npm run check:distribution
 
   draft:
@@ -130,9 +149,24 @@ jobs:
       - run: npm ci
       - name: Verify tag identity
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
         run: |
           if ($env:SAYWEAVE_RELEASE_TAG -ne "v$(node -p "require('./package.json').version")") { throw 'Tag and package version differ.' }
+          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen') {
+            $helper = Join-Path $env:RUNNER_TEMP 'owner-draft-validator.mjs'
+            $source = git show "$($env:SAYWEAVE_CONTROLLER_COMMIT):scripts/release-validation.mjs"
+            if ($LASTEXITCODE -ne 0) { throw 'Reviewed draft verifier missing.' }
+            $source | Set-Content -LiteralPath $helper -Encoding utf8
+            $draft = Join-Path $env:RUNNER_TEMP 'owner-draft.json'
+            gh api "repos/qinghui316/Sayweave/releases/$env:EXPECTED_RELEASE_ID" | Set-Content -LiteralPath $draft -Encoding utf8
+            if ($LASTEXITCODE -ne 0) { throw 'Owner draft unavailable.' }
+            node $helper draft-check $draft
+            if ($LASTEXITCODE -ne 0) { throw 'Owner draft identity/empty state differs.' }
+          }
       - name: Build signed NSIS package
+        id: signed
         shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -146,16 +180,36 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Manifest generation failed.' }
           npm run desktop:release:verify
           if ($LASTEXITCODE -ne 0) { throw 'Release verification failed.' }
+      - name: Preserve signed assets or failed bundle diagnostics before Release operations
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: release-package-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}-${{ steps.signed.outcome }}
+          retention-days: ${{ steps.signed.outcome == 'success' && 14 || 7 }}
+          path: |
+            ${{ steps.signed.outcome == 'success' && 'release/sayweave/*' || 'src-tauri/target/release/bundle/nsis/*.exe' }}
+            ${{ steps.signed.outcome == 'success' && 'release/release-notes.md' || 'src-tauri/target/release/bundle/nsis/*.sig' }}
+          if-no-files-found: warn
       - name: Create immutable draft
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
         run: |
-          gh release view $env:SAYWEAVE_RELEASE_TAG --repo '${{ github.repository }}' 2>$null
-          if ($LASTEXITCODE -eq 0) { throw 'Release tag already exists.' }
           $notes = 'release/release-notes.md'
           if (-not (Test-Path -LiteralPath $notes)) { throw "Release notes are missing: $notes" }
-          gh release create $env:SAYWEAVE_RELEASE_TAG --repo '${{ github.repository }}' --draft --verify-tag --target $env:SAYWEAVE_RELEASE_COMMIT --title "Sayweave $env:SAYWEAVE_RELEASE_TAG" --notes-file $notes release/sayweave/*
+          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen') {
+            $draft = Join-Path $env:RUNNER_TEMP 'owner-draft.json'
+            gh api "repos/qinghui316/Sayweave/releases/$env:EXPECTED_RELEASE_ID" | Set-Content -LiteralPath $draft -Encoding utf8
+            if ($LASTEXITCODE -ne 0) { throw 'Owner draft unavailable.' }
+            node (Join-Path $env:RUNNER_TEMP 'owner-draft-validator.mjs') draft-check $draft
+            if ($LASTEXITCODE -ne 0) { throw 'Owner draft changed during build.' }
+            gh release upload $env:SAYWEAVE_RELEASE_TAG --repo '${{ github.repository }}' release/sayweave/*
+          } else {
+            gh release view $env:SAYWEAVE_RELEASE_TAG --repo '${{ github.repository }}' 2>$null
+            if ($LASTEXITCODE -eq 0) { throw 'Release tag already exists.' }
+            gh release create $env:SAYWEAVE_RELEASE_TAG --repo '${{ github.repository }}' --draft --verify-tag --target $env:SAYWEAVE_RELEASE_COMMIT --title "Sayweave $env:SAYWEAVE_RELEASE_TAG" --notes-file $notes release/sayweave/*
+          }
           if ($LASTEXITCODE -ne 0) { throw 'Immutable draft creation failed.' }
       - name: Re-download and verify draft
         shell: pwsh
@@ -172,6 +226,7 @@ jobs:
         id: pin
         env:
           GH_TOKEN: ${{ github.token }}
+          EXPECTED_RELEASE_ID: ${{ inputs.release_id }}
         shell: pwsh
         run: |
           $releases = gh api 'repos/qinghui316/Sayweave/releases?per_page=100' | ConvertFrom-Json
@@ -180,6 +235,7 @@ jobs:
           if ($matching.Count -ne 1) { throw 'Uploaded draft identity is ambiguous.' }
           $release = $matching[0]
           if ($release.draft -ne $true -or $release.tag_name -ne $env:SAYWEAVE_RELEASE_TAG) { throw 'Uploaded draft identity differs.' }
+          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen' -and ([string]$release.id -ne $env:EXPECTED_RELEASE_ID -or $release.target_commitish -ne $env:SAYWEAVE_RELEASE_COMMIT)) { throw 'Owner draft identity changed.' }
           "release_id=$($release.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "checksum=$((Get-FileHash -LiteralPath 'release/sayweave/SHA256SUMS.txt' -Algorithm SHA256).Hash.ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 

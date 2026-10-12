@@ -6,7 +6,7 @@ import {join,resolve,sep} from 'node:path';
 import {describe,expect,it} from 'vitest';
 // The public release tools are JavaScript entry points with separately exercised inputs.
 // @ts-expect-error JavaScript release validator has no declaration file.
-import {releaseIdentity,validateRelease,releaseNotes,validateFrozenController,runFrozenReleaseTests} from '../scripts/release-validation.mjs';
+import {releaseIdentity,validateRelease,releaseNotes,validateFrozenController,runFrozenReleaseTests,validateOwnedDraft,validateVerificationRun} from '../scripts/release-validation.mjs';
 function fixture(){
  const identity=releaseIdentity('0.1.7','v0.1.7','a'.repeat(40)),bytes=Buffer.from('synthetic installer'),signature='synthetic signature';
  const sha512=createHash('sha512').update(bytes).digest('base64');
@@ -56,5 +56,18 @@ describe('frozen product release controller boundaries',()=>{
   }finally{
    rmSync(owned,{recursive:true});
   }
+ });
+});
+
+describe('owner draft and prior verification provenance',()=>{
+ const identity=releaseIdentity('0.1.9','v0.1.9','a'.repeat(40));
+ it('accepts only the exact empty draft and protects existing assets',()=>{
+  const draft={id:42,tag_name:identity.tag,target_commitish:identity.commit,draft:true,prerelease:false,assets:[]};expect(()=>validateOwnedDraft(identity,draft,'42')).not.toThrow();
+  for(const change of [{id:43},{tag_name:'v0.1.8'},{target_commitish:'b'.repeat(40)},{draft:false},{prerelease:true},{assets:[{name:'existing.exe'}]}])expect(()=>validateOwnedDraft(identity,{...draft,...change},'42')).toThrow();
+ });
+ const evidence=()=>({run:{id:99,repository:{full_name:'qinghui316/Sayweave'},path:'.github/workflows/windows-release.yml',event:'workflow_dispatch',status:'completed',conclusion:'failure',head_sha:'b'.repeat(40),head_branch:'v0.1.9-release-check-e2e-1'},jobs:[{id:101,name:'verify',status:'completed',conclusion:'success',steps:['Verify frozen product and landed controller','Run npm run check','Run reviewed E2E against the frozen product and restore its checkout','Run npm run check:distribution'].map(name=>({name,conclusion:'success'}))}]});
+ it('reuses a completed successful verification despite a later publication failure',()=>{const e=evidence();expect(()=>validateVerificationRun(identity,e.run,e.jobs,'99')).not.toThrow();});
+ it.each(['wrong_repo','wrong_commit','wrong_tag','wrong_workflow','unfinished','failed_verify','skipped_e2e','missing_distribution','ambiguous_job'])('refuses %s verification evidence',kind=>{
+  const e=evidence();if(kind==='wrong_repo')e.run.repository.full_name='evil/repo';if(kind==='wrong_commit')e.run.head_sha='unknown';if(kind==='wrong_tag')e.run.head_branch='v0.1.8-release-check-e2e-1';if(kind==='wrong_workflow')e.run.path='.github/workflows/windows-ci.yml';if(kind==='unfinished')e.run.status='in_progress';if(kind==='failed_verify')e.jobs[0]!.conclusion='failure';if(kind==='skipped_e2e')e.jobs[0]!.steps[2]!.conclusion='skipped';if(kind==='missing_distribution')e.jobs[0]!.steps.pop();if(kind==='ambiguous_job')e.jobs.push(e.jobs[0]!);expect(()=>validateVerificationRun(identity,e.run,e.jobs,'99')).toThrow();
  });
 });
