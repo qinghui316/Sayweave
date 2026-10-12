@@ -20,11 +20,26 @@ pub struct MachineRecord {
     pub old: Option<registration::InstallerRegistration>,
     pub old_hash: Option<String>,
     pub module: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_core: Option<sayweave_text_service::lifecycle::CurrentEngine>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_core: Option<sayweave_text_service::lifecycle::CurrentEngine>,
+    #[serde(default)]
+    pub core_publish_started: bool,
     pub error: Option<String>,
 }
 impl MachineRecord {
     pub fn validate(&self) -> Result<()> {
         self.target.validate()?;
+        if self.before_core.as_ref().is_some_and(|v| !v.valid())
+            || self.target_core.as_ref().is_some_and(|v| {
+                !v.valid()
+                    || v.proxy_sha256 != self.target.payload_hash
+                    || self.target.core_hash.as_deref() != Some(v.core_sha256.as_str())
+            })
+        {
+            return Err("installerCoreRecord".into());
+        }
         if self.schema_version != 1
             || uuid::Uuid::parse_str(&self.transaction).is_err()
             || self.language == 0
@@ -60,6 +75,16 @@ impl MachineRecord {
         {
             return Err("componentIdentity".into());
         }
+        if let Some(core) = &self.target_core
+            && (self.target.core_hash.as_deref() != Some(core.core_sha256.as_str())
+                || deployment::current_engine()
+                    .map_err(|_| "componentCoreIdentity")?
+                    .as_ref()
+                    != Some(core)
+                || deployment::verified_core(core).is_err())
+        {
+            return Err("componentCoreIdentity".into());
+        }
         Ok(())
     }
     fn rollback(&mut self) -> Result<()> {
@@ -73,8 +98,19 @@ impl MachineRecord {
         {
             return Err("componentOldIdentity".into());
         }
+        let current_core = deployment::current_engine().map_err(|_| "componentCoreIdentity")?;
+        if self.core_publish_started
+            && current_core.as_ref() != self.before_core.as_ref()
+            && current_core.as_ref() != self.target_core.as_ref()
+        {
+            return Err("componentCoreChanged".into());
+        }
         registration::restore_installer_machine(self.old.as_ref(), &self.module)
             .map_err(|_| "componentRollback")?;
+        if self.core_publish_started && current_core.as_ref() != self.before_core.as_ref() {
+            deployment::publish_engine(current_core.as_ref(), self.before_core.as_ref())
+                .map_err(|_| "componentCoreRollback")?;
+        }
         self.phase = Phase::RolledBack;
         self.error = None;
         self.save()
@@ -90,6 +126,19 @@ pub fn load() -> Result<Option<MachineRecord>> {
     Ok(Some(value))
 }
 pub fn deployment_state(payload: &[u8]) -> &'static str {
+    match deployment::core_update_pending() {
+        Ok(true) => {
+            return if deployment::can_repair_bundle(payload, crate::text_service::core_payload())
+                .unwrap_or(false)
+            {
+                "failed"
+            } else {
+                "pending"
+            };
+        }
+        Err(_) => return "failed",
+        _ => (),
+    }
     match load() {
         Ok(Some(record)) if !record.phase.terminal() => {
             if record.phase == Phase::Recovery {
@@ -100,7 +149,11 @@ pub fn deployment_state(payload: &[u8]) -> &'static str {
         }
         Err(_) => "failed",
         _ => {
-            if !payload.is_empty() && matches!(deployment::matches_payload(payload), Ok(Some(true)))
+            if !payload.is_empty()
+                && matches!(
+                    deployment::matches_bundle(payload, crate::text_service::core_payload()),
+                    Ok(Some(true))
+                )
             {
                 "ready"
             } else {
@@ -155,8 +208,12 @@ pub fn serve(
                 deployment::installer_module_hash(&old.module).map_err(|_| "componentOldIdentity")
             })
             .transpose()?;
-        let module = deployment::prepare_installer(crate::text_service::payload())
-            .map_err(|_| "componentPrepare")?;
+        let before_core = deployment::current_engine().map_err(|_| "componentCoreRead")?;
+        let (module, target_core) = deployment::prepare_engine(
+            crate::text_service::payload(),
+            crate::text_service::core_payload(),
+        )
+        .map_err(|_| "componentPrepare")?;
         if deployment::installer_module_hash(&module).map_err(|_| "componentIdentity")?
             != target.payload_hash
         {
@@ -173,6 +230,9 @@ pub fn serve(
             old,
             old_hash,
             module,
+            before_core,
+            target_core: Some(target_core),
+            core_publish_started: false,
             error: None,
         };
         value.save()?;
@@ -258,6 +318,13 @@ fn handle(pipe: &Pipe, record: &mut MachineRecord, recover: bool) -> Result<()> 
                     record.language,
                 )
                 .map_err(|_| "componentCommit")?;
+                record.core_publish_started = true;
+                record.save()?;
+                deployment::publish_engine(
+                    record.before_core.as_ref(),
+                    record.target_core.as_ref(),
+                )
+                .map_err(|_| "componentCoreCommit")?;
                 record.phase = Phase::MachineCommitted;
                 record.save()?;
             }

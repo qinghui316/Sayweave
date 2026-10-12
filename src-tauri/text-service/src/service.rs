@@ -26,8 +26,24 @@ use windows::{
 };
 static OBJECTS: AtomicUsize = AtomicUsize::new(0);
 static LOCKS: AtomicUsize = AtomicUsize::new(0);
+static CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+struct Callback;
+impl Callback {
+    fn enter() -> Self {
+        CALLBACKS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+impl Drop for Callback {
+    fn drop(&mut self) {
+        CALLBACKS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 static COMPOSITION_EPOCH: AtomicU64 = AtomicU64::new(0);
 static LEASE_GENERATION: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "engine")]
+#[path = "engine.rs"]
+mod engine;
 fn next_generation() -> u64 {
     LEASE_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
 }
@@ -69,6 +85,13 @@ struct Pending {
 }
 #[derive(Default)]
 struct State {
+    // Hosted engines never create a pipe, window or timer; the stable proxy owns them.
+    hosted: bool,
+    host_guard: Option<crate::engine_abi::HostGuardV1>,
+    binding: EngineBinding,
+    core_identity: Option<ModuleIdentity>,
+    output: Option<Rc<RefCell<std::collections::VecDeque<Vec<u8>>>>>,
+    reply_recovery: Option<Vec<u8>>,
     observation_task: Option<(String, u64)>,
     observations: Vec<edit_observation::Watch>,
     observation_epoch: u64,
@@ -590,47 +613,56 @@ impl ITfTextInputProcessor_Impl for Service_Impl {
                 return Err(failure(E_UNEXPECTED));
             }
             let manager = manager.as_ref().ok_or_else(|| failure(E_POINTER))?.clone();
-            let pipe = Pipe::server()?;
-            let class = WNDCLASSW {
-                lpfnWndProc: Some(procedure),
-                hInstance: module()?,
-                lpszClassName: w!("SayweaveTsfBridge"),
-                ..Default::default()
-            };
-            let _ = RegisterClassW(&class);
-            let window = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("SayweaveTsfBridge"),
-                w!(""),
-                WINDOW_STYLE(0),
-                0,
-                0,
-                0,
-                0,
-                Some(HWND_MESSAGE),
-                None,
-                Some(module()?),
-                None,
-            )?;
-            let data = Box::new(BridgeData {
-                state: self.state.clone(),
-                _lease: Lease::new(),
-            });
-            SetWindowLongPtrW(window, GWLP_USERDATA, Box::into_raw(data) as isize);
-            {
-                let mut s = self.state.borrow_mut();
-                s.manager = Some(manager);
-                s.client = client;
-                s.window = window.0 as usize;
-                s.active = true;
-                s.key_failure = false;
-                s.key_handoff = false;
-                s.generation = next_generation();
-                s.pipe = Some(pipe);
-            }
-            if SetTimer(Some(window), 1, 50, None) == 0 {
-                self.Deactivate()?;
-                return Err(failure(E_FAIL));
+            let hosted = self.state.borrow().hosted;
+            if hosted {
+                let mut state = self.state.borrow_mut();
+                state.manager = Some(manager.clone());
+                state.client = client;
+                state.active = true;
+                state.generation = next_generation();
+            } else {
+                let pipe = Pipe::server()?;
+                let class = WNDCLASSW {
+                    lpfnWndProc: Some(procedure),
+                    hInstance: module()?,
+                    lpszClassName: w!("SayweaveTsfBridge"),
+                    ..Default::default()
+                };
+                let _ = RegisterClassW(&class);
+                let window = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("SayweaveTsfBridge"),
+                    w!(""),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    Some(module()?),
+                    None,
+                )?;
+                let data = Box::new(BridgeData {
+                    state: self.state.clone(),
+                    _lease: Lease::new(),
+                });
+                SetWindowLongPtrW(window, GWLP_USERDATA, Box::into_raw(data) as isize);
+                {
+                    let mut s = self.state.borrow_mut();
+                    s.manager = Some(manager);
+                    s.client = client;
+                    s.window = window.0 as usize;
+                    s.active = true;
+                    s.key_failure = false;
+                    s.key_handoff = false;
+                    s.generation = next_generation();
+                    s.pipe = Some(pipe);
+                }
+                if SetTimer(Some(window), 1, 50, None) == 0 {
+                    self.Deactivate()?;
+                    return Err(failure(E_FAIL));
+                }
             }
             let (manager, generation) = {
                 let s = self.state.borrow();
@@ -795,6 +827,15 @@ fn poll(shared: &Shared) {
     dispatch(shared, r, connection);
 }
 fn dispatch(shared: &Shared, r: Request, connection: u64) {
+    {
+        let mut state = shared.borrow_mut();
+        if state.hosted && state.binding != r.engine {
+            return;
+        }
+        if !state.hosted {
+            state.binding = r.engine.clone();
+        }
+    }
     if matches!(
         r.action,
         Action::ObserveStart | Action::ObservePoll | Action::ObserveStop
@@ -1175,12 +1216,15 @@ fn send_reply(
     } else {
         None
     };
-    let s = shared.borrow();
+    let mut s = shared.borrow_mut();
     if !s.connected || s.connection != connection || s.capability.as_ref() != Some(&r.capability) {
         return;
     }
-    if let Some(pipe) = s.pipe.as_ref() {
+    if s.pipe.is_some() || s.output.is_some() {
         let reply = Reply {
+            engine: s.binding.clone(),
+            task: r.task.clone(),
+            turn: r.turn,
             operation: r.operation,
             revision: r.revision,
             applied,
@@ -1235,13 +1279,29 @@ fn send_reply(
             settlement,
             edit_observation,
             runtime: (r.action == Action::Inspect).then(|| Runtime {
+                engine: s.binding.clone(),
+                core: s.core_identity.clone(),
+                proxy: None,
                 protocol: PROTOCOL,
                 process: std::process::id(),
                 thread: unsafe { windows::Win32::System::Threading::GetCurrentThreadId() },
             }),
         };
         if let Ok(data) = serde_json::to_vec(&reply) {
-            let _ = pipe.send(&data);
+            if let Some(output) = s.output.clone() {
+                let mut output = output.borrow_mut();
+                if output.len() < 4
+                    && output.iter().map(Vec::len).sum::<usize>() + data.len() <= MAX_FRAME * 4
+                {
+                    output.push_back(data);
+                } else if s.reply_recovery.is_none() {
+                    // Retain the first undelivered outcome and stop admission;
+                    // never silently erase a text-effect acknowledgement.
+                    s.reply_recovery = Some(data);
+                }
+            } else if let Some(pipe) = &s.pipe {
+                let _ = pipe.send(&data);
+            }
         }
     }
 }
@@ -1504,6 +1564,7 @@ struct ObserveAttach {
 }
 impl ITfEditSession_Impl for ObserveAttach_Impl {
     fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        let _callback = Callback::enter();
         let Some(shared) = self.state.upgrade() else {
             return Ok(());
         };
@@ -1576,9 +1637,12 @@ fn lease(
             if !s.active || s.generation != generation || !s.version.accepts(r) || s.cleanup {
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            let pipe = s.pipe.as_ref().ok_or_else(|| failure(TF_E_DISCONNECTED))?;
             let peer = s.peer.ok_or_else(|| failure(E_ACCESSDENIED))?;
-            if !pipe.alive() || pipe.client_pid().ok() != Some(peer.pid) {
+            if let Some(pipe) = s.pipe.as_ref() {
+                if !pipe.alive() || pipe.client_pid().ok() != Some(peer.pid) {
+                    return Err(failure(TF_E_DISCONNECTED));
+                }
+            } else if !hosted_channel_alive(&s, &r.capability) {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             (
@@ -1640,11 +1704,32 @@ fn edit_identity(
         || !s.version.accepts(r)
         || s.cleanup
         || s.capability.as_ref() != Some(&r.capability)
+        || s.hosted && !hosted_channel_alive(&s, &r.capability)
         || !r.live(unsafe { GetTickCount64() })
     {
         return Err(failure(TF_E_DISCONNECTED));
     }
     Ok(())
+}
+fn hosted_channel_alive(state: &State, capability: &str) -> bool {
+    let Some(guard) = state.host_guard else {
+        return false;
+    };
+    let Some(peer) = state.peer else {
+        return false;
+    };
+    state.hosted
+        && state.connected
+        && state.connection != 0
+        && unsafe {
+            (guard.validate)(
+                guard.context,
+                guard.engine_generation,
+                peer.pid,
+                capability.as_ptr(),
+                capability.len(),
+            ) == S_OK.0
+        }
 }
 fn schedule(
     shared: &Shared,
@@ -1886,6 +1971,7 @@ fn release_composition_with_failure(
 }
 fn reply_interrupted_prefix(shared: &Shared, pending: &Pending) {
     let request = Request {
+        engine: shared.borrow().binding.clone(),
         protocol: PROTOCOL,
         capability: pending.capability.clone(),
         task: pending.task.clone(),
@@ -2203,6 +2289,7 @@ impl KeySink {
 }
 impl ITfKeyEventSink_Impl for KeySink_Impl {
     fn OnSetFocus(&self, _: BOOL) -> windows::core::Result<()> {
+        let _callback = Callback::enter();
         Ok(())
     }
     fn OnTestKeyDown(
@@ -2211,6 +2298,7 @@ impl ITfKeyEventSink_Impl for KeySink_Impl {
         key: WPARAM,
         _: LPARAM,
     ) -> windows::core::Result<BOOL> {
+        let _callback = Callback::enter();
         Ok(self.owns_key(context, key).is_some().into())
     }
     fn OnKeyDown(
@@ -2219,6 +2307,7 @@ impl ITfKeyEventSink_Impl for KeySink_Impl {
         key: WPARAM,
         _: LPARAM,
     ) -> windows::core::Result<BOOL> {
+        let _callback = Callback::enter();
         if let Some(shared) = self.owns_key(context, key) {
             let observation = prepare_key_observation(&shared);
             let ended = end_owned_with_flags(&shared, TF_ES_SYNC);
@@ -2234,12 +2323,15 @@ impl ITfKeyEventSink_Impl for KeySink_Impl {
         Ok(false.into())
     }
     fn OnTestKeyUp(&self, _: Ref<ITfContext>, _: WPARAM, _: LPARAM) -> windows::core::Result<BOOL> {
+        let _callback = Callback::enter();
         Ok(false.into())
     }
     fn OnKeyUp(&self, _: Ref<ITfContext>, _: WPARAM, _: LPARAM) -> windows::core::Result<BOOL> {
+        let _callback = Callback::enter();
         Ok(false.into())
     }
     fn OnPreservedKey(&self, _: Ref<ITfContext>, _: *const GUID) -> windows::core::Result<BOOL> {
+        let _callback = Callback::enter();
         Ok(false.into())
     }
 }
@@ -2286,6 +2378,7 @@ struct EndOwned {
 }
 impl ITfEditSession_Impl for EndOwned_Impl {
     fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        let _callback = Callback::enter();
         let guard = || {
             cleanup_identity(
                 &self.state,
@@ -2340,6 +2433,7 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
         ec: u32,
         composition: Ref<ITfComposition>,
     ) -> windows::core::Result<()> {
+        let _callback = Callback::enter();
         let Some(composition) = composition.as_ref() else {
             // No object is not evidence that the current empty/prepared lease
             // ended. In particular None must never compare equal to None here.
@@ -2512,6 +2606,7 @@ impl ITfTextEditSink_Impl for TextSink_Impl {
         ec: u32,
         record: Ref<ITfEditRecord>,
     ) -> windows::core::Result<()> {
+        let _callback = Callback::enter();
         let _notification = TextNotification::enter(self.state.borrow().text_notifications.clone());
         let (client, binding, expected, expected_selection) = {
             let s = self.state.borrow();
@@ -2786,6 +2881,7 @@ struct RetireOwned {
 }
 impl ITfEditSession_Impl for RetireOwned_Impl {
     fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        let _callback = Callback::enter();
         let result = (|| {
             edit_identity(&self.state, &self.request, self.generation, self.epoch)?;
             let peer = {
@@ -2794,7 +2890,8 @@ impl ITfEditSession_Impl for RetireOwned_Impl {
                     || s.connection != self.connection
                     || s.context.as_ref() != Some(&self.context)
                     || s.composition.as_ref() != Some(&self.composition)
-                    || !s.pipe.as_ref().is_some_and(|p| p.alive())
+                    || !(s.pipe.as_ref().is_some_and(|p| p.alive())
+                        || hosted_channel_alive(&s, &self.request.capability))
                 {
                     return Err(failure(TF_E_DISCONNECTED));
                 }
@@ -2848,6 +2945,7 @@ struct Edit {
 }
 impl ITfEditSession_Impl for Edit_Impl {
     fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        let _callback = Callback::enter();
         let mut mutation = Mutation::NotAttempted;
         let mut settlement = (self.request.action == Action::Settle).then(Settlement::default);
         let mut phase = "lease";
@@ -4252,7 +4350,10 @@ pub unsafe extern "system" fn DllGetClassObject(
 }
 #[unsafe(no_mangle)]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
-    if OBJECTS.load(Ordering::Acquire) == 0 && LOCKS.load(Ordering::Acquire) == 0 {
+    if OBJECTS.load(Ordering::Acquire) == 0
+        && LOCKS.load(Ordering::Acquire) == 0
+        && CALLBACKS.load(Ordering::Acquire) == 0
+    {
         S_OK
     } else {
         S_FALSE
@@ -4267,6 +4368,7 @@ mod tests {
         let old = uuid::Uuid::new_v4().to_string();
         let newer = uuid::Uuid::new_v4().to_string();
         let request = Request {
+            engine: crate::wire::fixture_binding(),
             protocol: PROTOCOL,
             capability: uuid::Uuid::new_v4().to_string(),
             task: old.clone(),
@@ -4314,6 +4416,7 @@ mod tests {
         .unwrap();
         assert!(server.connect());
         let request = Request {
+            engine: crate::wire::fixture_binding(),
             protocol: PROTOCOL,
             task: uuid::Uuid::new_v4().to_string(),
             capability: uuid::Uuid::new_v4().to_string(),
@@ -4448,6 +4551,7 @@ mod tests {
             dispatch(
                 &shared,
                 Request {
+                    engine: crate::wire::fixture_binding(),
                     protocol: PROTOCOL,
                     task,
                     capability,
@@ -4518,6 +4622,7 @@ mod tests {
         let old_task = uuid::Uuid::new_v4().to_string();
         let new_task = uuid::Uuid::new_v4().to_string();
         let request = Request {
+            engine: crate::wire::fixture_binding(),
             protocol: PROTOCOL,
             capability: capability.clone(),
             task: old_task,
@@ -4635,6 +4740,7 @@ mod tests {
         let capability = uuid::Uuid::new_v4().to_string();
         let task = uuid::Uuid::new_v4().to_string();
         let request = Request {
+            engine: crate::wire::fixture_binding(),
             protocol: PROTOCOL,
             capability: capability.clone(),
             task: task.clone(),
@@ -4913,6 +5019,7 @@ mod tests {
             ..Default::default()
         }));
         let old = Request {
+            engine: crate::wire::fixture_binding(),
             protocol: crate::wire::PROTOCOL,
             capability: uuid::Uuid::new_v4().to_string(),
             task,

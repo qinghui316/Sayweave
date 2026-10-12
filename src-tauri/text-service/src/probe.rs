@@ -8,7 +8,16 @@ use windows::{
     },
     core::Interface,
 };
+fn fixture_binding() -> EngineBinding {
+    EngineBinding {
+        proxy_instance: "11111111-1111-4111-8111-111111111111".into(),
+        engine_generation: 1,
+    }
+}
 struct Apartment;
+#[cfg(feature = "acceptance")]
+#[path = "core_switch_probe.rs"]
+mod core_switch_probe;
 impl Drop for Apartment {
     fn drop(&mut self) {
         unsafe {
@@ -28,6 +37,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _apartment = Apartment;
         let args: Vec<_> = std::env::args().collect();
         match args.get(1).map(String::as_str) {
+            #[cfg(feature = "acceptance")]
+            Some("core-switch") => core_switch_probe::run(&args)?,
+            #[cfg(feature = "acceptance")]
+            Some("core-switch-multi") => core_switch_probe::multi(&args)?,
             #[cfg(feature = "acceptance")]
             Some("host-identity-hold") => {
                 let capability = uuid::Uuid::new_v4().to_string();
@@ -388,6 +401,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         return Err("target foreground changed; stopped without retry".into());
                     }
                     let r = Request {
+                        engine: fixture_binding(),
                         protocol: sayweave_text_service::wire::PROTOCOL,
                         capability: capability.clone(),
                         task: task.clone(),
@@ -994,6 +1008,7 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
             ] {
                 let operation = operation + u64::from(observation && operation > 1);
                 let request = Request {
+                    engine: fixture_binding(),
                     protocol: sayweave_text_service::wire::PROTOCOL,
                     capability: capability.clone(),
                     task: task.clone(),
@@ -1872,6 +1887,7 @@ fn observation_ranges_fixture(
                     let inject: unsafe extern "system" fn(usize) = std::mem::transmute(entry);
                     inject(6);
                     let request = Request {
+                        engine: fixture_binding(),
                         protocol: PROTOCOL,
                         capability: capability.into(),
                         task: task.clone(),
@@ -1920,6 +1936,7 @@ fn observation_ranges_fixture(
                     false,
                 )?;
                 let request = Request {
+                    engine: fixture_binding(),
                     protocol: PROTOCOL,
                     capability: capability.into(),
                     task: task.clone(),
@@ -2640,6 +2657,7 @@ fn exchange(
 ) -> Result<Reply, Box<dyn std::error::Error>> {
     let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
     let r = Request {
+        engine: fixture_binding(),
         protocol: sayweave_text_service::wire::PROTOCOL,
         capability: capability.into(),
         task: task.into(),
@@ -2736,6 +2754,7 @@ fn prefix_fixture(
             );
         }
         let settle = Request {
+            engine: fixture_binding(),
             protocol: PROTOCOL,
             capability: capability.into(),
             task: task.clone(),
@@ -3157,6 +3176,7 @@ fn initial_selection_fixture(
             }
             inject(mode);
             let request = Request {
+                engine: fixture_binding(),
                 protocol: sayweave_text_service::wire::PROTOCOL,
                 capability: capability.into(),
                 task: task.clone(),
@@ -3308,6 +3328,7 @@ fn prefix_fault_fixture(
                 "原文尾🙂"
             };
             let request = Request {
+                engine: fixture_binding(),
                 protocol: PROTOCOL,
                 capability: capability.into(),
                 task: task.clone(),

@@ -1,11 +1,12 @@
 import {SpeechError} from './speech';
 export type ComponentDeploymentState='required'|'pending'|'ready'|'failed';
-export interface TextServiceStatus {installed:boolean;enabled:boolean;updateAvailable:boolean;payloadAvailable:boolean;cleanupPending:boolean;deploymentState:ComponentDeploymentState;error:string|null}
+export interface TextServiceStatus {installed:boolean;enabled:boolean;updateAvailable:boolean;payloadAvailable:boolean;cleanupPending:boolean;maintenanceAvailable?:boolean;restartRequired?:boolean;deploymentState:ComponentDeploymentState;error:string|null}
 export type TextServiceAction='enable'|'disable'|'install'|'remove';
 export interface TextServicePort {readonly mode:'native'|'simulation';status():Promise<TextServiceStatus>;act(action:TextServiceAction):Promise<TextServiceStatus>}
 export function parseTextService(value:unknown):TextServiceStatus {
  if(!value||typeof value!=='object'||Array.isArray(value))throw new SpeechError('protocol');
  const v=value as Record<string,unknown>;
+ if(['maintenanceAvailable','restartRequired'].some(key=>v[key]!==undefined&&typeof v[key]!=='boolean'))throw new SpeechError('protocol');
  if(!['installed','enabled','updateAvailable','payloadAvailable','cleanupPending'].every(k=>typeof v[k]==='boolean')||!['required','pending','ready','failed'].includes(String(v.deploymentState))||(v.error!==null&&typeof v.error!=='string')||(v.enabled&&!v.installed)||(v.updateAvailable&&(!v.installed||!v.payloadAvailable)))throw new SpeechError('protocol');
  return v as unknown as TextServiceStatus;
 }

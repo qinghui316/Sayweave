@@ -328,7 +328,9 @@ jobs:
         run: |
           cargo metadata --locked --no-deps --manifest-path src-tauri/Cargo.toml > $null
           if ($LASTEXITCODE -ne 0) { throw 'Application lock differs.' }
-          cargo build --locked --release --manifest-path src-tauri/text-service/Cargo.toml --lib
+          $componentFeatures = @()
+          if ((Get-Content -LiteralPath 'src-tauri/text-service/Cargo.toml' -Raw -Encoding UTF8) -match '(?m)^engine\s*=') { $componentFeatures = @('--features','engine') }
+          cargo build --locked --release --manifest-path src-tauri/text-service/Cargo.toml --lib @componentFeatures
           if ($LASTEXITCODE -ne 0) { throw 'Ordinary component build failed.' }
           "SAYWEAVE_TSF_PAYLOAD=$(Join-Path $env:GITHUB_WORKSPACE 'src-tauri/text-service/target/release/sayweave_text_service.dll')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build frontend assets required by the existing native verifier

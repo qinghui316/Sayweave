@@ -210,3 +210,9 @@ Current WebView2 runtimes ignore environment/HKCU browser-argument overrides for
 ## 口述编辑后结束
 
 复用 `npm run test:composition` 的自有编辑器入口核对实际正文：编辑后立即结束、短延迟交接、恢复空范围、恢复后无新文字、继续输入再结束和迟到旧识别。受控原生答复测试另行锁定准备成功／拒绝与结束的准确先后顺序；延迟实机样本不代替准确竞态证明。组件保持普通已验证 DLL，核对目标实际加载身份。Codex 和物理麦克风由用户后续试用，不能由这些夹具记录为通过。
+
+## 同进程核心切换
+
+`npm run test:tsf` 保留现有输入检查，并调用 `scripts/test-core-switch.ps1`。轻量自有宿主通过同一代理 COM 对象，在同一 PID/STA 从普通核心 A→B→C 读回实际正文，核对哈希和代次、活动范围拒绝切换、旧请求隔离、候选激活失败恢复、引用保活与多 STA。普通管道回执检查覆盖 Commit 未确认、Deactivate、原控制进程重连读取与精确哈希 ACK，不重放编辑。验收代理的受控导出仅选择测试核心及生命周期故障，普通代理和核心禁止这些导出。输出保留在 `.local/core-switch/current`，不修改系统登记或日常程序。
+
+实际 Codex 验收另行记录首次迁移重开、此后两次更新时 PID/创建身份/STA/代理保持不变、执行核心改变与实际正文。受控宿主通过或模块出现不代替实际输入；Codex 未完成时 Change 保持活动。

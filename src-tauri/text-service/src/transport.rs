@@ -11,11 +11,33 @@ use windows::{
 };
 
 pub struct Pipe(pub HANDLE);
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Identity {
     pub pid: u32,
     pub session: u32,
     pub created: u64,
+}
+pub fn same_process_alive(expected: Identity) -> windows::core::Result<bool> {
+    unsafe {
+        let handle = match OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            expected.pid,
+        ) {
+            Ok(handle) => Pipe(handle),
+            Err(error)
+                if error.code()
+                    == windows::core::HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        if WaitForSingleObject(handle.0, 0) != WAIT_TIMEOUT {
+            return Ok(false);
+        }
+        Ok(identity(expected.pid).is_ok_and(|now| now == expected))
+    }
 }
 pub fn identity(pid: u32) -> windows::core::Result<Identity> {
     unsafe {

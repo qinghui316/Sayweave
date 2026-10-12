@@ -3,7 +3,7 @@ use crate::history::types::Error;
 use serde::Serialize;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     mpsc,
 };
 use tokio::sync::oneshot;
@@ -115,20 +115,43 @@ pub struct Anchor {
     pub activity: u64,
 }
 #[derive(Default)]
-pub struct DeliveryGate(AtomicU8);
+pub struct DeliveryGate {
+    state: AtomicU8,
+    preparation_deadline: AtomicU64,
+}
 impl DeliveryGate {
     pub fn cancel(&self) -> bool {
-        self.0
+        self.state
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
     pub fn cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire) == 1
+        self.state.load(Ordering::Acquire) == 1
     }
     pub fn commit(&self) -> bool {
-        self.0
+        self.state
             .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
+    }
+    pub fn set_preparation_budget(&self, budget: std::time::Duration) {
+        #[cfg(windows)]
+        self.preparation_deadline.store(
+            unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+                .saturating_add(budget.as_millis().min(15_000) as u64),
+            Ordering::Release,
+        );
+        #[cfg(not(windows))]
+        let _ = budget;
+    }
+    #[cfg(windows)]
+    pub(crate) fn preparation_deadline(&self) -> u64 {
+        let value = self.preparation_deadline.load(Ordering::Acquire);
+        if value == 0 {
+            unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+                .saturating_add(15_000)
+        } else {
+            value
+        }
     }
 }
 pub(crate) fn observe_pointer(window: usize, event_tick: u32) {

@@ -20,6 +20,15 @@ describe('component lifecycle',()=>{
   await waitFor(()=>expect(screen.getByRole('switch')).not.toBeChecked());
   expect(action.mock.calls.map(c=>c[0])).toEqual(['install','disable','enable','remove']);
  });
+ it('keeps the user disabled after core repair and asks for restart only when native migration requires it',async()=>{
+  const value:TextServiceStatus={installed:true,enabled:false,updateAvailable:true,payloadAvailable:true,cleanupPending:false,maintenanceAvailable:true,restartRequired:false,deploymentState:'failed',error:null};
+  const port:TextServicePort={mode:'native',status:async()=>value,act:vi.fn().mockResolvedValue({...value,updateAvailable:false,deploymentState:'ready'})};
+  render(<TextServiceSettings port={port}/>);const user=userEvent.setup();
+  await user.click(screen.getByRole('button',{name:'组件管理'}));await user.click(screen.getByRole('menuitem',{name:'修复组件'}));
+  await screen.findByText('组件已更新。');expect(screen.getByRole('switch')).not.toBeChecked();
+  expect(()=>parseTextService({...value,restartRequired:'true'})).toThrow();
+  expect(()=>parseTextService({...value,maintenanceAvailable:1})).toThrow();
+ });
  it('retains the saved status after a failed action and ignores late replies after unmount',async()=>{
   const value:TextServiceStatus={installed:true,enabled:false,updateAvailable:false,payloadAvailable:true,cleanupPending:false,deploymentState:'ready',error:null};
   let resolve!:(v:TextServiceStatus)=>void;

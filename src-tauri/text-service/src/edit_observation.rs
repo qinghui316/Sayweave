@@ -1,6 +1,6 @@
 //! Optional read-only output observation, independent of composition ownership.
 //! COM ranges and sinks never leave their target apartment.
-use super::{Lease, range_text};
+use super::{Callback, Lease, range_text};
 #[path = "native_observation.rs"]
 mod native_observation;
 #[cfg(feature = "acceptance")]
@@ -131,6 +131,7 @@ impl Watch {
             range.SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_BACKWARD)?;
             let data = Rc::new(RefCell::new(Reading {
                 value: ObservedEdit {
+                    engine: request.engine.clone(),
                     task: request.task.clone(),
                     turn: request.turn,
                     operation: request.operation,
@@ -205,6 +206,7 @@ impl Watch {
             }
             let data = Rc::new(RefCell::new(Reading {
                 value: ObservedEdit {
+                    engine: request.engine.clone(),
                     task: request.task.clone(),
                     turn: request.turn,
                     operation: request.operation,
@@ -346,6 +348,7 @@ impl ITfTextEditSink_Impl for Sink_Impl {
         ec: u32,
         record: Ref<ITfEditRecord>,
     ) -> windows::core::Result<()> {
+        let _callback = Callback::enter();
         let _notification = super::TextNotification::enter(self.notifications.clone());
         #[cfg(feature = "acceptance")]
         super::observation_fixture_reentry()?;

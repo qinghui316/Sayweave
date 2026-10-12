@@ -446,6 +446,7 @@ impl DictationCoordinator {
         let input = app.state::<WindowsInputService>();
         let mut anchor = anchor;
         let preparation_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        gate.set_preparation_budget(std::time::Duration::from_secs(15));
         let optional = async {
             let dictionary = processing_context::dictionary(&app).await.unwrap_or_else(|error| {
             log::info!(target:"sayweave", "operation=dictionary_prepare task_id={} result=unavailable error={}", id,error.code);

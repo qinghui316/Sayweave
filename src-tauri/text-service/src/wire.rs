@@ -1,22 +1,22 @@
 use serde::{Deserialize, Serialize};
 
-pub const MAX_FRAME: usize = 128 * 1024;
+pub use crate::routing::{EngineBinding, MAX_FRAME, ModuleIdentity, Runtime};
 pub const MAX_TEXT_UTF16: usize = 16 * 1024;
-// v8 settles inside one composition owner at a verified native split and reports the exact
-// origin operation of a committed prefix, including cancellation/interruption.
-// A registered upgrade is insufficient: the target must be running this version.
-pub const PROTOCOL: u32 = 8;
+// v9 binds every text effect and observation to one stable proxy/core generation.
+pub const PROTOCOL: u32 = 9;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Runtime {
-    pub protocol: u32,
-    pub process: u32,
-    pub thread: u32,
+#[cfg(any(test, feature = "acceptance"))]
+pub fn fixture_binding() -> EngineBinding {
+    EngineBinding {
+        proxy_instance: "11111111-1111-4111-8111-111111111111".into(),
+        engine_generation: 1,
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
+    pub engine: EngineBinding,
     pub protocol: u32,
     pub capability: String,
     pub task: String,
@@ -52,6 +52,9 @@ pub enum Action {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Reply {
+    pub engine: EngineBinding,
+    pub task: String,
+    pub turn: u64,
     pub operation: u64,
     pub revision: u64,
     pub applied: bool,
@@ -75,6 +78,7 @@ pub struct EditObservation {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ObservedEdit {
+    pub engine: EngineBinding,
     pub task: String,
     pub turn: u64,
     pub operation: u64,
@@ -107,7 +111,11 @@ impl Reply {
         self.applied
             && self.mutation == Mutation::NotAttempted
             && self.runtime.as_ref().is_some_and(|r| {
-                r.protocol == PROTOCOL && r.process == process && r.thread == thread
+                r.protocol == PROTOCOL
+                    && r.process == process
+                    && r.thread == thread
+                    && r.engine == self.engine
+                    && r.engine.valid()
             })
     }
 }
@@ -122,6 +130,7 @@ pub enum Mutation {
 impl Request {
     pub fn valid(&self) -> bool {
         self.protocol == PROTOCOL
+            && self.engine.valid()
             && uuid::Uuid::parse_str(&self.task).is_ok()
             && uuid::Uuid::parse_str(&self.capability).is_ok()
             && self.turn > 0
@@ -214,6 +223,7 @@ mod tests {
     use super::*;
     fn request(action: Action, operation: u64, revision: u64) -> Request {
         Request {
+            engine: fixture_binding(),
             protocol: crate::wire::PROTOCOL,
             capability: uuid::Uuid::new_v4().to_string(),
             task: "3923cd50-c588-49b5-9895-ce2e23e21b5b".into(),
@@ -234,6 +244,9 @@ mod tests {
         r.protocol = 1;
         assert!(!r.valid());
         let mut reply = Reply {
+            engine: fixture_binding(),
+            task: uuid::Uuid::new_v4().to_string(),
+            turn: 1,
             edit_observation: None,
             range_epoch: 0,
             settlement: None,
@@ -246,6 +259,9 @@ mod tests {
         };
         assert!(!reply.compatible_runtime(10, 20));
         reply.runtime = Some(Runtime {
+            engine: fixture_binding(),
+            core: None,
+            proxy: None,
             protocol: PROTOCOL,
             process: 10,
             thread: 20,

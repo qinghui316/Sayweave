@@ -31,6 +31,7 @@ pub fn target(main_source: &Path) -> Result<Target> {
         commit: build.commit.into(),
         product: env!("SAYWEAVE_BUILD_PRODUCT").into(),
         payload_hash: hash(crate::text_service::payload()),
+        core_hash: Some(hash(crate::text_service::core_payload())),
         main_hash: hash(&read(main_source, MAX_FILE)?),
         helper_hash: hash(&read(&exe, MAX_FILE)?),
         uninstall_hash: hash(&read(
@@ -40,7 +41,7 @@ pub fn target(main_source: &Path) -> Result<Target> {
             MAX_FILE,
         )?),
     };
-    if crate::text_service::payload().is_empty() {
+    if crate::text_service::payload().is_empty() || crate::text_service::core_payload().is_empty() {
         return Err("componentPayloadMissing".into());
     }
     value.validate()?;
@@ -86,6 +87,7 @@ fn running_target() -> Result<Target> {
         commit: build.commit.into(),
         product: env!("SAYWEAVE_BUILD_PRODUCT").into(),
         payload_hash: hash(crate::text_service::payload()),
+        core_hash: Some(hash(crate::text_service::core_payload())),
         main_hash: hash(&read(&exe, MAX_FILE)?),
         helper_hash: hash(&read(&helper, MAX_FILE)?),
         uninstall_hash: hash(&read(

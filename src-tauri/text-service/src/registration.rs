@@ -583,13 +583,13 @@ pub fn deactivate(language: u16, session: bool) -> windows::core::Result<()> {
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InstallerRegistration {
     pub module: String,
     module_bytes: Vec<u8>,
     profiles: Vec<InstallerProfile>,
 }
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct InstallerProfile {
     language: u16,
     description: Vec<u8>,
@@ -625,6 +625,83 @@ pub fn snapshot_installer_machine() -> windows::core::Result<Option<InstallerReg
         module_bytes,
         profiles: snapshots,
     }))
+}
+/// Removal may have already deleted a subset of our profiles/category.
+/// Verify every remaining value against the durable full snapshot before retrying.
+pub fn removal_matches(snapshot: Option<&InstallerRegistration>) -> windows::core::Result<bool> {
+    if exists(HKEY_CURRENT_USER, COM_ROOT)? {
+        return Err(preference_error());
+    }
+    let Some(before) = snapshot else {
+        return Ok(!exists(HKEY_LOCAL_MACHINE, COM_ROOT)?
+            && !exists(HKEY_LOCAL_MACHINE, TIP_ROOT)?
+            && owned_category_count()? == 0);
+    };
+    if let Some(root) = open_existing(HKEY_LOCAL_MACHINE, COM_ROOT, KEY_READ)?
+        && (!names(&root, false)?.is_empty()
+            || names(&root, true)?
+                .iter()
+                .any(|name| name != "InprocServer32"))
+    {
+        return Ok(false);
+    }
+    if let Some(key) = open_existing(HKEY_LOCAL_MACHINE, COM_PATH, KEY_READ)? {
+        if !names(&key, true)?.is_empty() {
+            return Ok(false);
+        }
+        for name in names(&key, false)? {
+            let expected = match name.as_str() {
+                "" => before.module_bytes.clone(),
+                "SayweaveOwner" => string_bytes(OWNER),
+                "ThreadingModel" => string_bytes("Apartment"),
+                _ => return Ok(false),
+            };
+            if raw_string(&key, &name)? != expected {
+                return Ok(false);
+            }
+        }
+    }
+    owned_category_count()?;
+    for language in owned_languages(&profiles()?)? {
+        let Some(old) = before.profiles.iter().find(|old| old.language == language) else {
+            return Ok(false);
+        };
+        let path = format!("{TIP_ROOT}\\LanguageProfile\\0x{language:08X}\\{PROFILE_KEY}");
+        if let Some(key) = open_existing(HKEY_LOCAL_MACHINE, &path, KEY_READ)?
+            && (raw_string(&key, "Description")? != old.description
+                || raw_string(&key, "IconFile")? != old.icon)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+pub fn resume_installer_removal(
+    snapshot: Option<&InstallerRegistration>,
+) -> windows::core::Result<()> {
+    administrator()?;
+    if !removal_matches(snapshot)? {
+        return Err(preference_error());
+    }
+    user_preferences()?;
+    if owned_category_count()? != 0 {
+        let categories: ITfCategoryMgr =
+            unsafe { CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)? };
+        unsafe {
+            categories.UnregisterCategory(&CLASS, &GUID_TFCAT_TIP_SPEECH, &CLASS)?;
+        }
+    }
+    remove_registered_profiles(&profiles()?, true)?;
+    clear_user_preferences()?;
+    confirm_registry_removal(true)?;
+    if !removal_matches(snapshot)? {
+        return Err(preference_error());
+    }
+    let result = unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, PCWSTR(wide(COM_ROOT).as_ptr())) };
+    if result != ERROR_SUCCESS && result != ERROR_FILE_NOT_FOUND {
+        result.ok()?;
+    }
+    Ok(())
 }
 pub fn restore_installer_machine(
     snapshot: Option<&InstallerRegistration>,

@@ -1,5 +1,6 @@
 import {spawnSync} from 'node:child_process';
 import path from 'node:path';
+import { buildTextService } from './build-text-service.mjs';
 import {fileURLToPath} from 'node:url';
 import {readFileSync,writeFileSync,mkdirSync,existsSync} from 'node:fs';
 import {createHash} from 'node:crypto';
@@ -10,8 +11,8 @@ function run(file,args,env=process.env){const result=spawnSync(file,args,{cwd:ro
 if(process.platform!=='win32')throw new Error('Windows text-service builds require Windows. Browser dev/build remain portable.');
 // A release may reuse its independently verified, unchanged component artifact.
 // The caller must bind its source revision/hash; the default builds from source.
-if(!process.env.SAYWEAVE_TSF_PAYLOAD)run('cargo',['build','--manifest-path','src-tauri/text-service/Cargo.toml','--release','--lib']);
-const env={...process.env,SAYWEAVE_TSF_PAYLOAD:process.env.SAYWEAVE_TSF_PAYLOAD??path.join(root,'src-tauri/text-service/target/release/sayweave_text_service.dll')};
+const components=buildTextService(root);
+const env={...process.env,SAYWEAVE_TSF_PAYLOAD:components.core,SAYWEAVE_TSF_PROXY_PAYLOAD:components.proxy};
 let extra=process.argv.slice(3);
 if(mode==='package'){
  const pinned=JSON.parse(readFileSync(path.join(root,'src-tauri/windows/installer-source.json'),'utf8'));

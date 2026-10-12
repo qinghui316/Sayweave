@@ -3,12 +3,13 @@ use super::{Anchor, Delivery, DeliveryGate, Submission, Verification};
 use crate::history::types::Error;
 use sayweave_text_service::{
     client::ProfileLease,
+    lifecycle::{ControlAction, ControlReply, ControlRequest, ReceiptKey},
     registration,
     transport::Pipe,
-    wire::{Action, Mutation, OutputRegion, Prefix, Reply, Request},
+    wire::{Action, EngineBinding, Mutation, OutputRegion, Prefix, Reply, Request},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -428,10 +429,14 @@ struct Host {
     gate: Arc<DeliveryGate>,
     pipe: Pipe,
     capability: String,
+    engine: EngineBinding,
     operation: u64,
     revision: u64,
     range_epoch: u64,
     transport_attempted: bool,
+    retained_ack: Option<ReceiptKey>,
+    receipt_inbox: VecDeque<Vec<u8>>,
+    acknowledged_receipts: VecDeque<ReceiptKey>,
     text: String,
     attempted: bool,
     visible: bool,
@@ -494,6 +499,9 @@ impl Host {
             return;
         }
         for value in observation.records {
+            if value.engine != self.engine {
+                continue;
+            }
             if !value.ended
                 || value.composing
                 || value.task != self.task
@@ -642,10 +650,14 @@ impl Host {
             gate,
             pipe,
             capability,
+            engine: EngineBinding::default(),
             operation: 0,
             revision: 0,
             range_epoch: 0,
             transport_attempted: false,
+            retained_ack: None,
+            receipt_inbox: VecDeque::new(),
+            acknowledged_receipts: VecDeque::new(),
             text: String::new(),
             attempted: false,
             visible: false,
@@ -656,6 +668,7 @@ impl Host {
             _lease: lease,
             _apartment: apartment,
         };
+        host.prepare_engine()?;
         // Inspect the component executing in this target, not the registered file.
         // An old loaded DLL rejects v2 before any edit; there is no downgrade.
         host.exchange(Action::Inspect, "", false).map_err(|error| {
@@ -666,7 +679,7 @@ impl Host {
                 error
             }
         })?;
-        super::runtime_module::verify(pid)?;
+        // prepare_engine already verified the actual proxy and executing core.
         super::native::composition_begin_target(&host.task, &host.anchor)?;
         host.exchange(Action::Begin, "", false)?;
         host.range_open = true;
@@ -710,6 +723,264 @@ impl Host {
         }
         Ok(())
     }
+    fn prepare_engine(&mut self) -> Result<(), Error> {
+        let deadline = self.gate.preparation_deadline();
+        let mut operation = 0;
+        let expected = crate::installer::package_hash(crate::text_service::core_payload());
+        loop {
+            target_ready(&self.task, &self.anchor, &self.gate)?;
+            let now = unsafe { GetTickCount64() };
+            if now >= deadline {
+                return Err(Error::new("compositionTimeout"));
+            }
+            operation += 1;
+            let request = ControlRequest {
+                control_protocol: 1,
+                capability: self.capability.clone(),
+                task: self.task.clone(),
+                turn: self.turn,
+                operation,
+                deadline_tick: deadline.min(now + 15_000),
+                action: ControlAction::PrepareEngine,
+                expected_core: expected.clone(),
+                receipt: None,
+            };
+            self.pipe
+                .send(&serde_json::to_vec(&request).map_err(|_| Error::new("compositionProtocol"))?)
+                .map_err(|_| Error::new("compositionRuntimeUnavailable"))?;
+            let reply = loop {
+                pump();
+                target_ready(&self.task, &self.anchor, &self.gate)?;
+                if let Some(frame) = self
+                    .pipe
+                    .receive()
+                    .map_err(|_| Error::new("compositionDisconnected"))?
+                {
+                    let reply: ControlReply = serde_json::from_slice(&frame)
+                        .map_err(|_| Error::new("compositionTargetVersion"))?;
+                    if reply.control_protocol != 1
+                        || reply.task != self.task
+                        || reply.turn != self.turn
+                        || reply.operation != operation
+                    {
+                        return Err(Error::new("compositionProtocol"));
+                    }
+                    break reply;
+                }
+                if unsafe { GetTickCount64() } >= deadline {
+                    return Err(Error::new("compositionTimeout"));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            if !reply.ready {
+                if reply.code == "engineBusy" {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                log::info!(target:"sayweave","operation=engine_prepare task_id={} result=rejected reason={}",self.task,reply.code);
+                return Err(Error::new("compositionRuntimeUnavailable"));
+            }
+            let binding = reply
+                .engine
+                .ok_or_else(|| Error::new("compositionProtocol"))?;
+            let runtime = reply
+                .runtime
+                .ok_or_else(|| Error::new("compositionProtocol"))?;
+            let mut process = 0;
+            let thread = unsafe {
+                GetWindowThreadProcessId(HWND(self.anchor.window as *mut _), Some(&mut process))
+            };
+            if !binding.valid()
+                || runtime.engine != binding
+                || runtime.protocol != sayweave_text_service::wire::PROTOCOL
+                || runtime.process != self.anchor.process
+                || process != self.anchor.process
+                || runtime.thread != thread
+            {
+                return Err(Error::new("compositionTargetVersion"));
+            }
+            super::runtime_module::verify(process, &runtime)?;
+            self.engine = binding;
+            log::info!(target:"sayweave","operation=engine_prepare task_id={} result=ready process={} lifetime={} thread={} proxy_instance={} engine_generation={} core_hash={}",self.task,process,self.anchor.lifetime,thread,self.engine.proxy_instance,self.engine.engine_generation,expected);
+            return Ok(());
+        }
+    }
+    fn receipt_request(
+        &self,
+        action: ControlAction,
+        key: ReceiptKey,
+        deadline: u64,
+    ) -> ControlRequest {
+        ControlRequest {
+            control_protocol: 1,
+            capability: self.capability.clone(),
+            task: key.task.clone(),
+            turn: key.turn,
+            operation: key.operation,
+            deadline_tick: deadline,
+            action,
+            expected_core: crate::installer::package_hash(crate::text_service::core_payload()),
+            receipt: Some(key),
+        }
+    }
+    fn recover_receipt(&mut self, request: &Request) -> Result<Vec<u8>, Error> {
+        // Read-only recovery has a short bound. It never retries the original edit.
+        let deadline = unsafe { GetTickCount64() } + 500;
+        let key = ReceiptKey {
+            engine: request.engine.clone(),
+            task: request.task.clone(),
+            turn: request.turn,
+            operation: request.operation,
+            revision: request.revision,
+            sha256: None,
+        };
+        let control = self.receipt_request(ControlAction::ReadRetired, key.clone(), deadline);
+        self.pipe = Pipe(HANDLE::default());
+        let mut pid = 0;
+        let thread =
+            unsafe { GetWindowThreadProcessId(HWND(self.anchor.window as *mut _), Some(&mut pid)) };
+        if pid != self.anchor.process {
+            return Err(Error::new("compositionDisconnected"));
+        }
+        loop {
+            if unsafe { GetTickCount64() } >= deadline {
+                return Err(Error::new("compositionDisconnected"));
+            }
+            pump();
+            if let Ok(pipe) = Pipe::client(pid, thread) {
+                self.pipe = pipe;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.pipe
+            .send(&serde_json::to_vec(&control).map_err(|_| Error::new("compositionProtocol"))?)
+            .map_err(|_| Error::new("compositionDisconnected"))?;
+        loop {
+            pump();
+            if let Some(bytes) = self
+                .pipe
+                .receive()
+                .map_err(|_| Error::new("compositionDisconnected"))?
+            {
+                let receipt = ReceiptKey::from_frame(&bytes)
+                    .ok_or_else(|| Error::new("compositionDisconnected"))?;
+                if !key.matches(&receipt) {
+                    return Err(Error::new("compositionProtocol"));
+                }
+                self.retained_ack = Some(receipt);
+                return Ok(bytes);
+            }
+            if unsafe { GetTickCount64() } >= deadline {
+                return Err(Error::new("compositionDisconnected"));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn receive_business(&mut self) -> Result<Option<Vec<u8>>, windows::core::Error> {
+        if let Some(frame) = self.receipt_inbox.pop_front() {
+            return Ok(Some(frame));
+        }
+        loop {
+            let Some(frame) = self.pipe.receive()? else {
+                return Ok(None);
+            };
+            let value: serde_json::Value = serde_json::from_slice(&frame)
+                .map_err(|_| windows::core::Error::from_hresult(E_INVALIDARG))?;
+            if value.get("control_protocol").is_none() {
+                return Ok(Some(frame));
+            }
+            let reply: ControlReply = serde_json::from_value(value)
+                .map_err(|_| windows::core::Error::from_hresult(E_INVALIDARG))?;
+            let known = self
+                .acknowledged_receipts
+                .iter()
+                .chain(self.retained_ack.iter())
+                .any(|key| {
+                    reply.control_protocol == 1
+                        && reply.task == key.task
+                        && reply.turn == key.turn
+                        && reply.operation == key.operation
+                        && reply.engine.as_ref() == Some(&key.engine)
+                        && reply.ready
+                        && reply.code == "receiptAcknowledged"
+                });
+            if !known {
+                return Err(windows::core::Error::from_hresult(E_ACCESSDENIED));
+            }
+        }
+    }
+    fn acknowledge_receipt(&mut self) -> Result<(), Error> {
+        let Some(key) = self.retained_ack.clone() else {
+            return Ok(());
+        };
+        let deadline = unsafe { GetTickCount64() } + 500;
+        let request =
+            self.receipt_request(ControlAction::AcknowledgeRetired, key.clone(), deadline);
+        self.pipe
+            .send(&serde_json::to_vec(&request).map_err(|_| Error::new("compositionProtocol"))?)
+            .map_err(|_| Error::new("compositionDisconnected"))?;
+        loop {
+            pump();
+            if let Some(bytes) = self
+                .pipe
+                .receive()
+                .map_err(|_| Error::new("compositionDisconnected"))?
+            {
+                let value: serde_json::Value = serde_json::from_slice(&bytes)
+                    .map_err(|_| Error::new("compositionProtocol"))?;
+                if value.get("control_protocol").is_none() {
+                    let reply: Reply = serde_json::from_value(value)
+                        .map_err(|_| Error::new("compositionProtocol"))?;
+                    let identity = ReceiptKey::from_frame(&bytes)
+                        .ok_or_else(|| Error::new("compositionProtocol"))?;
+                    if key.matches(&identity) {
+                        continue;
+                    } // Duplicate of the receipt already assigned to its caller.
+                    if !pending_business_receipt(
+                        &reply,
+                        &self.engine,
+                        &self.task,
+                        self.turn,
+                        (self.operation, self.revision),
+                        &self.abandoned_optional,
+                    ) || self.receipt_inbox.len() >= 4
+                    {
+                        return Err(Error::new("compositionProtocol"));
+                    }
+                    self.receipt_inbox.push_back(bytes);
+                    continue;
+                }
+                let reply: ControlReply =
+                    serde_json::from_value(value).map_err(|_| Error::new("compositionProtocol"))?;
+                let matches = |old: &ReceiptKey| {
+                    reply.control_protocol == 1
+                        && reply.task == old.task
+                        && reply.turn == old.turn
+                        && reply.operation == old.operation
+                        && reply.engine.as_ref() == Some(&old.engine)
+                        && reply.ready
+                        && reply.code == "receiptAcknowledged"
+                };
+                if !matches(&key) {
+                    if self.acknowledged_receipts.iter().any(matches) {
+                        continue;
+                    }
+                    return Err(Error::new("compositionProtocol"));
+                }
+                if self.acknowledged_receipts.len() >= 16 {
+                    self.acknowledged_receipts.pop_front();
+                }
+                self.acknowledged_receipts.push_back(key.clone());
+                self.retained_ack = None;
+                return Ok(());
+            }
+            if unsafe { GetTickCount64() } >= deadline {
+                return Err(Error::new("compositionDisconnected"));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     fn exchange(&mut self, action: Action, text: &str, cleanup: bool) -> Result<(), Error> {
         let reply = self.exchange_reply(action, text, None, cleanup, None)?;
         if reply.applied {
@@ -727,6 +998,7 @@ impl Host {
         permission: Option<&AtomicBool>,
     ) -> Result<Reply, Error> {
         self.transport_attempted = false;
+        self.acknowledge_receipt()?;
         let optional = matches!(
             action,
             Action::ObserveStart | Action::ObservePoll | Action::ObserveStop
@@ -745,6 +1017,7 @@ impl Host {
             self.revision += 1;
         }
         let request = Request {
+            engine: self.engine.clone(),
             protocol: sayweave_text_service::wire::PROTOCOL,
             capability: self.capability.clone(),
             task: self.task.clone(),
@@ -775,29 +1048,54 @@ impl Host {
         let at = Instant::now();
         loop {
             pump();
-            if let Some(frame) = self
-                .pipe
-                .receive()
-                .map_err(|error| {
+            let frame = match self.receive_business() {
+                Ok(frame) => frame,
+                Err(error) => {
+                    if matches!(error.code(), E_ACCESSDENIED | E_INVALIDARG) {
+                        return Err(Error::new("compositionProtocol"));
+                    }
                     log::info!(target:"sayweave", "operation=draft_transport task_id={} turn={} action={:?} phase=receive hresult={:08x}", self.task,self.turn,action,error.code().0 as u32);
-                    Error::new("compositionDisconnected")
-                })?
-            {
+                    Some(self.recover_receipt(&request)?)
+                }
+            };
+            if let Some(frame) = frame {
                 let reply: Reply = serde_json::from_slice(&frame)
                     .map_err(|_| Error::new("compositionProtocol"))?;
+                if reply.engine != self.engine || reply.task != self.task || reply.turn != self.turn
+                {
+                    return Err(Error::new("compositionProtocol"));
+                }
                 // Only a timed-out optional read may finish after its caller
                 // abandoned it. Its exact receipt must not poison the next
                 // write. Unknown/core mismatches remain protocol failures.
-                if discard_optional_reply(&mut self.abandoned_optional, reply.operation, reply.revision) {
+                if discard_optional_reply(
+                    &mut self.abandoned_optional,
+                    reply.operation,
+                    reply.revision,
+                ) {
+                    self.retained_ack = ReceiptKey::from_frame(&frame);
+                    self.acknowledge_receipt()?;
                     continue;
                 }
                 if reply.operation != request.operation || reply.revision != request.revision {
                     return Err(Error::new("compositionProtocol"));
                 }
+                self.retained_ack = ReceiptKey::from_frame(&frame);
+                // Exact receipt is parsed and assigned to this request before acknowledgement.
+                if self.retained_ack.is_some()
+                    && let Err(error) = self.acknowledge_receipt()
+                {
+                    log::info!(target:"sayweave", "operation=retired_receipt_ack task_id={} result=pending error={}", self.task,error.code);
+                }
                 if action == Action::Inspect {
-                    self.supports_observation=reply.edit_observation.as_ref().is_some_and(|v|v.capability==2);
+                    self.supports_observation = reply
+                        .edit_observation
+                        .as_ref()
+                        .is_some_and(|v| v.capability == 2);
                     let mut pid = 0;
-                    let thread = unsafe { GetWindowThreadProcessId(HWND(self.anchor.window as *mut _), Some(&mut pid)) };
+                    let thread = unsafe {
+                        GetWindowThreadProcessId(HWND(self.anchor.window as *mut _), Some(&mut pid))
+                    };
                     if pid != self.anchor.process || !reply.compatible_runtime(pid, thread) {
                         return Err(Error::new("compositionTargetVersion"));
                     }
@@ -806,7 +1104,9 @@ impl Host {
                 if reply.mutation == Mutation::Changed {
                     self.visible = true;
                 }
-                if reply.applied {self.range_epoch=reply.range_epoch;}
+                if reply.applied {
+                    self.range_epoch = reply.range_epoch;
+                }
                 log::info!(target:"sayweave", "operation=composition_edit task_id={} turn={} revision={} action={:?} applied={} code={} mutation={:?} elapsed_ms={}", self.task, self.turn, request.revision, action, reply.applied, reply.code, reply.mutation, at.elapsed().as_millis());
                 return Ok(reply);
             }
@@ -1028,12 +1328,29 @@ impl Host {
         result
     }
     fn close(&mut self) -> Result<(), Error> {
+        let receipt = self.acknowledge_receipt();
         self.stop_observation();
         self.sink = None;
-        self.profile
+        let closed = self
+            .profile
             .close()
-            .map_err(|_| Error::new("compositionCleanup"))
+            .map_err(|_| Error::new("compositionCleanup"));
+        receipt.and(closed)
     }
+}
+fn pending_business_receipt(
+    reply: &Reply,
+    engine: &EngineBinding,
+    task: &str,
+    turn: u64,
+    current: (u64, u64),
+    abandoned: &[(u64, u64)],
+) -> bool {
+    reply.engine == *engine
+        && reply.task == task
+        && reply.turn == turn
+        && ((reply.operation, reply.revision) == current
+            || abandoned.contains(&(reply.operation, reply.revision)))
 }
 fn discard_optional_reply(abandoned: &mut Vec<(u64, u64)>, operation: u64, revision: u64) -> bool {
     if let Some(index) = abandoned
@@ -1119,6 +1436,57 @@ fn pump() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ack_wait_preserves_current_write_and_late_optional_identity() {
+        let engine = EngineBinding {
+            proxy_instance: uuid::Uuid::new_v4().to_string(),
+            engine_generation: 1,
+        };
+        let task = uuid::Uuid::new_v4().to_string();
+        let mut reply: Reply =
+            serde_json::from_value(serde_json::json!({"engine":engine,"task":task,"turn":1,
+            "operation":11,"revision":3,"applied":true,"code":"ok","mutation":"changed"}))
+            .unwrap();
+        assert!(pending_business_receipt(
+            &reply,
+            &engine,
+            &task,
+            1,
+            (11, 3),
+            &[(10, 2)]
+        ));
+        reply.operation = 10;
+        reply.revision = 2;
+        assert!(pending_business_receipt(
+            &reply,
+            &engine,
+            &task,
+            1,
+            (11, 3),
+            &[(10, 2)]
+        ));
+        reply.operation = 12;
+        assert!(!pending_business_receipt(
+            &reply,
+            &engine,
+            &task,
+            1,
+            (11, 3),
+            &[(10, 2)]
+        ));
+        reply.operation = 11;
+        reply.revision = 3;
+        reply.engine.engine_generation += 1;
+        assert!(!pending_business_receipt(
+            &reply,
+            &engine,
+            &task,
+            1,
+            (11, 3),
+            &[(10, 2)]
+        ));
+    }
+
     #[test]
     fn empty_tail_completion_requires_the_exact_settlement_and_no_remaining_text() {
         assert!(super::completed_prefix(Some(9), 9, "", ""));

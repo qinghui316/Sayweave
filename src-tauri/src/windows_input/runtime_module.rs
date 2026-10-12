@@ -6,11 +6,15 @@ use std::path::{Path, PathBuf};
 fn unavailable() -> Error {
     Error::new("compositionRuntimeUnavailable")
 }
+#[cfg(test)]
 fn verify_files(modules: &[PathBuf], registered: &Path, payload: &[u8]) -> Result<(), Error> {
     // Multiple same-name modules cannot be attributed to the Inspect reply.
     let [module] = modules else {
         return Err(unavailable());
     };
+    verify_file(module, registered, payload)
+}
+fn verify_file(module: &Path, registered: &Path, payload: &[u8]) -> Result<(), Error> {
     let base = registered
         .parent()
         .and_then(Path::parent)
@@ -58,7 +62,10 @@ fn verify_files(modules: &[PathBuf], registered: &Path, payload: &[u8]) -> Resul
     Ok(())
 }
 
-pub(super) fn verify(process: u32) -> Result<(), Error> {
+pub(super) fn verify(
+    process: u32,
+    runtime: &sayweave_text_service::wire::Runtime,
+) -> Result<(), Error> {
     use windows::Win32::{Foundation::*, System::Diagnostics::ToolHelp::*};
     struct Snapshot(HANDLE);
     impl Drop for Snapshot {
@@ -93,23 +100,29 @@ pub(super) fn verify(process: u32) -> Result<(), Error> {
         ..Default::default()
     };
     unsafe { Module32FirstW(snapshot.0, &mut entry) }.map_err(|_| unavailable())?;
-    let mut modules = Vec::new();
+    let proxy = runtime.proxy.as_ref().ok_or_else(unavailable)?;
+    let core = runtime.core.as_ref().ok_or_else(unavailable)?;
+    if proxy.base == core.base || !runtime.engine.valid() {
+        return Err(unavailable());
+    }
+    let mut proxy_module = None;
+    let mut core_module = None;
     for count in 0..4096 {
-        let name_len = entry
-            .szModule
-            .iter()
-            .position(|c| *c == 0)
-            .ok_or_else(unavailable)?;
-        let name = String::from_utf16(&entry.szModule[..name_len]).map_err(|_| unavailable())?;
-        if name.eq_ignore_ascii_case("sayweave_text_service.dll") {
+        let base = entry.modBaseAddr as u64;
+        if base == proxy.base || base == core.base {
             let length = entry
                 .szExePath
                 .iter()
                 .position(|c| *c == 0)
                 .ok_or_else(unavailable)?;
-            modules.push(PathBuf::from(
+            let path = PathBuf::from(
                 String::from_utf16(&entry.szExePath[..length]).map_err(|_| unavailable())?,
-            ));
+            );
+            if base == proxy.base {
+                proxy_module = Some(path);
+            } else {
+                core_module = Some(path);
+            }
         }
         match unsafe { Module32NextW(snapshot.0, &mut entry) } {
             Ok(()) if count < 4095 => {}
@@ -125,12 +138,34 @@ pub(super) fn verify(process: u32) -> Result<(), Error> {
     let registered = sayweave_text_service::registration::owned_module()
         .map_err(|_| unavailable())?
         .ok_or_else(unavailable)?;
-    let result = verify_files(
-        &modules,
-        Path::new(&registered),
-        crate::text_service::payload(),
-    );
-    log::info!(target:"sayweave", "operation=draft_payload process={} modules={} result={}", process, modules.len(), result.as_ref().err().map_or("matched", |e|e.code.as_str()));
+    let proxy_module = proxy_module.ok_or_else(unavailable)?;
+    let core_module = core_module.ok_or_else(unavailable)?;
+    let result = (|| {
+        use sha2::{Digest, Sha256};
+        if proxy.sha256 != format!("{:x}", Sha256::digest(crate::text_service::payload()))
+            || core.sha256 != format!("{:x}", Sha256::digest(crate::text_service::core_payload()))
+            || !proxy_module
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&registered)
+        {
+            return Err(Error::new("compositionTargetVersion"));
+        }
+        for path in [&proxy_module, &core_module] {
+            sayweave_text_service::deployment::verify_runtime_location(path)
+                .map_err(|_| unavailable())?;
+        }
+        verify_file(
+            &proxy_module,
+            Path::new(&registered),
+            crate::text_service::payload(),
+        )?;
+        verify_file(
+            &core_module,
+            Path::new(&registered),
+            crate::text_service::core_payload(),
+        )
+    })();
+    log::info!(target:"sayweave", "operation=draft_payload process={} proxy_base={} core_base={} engine_generation={} result={}", process,proxy.base,core.base,runtime.engine.engine_generation,result.as_ref().err().map_or("matched", |e|e.code.as_str()));
     result
 }
 

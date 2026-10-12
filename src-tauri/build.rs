@@ -152,6 +152,21 @@ fn main() {
         payload.is_empty() || (payload.starts_with(b"MZ") && payload.len() <= 32 * 1024 * 1024),
         "invalid TSF payload"
     );
-    std::fs::write(out.join("text-service.dll"), payload).expect("copy build payload");
+    std::fs::write(out.join("text-service-core.dll"), payload).expect("copy core payload");
+    println!("cargo:rerun-if-env-changed=SAYWEAVE_TSF_PROXY_PAYLOAD");
+    let proxy = if let Some(path) = std::env::var_os("SAYWEAVE_TSF_PROXY_PAYLOAD") {
+        println!(
+            "cargo:rerun-if-changed={}",
+            std::path::Path::new(&path).display()
+        );
+        std::fs::read(path).expect("read fixed TSF proxy")
+    } else {
+        Vec::new()
+    };
+    assert!(
+        proxy.is_empty() || (proxy.starts_with(b"MZ") && proxy.len() <= 32 * 1024 * 1024),
+        "invalid TSF proxy"
+    );
+    std::fs::write(out.join("text-service.dll"), proxy).expect("copy proxy payload");
     tauri_build::build()
 }

@@ -54,6 +54,8 @@ pub struct Target {
     pub commit: String,
     pub product: String,
     pub payload_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_hash: Option<String>,
     pub main_hash: String,
     pub helper_hash: String,
     pub uninstall_hash: String,
@@ -62,6 +64,7 @@ impl Target {
     pub fn validate(&self) -> Result<()> {
         if !hex(&self.commit, 40)
             || !hex(&self.payload_hash, 64)
+            || self.core_hash.as_ref().is_some_and(|h| !hex(h, 64))
             || !hex(&self.main_hash, 64)
             || !hex(&self.helper_hash, 64)
             || !hex(&self.uninstall_hash, 64)

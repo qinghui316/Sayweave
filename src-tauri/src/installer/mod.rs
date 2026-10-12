@@ -17,7 +17,11 @@ pub fn package_hash(bytes: &[u8]) -> String {
 #[cfg(windows)]
 pub(crate) fn legacy_maintenance_guard(payload: &[u8]) -> Result<impl Drop, String> {
     let lock = native::MachineLock::acquire()?;
-    if matches!(deployment_state(payload), "pending" | "failed") {
+    let _ = payload;
+    if machine::load()
+        .map_err(|_| "componentDeploymentPending")?
+        .is_some_and(|r| !r.phase.terminal())
+    {
         return Err("componentDeploymentPending".into());
     }
     Ok(lock)

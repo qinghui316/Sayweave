@@ -3,6 +3,10 @@ use crate::history::types::Error;
 use serde::{Deserialize, Serialize};
 use tauri::{State, WebviewWindow};
 const PAYLOAD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text-service.dll"));
+const CORE_PAYLOAD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/text-service-core.dll"));
+pub(crate) fn core_payload() -> &'static [u8] {
+    CORE_PAYLOAD
+}
 pub(crate) fn payload() -> &'static [u8] {
     PAYLOAD
 }
@@ -14,6 +18,8 @@ pub struct Status {
     update_available: bool,
     payload_available: bool,
     cleanup_pending: bool,
+    maintenance_available: bool,
+    restart_required: bool,
     deployment_state: &'static str,
     error: Option<String>,
 }
@@ -54,7 +60,7 @@ fn status() -> Result<Status, Error> {
     let installed = registration::owned_module()
         .map_err(|_| Error::new("componentRegistration"))?
         .is_some();
-    let matches = deployment::matches_payload(PAYLOAD);
+    let matches = deployment::matches_bundle(PAYLOAD, CORE_PAYLOAD);
     let cleanup = deployment::cleanup_pending();
     let enabled = if installed && matches.is_ok() {
         (|| unsafe {
@@ -77,6 +83,9 @@ fn status() -> Result<Status, Error> {
         update_available: installed && !PAYLOAD.is_empty() && !matches!(matches, Ok(Some(true))),
         payload_available: !PAYLOAD.is_empty(),
         cleanup_pending: cleanup.as_ref().copied().unwrap_or(false),
+        maintenance_available: deployment::can_repair_bundle(PAYLOAD, CORE_PAYLOAD)
+            .unwrap_or(false),
+        restart_required: deployment::proxy_restart_required(PAYLOAD, CORE_PAYLOAD).unwrap_or(true),
         deployment_state: crate::installer::deployment_state(PAYLOAD),
         error: if matches.is_err() || cleanup.is_err() {
             Some("componentRegistration".into())
@@ -114,6 +123,8 @@ fn status() -> Result<Status, Error> {
         update_available: false,
         payload_available: false,
         cleanup_pending: false,
+        maintenance_available: false,
+        restart_required: false,
         deployment_state: "required",
         error: Some("platform".into()),
     })
@@ -150,9 +161,24 @@ fn operate(
     if matches!(
         crate::installer::deployment_state(PAYLOAD),
         "pending" | "failed"
-    ) {
+    ) && !(matches!(action, Action::Install)
+        && sayweave_text_service::deployment::can_repair_bundle(PAYLOAD, CORE_PAYLOAD)
+            .unwrap_or(false))
+    {
         return Err(Error::new("componentDeploymentPending"));
     }
+    let install_choice = if matches!(action, Action::Install) {
+        let profiles = registration::profiles().map_err(|_| Error::new("componentUnavailable"))?;
+        let language = unsafe { profiles.GetCurrentLanguage() }
+            .map_err(|_| Error::new("componentQueryFailed"))?;
+        Some(
+            registration::installer_user_choice(language)
+                .map_err(|_| Error::new("componentQueryFailed"))?
+                .unwrap_or(true),
+        )
+    } else {
+        None
+    };
     let maintenance = if matches!(action, Action::Install | Action::Remove) {
         // Registration is machine-wide. Enablement belongs to this ordinary initiating
         // user's process, not to the elevated helper or a diagnostic launch environment.
@@ -190,7 +216,7 @@ fn operate(
                     &registration::CLASS,
                     lang,
                     &registration::PROFILE,
-                    !matches!(action, Action::Disable),
+                    install_choice.unwrap_or(!matches!(action, Action::Disable)),
                 )
                 .map_err(|_| Error::new("componentEnableFailed"))?;
             }
@@ -198,7 +224,7 @@ fn operate(
             if let Some(code) = enabled.error {
                 return Err(Error::new(&code));
             }
-            if enabled.enabled != !matches!(action, Action::Disable) {
+            if enabled.enabled != install_choice.unwrap_or(!matches!(action, Action::Disable)) {
                 return Err(Error::new("componentEnableFailed"));
             }
             Ok(())
@@ -320,9 +346,12 @@ pub fn helper_entry() -> Option<i32> {
             }
             let r = match action {
                 "--sayweave-text-service=install" => {
-                    sayweave_text_service::deployment::install(PAYLOAD, sid)
+                    sayweave_text_service::deployment::install_bundle(PAYLOAD, CORE_PAYLOAD, sid)
                 }
                 "--sayweave-text-service=remove" => sayweave_text_service::deployment::remove(sid),
+                "--sayweave-text-service=rollback" => {
+                    sayweave_text_service::deployment::rollback_bundle(PAYLOAD, CORE_PAYLOAD, sid)
+                }
                 _ => return Err(Error::new("invalidAction")),
             };
             r.map_err(|_| Error::new("componentInstallFailed"))

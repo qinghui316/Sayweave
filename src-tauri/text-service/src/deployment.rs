@@ -301,6 +301,116 @@ fn write_payload(module: &Path, bytes: &[u8]) -> windows::core::Result<()> {
     }
     result
 }
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Removal {
+    schema: u32,
+    initiator: String,
+    updater: crate::transport::Identity,
+    registration: Option<registration::InstallerRegistration>,
+    descriptor: Option<crate::lifecycle::CurrentEngine>,
+    complete: bool,
+}
+fn removal_file() -> windows::core::Result<PathBuf> {
+    Ok(program_files()?
+        .join("Sayweave")
+        .join("TextService")
+        .join("component-removal.json"))
+}
+fn read_removal() -> windows::core::Result<Option<Removal>> {
+    let file = removal_file()?;
+    if !present(&file)? {
+        return Ok(None);
+    }
+    for path in [
+        &program_files()?,
+        file.parent().unwrap().parent().unwrap(),
+        file.parent().unwrap(),
+        &file,
+    ] {
+        protected(path)?;
+    }
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(file)
+        .map_err(|_| fail("componentRemovalRead"))?
+        .take(128 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| fail("componentRemovalRead"))?;
+    if bytes.len() > 128 * 1024 {
+        return Err(fail("componentRemovalLimit"));
+    }
+    let record: Removal =
+        serde_json::from_slice(&bytes).map_err(|_| fail("componentRemovalInvalid"))?;
+    if record.schema != 1
+        || record.initiator.is_empty()
+        || record.initiator.len() > 256
+        || record.descriptor.as_ref().is_some_and(|d| !d.valid())
+    {
+        return Err(fail("componentRemovalInvalid"));
+    }
+    if let Some(old) = &record.registration {
+        owned_location(&old.module)?;
+    }
+    Ok(Some(record))
+}
+fn save_removal(record: &Removal) -> windows::core::Result<()> {
+    let file = removal_file()?;
+    let base = file.parent().unwrap();
+    protected(base)?;
+    if present(&file)? {
+        protected(&file)?;
+    }
+    let bytes = serde_json::to_vec(record).map_err(|_| fail("componentRemovalInvalid"))?;
+    let temp = base.join(format!("removal-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut out = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .map_err(|_| fail("componentRemovalWrite"))?;
+        out.write_all(&bytes)
+            .map_err(|_| fail("componentRemovalWrite"))?;
+        out.sync_all().map_err(|_| fail("componentRemovalWrite"))?;
+        drop(out);
+        protected(&temp)?;
+        std::fs::rename(&temp, &file).map_err(|_| fail("componentRemovalWrite"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    result
+}
+fn finish_removal(record: &mut Removal) -> windows::core::Result<()> {
+    let descriptor = current_engine()?;
+    if !registration::removal_matches(record.registration.as_ref())?
+        || descriptor
+            .as_ref()
+            .is_some_and(|now| record.descriptor.as_ref() != Some(now))
+    {
+        return Err(fail("componentRemovalChanged"));
+    }
+    registration::resume_installer_removal(record.registration.as_ref())?;
+    publish_engine(descriptor.as_ref(), None)?;
+    if let Some(mut update) = read_core_update()? {
+        // Removal is a durable terminal intent, never a request to restore old payloads.
+        update.phase = "removed".into();
+        save_core_update(&update)?;
+    }
+    record.complete = true;
+    save_removal(record)
+}
+fn recover_removal(expected_sid: &str) -> windows::core::Result<()> {
+    if let Some(mut record) = read_removal()?
+        && !record.complete
+    {
+        if record.initiator != expected_sid {
+            return Err(fail("componentRemovalOwner"));
+        }
+        finish_removal(&mut record)?;
+    }
+    Ok(())
+}
 pub fn remove(expected_sid: &str) -> windows::core::Result<()> {
     registration::administrator()?;
     if expected_sid != crate::transport::current_user_sid()? {
@@ -317,11 +427,27 @@ pub fn remove(expected_sid: &str) -> windows::core::Result<()> {
     for path in &managed {
         owned_path(path)?;
     }
-    // Registry/profile removal comes first; a mapped DLL can remain for a later exact cleanup.
-    registration::unregister_machine()?;
     if !present(&base)? {
+        registration::unregister_machine()?;
         return Ok(());
     }
+    let mut record = match read_removal()? {
+        Some(record) if !record.complete => record,
+        _ => Removal {
+            schema: 1,
+            initiator: expected_sid.into(),
+            updater: crate::transport::identity(std::process::id())?,
+            registration: registration::snapshot_installer_machine()?,
+            descriptor: current_engine()?,
+            complete: false,
+        },
+    };
+    if record.initiator != expected_sid {
+        return Err(fail("componentRemovalOwner"));
+    }
+    // Persist intent before touching registration or the current descriptor.
+    save_removal(&record)?;
+    finish_removal(&mut record)?;
     let mut pending = Vec::new();
     for path in managed {
         let module = Path::new(&path);
@@ -411,6 +537,465 @@ pub fn matches_payload(bytes: &[u8]) -> windows::core::Result<Option<bool>> {
     let module = owned_path(&path)?;
     let data = std::fs::read(module).map_err(|_| fail("payloadReadFailed"))?;
     Ok(Some(!bytes.is_empty() && version(&data) == version(bytes)))
+}
+/// One protected descriptor; no path from a caller, frontend or registry is trusted.
+pub fn current_engine() -> windows::core::Result<Option<crate::lifecycle::CurrentEngine>> {
+    let base = program_files()?.join("Sayweave").join("TextService");
+    let file = base.join("current-engine.json");
+    if !present(&file)? {
+        return Ok(None);
+    }
+    for path in [&program_files()?, base.parent().unwrap(), &base, &file] {
+        protected(path)?;
+    }
+    let mut data = Vec::new();
+    use std::io::Read;
+    std::fs::File::open(&file)
+        .map_err(|_| fail("descriptorRead"))?
+        .take(4097)
+        .read_to_end(&mut data)
+        .map_err(|_| fail("descriptorRead"))?;
+    if data.len() > 4096 {
+        return Err(fail("descriptorLimit"));
+    }
+    let descriptor: crate::lifecycle::CurrentEngine =
+        serde_json::from_slice(&data).map_err(|_| fail("descriptorInvalid"))?;
+    if !descriptor.valid() {
+        return Err(fail("descriptorInvalid"));
+    }
+    Ok(Some(descriptor))
+}
+pub fn verified_core(
+    descriptor: &crate::lifecycle::CurrentEngine,
+) -> windows::core::Result<PathBuf> {
+    if !descriptor.valid() {
+        return Err(fail("descriptorInvalid"));
+    }
+    let proxy = registration::owned_module()?.ok_or_else(|| fail("proxyMissing"))?;
+    if installer_module_hash(&proxy)? != descriptor.proxy_sha256 {
+        return Err(fail("proxyIdentity"));
+    }
+    let path = program_files()?
+        .join("Sayweave")
+        .join("TextService")
+        .join(&descriptor.core_sha256)
+        .join("sayweave_text_service.dll");
+    let path = owned_path(&path.to_string_lossy())?;
+    if installer_module_hash(&path.to_string_lossy())? != descriptor.core_sha256 {
+        return Err(fail("coreIdentity"));
+    }
+    Ok(path)
+}
+pub fn verify_runtime_location(path: &Path) -> windows::core::Result<()> {
+    owned_path(&path.to_string_lossy()).map(|_| ())
+}
+pub fn matches_bundle(proxy: &[u8], core: &[u8]) -> windows::core::Result<Option<bool>> {
+    let Some(matched) = matches_payload(proxy)? else {
+        return Ok(None);
+    };
+    if core.is_empty() {
+        return Ok(Some(false));
+    }
+    let Some(descriptor) = current_engine()? else {
+        return Ok(Some(false));
+    };
+    Ok(Some(
+        matched
+            && descriptor.input_protocol == crate::wire::PROTOCOL
+            && descriptor.proxy_sha256 == version(proxy)
+            && descriptor.core_sha256 == version(core)
+            && verified_core(&descriptor).is_ok(),
+    ))
+}
+pub fn publish_engine(
+    expected: Option<&crate::lifecycle::CurrentEngine>,
+    target: Option<&crate::lifecycle::CurrentEngine>,
+) -> windows::core::Result<()> {
+    registration::administrator()?;
+    if current_engine()?.as_ref() != expected {
+        return Err(fail("descriptorChanged"));
+    }
+    let base = program_files()?.join("Sayweave").join("TextService");
+    protected(&base)?;
+    let file = base.join("current-engine.json");
+    if let Some(target) = target {
+        verified_core(target)?;
+        let bytes = serde_json::to_vec(target).map_err(|_| fail("descriptorInvalid"))?;
+        let temp = base.join(format!("engine-{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let mut out = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp)
+                .map_err(|_| fail("descriptorWrite"))?;
+            out.write_all(&bytes).map_err(|_| fail("descriptorWrite"))?;
+            out.sync_all().map_err(|_| fail("descriptorWrite"))?;
+            drop(out);
+            protected(&temp)?;
+            if current_engine()?.as_ref() != expected {
+                return Err(fail("descriptorChanged"));
+            }
+            std::fs::rename(&temp, &file).map_err(|_| fail("descriptorWrite"))?;
+            if current_engine()?.as_ref() != Some(target) {
+                return Err(fail("descriptorConfirmation"));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(temp);
+        }
+        result
+    } else {
+        if present(&file)? {
+            protected(&file)?;
+            std::fs::remove_file(&file).map_err(|_| fail("descriptorRemove"))?;
+        }
+        Ok(())
+    }
+}
+pub fn prepare_engine(
+    proxy: &[u8],
+    core: &[u8],
+) -> windows::core::Result<(String, crate::lifecycle::CurrentEngine)> {
+    let module = prepare_installer(proxy)?;
+    prepare_installer(core)?;
+    let descriptor = crate::lifecycle::CurrentEngine {
+        schema_version: 1,
+        revision: uuid::Uuid::new_v4().to_string(),
+        proxy_sha256: version(proxy),
+        core_sha256: version(core),
+        abi: 1,
+        input_protocol: crate::wire::PROTOCOL,
+        platform: "x86_64-pc-windows-msvc".into(),
+    };
+    Ok((module, descriptor))
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoreOrigin {
+    registration: Option<registration::InstallerRegistration>,
+    hash: Option<String>,
+    engine: Option<crate::lifecycle::CurrentEngine>,
+}
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CoreUpdate {
+    schema: u32,
+    phase: String,
+    initiator: String,
+    updater: crate::transport::Identity,
+    before_registration: Option<registration::InstallerRegistration>,
+    before_hash: Option<String>,
+    before_engine: Option<crate::lifecycle::CurrentEngine>,
+    #[serde(default)]
+    origin: Option<CoreOrigin>,
+    target: crate::lifecycle::CurrentEngine,
+    module: String,
+    error: Option<String>,
+}
+fn core_update_file() -> windows::core::Result<PathBuf> {
+    Ok(program_files()?
+        .join("Sayweave")
+        .join("TextService")
+        .join("component-update.json"))
+}
+fn read_core_update() -> windows::core::Result<Option<CoreUpdate>> {
+    let file = core_update_file()?;
+    if !present(&file)? {
+        return Ok(None);
+    }
+    for path in [
+        &program_files()?,
+        file.parent().unwrap().parent().unwrap(),
+        file.parent().unwrap(),
+        &file,
+    ] {
+        protected(path)?;
+    }
+    let mut data = Vec::new();
+    use std::io::Read;
+    std::fs::File::open(&file)
+        .map_err(|_| fail("componentUpdateRead"))?
+        .take(128 * 1024 + 1)
+        .read_to_end(&mut data)
+        .map_err(|_| fail("componentUpdateRead"))?;
+    if data.len() > 128 * 1024 {
+        return Err(fail("componentUpdateLimit"));
+    }
+    let record: CoreUpdate =
+        serde_json::from_slice(&data).map_err(|_| fail("componentUpdateInvalid"))?;
+    if record.schema != 1
+        || !record.target.valid()
+        || ![
+            "prepared",
+            "committed",
+            "rollbackPending",
+            "rolledBack",
+            "removed",
+        ]
+        .contains(&record.phase.as_str())
+        || record.initiator.is_empty()
+        || record.initiator.len() > 256
+    {
+        return Err(fail("componentUpdateInvalid"));
+    }
+    owned_location(&record.module)?;
+    if let Some(old) = &record.before_registration {
+        owned_location(&old.module)?;
+    }
+    if let Some(origin) = &record.origin {
+        if origin.registration.is_some() != origin.hash.is_some()
+            || origin.engine.as_ref().is_some_and(|d| !d.valid())
+            || origin
+                .hash
+                .as_ref()
+                .is_some_and(|h| h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(fail("componentOriginInvalid"));
+        }
+        if let Some(old) = &origin.registration {
+            owned_location(&old.module)?;
+        }
+    }
+    Ok(Some(record))
+}
+fn save_core_update(record: &CoreUpdate) -> windows::core::Result<()> {
+    let file = core_update_file()?;
+    let base = file
+        .parent()
+        .ok_or_else(|| fail("componentUpdateInvalid"))?;
+    protected(base)?;
+    if present(&file)? {
+        protected(&file)?;
+    }
+    let data = serde_json::to_vec(record).map_err(|_| fail("componentUpdateInvalid"))?;
+    if data.len() > 128 * 1024 {
+        return Err(fail("componentUpdateLimit"));
+    }
+    let temp = base.join(format!("component-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut out = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp)
+            .map_err(|_| fail("componentUpdateWrite"))?;
+        out.write_all(&data)
+            .map_err(|_| fail("componentUpdateWrite"))?;
+        out.sync_all().map_err(|_| fail("componentUpdateWrite"))?;
+        drop(out);
+        protected(&temp)?;
+        std::fs::rename(&temp, &file).map_err(|_| fail("componentUpdateWrite"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    result
+}
+pub fn core_update_pending() -> windows::core::Result<bool> {
+    Ok(read_removal()?.is_some_and(|r| !r.complete)
+        || read_core_update()?
+            .is_some_and(|r| !["committed", "rolledBack", "removed"].contains(&r.phase.as_str())))
+}
+pub fn can_repair_bundle(proxy: &[u8], core: &[u8]) -> windows::core::Result<bool> {
+    if let Some(record) = read_removal()?
+        && !record.complete
+    {
+        let descriptor = current_engine()?;
+        return Ok(record.initiator == crate::transport::current_user_sid()?
+            && !crate::transport::same_process_alive(record.updater)?
+            && registration::removal_matches(record.registration.as_ref())?
+            && descriptor
+                .as_ref()
+                .is_none_or(|now| record.descriptor.as_ref() == Some(now)));
+    }
+    let Some(record) = read_core_update()? else {
+        return Ok(false);
+    };
+    if record.phase == "committed"
+        || record.phase == "rolledBack"
+        || record.phase == "removed"
+        || record.initiator != crate::transport::current_user_sid()?
+        || record.target.proxy_sha256 != version(proxy)
+        || record.target.core_sha256 != version(core)
+        || crate::transport::same_process_alive(record.updater)?
+    {
+        return Ok(false);
+    }
+    let descriptor = current_engine()?;
+    let registered = registration::owned_module()?;
+    Ok((descriptor.as_ref() == record.before_engine.as_ref()
+        || descriptor.as_ref() == Some(&record.target))
+        && (registered.as_deref() == Some(record.module.as_str())
+            || registered.as_deref()
+                == record
+                    .before_registration
+                    .as_ref()
+                    .map(|r| r.module.as_str())))
+}
+fn rollback_core_update(record: &mut CoreUpdate) -> windows::core::Result<()> {
+    let current = current_engine()?;
+    if current.as_ref() != record.before_engine.as_ref() && current.as_ref() != Some(&record.target)
+    {
+        return Err(fail("descriptorChanged"));
+    }
+    if let (Some(old), Some(hash)) = (&record.before_registration, &record.before_hash)
+        && installer_module_hash(&old.module)? != *hash
+    {
+        return Err(fail("rollbackCoreIdentity"));
+    }
+    record.phase = "rollbackPending".into();
+    save_core_update(record)?;
+    registration::restore_installer_machine(record.before_registration.as_ref(), &record.module)?;
+    if current.as_ref() != record.before_engine.as_ref() {
+        publish_engine(current.as_ref(), record.before_engine.as_ref())?;
+    }
+    record.phase = "rolledBack".into();
+    save_core_update(record)
+}
+/// The caller holds the existing machine maintenance lock. This extends its
+/// protected component transaction, never user/HKCU files or arbitrary paths.
+pub fn proxy_restart_required(proxy: &[u8], core: &[u8]) -> windows::core::Result<bool> {
+    if let Some(record) = read_core_update()?
+        && record.phase == "committed"
+        && record.target.proxy_sha256 == version(proxy)
+        && record.target.core_sha256 == version(core)
+    {
+        return Ok(record
+            .before_registration
+            .as_ref()
+            .is_none_or(|before| before.module != record.module));
+    }
+    Ok(!matches!(matches_payload(proxy), Ok(Some(true))))
+}
+fn update_origin(
+    prior: Option<CoreUpdate>,
+    target: &crate::lifecycle::CurrentEngine,
+    before: CoreOrigin,
+) -> CoreOrigin {
+    prior
+        .filter(|r| r.phase == "committed" && r.target.proxy_sha256 == target.proxy_sha256)
+        .and_then(|r| r.origin)
+        .unwrap_or(before)
+}
+pub fn install_bundle(proxy: &[u8], core: &[u8], expected_sid: &str) -> windows::core::Result<()> {
+    registration::administrator()?;
+    if expected_sid != crate::transport::current_user_sid()? {
+        return Err(fail("initiatingUserChanged"));
+    }
+    recover_removal(expected_sid)?;
+    if let Some(mut prior) = read_core_update()?
+        && prior.phase != "committed"
+        && prior.phase != "rolledBack"
+        && prior.phase != "removed"
+    {
+        if prior.initiator != expected_sid {
+            return Err(fail("componentUpdateOwner"));
+        }
+        if prior.target.proxy_sha256 == version(proxy)
+            && prior.target.core_sha256 == version(core)
+            && current_engine()?.as_ref() == Some(&prior.target)
+            && matches!(matches_bundle(proxy, core), Ok(Some(true)))
+        {
+            prior.phase = "committed".into();
+            save_core_update(&prior)?;
+            return Ok(());
+        }
+        rollback_core_update(&mut prior)?;
+    }
+    let before_registration = registration::snapshot_installer_machine()?;
+    let before_hash = before_registration
+        .as_ref()
+        .map(|old| installer_module_hash(&old.module))
+        .transpose()?;
+    let before_engine = current_engine()?;
+    let (module, target) = prepare_engine(proxy, core)?;
+    // Carry one original rollback anchor across compatible core-only updates.
+    // A proxy migration creates a fresh anchor; normal failure rollback still uses immediate before.
+    let origin = update_origin(
+        read_core_update()?,
+        &target,
+        CoreOrigin {
+            registration: before_registration.clone(),
+            hash: before_hash.clone(),
+            engine: before_engine.clone(),
+        },
+    );
+    let mut record = CoreUpdate {
+        schema: 1,
+        phase: "prepared".into(),
+        initiator: expected_sid.into(),
+        updater: crate::transport::identity(std::process::id())?,
+        before_registration,
+        before_hash,
+        before_engine,
+        origin: Some(origin),
+        target,
+        module,
+        error: None,
+    };
+    save_core_update(&record)?;
+    let result = (|| {
+        match record
+            .before_registration
+            .as_ref()
+            .map(|r| r.module.as_str())
+        {
+            Some(old) if old != record.module => {
+                registration::replace_machine(&record.module, old)?
+            }
+            None => registration::register_machine(&record.module)?,
+            _ => (),
+        }
+        publish_engine(record.before_engine.as_ref(), Some(&record.target))?;
+        if !matches!(matches_bundle(proxy, core), Ok(Some(true))) {
+            return Err(fail("componentConfirmation"));
+        }
+        record.phase = "committed".into();
+        save_core_update(&record)
+    })();
+    if let Err(cause) = result {
+        record.error = Some(format!("{:08x}", cause.code().0 as u32));
+        let _ = save_core_update(&record);
+        if rollback_core_update(&mut record).is_err() {
+            return Err(fail("componentRollbackPending"));
+        }
+        return Err(cause);
+    }
+    Ok(())
+}
+
+/// Fixed rollback entry; the caller holds the original machine maintenance lock.
+/// No paths or replacement bytes are supplied by the frontend.
+pub fn rollback_bundle(proxy: &[u8], core: &[u8], expected_sid: &str) -> windows::core::Result<()> {
+    registration::administrator()?;
+    if expected_sid != crate::transport::current_user_sid()? {
+        return Err(fail("initiatingUserChanged"));
+    }
+    let mut record = read_core_update()?.ok_or_else(|| fail("componentRollbackMissing"))?;
+    if record.phase != "committed"
+        || record.initiator != expected_sid
+        || record.target.proxy_sha256 != version(proxy)
+        || record.target.core_sha256 != version(core)
+        || !matches!(matches_bundle(proxy, core), Ok(Some(true)))
+    {
+        return Err(fail("componentRollbackChanged"));
+    }
+    let origin = record
+        .origin
+        .clone()
+        .ok_or_else(|| fail("componentRollbackMissing"))?;
+    if let (Some(old), Some(hash)) = (&origin.registration, &origin.hash)
+        && installer_module_hash(&old.module)? != *hash
+    {
+        return Err(fail("componentRollbackIdentity"));
+    }
+    record.before_registration = origin.registration;
+    record.before_hash = origin.hash;
+    record.before_engine = origin.engine;
+    record.updater = crate::transport::identity(std::process::id())?;
+    record.error = Some("ownerRollback".into());
+    rollback_core_update(&mut record)
 }
 
 /// Read/replace the one protected deployment record, never a caller-selected path.
@@ -515,6 +1100,72 @@ pub fn commit_installer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn original_rollback_anchor_survives_two_core_updates_but_not_proxy_migration() {
+        let descriptor = |core: char, proxy: char| crate::lifecycle::CurrentEngine {
+            schema_version: 1,
+            revision: uuid::Uuid::new_v4().to_string(),
+            proxy_sha256: proxy.to_string().repeat(64),
+            core_sha256: core.to_string().repeat(64),
+            abi: 1,
+            input_protocol: 9,
+            platform: "x86_64-pc-windows-msvc".into(),
+        };
+        let a = descriptor('a', 'd');
+        let b = descriptor('b', 'd');
+        let c = descriptor('c', 'd');
+        let empty = CoreOrigin {
+            registration: None,
+            hash: None,
+            engine: None,
+        };
+        let make = |target, origin| CoreUpdate {
+            schema: 1,
+            phase: "committed".into(),
+            initiator: "owner".into(),
+            updater: crate::transport::Identity {
+                pid: 1,
+                session: 1,
+                created: 1,
+            },
+            before_registration: None,
+            before_hash: None,
+            before_engine: None,
+            origin: Some(origin),
+            target,
+            module: "unused".into(),
+            error: None,
+        };
+        let first = update_origin(
+            Some(make(a.clone(), empty)),
+            &b,
+            CoreOrigin {
+                registration: None,
+                hash: None,
+                engine: Some(a),
+            },
+        );
+        let second = update_origin(
+            Some(make(b.clone(), first)),
+            &c,
+            CoreOrigin {
+                registration: None,
+                hash: None,
+                engine: Some(b),
+            },
+        );
+        assert!(second.engine.is_none());
+        let migration = update_origin(
+            Some(make(c.clone(), second)),
+            &descriptor('a', 'e'),
+            CoreOrigin {
+                registration: None,
+                hash: None,
+                engine: Some(c.clone()),
+            },
+        );
+        assert_eq!(migration.engine, Some(c));
+    }
     #[test]
     fn current_install_has_protected_identity_without_registry_writes() {
         // Read-only: this succeeds without an install on contributor machines as well.

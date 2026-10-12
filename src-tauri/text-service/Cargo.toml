@@ -11,6 +11,8 @@ publish = false
 default = ["component"]
 component = ["windows/Win32_UI_Accessibility"]
 acceptance = ["component"]
+engine = ["component"]
+proxy = []
 
 [lib]
 name = "sayweave_text_service"
