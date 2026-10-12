@@ -409,12 +409,14 @@ fn worker_authorization_recovery_and_bounded_queue() {
             journal_io: worker.journal_io.clone(),
             deferred_cancellations: worker.deferred_cancellations.clone(),
             lease_active: worker.lease_active.clone(),
+            volatile_archive: worker.volatile_archive.clone(),
         };
         for _ in 0..64 {
             let (response, _) = oneshot::channel();
             fake.sender
                 .try_send(Request {
                     operation: Operation::Retry,
+                    archive: false,
                     response,
                     queued: Instant::now(),
                 })

@@ -136,6 +136,9 @@ pub(crate) struct ArchiveSettlement {
     pub task_id: String,
     pub saved: bool,
     pub save_error: bool,
+    pub attempt_id: Option<String>,
+    pub revision: u64,
+    pub state: String,
 }
 struct Task {
     id: String,
@@ -199,6 +202,7 @@ pub struct SpeechService {
     last_audio: Mutex<Option<(String, Vec<i16>)>>,
     operation_gate: Mutex<()>,
     operations: Arc<AtomicUsize>,
+    archive_revision: std::sync::atomic::AtomicU64,
 }
 pub struct FreshOperation(Arc<AtomicUsize>);
 impl Drop for FreshOperation {
@@ -227,6 +231,7 @@ impl SpeechService {
             last_audio: Mutex::new(None),
             operation_gate: Mutex::new(()),
             operations: Arc::new(AtomicUsize::new(0)),
+            archive_revision: std::sync::atomic::AtomicU64::new(0),
         }
     }
     pub fn admit(&self) -> Result<FreshOperation, Error> {
@@ -271,7 +276,24 @@ impl SpeechService {
             observer(event);
         }
     }
-    pub(crate) fn archive_settled(&self, result: ArchiveSettlement) {
+    pub(crate) fn archive_settled(&self, mut result: ArchiveSettlement) {
+        result.revision = self.archive_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        result.state = if result.saved {
+            "saved"
+        } else if result.save_error {
+            if result
+                .attempt_id
+                .as_ref()
+                .is_some_and(|id| self.history.data.pending_archive(id))
+            {
+                "pending"
+            } else {
+                "unavailable"
+            }
+        } else {
+            "disabled"
+        }
+        .into();
         self.update(&result.task_id, |s| {
             s.saved = result.saved;
             s.save_error = result.save_error;
@@ -549,10 +571,10 @@ impl SpeechService {
         } else {
             None
         };
-        if persistent
-            && let Err(e) = self
-                .history
-                .db(if retry_id.is_some() {
+        if persistent {
+            archive.enqueue(
+                "prepare".into(),
+                crate::data::Operation::History(if retry_id.is_some() {
                     DbOperation::Retry(attempt)
                 } else {
                     DbOperation::Prepare(Prepare {
@@ -560,10 +582,8 @@ impl SpeechService {
                         attempt,
                         audio: audio.clone(),
                     })
-                })
-                .await
-        {
-            return Err(e);
+                }),
+            );
         }
         let continuous = context.as_ref().and_then(|c| c.continuous.clone());
         let hotwords = if let Some(context) = &context {
@@ -744,6 +764,11 @@ impl SpeechService {
                     task_id: archive_id,
                     saved,
                     save_error: prior_save_error || !success,
+                    attempt_id: archived_snapshot
+                        .as_ref()
+                        .and_then(|s| s.attempt_id.clone()),
+                    revision: 0,
+                    state: String::new(),
                 };
                 if !coordinated {
                     handle

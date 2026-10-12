@@ -63,7 +63,23 @@ impl HistoryService {
         }
     }
     pub async fn db(&self, op: DbOperation) -> Result<DbOutput, Error> {
-        match self.data.request_admitted(Operation::History(op)).await? {
+        let archive = matches!(
+            op,
+            DbOperation::Prepare(_)
+                | DbOperation::Retry(_)
+                | DbOperation::Stage { .. }
+                | DbOperation::Checkpoint { .. }
+                | DbOperation::Finish { .. }
+                | DbOperation::AudioState { .. }
+                | DbOperation::Delivery { .. }
+        );
+        let operation = Operation::History(op);
+        let value = if archive {
+            self.data.request_archive(operation).await
+        } else {
+            self.data.request_admitted(operation).await
+        }?;
+        match value {
             Output::History(v) => Ok(v),
             _ => Err(Error::new("unavailable")),
         }

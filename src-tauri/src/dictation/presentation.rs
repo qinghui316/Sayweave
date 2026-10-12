@@ -50,6 +50,27 @@ pub fn final_presentation(
     error: Option<&str>,
     explicit_end: bool,
 ) -> Presentation {
+    // Terminal input/storage facts remain available in their owners. They do
+    // not create a blocking external bubble or grant permission to retry input.
+    let silent = |code: &str| {
+        matches!(
+            code,
+            "saveFailed"
+                | "compositionCleanup"
+                | "compositionRollback"
+                | "compositionHandoffFailed"
+                | "targetReadonlyContext"
+        )
+    };
+    if error.is_some_and(silent)
+        || delivery.is_some_and(|d| {
+            d.restore_error
+                || d.submission == Submission::Uncertain
+                || d.error.as_deref().is_some_and(silent)
+        })
+    {
+        return Presentation::Idle;
+    }
     let interruption = |code: &str| {
         matches!(
             code,
@@ -208,7 +229,7 @@ mod tests {
         }
     }
     #[test]
-    fn empty_or_user_ended_interruption_is_quiet_but_real_effects_are_not() {
+    fn input_safety_facts_are_preserved_without_external_terminal_bubbles() {
         for code in [
             "targetReadonlyContext",
             "targetChanged",
@@ -227,26 +248,19 @@ mod tests {
             delivery.restore_error = true;
             assert_eq!(
                 final_presentation(false, "", Some(&delivery), Some("emptyText"), true),
-                Presentation::Error
+                Presentation::Idle
             );
             delivery.restore_error = false;
             delivery.submission = Submission::Uncertain;
             assert_eq!(
                 final_presentation(false, "", Some(&delivery), Some("cancelled"), true),
-                Presentation::Error
+                Presentation::Idle
             );
         }
-        for code in [
-            "saveFailed",
-            "compositionRollback",
-            "compositionCleanup",
-            "credentialMissing",
-            "deviceAccess",
-            "network",
-        ] {
+        for code in ["saveFailed", "compositionRollback", "compositionCleanup"] {
             assert_eq!(
                 final_presentation(false, "", None, Some(code), true),
-                Presentation::Error
+                Presentation::Idle
             );
         }
     }
@@ -306,17 +320,17 @@ mod tests {
         delivery.restore_error = true;
         assert_eq!(
             final_presentation(false, "文字", Some(&delivery), None, false),
-            Presentation::Error
+            Presentation::Idle
         );
     }
     #[test]
-    fn terminal_failure_is_visible_and_successful_cancel_stays_quiet() {
+    fn safety_terminal_is_quiet_and_delivery_facts_remain() {
         let mut delivery = Delivery::not_submitted("compositionRollback");
         delivery.state = "unconfirmed".into();
         delivery.submission = Submission::Submitted;
         assert_eq!(
             final_presentation(false, "部分文字", Some(&delivery), Some("cancelled"), false),
-            Presentation::Error
+            Presentation::Idle
         );
         delivery.submission = Submission::NotSubmitted;
         delivery.error = Some("cancelled".into());
@@ -343,7 +357,7 @@ mod tests {
                 Some("saveFailed"),
                 false
             ),
-            Presentation::Error
+            Presentation::Idle
         );
     }
     #[test]

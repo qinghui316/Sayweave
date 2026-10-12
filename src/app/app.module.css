@@ -6,6 +6,6 @@
 .body { min-width: 0; flex: 1; display: flex; flex-direction: column; padding: 0 var(--space-28) var(--space-24); gap: var(--space-12); }
 .titlebar { min-height: 32px; height: 32px; display: flex; align-items: center; justify-content: flex-end; gap: 0; flex: none; margin-right: calc(-1 * var(--space-12)); }.titlebar button { height: 32px; }
 .content { min-height: 0; overflow: auto; flex: 1; padding-bottom: var(--space-24); }
-.historyContent { overflow: hidden; padding-bottom: 0; }
+.historyContent { overflow:hidden;padding-bottom:0;display:flex;flex-direction:column; }.historyContent>section{flex:1;min-height:0;height:auto;}
 .error { padding: var(--space-16); display: flex; gap: var(--space-16); align-items: center; background: var(--surface-content); border-radius: var(--radius-control); margin-bottom: var(--space-24); }
 .devEntry { font-size: var(--text-meta); color: var(--text-secondary); padding-left: var(--space-12); }

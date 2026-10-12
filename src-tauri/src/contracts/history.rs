@@ -136,7 +136,7 @@ pub struct Usage {
     pub duration_ms: u64,
     pub count: u64,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Prepare {
     pub record_id: String,
     pub attempt: Attempt,

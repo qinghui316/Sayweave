@@ -24,4 +24,10 @@ test('history keeps 20-row pages, reading position and accessible controls',asyn
  await page.getByRole('button',{name:'历史保存设置',exact:true}).click();await page.getByRole('combobox',{name:'录音保留时间'}).click();await page.getByRole('option',{name:'7 天',exact:true}).click();await page.getByRole('link',{name:'词典',exact:true}).click();await expect(page.getByRole('alertdialog')).toHaveCount(0);await page.getByRole('link',{name:'历史记录',exact:true}).click();await expect(page.getByRole('textbox',{name:'搜索识别文字'})).toHaveValue('记录 9');
  await page.setViewportSize({width:960,height:640});const row=page.getByRole('listitem').first();await row.getByRole('button',{name:'更多操作'}).focus();await expect(row.getByRole('button',{name:'复制',exact:true})).toBeVisible();await page.keyboard.press('Enter');await expect(page.getByRole('menuitem',{name:'删除记录'})).toBeVisible();await page.keyboard.press('Escape');await expect(row.getByRole('button',{name:'更多操作'})).toBeFocused();
  expect(await page.locator('main').evaluate(node=>node.scrollHeight<=node.clientHeight+1)).toBe(true);expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+ await scroller.evaluate(node=>{node.scrollTop=node.scrollHeight;});
+ const last=page.getByRole('listitem').last();await last.scrollIntoViewIfNeeded();
+ const bottom=(await last.boundingBox())!,list=(await scroller.boundingBox())!,footer=(await page.getByLabel('历史分页').boundingBox())!;
+ expect(bottom.y+bottom.height).toBeLessThanOrEqual(list.y+list.height+1);expect(list.y+list.height).toBeLessThanOrEqual(footer.y);
+ await page.screenshot({path:'.local/settlement-ui/history-960.png'});
+
 });

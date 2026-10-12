@@ -25,6 +25,8 @@ struct Shared {
     wake: Notify,
     failed: AtomicBool,
     _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    fallback: Option<DataWorker>,
+    unavailable: bool,
 }
 fn bytes(operation: &Operation) -> usize {
     use crate::contracts::{history::DbOperation as H, processing::DbOperation as P};
@@ -60,14 +62,39 @@ impl Archive {
         data: DataWorker,
         task: String,
     ) -> Result<Self, crate::contracts::dictionary::DataError> {
-        let permit = QUEUES
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| crate::contracts::dictionary::DataError::new("busy"))?;
-        Ok(Self::with_permit(task, Some(permit), move |operation| {
-            let data = data.clone();
-            async move { data.request_archive(operation).await.is_ok() }
-        }))
+        let permit = match QUEUES.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // Internal worker saturation cannot revoke valid input admission.
+                // Refuse archive work truthfully without creating unbounded workers.
+                let state = Arc::new(Shared {
+                    pending: Mutex::new(Pending {
+                        writes: VecDeque::new(),
+                        bytes: 0,
+                        sealed: false,
+                    }),
+                    wake: Notify::new(),
+                    failed: AtomicBool::new(false),
+                    _permit: None,
+                    fallback: Some(data),
+                    unavailable: true,
+                });
+                let (_, done) = watch::channel(true);
+                return Ok(Self {
+                    producer: Arc::new(Producer(state)),
+                    done,
+                });
+            }
+        };
+        Ok(Self::with_permit(
+            task,
+            Some(permit),
+            Some(data.clone()),
+            move |operation| {
+                let data = data.clone();
+                async move { data.request_archive(operation).await.map(|_| ()) }
+            },
+        ))
     }
     #[cfg(test)]
     fn with_writer<F, Fut>(task: String, write: F) -> Self
@@ -75,16 +102,27 @@ impl Archive {
         F: Fn(Operation) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = bool> + Send,
     {
-        Self::with_permit(task, None, write)
+        Self::with_permit(task, None, None, move |op| {
+            let result = write(op);
+            async move {
+                if result.await {
+                    Ok(())
+                } else {
+                    Err(crate::contracts::dictionary::DataError::new("unavailable"))
+                }
+            }
+        })
     }
     fn with_permit<F, Fut>(
         task: String,
         permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        fallback: Option<DataWorker>,
         write: F,
     ) -> Self
     where
         F: Fn(Operation) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = bool> + Send,
+        Fut: std::future::Future<Output = Result<(), crate::contracts::dictionary::DataError>>
+            + Send,
     {
         let shared = Arc::new(Shared {
             pending: Mutex::new(Pending {
@@ -95,6 +133,8 @@ impl Archive {
             wake: Notify::new(),
             failed: AtomicBool::new(false),
             _permit: permit,
+            fallback,
+            unavailable: false,
         });
         let (done, receiver) = watch::channel(false);
         let state = shared.clone();
@@ -124,7 +164,8 @@ impl Archive {
                     }
                 };
                 if let Some(operation) = item {
-                    if !write(operation).await {
+                    if let Err(error) = write(operation).await {
+                        log::warn!(target:"sayweave", "operation=archive_write task_id={} result={}", task, error.code);
                         state.failed.store(true, Ordering::Release);
                     }
                 } else {
@@ -152,6 +193,15 @@ impl Archive {
         if pending.sealed {
             return false;
         }
+        if state.unavailable {
+            if !state.failed.swap(true, Ordering::AcqRel) {
+                FAILURES.fetch_add(1, Ordering::AcqRel);
+            }
+            if let Some(data) = &state.fallback {
+                data.retain_archive(&operation);
+            }
+            return false;
+        }
         let previous = pending.writes.iter().position(|(old, _, _)| old == &key);
         let size = bytes(&operation);
         let previous_size = previous.map_or(0, |index| pending.writes[index].2);
@@ -159,6 +209,9 @@ impl Archive {
             || pending.bytes - previous_size + size > BYTE_CAPACITY
         {
             state.failed.store(true, Ordering::Release);
+            if let Some(data) = &state.fallback {
+                data.retain_archive(&operation);
+            }
             return false;
         }
         if let Some(index) = previous {
@@ -176,6 +229,16 @@ impl Archive {
                 return;
             }
             if let Some(operation) = terminal {
+                if state.unavailable {
+                    if !state.failed.swap(true, Ordering::AcqRel) {
+                        FAILURES.fetch_add(1, Ordering::AcqRel);
+                    }
+                    if let Some(data) = &state.fallback {
+                        data.retain_archive(&operation);
+                    }
+                    pending.sealed = true;
+                    return;
+                }
                 let size = bytes(&operation);
                 pending.bytes += size;
                 pending.writes.push_back((String::new(), operation, size));

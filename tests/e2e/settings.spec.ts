@@ -9,16 +9,21 @@ test('planned modes, concise product pages and history settings have truthful de
   }
   const start=(await page.getByRole('button',{name:'开始录音',exact:true}).boundingBox())!;
   expect(start.y+start.height).toBeLessThanOrEqual(height-24);
-  await page.screenshot({path:'.local/product-copy/home-'+width+'.png'});
+  await page.screenshot({path:'.local/settlement-ui/home-'+width+'.png'});
   await page.getByRole('button',{name:'设置',exact:true}).click();
-  await page.getByRole('button',{name:'外观与历史保存',exact:true}).click();
-  await page.getByRole('button',{name:'打开历史保存设置',exact:true}).click();
-  await expect(page.getByRole('dialog')).toHaveCount(0);
-  await expect(page.locator('#history-settings')).toBeVisible();
+  await page.screenshot({path:'.local/settlement-ui/device-'+width+'.png'});
+  await page.getByRole('button',{name:'外观',exact:true}).click();
+  await expect(page.getByRole('heading',{name:'外观',exact:true})).toBeVisible();
+  await expect(page.getByRole('button',{name:'打开历史保存设置'})).toHaveCount(0);
+  await expect(page.getByRole('button',{name:'语言与翻译'})).toHaveCount(0);
+  await page.getByRole('button',{name:'关于',exact:true}).last().click();
+  await expect(page.getByText('待确定')).toHaveCount(0);await expect(page.getByText('此构建使用开发渠道')).toHaveCount(0);
+  await page.screenshot({path:'.local/settlement-ui/about-'+width+'.png'});
+  await page.getByRole('dialog').getByRole('button',{name:'关闭',exact:true}).click();
   await page.getByRole('link',{name:'词典',exact:true}).click();await expect(page.getByRole('switch',{name:'自动入词'})).toBeVisible();await expect(page.getByRole('button',{name:'文字模型设置'})).toHaveCount(0);
-  await page.screenshot({path:'.local/product-copy/dictionary-'+width+'.png'});
+  await page.screenshot({path:'.local/settlement-ui/dictionary-'+width+'.png'});
   await page.getByRole('link',{name:'个性化',exact:true}).click();await expect(page.getByRole('switch',{name:'个性化'})).toBeVisible();await expect(page.getByRole('button',{name:'文字模型设置'})).toHaveCount(0);
-  await page.screenshot({path:'.local/product-copy/personalization-'+width+'.png'});
+  await page.screenshot({path:'.local/settlement-ui/personalization-'+width+'.png'});
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
  }
  for(const [path,title] of [['translation','翻译规划中'],['edit','编辑规划中'],['unknown','页面未找到']]){

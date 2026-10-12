@@ -57,6 +57,22 @@ impl Entry {
             _ => None,
         }
     }
+    fn has_parent(&self, repository: &Repository) -> Result<bool, DataError> {
+        let (sql, id) = match self {
+            Self::History { attempt_id, .. } => (
+                "SELECT EXISTS(SELECT 1 FROM speech_attempts WHERE id=?1)",
+                attempt_id,
+            ),
+            Self::Processing { id, .. } => (
+                "SELECT EXISTS(SELECT 1 FROM processing_runs p JOIN speech_attempts a ON a.id=p.attempt_id WHERE p.id=?1)",
+                id,
+            ),
+        };
+        repository
+            .connection
+            .query_row(sql, [id], |r| r.get(0))
+            .map_err(super::repository::db_error)
+    }
     fn apply(self, repository: &mut Repository) -> Result<(), DataError> {
         match self {
             Self::Processing {
@@ -202,6 +218,10 @@ pub(super) fn replay_except(
         Entry::History { .. } => 1,
     });
     for (path, entry) in entries {
+        if !entry.has_parent(repository)? {
+            log::warn!(target:"sayweave", "operation=cancel_recovery result=parentUnavailable");
+            continue;
+        }
         entry.apply(repository)?;
         fs::remove_file(path).map_err(|_| DataError::new("unavailable"))?;
     }
@@ -645,6 +665,7 @@ mod tests {
             journal_io: worker.journal_io.clone(),
             deferred_cancellations: worker.deferred_cancellations.clone(),
             lease_active: worker.lease_active.clone(),
+            volatile_archive: worker.volatile_archive.clone(),
         };
         for _ in 0..64 {
             let (response, _) = oneshot::channel();
@@ -652,6 +673,7 @@ mod tests {
                 fake.sender
                     .try_send(super::super::Request {
                         operation: Operation::Retry,
+                        archive: false,
                         response,
                         queued: std::time::Instant::now(),
                     })
@@ -692,5 +714,30 @@ mod tests {
                 .join(format!("{attempt}.json"))
                 .exists()
         );
+    }
+    #[test]
+    fn orphan_cancel_is_retained_without_blocking_unrelated_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut repo = Repository::open(temp.path()).unwrap();
+        let attempt = uuid::Uuid::new_v4().to_string();
+        stage(
+            temp.path(),
+            &Operation::History(history::DbOperation::PruneCancelled {
+                attempt_id: attempt.clone(),
+                text: String::new(),
+            }),
+        )
+        .unwrap();
+        replay(&mut repo, temp.path()).unwrap();
+        assert!(
+            temp.path()
+                .join("cancel-recovery")
+                .join(format!("{attempt}.json"))
+                .exists()
+        );
+        drop(repo);
+        let mut repo = Repository::open(temp.path()).unwrap();
+        repo.history_operation(history::DbOperation::Preferences)
+            .unwrap();
     }
 }

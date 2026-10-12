@@ -2,6 +2,7 @@ import { useId, useLayoutEffect, useRef, useState, type ButtonHTMLAttributes, ty
 import { AnimatedIcon } from './AnimatedIcon';
 import { useMotion } from './useMotion';
 import {useChoiceFeedback} from './selection';
+import {RubberIndicator} from './RubberSelection';
 export {Select, Switch, SingleChoice} from './selection';
 
 import * as TabsPrimitive from '@radix-ui/react-tabs';
@@ -33,7 +34,7 @@ export function PasswordInput(props: InputHTMLAttributes<HTMLInputElement>) {
 }
 export function Tabs({ value, onValueChange, options, children, label, className, contentClassName, disabled, activationMode = 'automatic' }: { value: string; onValueChange: (value: string) => void; options: {value: string; label: string}[]; children: ReactNode; label: string; className?: string; contentClassName?: string; disabled?: boolean; activationMode?: 'automatic'|'manual' }) {
   const {ref,mark}=useChoiceFeedback(value,disabled);
-  return <TabsPrimitive.Root className={className} value={value} onValueChange={next=>mark(next,()=>onValueChange(next))} activationMode={activationMode}><TabsPrimitive.List ref={ref} className={`${s.tabs} ${s.choiceGroup}`} aria-label={label}>{options.map(o => <TabsPrimitive.Trigger disabled={disabled} key={o.value} value={o.value} className={s.tab} data-choice-item="" data-current={value===o.value}><span className={s.tabFace} data-choice-face="" data-current={value===o.value}/><span className={s.tabLabel}>{o.label}</span></TabsPrimitive.Trigger>)}</TabsPrimitive.List><TabsPrimitive.Content className={contentClassName} value={value}>{children}</TabsPrimitive.Content></TabsPrimitive.Root>;
+  return <TabsPrimitive.Root className={className} value={value} onValueChange={next=>mark(next,()=>onValueChange(next))} activationMode={activationMode}><TabsPrimitive.List ref={ref} data-rubber="" className={`${s.tabs} ${s.choiceGroup}`} aria-label={label}><RubberIndicator/>{options.map(o => <TabsPrimitive.Trigger disabled={disabled} key={o.value} value={o.value} className={s.tab} data-choice-item="" data-current={value===o.value}><span className={s.tabFace} data-choice-face="" data-current={value===o.value}/><span className={s.tabLabel}>{o.label}</span></TabsPrimitive.Trigger>)}</TabsPrimitive.List><TabsPrimitive.Content className={contentClassName} value={value}>{children}</TabsPrimitive.Content></TabsPrimitive.Root>;
 }
 export function InlineMessage({ children, status = 'info' }: { children: ReactNode; status?: 'info'|'error'|'success' }) {
   return <p className={s.message} role={status === 'error' ? 'alert' : 'status'}><span aria-hidden="true" className={status === 'success' ? s.confirm : ''}>{status === 'error' ? '!' : status === 'success' ? '✓' : 'i'}</span>{children}</p>;

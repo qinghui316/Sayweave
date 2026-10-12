@@ -3,6 +3,7 @@ export class SpeechStore {
  private value=initialSpeech();private level=0;private meterSequence=0;private display={snapshot:this.value,level:0};private listeners=new Set<()=>void>();
  private trialDisplay={snapshot:initialSpeech(),level:0};private trialMeterSequence=0;private trialListeners=new Set<()=>void>();
  private archiveFailure:SpeechArchive|null=null;private archiveListeners=new Set<()=>void>();
+ private archiveRevisions=new Map<string,number>();
  private meterValue:SpeechMeterFrame|null=null;private meterListeners=new Set<()=>void>();
  private trialMeterValue:SpeechMeterFrame|null=null;private trialMeterListeners=new Set<()=>void>();
  readonly liveMeter:SpeechMeterSource={getSnapshot:()=>this.meterValue,subscribe:fn=>{this.meterListeners.add(fn);return()=>{this.meterListeners.delete(fn);};}};
@@ -30,9 +31,13 @@ export class SpeechStore {
   if(globalNew)this.emit();if(trialNew)this.emitTrial();
  };
  archived=(result:SpeechArchive)=>{
-  if(result.saveError){this.archiveFailure=result;for(const fn of this.archiveListeners)fn();}
-  if(result.taskId===this.value.taskId){this.value={...this.value,saved:result.saved,saveError:result.saveError};this.emit();}
-  if(result.taskId===this.trialDisplay.snapshot.taskId){this.trialDisplay={...this.trialDisplay,snapshot:{...this.trialDisplay.snapshot,saved:result.saved,saveError:result.saveError}};this.emitTrial();}
+  const matches=(snapshot:SpeechSnapshot)=>result.taskId===snapshot.taskId&&(result.attemptId===undefined||result.attemptId===snapshot.attemptId);
+  if(!matches(this.value)&&!matches(this.trialDisplay.snapshot))return;
+  const revision=result.revision??0;if(revision<=(this.archiveRevisions.get(result.taskId)??-1))return;
+  this.archiveRevisions.set(result.taskId,revision);
+  for(const id of this.archiveRevisions.keys())if(id!==this.value.taskId&&id!==this.trialDisplay.snapshot.taskId)this.archiveRevisions.delete(id);
+  if(matches(this.value)){this.value={...this.value,saved:result.saved,saveError:result.saveError};this.emit();}
+  if(matches(this.trialDisplay.snapshot)){this.trialDisplay={...this.trialDisplay,snapshot:{...this.trialDisplay.snapshot,saved:result.saved,saveError:result.saveError}};this.emitTrial();}
  };
  meter=(m:SpeechMeter)=>{
   if(m.taskId!==this.value.taskId||m.sequence<=this.meterSequence||this.value.phase!=='recording')return;

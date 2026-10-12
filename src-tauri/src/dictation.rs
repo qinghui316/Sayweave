@@ -653,32 +653,34 @@ impl DictationCoordinator {
         let source = source.to_string();
         tauri::async_runtime::spawn(async move {
             let coordinator = app.state::<Self>();
+            let journal_queue = crate::archive::Archive::new(
+                app.state::<crate::data::DataWorker>().inner().clone(),
+                id.clone(),
+            )
+            .ok();
             #[cfg(windows)]
-            let mut journal_ok = true;
-            #[cfg(windows)]
-            if raw_draft.is_some() {
-                let initial = app
+            if raw_draft.is_some()
+                && let Some(s) = app
                     .state::<SpeechService>()
                     .snapshot()
                     .ok()
-                    .filter(|s| s.task_id.as_deref() == Some(&id));
-                journal_ok = match initial {
-                    Some(s) if s.record_id.is_some() => {
-                        // Streaming may mutate the range before the terminal result. Enter
-                        // delivering before publishing its first writable update, using the
-                        // same monotonic journal transitions as final-only input.
-                        coordinator
-                            .journal(&app, &id, s.attempt_id.as_deref(), "pending", None)
-                            .await
-                            .is_ok()
-                            && coordinator
-                                .journal(&app, &id, s.attempt_id.as_deref(), "delivering", None)
-                                .await
-                                .is_ok()
+                    .filter(|s| s.task_id.as_deref() == Some(&id))
+                && s.record_id.is_some()
+                && let Some(attempt) = s.attempt_id
+            {
+                for state in ["pending", "delivering"] {
+                    if let Some(queue) = &journal_queue {
+                        queue.enqueue(
+                            state.into(),
+                            crate::data::Operation::History(DbOperation::Delivery {
+                                task: id.clone(),
+                                attempt: attempt.clone(),
+                                state: state.into(),
+                                error: None,
+                            }),
+                        );
                     }
-                    Some(_) => true,
-                    None => false,
-                };
+                }
             }
             #[cfg(windows)]
             let mut processing = processing;
@@ -689,13 +691,7 @@ impl DictationCoordinator {
                     .snapshot()
                     .ok()
                     .filter(|s| s.task_id.as_deref() == Some(&id));
-                if current.as_ref().is_some_and(|s| s.record_id.is_some())
-                    && shared_record.is_none()
-                {
-                    journal_ok = false;
-                }
-                if journal_ok
-                    && !gate.cancelled()
+                if !gate.cancelled()
                     && let (Some(context), Some(current)) = (&processing, &current)
                     && context
                         .attach(current.record_id.as_deref(), current.attempt_id.as_deref())
@@ -722,7 +718,7 @@ impl DictationCoordinator {
             });
             #[cfg(windows)]
             if let Some(draft) = &draft {
-                if journal_ok && !gate.cancelled() {
+                if !gate.cancelled() {
                     draft.activate();
                     if let Ok(mut active) = coordinator.active.lock()
                         && let Some(session) = active.as_mut().filter(|s| s.id == id)
@@ -735,12 +731,6 @@ impl DictationCoordinator {
                         .borrow()
                         .clone();
                     coordinator.observe_transcript(&latest);
-                } else if !journal_ok && !gate.cancelled() {
-                    coordinator.update(&app, &id, |s| s.error = Some("saveFailed".into()));
-                    let _ = crate::task_stop::request(
-                        &session_cancel,
-                        crate::contracts::speech::StopReason::Interrupted,
-                    );
                 }
                 // Every admitted range has a cleanup owner, including the
                 // cancelled/failed-journal path which may never write text.
@@ -772,8 +762,7 @@ impl DictationCoordinator {
                     #[cfg(windows)]
                     let inline = match &draft {
                         Some(draft) => {
-                            let mode =
-                                composition_finish(terminal.phase, journal_ok, gate.cancelled());
+                            let mode = composition_finish(terminal.phase, true, gate.cancelled());
                             let latest = terminal.transcript.clone();
                             Some(draft.finish(&latest, mode).await)
                         }
@@ -930,6 +919,10 @@ impl DictationCoordinator {
                 let id = archive_id;
                 let coordinator = app.state::<DictationCoordinator>();
                 let mut saved = false;
+                archive_error |= match journal_queue {
+                    Some(queue) => !queue.finish().await,
+                    None => true,
+                };
                 if let Some(archive) = recognition_archive {
                     match archive.await {
                         Ok(result) => {
@@ -1024,6 +1017,9 @@ impl DictationCoordinator {
                         task_id: id,
                         saved: saved && !archive_error,
                         save_error: archive_error,
+                        attempt_id: language_source.as_ref().and_then(|s| s.attempt_id.clone()),
+                        revision: 0,
+                        state: String::new(),
                     });
                 !archive_error
             });

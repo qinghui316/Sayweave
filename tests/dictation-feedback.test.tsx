@@ -15,12 +15,12 @@ it('quiet native terminal cannot show an older source error during its pending h
  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
  expect(screen.queryByRole('button')).not.toBeInTheDocument();
 });
-it('specific safety errors win over an empty recognition result and never use the generic fallback',()=>{
+it('safety facts remain in the task without a blocking external bubble',()=>{
  const value={...initialDictation(),source:'external' as const,taskId:'current',presentationId:'view',presentation:'error' as const,error:'emptyText',delivery:{state:'unconfirmed' as const,submission:'uncertain' as const,verification:'unavailable' as const,stage:'composition',submittedEvents:0,error:'compositionCleanup',restoreError:true,elapsedMs:1}};
  const message=dictationFeedback(value,initialSpeech());
- expect(message).toContain('恢复未完成');
+ expect(message).toBeUndefined();
  render(<VoiceSurface presentation="error" phase="failed" error={message} start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
- expect(screen.getByRole('alert')).toHaveTextContent('输入恢复未完成');
+ expect(screen.queryByRole('alert')).not.toBeInTheDocument();
  expect(screen.queryByText('识别未完成，请重试。')).not.toBeInTheDocument();
 });
 it('missing presentation detail cannot invent a recognition failure',()=>{
@@ -36,4 +36,9 @@ it('a fresh start failure remains visible while the previous trial terminal stay
  render(<Home quietTerminal phase="failed" speech={{...initialSpeech(),taskId:'old',error:'emptyText'}} failure="无法访问麦克风，请检查权限。" onShortcuts={()=>{}} onModels={()=>{}} start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
  expect(screen.getByRole('alert')).toHaveTextContent('无法访问麦克风');
  expect(screen.queryByText('未识别到文字。')).not.toBeInTheDocument();
+});
+
+it('archive failure does not add a trial warning or empty copy button',()=>{
+ render(<Home phase="completed" speech={{...initialSpeech(),taskId:'trial',source:'trial',phase:'completed',saveError:true}} copy={async()=>{}} onShortcuts={()=>{}} onModels={()=>{}} start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
+ expect(screen.queryByRole('alert')).not.toBeInTheDocument();expect(screen.queryByRole('button',{name:'复制'})).not.toBeInTheDocument();
 });

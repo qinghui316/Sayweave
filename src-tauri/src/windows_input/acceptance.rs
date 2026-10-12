@@ -186,6 +186,54 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
     let mut fixture = Fixture::open(exe, true)?;
     let _evidence = EvidenceLease::new()?;
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    for (start, end) in [(1, 1), (1, 3)] {
+        for mode in [
+            Finish::Commit,
+            Finish::Abort,
+            Finish::Handoff("editing".into()),
+        ] {
+            fixture.command(serde_json::json!({"action":"readonly","enabled":false}))?;
+            fixture.command(
+                serde_json::json!({"action":"focus","text":"原有正文","start":start,"end":end}),
+            )?;
+            std::thread::sleep(Duration::from_millis(60));
+            let id = uuid::Uuid::new_v4().to_string();
+            let anchor = WindowsInputService::anchor().ok_or("fixture not foreground")?;
+            bind_watch(&id, &anchor, None).map_err(|e| e.code)?;
+            let draft = runtime
+                .block_on(Draft::begin(
+                    id.clone(),
+                    1,
+                    anchor,
+                    Arc::new(DeliveryGate::default()),
+                ))
+                .map_err(|e| e.code)?;
+            fixture.command(serde_json::json!({"action":"readonly","enabled":true}))?;
+            let result = runtime.block_on(draft.finish(String::new(), mode));
+            if result.submission != Submission::NotSubmitted
+                || result.restore_error
+                || !matches!(
+                    result.error.as_deref(),
+                    Some("none" | "cancelled" | "editing")
+                )
+            {
+                return Err(format!(
+                    "unwritten readonly terminal failed: {:?}",
+                    result.error
+                ));
+            }
+            let actual = fixture.command(serde_json::json!({"action":"read"}))?;
+            if actual["text"].as_str() != Some("原有正文") {
+                return Err("unwritten release changed existing body".into());
+            }
+            release_watch(&id);
+            println!(
+                "SAYWEAVE_PREPARED_READONLY_PASS selected={} body_unchanged=true",
+                start != end
+            );
+        }
+    }
+    fixture.command(serde_json::json!({"action":"readonly","enabled":false}))?;
     for (before, start, end, prefix, text, expected) in [
         ("abc", 1, 1, "中", "中文，🙂", "a中文，🙂bc"),
         ("前 被选🙂 后", 2, 6, "替", "替换🙂", "前 替换🙂 后"),

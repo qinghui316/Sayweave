@@ -1,3 +1,4 @@
+mod archive_recovery;
 mod cancellation;
 pub mod model;
 mod repositories;
@@ -47,6 +48,7 @@ pub enum Output {
 }
 struct Request {
     operation: Operation,
+    archive: bool,
     response: oneshot::Sender<Result<Output, DataError>>,
     queued: Instant,
 }
@@ -61,6 +63,7 @@ pub struct DataWorker {
     journal_io: Arc<Mutex<()>>,
     deferred_cancellations: Arc<Mutex<HashSet<String>>>,
     lease_active: Arc<AtomicBool>,
+    volatile_archive: Arc<Mutex<archive_recovery::Memory>>,
 }
 pub fn profile_root(base: &Path, development: bool) -> PathBuf {
     base.join(if development { "data-dev" } else { "data" })
@@ -102,6 +105,8 @@ impl DataWorker {
         let worker_root = root.clone();
         let lease_active = Arc::new(AtomicBool::new(lease.is_some()));
         let thread_lease = lease_active.clone();
+        let volatile_archive = Arc::new(Mutex::new(archive_recovery::Memory::default()));
+        let thread_volatile = volatile_archive.clone();
         std::thread::Builder::new()
             .name("sayweave-data".into())
             .spawn(move || {
@@ -172,10 +177,30 @@ impl DataWorker {
                                     .lock()
                                     .map_err(|_| DataError::new("unavailable"))?;
                                 let deferred=thread_deferred.lock().map_err(|_|DataError::new("unavailable"))?;
+                                if !request.archive {
+                                    if let Ok(mut memory) = thread_volatile.lock() { memory.flush(&root); }
+                                    if let Err(e) = archive_recovery::replay(repo, &root, true) {
+                                        log::warn!(target:"sayweave", "operation=archive_recovery result={}", e.code);
+                                    }
+                                }
                                 cancellation::replay_except(repo, &root, &deferred)?;
                                 if cancellation::blocks_read(repo, &request.operation, &deferred)? { return Err(DataError::new("busy")); }
+                                if !request.archive && deferred.is_empty() && let Err(e) = archive_recovery::replay(repo, &root, false) {
+                                        log::warn!(target:"sayweave", "operation=archive_recovery result={}", e.code);
+                                }
+                                if let Operation::History(crate::contracts::history::DbOperation::MarkDelete { id, revision }) = &request.operation {
+                                    repo.history_operation(crate::contracts::history::DbOperation::MarkDelete { id: id.clone(), revision: *revision })?;
+                                    let mut memory=thread_volatile.lock().map_err(|_|DataError::new("unavailable"))?;
+                                    archive_recovery::invalidate_all(repo,&root,id,&mut memory)?;
+                                    return Ok(Output::History(crate::contracts::history::DbOutput::Done));
+                                }
+                                if let Operation::History(crate::contracts::history::DbOperation::DeleteRecord(id)) = &request.operation {
+                                    let mut memory=thread_volatile.lock().map_err(|_|DataError::new("unavailable"))?;
+                                    archive_recovery::invalidate_all(repo,&root,id,&mut memory)?;
+                                }
                                 drop(deferred);
                                 drop(_journal);
+                                if request.archive { return archive_recovery::apply(repo, request.operation); }
                                 match request.operation {
                                     Operation::List(query) => repo.list(query).map(Output::Page),
                                     Operation::Get(kind, id) => {
@@ -224,7 +249,7 @@ impl DataWorker {
                         }
                     };
                     if let Err(error) = &result
-                        && error.code == "unavailable"
+                        && error.code == "unavailable" && !request.archive
                     {
                         repository = Err(error.clone());
                         Self::set_status(&shared, &repository);
@@ -250,6 +275,7 @@ impl DataWorker {
             journal_io,
             deferred_cancellations,
             lease_active,
+            volatile_archive,
         })
     }
     fn set_status(shared: &Mutex<Status>, repository: &Result<Repository, DataError>) {
@@ -282,6 +308,16 @@ impl DataWorker {
             .map(|s| s.clone())
             .map_err(|_| DataError::new("unavailable"))
     }
+    pub(crate) fn pending_archive(&self, attempt: &str) -> bool {
+        self.journal_io
+            .lock()
+            .is_ok_and(|_guard| archive_recovery::pending_attempt(&self.root, attempt))
+    }
+    pub(crate) fn retain_archive(&self, operation: &Operation) {
+        if let Ok(mut memory) = self.volatile_archive.lock() {
+            memory.retain(operation);
+        }
+    }
     pub async fn request(&self, caller: &str, operation: Operation) -> Result<Output, DataError> {
         authorize(caller)?;
         self.request_inner(operation, false).await
@@ -293,6 +329,52 @@ impl DataWorker {
     /// Already admitted ordinary archive facts wait for bounded queue capacity
     /// in the background. Cancellation intents still use request_admitted.
     pub(crate) async fn request_archive(&self, operation: Operation) -> Result<Output, DataError> {
+        let ticket = archive_recovery::stamp();
+        let mut result = self.request_archive_once(operation.clone(), ticket).await;
+        for delay in [100, 300, 1000] {
+            if !result.as_ref().is_err_and(|e| e.code == "busy") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            result = self.request_archive_once(operation.clone(), ticket).await;
+        }
+        result
+    }
+    async fn request_archive_once(
+        &self,
+        operation: Operation,
+        ticket: archive_recovery::Stamp,
+    ) -> Result<Output, DataError> {
+        let backup = operation.clone();
+        let root = self.root.clone();
+        let journal = self.journal_io.clone();
+        let intent = operation.clone();
+        let active = self.lease_active.load(Ordering::Acquire);
+        let receipt = tokio::task::spawn_blocking(move || {
+            if !active {
+                return Err(DataError::new("unavailable"));
+            }
+            let _guard = journal.lock().map_err(|_| DataError::new("unavailable"))?;
+            archive_recovery::stage_stamped(&root, &intent, ticket)
+        })
+        .await
+        .map_err(|_| DataError::new("unavailable"))?;
+        if receipt
+            .as_ref()
+            .is_err_and(|e| e.code == "conflict" || e.code == "staleArchive")
+        {
+            return Err(DataError::new("conflict"));
+        }
+        if matches!(&receipt, Ok(Some(_)))
+            && let Ok(mut memory) = self.volatile_archive.lock()
+        {
+            memory.forget(&backup, ticket);
+        }
+        if receipt.is_err()
+            && let Ok(mut memory) = self.volatile_archive.lock()
+        {
+            memory.retain_stamped(&backup, ticket);
+        }
         let permit = tokio::time::timeout(std::time::Duration::from_secs(5), self.sender.reserve())
             .await
             .map_err(|_| DataError::new("busy"))?
@@ -300,10 +382,27 @@ impl DataWorker {
         let (response, receive) = oneshot::channel();
         permit.send(Request {
             operation,
+            archive: true,
             response,
             queued: Instant::now(),
         });
-        receive.await.map_err(|_| DataError::new("unavailable"))?
+        let result = receive.await.map_err(|_| DataError::new("unavailable"))?;
+        if result.is_ok()
+            && let Ok(mut memory) = self.volatile_archive.lock()
+        {
+            memory.forget(&backup, ticket);
+        }
+        if result.is_ok()
+            && let Ok(Some(receipt)) = receipt
+        {
+            let journal = self.journal_io.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _guard = journal.lock().map_err(|_| DataError::new("unavailable"))?;
+                archive_recovery::acknowledge(&receipt)
+            })
+            .await;
+        }
+        result
     }
     async fn request_inner(
         &self,
@@ -343,6 +442,7 @@ impl DataWorker {
             self.sender
                 .try_send(Request {
                     operation,
+                    archive: false,
                     response,
                     queued: Instant::now(),
                 })
@@ -401,6 +501,7 @@ impl DataWorker {
         self.sender
             .send(Request {
                 operation: Operation::Drain,
+                archive: false,
                 response,
                 queued: Instant::now(),
             })

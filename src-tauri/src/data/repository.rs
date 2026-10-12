@@ -210,6 +210,7 @@ pub fn migrate(
 }
 pub struct Repository {
     pub connection: Connection,
+    pub(super) archive_cursor: [usize; 2],
 }
 impl Repository {
     pub fn open(root: &Path) -> Result<Self, DataError> {
@@ -220,8 +221,17 @@ impl Repository {
             .map_err(db_error)?;
         migrate(&mut connection, root, MIGRATIONS)?;
         configure(&connection)?;
-        let mut repository = Self { connection };
+        let mut repository = Self {
+            connection,
+            archive_cursor: [0, 0],
+        };
+        if let Err(e) = super::archive_recovery::replay(&mut repository, root, true) {
+            log::warn!(target:"sayweave", "operation=archive_recovery result={}", e.code);
+        }
         super::cancellation::replay(&mut repository, root)?;
+        if let Err(e) = super::archive_recovery::replay(&mut repository, root, false) {
+            log::warn!(target:"sayweave", "operation=archive_recovery result={}", e.code);
+        }
         Ok(repository)
     }
     pub(super) fn row(kind: Kind, row: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {

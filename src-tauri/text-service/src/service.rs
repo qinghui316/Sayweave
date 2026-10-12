@@ -982,6 +982,43 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
         );
         return;
     }
+    let prepared_release = {
+        let state = shared.borrow();
+        matches!(r.action, Action::Abort | Action::Commit | Action::Handoff)
+            && r.text.is_empty()
+            && r.live(unsafe { GetTickCount64() })
+            && state.active
+            && state.connected
+            && state.connection == connection
+            && state.capability.as_deref() == Some(r.capability.as_str())
+            && state.pending.is_none()
+            && !state.cleanup
+            && !state.key_failure
+            && state.composition.is_none()
+            && state.prepared.as_ref().is_some_and(|p| !p.writing)
+            && state.text.is_none()
+            && matches!(state.backup, Some(Rollback::OriginalSelection(..)))
+            && state.version.accepts(&r)
+            && state.version.revision == r.revision
+    };
+    if prepared_release {
+        // Begin has not touched the document. Release only this authenticated
+        // preparation; a new focus or readonly field cannot grant write authority.
+        apply_terminal_then_retire(shared, &r, |epoch| {
+            if let Some(epoch) = epoch {
+                release_composition(shared, epoch, None);
+            }
+        });
+        reply(
+            shared,
+            &r,
+            connection,
+            true,
+            "preparedReleased",
+            Mutation::NotAttempted,
+        );
+        return;
+    }
     let settled_release = {
         let state = shared.borrow();
         r.action == Action::Handoff
@@ -1636,10 +1673,57 @@ fn schedule(
                 s.generation,
             )
         };
-        let context = manager
-            .GetFocus()
-            .and_then(|d| d.GetTop())
-            .map_err(|e| ("editFocus", e))?;
+        let focused = manager.GetFocus().and_then(|d| d.GetTop());
+        let owned_release = {
+            let state = shared.borrow();
+            if r.action == Action::Handoff {
+                state
+                    .context
+                    .clone()
+                    .zip(state.composition.clone())
+                    .filter(|(owned, _)| focused.as_ref().ok() != Some(owned))
+                    .map(|(owned, composition)| (owned, composition, state.epoch))
+            } else {
+                None
+            }
+        };
+        if let Some((owned, composition, epoch)) = owned_release {
+            // Release the captured composition under its own write cookie.
+            // Never materialize recognition text into either the old or new field.
+            let edit: ITfEditSession = RetireOwned {
+                state: shared.clone(),
+                context: owned.clone(),
+                composition,
+                request: r.clone(),
+                generation,
+                epoch,
+                connection,
+                _lease: Lease::new(),
+            }
+            .into();
+            shared.borrow_mut().pending = Some(Pending {
+                operation: r.operation,
+                revision: r.revision,
+                task: r.task.clone(),
+                turn: r.turn,
+                connection,
+                capability: r.capability.clone(),
+                settlement: inherited_settlement,
+            });
+            let result = owned
+                .RequestEditSession(client, &edit, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE)
+                .map_err(|e| ("ownedRelease", e))?;
+            if shared
+                .borrow()
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.operation == r.operation)
+            {
+                result.ok().map_err(|e| ("ownedReleaseResult", e))?;
+            }
+            return Ok(());
+        }
+        let context = focused.map_err(|e| ("editFocus", e))?;
         lease(shared, r, generation, &context).map_err(|e| ("editLease", e))?;
         if r.action != Action::Begin && shared.borrow().context.as_ref() != Some(&context) {
             return Err(("editContext", failure(TF_E_DISCONNECTED)));
@@ -2690,6 +2774,70 @@ fn updates_within(
     }
 }
 #[implement(ITfEditSession)]
+struct RetireOwned {
+    state: Shared,
+    context: ITfContext,
+    composition: ITfComposition,
+    request: Request,
+    generation: u64,
+    epoch: u64,
+    connection: u64,
+    _lease: Lease,
+}
+impl ITfEditSession_Impl for RetireOwned_Impl {
+    fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        let result = (|| {
+            edit_identity(&self.state, &self.request, self.generation, self.epoch)?;
+            let peer = {
+                let s = self.state.borrow();
+                if !s.connected
+                    || s.connection != self.connection
+                    || s.context.as_ref() != Some(&self.context)
+                    || s.composition.as_ref() != Some(&self.composition)
+                    || !s.pipe.as_ref().is_some_and(|p| p.alive())
+                {
+                    return Err(failure(TF_E_DISCONNECTED));
+                }
+                s.peer.ok_or_else(|| failure(E_ACCESSDENIED))?
+            };
+            if registration::read_host() != Some((peer.pid, self.request.capability.clone()))
+                || identity(peer.pid).ok() != Some(peer)
+            {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            end_settled_composition(
+                &self.state,
+                &self.composition,
+                &self.request,
+                self.generation,
+                self.epoch,
+                ec,
+            )?;
+            self.state.borrow_mut().version.applied(&self.request);
+            release_composition(&self.state, self.epoch, Some(&self.composition));
+            Ok(())
+        })();
+        let code = result
+            .as_ref()
+            .err()
+            .map(|e| format!("ownedRelease:{:08x}", e.code().0 as u32))
+            .unwrap_or_else(|| "ownedReleased".into());
+        complete(
+            &self.state,
+            &self.request,
+            self.connection,
+            result.is_ok(),
+            &code,
+            Mutation::NotAttempted,
+            None,
+        );
+        if result.is_err() {
+            mark_handoff_failed(&self.state, self.epoch);
+        }
+        result
+    }
+}
+#[implement(ITfEditSession)]
 struct Edit {
     state: Shared,
     context: ITfContext,
@@ -3688,23 +3836,13 @@ fn apply(
             }
             let original_selection = range.Clone()?;
             let native_position = native_edit_position(context)?;
-            let prepared = if !range.IsEmpty(ec)?.as_bool() {
-                Some(PreparedSelection {
-                    range: range.Clone()?,
-                    position: range_position(context, &range, ec)?,
-                    writing: false,
-                })
-            } else {
-                None
-            };
+            let prepared = Some(PreparedSelection {
+                range: range.Clone()?,
+                position: range_position(context, &range, ec)?,
+                writing: false,
+            });
             lease(shared, r, generation, context)?;
             let epoch = COMPOSITION_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
-            let sink: ITfCompositionSink = CompositionSink {
-                state: shared.clone(),
-                epoch,
-                _lease: Lease::new(),
-            }
-            .into();
             let text_sink: ITfTextEditSink = TextSink {
                 state: shared.clone(),
                 epoch,
@@ -3718,25 +3856,7 @@ fn apply(
                 let _ = source.UnadviseSink(cookie);
                 return Err(e);
             }
-            *phase = "beginComposition";
-            let composition = match prepared.as_ref().map_or_else(
-                || {
-                    composition_context
-                        .StartComposition(ec, &range, &sink)
-                        .map(Some)
-                },
-                |_| Ok(None),
-            ) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = source.UnadviseSink(cookie);
-                    return Err(e);
-                }
-            };
             if shared.borrow().generation != generation || !shared.borrow().active {
-                if let Some(composition) = &composition {
-                    let _ = composition.EndComposition(ec);
-                }
                 let _ = source.UnadviseSink(cookie);
                 return Err(failure(TF_E_DISCONNECTED));
             }
@@ -3747,7 +3867,7 @@ fn apply(
                 .map(|o| o.semantic.clone())
                 .or_else(|| (!expected.is_empty()).then(|| expected.clone()))
                 .map(Rc::<str>::from);
-            s.composition = composition;
+            s.composition = None;
             s.prepared = prepared;
             s.preserved_attributes.clear();
             s.backup = Some(Rollback::OriginalSelection(backup, original_semantic));

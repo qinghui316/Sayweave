@@ -9,3 +9,4 @@ export * from './AsyncStatusFeedback';
 export * from './ActionMenu';
 export * from './UpdateIndicator';
 export { MotionScope } from './useMotion';
+export {RubberIndicator,useRubberSelection} from './RubberSelection';

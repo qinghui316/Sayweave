@@ -126,3 +126,9 @@ Cancellation, rollback failure and lease cleanup are independent finish facts. A
 Read-only learning observation follows receipt-backed output for up to60 seconds and normally settles after15 seconds without edits. If the same captured output range is cleared before that delay, it can settle the latest already-verified complete correction. This adapts Typeless's cached-edit-before-clear mechanism to Sayweave's receipt scope. Clearing itself is not lexical evidence or proof that a message was sent. Current and prior IME completion, field identity, edit generation, protection and source eligibility still apply; undo, restoration of original text and deletion without a correction cannot revive an earlier correction. Only the captured output range is read. Whole-field emptiness can additionally use TSF structural metadata or the length of a same-process native EDIT/RichEdit control, never a browser window's caption length.
 
 Foreground accessibility notifications are distinct from actual activation. A live `WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` window reporting foreground while the captured top is still the actual foreground is advisory; names, classes and process IDs do not authorize this exception. Original range and execution-time target checks still apply, and an earlier confirmed switch remains invalid. If the helper actually owns foreground, automatic input stops. Ordinary external-window switch-and-return events remain invalidating. A nonactivating tool explicitly activated and returned before a delayed callback can be treated as advisory; this policy does not prove that the tool belongs to the target's IME.
+
+## 准备范围与终态
+
+Begin 对空光标和非空选区统一只准备范围；首次非空更新才创建原生组合。未写入的结束、取消与交接只释放本任务范围和监听，不需要新焦点可写，也不提交或恢复正文。已写入组合跨焦点交接仅在其捕获上下文的合法写会话结束组合，不向新目标写入旧识别文字。身份、代际、操作修订和组合对象仍约束所有回调；拒绝结束时保留实际范围和恢复事实。
+
+普通投递 pending/delivering 记录在后台归档，不作为输入激活门禁；取消与正文恢复的安全意图仍由原生所有者处理。空结果、取消、只读以及结算安全事实不弹遮挡目标输入框的长条提示；安静投影不改变输入效果、首个错误和历史诊断。真正不确定的效果阻止后续不安全写入，终态不能由迟到准备或识别事件重新打开。

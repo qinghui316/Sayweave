@@ -61,7 +61,7 @@
 
 ## Shared selection and live meter revision
 
-Selection behavior stays in Radix Select/Switch and native radio inputs. Business callbacks run immediately. Model categories, dictionary categories and recording mode share the same choice spring: selected scale1.2, other items0.95, neighbour displacement includes half the extra selected width plus6px,22ms distance stagger and bounded spring integration. Whole visible items and their hit areas transform together inside a stable padded group. Selected controls use existing black/inverse text tokens. Initial/external/failed-state restoration snaps; rapid reversal retains current position and velocity. Reduced motion removes spatial deformation.
+Selection behavior stays in Radix Select/Switch and native radio inputs. Business callbacks run immediately. Model categories, dictionary categories, recording mode and navigation share an interruptible black indicator spring. Only the measured indicator stretches and moves; labels, icons and hit areas remain fixed. Selected controls use existing black/inverse text tokens. Initial/external/failed-state restoration snaps; rapid reversal retains current position and velocity. Reduced motion removes spatial deformation.
 
 Menus enter/exit in180/120ms with transform/opacity; measured highlighting glides220ms. Highlight dimensions synchronize directly, without layout-property animation. Intermediate scrolling offsets are included; the last browsed option remains highlighted until pointer/keyboard input changes it. The48×28 switch uses a36px hit area and velocity-dependent thumb stretch with reciprocal vertical scale, returning to a circular resting thumb. Model search keeps its dialog, search/refresh/manual entry and shares select trigger geometry, chevron and row highlight.
 
@@ -70,3 +70,7 @@ Capture analyzes fixed128-sample windows at16kHz (8ms), retaining total RMS,15 t
 SpeechStore separates task-bound high-frequency meter sources from page notifications. Home retains its trial projection; visible elapsed seconds update at1Hz. MeterWave owns one drawing loop with100ms interruptible linear interpolation from the visible height toward the latest published bars, not another gain/envelope stage. Bars use transform and per-bar opacity; no per-frame React state. Fresh silence breathes at1.8s with a2–3px floor. After250ms without advancing capture, sound decays; after1s, breathing stops. Hidden/offscreen/unmounted views release loops; reduced motion preserves real amplitude without decoration. Green remains#75FB91 with a static related gradient. The compact capsule remains136×34 and bars at most24px.
 
 Reference mechanisms: React Bits Glide Select/Jelly Radio/Squish Switch (official interaction scale); local fixed-version SayIt waveform source (mechanism study). Implementation is independent and adds no animation framework. The offline ignored `export_meter_speech_fixture` test accepts explicit16kHz mono WAV/output JSON paths via `SAYWEAVE_METER_FIXTURE`/`SAYWEAVE_METER_OUTPUT` for visual comparison. Synthetic fixture comparison and real device frame checks do not substitute for human observation of speech in the shipped UI.
+
+## 选中底板统一
+
+主导航、设置导航、模型页签和词典筛选共用本地可中断弹簧底板。黑色底板移动时轻微拉伸并落位，标签、图标和命中区域保持固定；实际接受的选择决定目标，未保存保护仍先执行。快速反向切换保留当前速度，减少动态和布局调整直接同步。普通滚动条为6逻辑像素透明轨道与低透明滑块，悬停或聚焦时增强；高对比度采用系统可辨表现。

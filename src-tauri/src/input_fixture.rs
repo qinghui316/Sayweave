@@ -511,7 +511,12 @@ fn main() {
                     );
                 }
                 if value["action"] == "readonly" {
-                    let _ = message(editor, 0x00CF, WPARAM(1), LPARAM(0));
+                    let _ = message(
+                        editor,
+                        0x00CF,
+                        WPARAM(usize::from(value["enabled"].as_bool().unwrap_or(true))),
+                        LPARAM(0),
+                    );
                 }
                 if value["action"] == "selection" {
                     let _ = message(

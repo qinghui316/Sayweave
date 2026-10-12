@@ -3,7 +3,8 @@ import * as SelectPrimitive from '@radix-ui/react-select';
 import * as SwitchPrimitive from '@radix-ui/react-switch';
 import {useMotion} from './useMotion';
 import s from './ui.module.css';
-import {body,runSelectionSpring,settle,type SpringBody} from './selection-motion';
+import {body,runSelectionSpring,settle} from './selection-motion';
+import {RubberIndicator,useRubberSelection} from './RubberSelection';
 
 /** Highlight geometry follows actual rows, including wrapping and viewport scrolling. */
 export function useSelectionHighlight() {
@@ -96,38 +97,12 @@ export function Switch({checked, onCheckedChange, label, id, disabled = false}: 
 export function SingleChoice({value, onValueChange, options, label, disabled = false}: {value: string; onValueChange: (value: string) => void; options: {value: string; label: string}[]; label: string; disabled?: boolean}) {
   const name = useId();
   const {ref,mark}=useChoiceFeedback(value,disabled);
-  return <div ref={ref} role="radiogroup" aria-label={label} className={`${s.singleChoice} ${s.choiceGroup}`}>{options.map(option => <label key={option.value} className={s.choice} data-choice-item="" data-current={value===option.value}>
+  return <div ref={ref} data-rubber="" role="radiogroup" aria-label={label} className={`${s.singleChoice} ${s.choiceGroup}`}><RubberIndicator/>{options.map(option => <label key={option.value} className={s.choice} data-choice-item="" data-current={value===option.value}>
     <input type="radio" name={name} value={option.value} checked={value === option.value} disabled={disabled} onChange={() => { mark(option.value,()=>onValueChange(option.value)); }}/><span data-choice-face="" data-current={value===option.value} className={s.choiceFace}/><span className={s.choiceLabel}>{option.label}</span>
   </label>)}</div>;
 }
 
 export function useChoiceFeedback(value:string,disabled=false){
-  const {ref,active}=useMotion<HTMLDivElement>();
-  const pending=useRef<{value:string}|null>(null);
-  const springs=useRef(new Map<HTMLElement,SpringBody>());
-  useLayoutEffect(()=>{
-    const request=pending.current;pending.current=null;
-    const nodes=Array.from(ref.current?.querySelectorAll<HTMLElement>('[data-choice-item]')??[]);
-    const index=nodes.findIndex(node=>node.dataset.current==='true');
-    if(index<0)return;
-    const selectedWidth=nodes[index]!.offsetWidth;
-    for(const node of springs.current.keys())if(!nodes.includes(node))springs.current.delete(node);
-    const items=nodes.map((node,i)=>{
-      let state=springs.current.get(node);if(!state){state=body([0,1,1]);springs.current.set(node,state);}
-      const selected=i===index,distance=Math.abs(i-index);
-      const x=active&&!selected?Math.sign(i-index)*(selectedWidth*.1+6):0;
-      const size=active?(selected?1.2:.95):1;
-      state.target=[x,size,size];state.delay=selected?0:Math.min(3,distance)*22;
-      const target=state;
-      const paint=()=>{node.style.transform=`translateX(${target.position[0]}px) scale(${target.position[1]},${target.position[2]})`;};
-      // The horizontal response leads the vertical swell, producing the jelly split.
-      if(active&&!disabled&&request?.value===value&&selected)state.velocity[1]=state.velocity[1]!+3;
-      else if(!active||disabled||request?.value!==value)settle(state);
-      paint();return {body:state,paint,stiffness:selected?580:580/(1+distance*.12)};
-    });
-    if(!active||disabled||request?.value!==value)return;
-    return runSelectionSpring(items);
-  },[value,active,disabled,ref]);
-  const mark=(value:string,change:()=>void)=>{const request={value};pending.current=request;change();queueMicrotask(()=>{if(pending.current===request)pending.current=null;});};
-  return {ref,mark};
+ const {ref}=useRubberSelection(value,disabled);
+ return {ref,mark:(_value:string,change:()=>void)=>change()};
 }

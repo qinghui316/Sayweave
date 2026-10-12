@@ -97,3 +97,16 @@ it('meter frames notify only the waveform, publishing page time once per second'
  expect(store.trialMeter.getSnapshot()).toBe(current);expect(wave).toHaveBeenCalledTimes(20);
  expect(()=>parseMeter({...current,bars:[0]})).toThrow();expect(()=>parseMeter({...current,bars:Array(15).fill(Infinity)})).toThrow();expect(()=>parseMeter({...current,energies:[0]})).toThrow();expect(()=>parseMeter({...current,energies:Array(15).fill(NaN),bars:Array(15).fill(NaN)})).toThrow();
 });
+
+it('archive attempts and revisions cannot replace a newer result or open global warnings',()=>{
+ const store=new SpeechStore(new BrowserSpeech());
+ store.accept({...initialSpeech(),sequence:2,taskId:'trial',attemptId:'attempt',source:'trial',phase:'completed',text:'正文'});
+ store.archived({taskId:'trial',attemptId:'other',revision:9,saved:false,saveError:true});
+ expect(store.getTrialSnapshot().snapshot.saveError).toBe(false);
+ store.archived({taskId:'trial',attemptId:'attempt',revision:3,saved:true,saveError:false,state:'saved'});
+ store.archived({taskId:'trial',attemptId:'attempt',revision:2,saved:false,saveError:true,state:'pending'});
+ expect(store.getTrialSnapshot().snapshot.saved).toBe(true);expect(store.getArchiveFailure()).toBeNull();
+ store.accept({...initialSpeech(),sequence:3,taskId:'next',attemptId:'next-attempt',source:'trial'});
+ store.archived({taskId:'trial',attemptId:'attempt',revision:10,saved:false,saveError:true});
+ expect(store.getTrialSnapshot().snapshot.taskId).toBe('next');expect(store.getTrialSnapshot().snapshot.saveError).toBe(false);
+});

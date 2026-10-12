@@ -33,10 +33,17 @@ pub async fn settings(
     data: &DataWorker,
     operation: DbOperation,
 ) -> Result<DbOutput, crate::contracts::dictionary::DataError> {
-    match data
-        .request_admitted(Operation::Processing(operation))
-        .await?
-    {
+    let archive = matches!(
+        operation,
+        DbOperation::Prepare(_) | DbOperation::SaveUnit(_) | DbOperation::Finish { .. }
+    );
+    let operation = Operation::Processing(operation);
+    let output = if archive {
+        data.request_archive(operation).await
+    } else {
+        data.request_admitted(operation).await
+    }?;
+    match output {
         Output::Processing(value) => Ok(value),
         _ => Err(crate::contracts::dictionary::DataError::new("unavailable")),
     }
@@ -200,7 +207,12 @@ impl Context {
                     settings_revision: self.settings.revision,
                     dictionary_version: self.dictionary.version.clone(),
                 };
-                settings(&self.data, DbOperation::Prepare(metadata.clone())).await?;
+                if !self.archive.enqueue(
+                    "prepare".into(),
+                    Operation::Processing(DbOperation::Prepare(metadata.clone())),
+                ) {
+                    self.save_error.store(true, Ordering::Release);
+                }
                 Some(RunBinding { metadata })
             }
             _ => None,

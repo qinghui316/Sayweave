@@ -67,7 +67,7 @@ pub enum DbOutput {
     Dictionary(Vec<crate::contracts::dictionary::Record>),
     Done,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunMetadata {
     pub id: String,

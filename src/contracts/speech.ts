@@ -6,10 +6,10 @@ export function speechError(e:unknown):SpeechError {if(e instanceof SpeechError)
 export interface SpeechSegment {id:number;sequence:number;text:string;confirmed:boolean;beginMs:number|null;endMs:number|null}
 export type SpeechSource='trial'|'external'|'history';
 export interface SpeechSnapshot {protocol:1;sequence:number;lifecycle:number;taskId:string|null;source:SpeechSource|null;attemptId:string|null;recordId:string|null;phase:Phase;text:string;segments:SpeechSegment[];modelName:string|null;deviceName:string|null;durationMs:number;error:SpeechErrorCode|null;saveError:boolean;saved:boolean;retry:boolean;canRetry:boolean}
-export interface SpeechArchive {taskId:string;saved:boolean;saveError:boolean}
+export interface SpeechArchive {taskId:string;saved:boolean;saveError:boolean;attemptId?:string|null;revision?:number;state?:'disabled'|'pending'|'saved'|'unavailable'}
 export function isQuietLiveTerminal(value:SpeechSnapshot):boolean {
  return value.taskId!==null&&(value.source==='trial'||value.source==='external')&&!value.retry
-  &&['completed','cancelled','failed'].includes(value.phase)&&!value.text.trim()&&!value.saveError
+  &&['completed','cancelled','failed'].includes(value.phase)&&!value.text.trim()
   &&(value.error===null||value.error==='emptyText'||value.error==='cancelled');
 }
 export interface SpeechMeter {taskId:string;sequence:number;level:number;energies:number[];bars:number[];captureSequence:number;durationMs:number}
@@ -37,4 +37,4 @@ export function parseMeter(v:unknown):SpeechMeter{const s=object(v);if(typeof s.
 export function parsePreferences(v:unknown):RecordingPreferences{const p=object(v);if(!nullableText(p.deviceId)||typeof p.historyEnabled!=='boolean'||typeof p.audioEnabled!=='boolean'||!(p.retentionDays===null||typeof p.retentionDays==='number'&&[7,30,90].includes(p.retentionDays))||!count(p.revision)||p.revision===0)throw new SpeechError('protocol');return p as unknown as RecordingPreferences;}
 export function parseDevices(v:unknown):Microphone[]{if(!Array.isArray(v))throw new SpeechError('protocol');return v.map(raw=>{const d=object(raw);if(typeof d.id!=='string'||typeof d.name!=='string'||typeof d.isDefault!=='boolean')throw new SpeechError('protocol');return d as unknown as Microphone;});}
 
-export function parseSpeechArchive(v:unknown):SpeechArchive {const s=object(v);if(typeof s.taskId!=='string'||typeof s.saved!=='boolean'||typeof s.saveError!=='boolean')throw new SpeechError('protocol');return {taskId:s.taskId,saved:s.saved,saveError:s.saveError};}
+export function parseSpeechArchive(v:unknown):SpeechArchive {const s=object(v);if(typeof s.taskId!=='string'||typeof s.saved!=='boolean'||typeof s.saveError!=='boolean'||s.attemptId!==undefined&&s.attemptId!==null&&typeof s.attemptId!=='string'||s.revision!==undefined&&!count(s.revision)||s.state!==undefined&&!['disabled','pending','saved','unavailable'].includes(String(s.state)))throw new SpeechError('protocol');return {taskId:s.taskId,saved:s.saved,saveError:s.saveError,...(s.attemptId!==undefined?{attemptId:s.attemptId as string|null}:{}),...(s.revision!==undefined?{revision:s.revision as number}:{}),...(s.state!==undefined?{state:s.state as SpeechArchive['state']}:{} )};}
