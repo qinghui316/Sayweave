@@ -694,6 +694,15 @@ struct CoreUpdate {
     module: String,
     error: Option<String>,
 }
+impl CoreUpdate {
+    fn can_confirm_install(&self) -> bool {
+        self.phase == "prepared" && self.error.is_none()
+    }
+    fn owner_rollback_resume(&self) -> bool {
+        ["rollbackPending", "rolledBack"].contains(&self.phase.as_str())
+            && self.error.as_deref() == Some("ownerRollback")
+    }
+}
 fn core_update_file() -> windows::core::Result<PathBuf> {
     Ok(program_files()?
         .join("Sayweave")
@@ -892,7 +901,8 @@ pub fn install_bundle(proxy: &[u8], core: &[u8], expected_sid: &str) -> windows:
         if prior.initiator != expected_sid {
             return Err(fail("componentUpdateOwner"));
         }
-        if prior.target.proxy_sha256 == version(proxy)
+        if prior.can_confirm_install()
+            && prior.target.proxy_sha256 == version(proxy)
             && prior.target.core_sha256 == version(core)
             && current_engine()?.as_ref() == Some(&prior.target)
             && matches!(matches_bundle(proxy, core), Ok(Some(true)))
@@ -901,7 +911,11 @@ pub fn install_bundle(proxy: &[u8], core: &[u8], expected_sid: &str) -> windows:
             save_core_update(&prior)?;
             return Ok(());
         }
+        let owner_rollback = prior.error.as_deref() == Some("ownerRollback");
         rollback_core_update(&mut prior)?;
+        if owner_rollback {
+            return Err(fail("componentRollbackCompleted"));
+        }
     }
     let before_registration = registration::snapshot_installer_machine()?;
     let before_hash = before_registration
@@ -973,11 +987,11 @@ pub fn rollback_bundle(proxy: &[u8], core: &[u8], expected_sid: &str) -> windows
         return Err(fail("initiatingUserChanged"));
     }
     let mut record = read_core_update()?.ok_or_else(|| fail("componentRollbackMissing"))?;
-    if record.phase != "committed"
+    if (record.phase != "committed" && !record.owner_rollback_resume())
         || record.initiator != expected_sid
         || record.target.proxy_sha256 != version(proxy)
         || record.target.core_sha256 != version(core)
-        || !matches!(matches_bundle(proxy, core), Ok(Some(true)))
+        || (record.phase == "committed" && !matches!(matches_bundle(proxy, core), Ok(Some(true))))
     {
         return Err(fail("componentRollbackChanged"));
     }
@@ -1100,6 +1114,23 @@ pub fn commit_installer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn persisted_rollback_intent_cannot_be_promoted_to_install_commit() {
+        let mut record: CoreUpdate = serde_json::from_value(serde_json::json!({"schema":1,"phase":"prepared","initiator":"owner",
+            "updater":{"pid":1,"session":1,"created":1},"before_registration":null,"before_hash":null,"before_engine":null,
+            "target":{"schema_version":1,"revision":uuid::Uuid::new_v4().to_string(),"proxy_sha256":"a".repeat(64),"core_sha256":"b".repeat(64),
+                "abi":1,"input_protocol":9,"platform":"x86_64-pc-windows-msvc"},"module":"unused","error":null})).unwrap();
+        assert!(record.can_confirm_install());
+        record.phase = "rollbackPending".into();
+        record.error = Some("ownerRollback".into());
+        assert!(!record.can_confirm_install());
+        assert!(record.owner_rollback_resume());
+        record.phase = "rolledBack".into();
+        assert!(record.owner_rollback_resume());
+        record.phase = "prepared".into();
+        assert!(!record.can_confirm_install());
+        assert!(!record.owner_rollback_resume());
+    }
     #[test]
     fn original_rollback_anchor_survives_two_core_updates_but_not_proxy_migration() {
         let descriptor = |core: char, proxy: char| crate::lifecycle::CurrentEngine {
