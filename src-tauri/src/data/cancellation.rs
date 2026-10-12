@@ -666,6 +666,7 @@ mod tests {
             deferred_cancellations: worker.deferred_cancellations.clone(),
             lease_active: worker.lease_active.clone(),
             volatile_archive: worker.volatile_archive.clone(),
+            causal: worker.causal.clone(),
         };
         for _ in 0..64 {
             let (response, _) = oneshot::channel();
@@ -674,6 +675,7 @@ mod tests {
                     .try_send(super::super::Request {
                         operation: Operation::Retry,
                         archive: false,
+                        ticket: None,
                         response,
                         queued: std::time::Instant::now(),
                     })

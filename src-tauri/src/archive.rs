@@ -190,8 +190,13 @@ impl Archive {
     /// Replace a pending checkpoint/unit only, never an already executing write.
     /// Terminal facts use seal_with, which has one reserved slot beyond capacity.
     pub fn enqueue(&self, key: String, operation: Operation) -> bool {
-        let ticket = crate::data::archive_stamp();
         let state = &self.producer.0;
+        let ticket = state
+            .fallback
+            .as_ref()
+            .map_or_else(crate::data::archive_stamp, |data| {
+                data.archive_ticket(&operation)
+            });
         let Ok(mut pending) = state.pending.lock() else {
             return false;
         };
@@ -234,7 +239,12 @@ impl Archive {
                 return;
             }
             if let Some(operation) = terminal {
-                let ticket = crate::data::archive_stamp();
+                let ticket = state
+                    .fallback
+                    .as_ref()
+                    .map_or_else(crate::data::archive_stamp, |data| {
+                        data.archive_ticket(&operation)
+                    });
                 if state.unavailable {
                     if !state.failed.swap(true, Ordering::AcqRel) {
                         FAILURES.fetch_add(1, Ordering::AcqRel);
@@ -447,6 +457,14 @@ mod tests {
                 text: latest.clone()
             })
         ));
+        let crate::data::Output::History(DbOutput::Record(before)) = data
+            .request_admitted(Operation::History(H::Detail(record.clone())))
+            .await
+            .unwrap()
+        else {
+            panic!("record")
+        };
+        assert_eq!(before.attempts[0].text, latest);
         held.notify_one();
         assert!(!archive.finish().await);
         let crate::data::Output::History(DbOutput::Record(row)) = data

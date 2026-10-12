@@ -211,9 +211,20 @@ pub fn migrate(
 pub struct Repository {
     pub connection: Connection,
     pub(super) archive_cursor: [usize; 2],
+    pub(super) archive_causal: std::sync::Arc<super::archive_recovery::Causal>,
 }
 impl Repository {
+    #[cfg(test)]
     pub fn open(root: &Path) -> Result<Self, DataError> {
+        Self::open_with_causal(
+            root,
+            std::sync::Arc::new(super::archive_recovery::Causal::default()),
+        )
+    }
+    pub(super) fn open_with_causal(
+        root: &Path,
+        archive_causal: std::sync::Arc<super::archive_recovery::Causal>,
+    ) -> Result<Self, DataError> {
         let mut connection = Connection::open(root.join("dictionary.sqlite")).map_err(db_error)?;
         // Inspect before applying configuration so future/corrupt databases are not modified.
         connection
@@ -224,6 +235,7 @@ impl Repository {
         let mut repository = Self {
             connection,
             archive_cursor: [0, 0],
+            archive_causal,
         };
         if let Err(e) = super::archive_recovery::replay(&mut repository, root, true) {
             log::warn!(target:"sayweave", "operation=archive_recovery result={}", e.code);

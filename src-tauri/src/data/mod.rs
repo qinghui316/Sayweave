@@ -1,5 +1,5 @@
 mod archive_recovery;
-pub(crate) use archive_recovery::{Stamp as ArchiveStamp, stamp as archive_stamp};
+pub(crate) use archive_recovery::{Ticket as ArchiveStamp, untracked_ticket as archive_stamp};
 mod cancellation;
 pub mod model;
 mod repositories;
@@ -50,6 +50,7 @@ pub enum Output {
 struct Request {
     operation: Operation,
     archive: bool,
+    ticket: Option<ArchiveStamp>,
     response: oneshot::Sender<Result<Output, DataError>>,
     queued: Instant,
 }
@@ -65,6 +66,7 @@ pub struct DataWorker {
     deferred_cancellations: Arc<Mutex<HashSet<String>>>,
     lease_active: Arc<AtomicBool>,
     volatile_archive: Arc<Mutex<archive_recovery::Memory>>,
+    causal: Arc<archive_recovery::Causal>,
 }
 pub fn profile_root(base: &Path, development: bool) -> PathBuf {
     base.join(if development { "data-dev" } else { "data" })
@@ -108,13 +110,15 @@ impl DataWorker {
         let thread_lease = lease_active.clone();
         let volatile_archive = Arc::new(Mutex::new(archive_recovery::Memory::default()));
         let thread_volatile = volatile_archive.clone();
+        let causal = Arc::new(archive_recovery::Causal::default());
+        let thread_causal = causal.clone();
         std::thread::Builder::new()
             .name("sayweave-data".into())
             .spawn(move || {
                 let mut lease = lease;
                 let mut repository = if lease.is_some() {
                     match thread_journal.lock() {
-                        Ok(_guard) => Repository::open(&root),
+                        Ok(_guard) => Repository::open_with_causal(&root,thread_causal.clone()),
                         Err(_) => Err(DataError::new("unavailable")),
                     }
                 } else {
@@ -150,7 +154,7 @@ impl DataWorker {
                             }
                             repository = if lease.is_some() {
                                 match thread_journal.lock() {
-                                    Ok(_guard) => Repository::open(&root),
+                                    Ok(_guard) => Repository::open_with_causal(&root,thread_causal.clone()),
                                     Err(_) => Err(DataError::new("unavailable")),
                                 }
                             } else {
@@ -200,8 +204,8 @@ impl DataWorker {
                                     archive_recovery::invalidate_all(repo,&root,id,&mut memory)?;
                                 }
                                 drop(deferred);
+                                if request.archive { return archive_recovery::apply_stamped(repo, request.operation,request.ticket.as_ref().ok_or_else(||DataError::new("invalid"))?.stamp); }
                                 drop(_journal);
-                                if request.archive { return archive_recovery::apply(repo, request.operation); }
                                 match request.operation {
                                     Operation::List(query) => repo.list(query).map(Output::Page),
                                     Operation::Get(kind, id) => {
@@ -277,6 +281,7 @@ impl DataWorker {
             deferred_cancellations,
             lease_active,
             volatile_archive,
+            causal,
         })
     }
     fn set_status(shared: &Mutex<Status>, repository: &Result<Repository, DataError>) {
@@ -314,6 +319,9 @@ impl DataWorker {
             .lock()
             .is_ok_and(|_guard| archive_recovery::pending_attempt(&self.root, attempt))
     }
+    pub(crate) fn archive_ticket(&self, op: &Operation) -> ArchiveStamp {
+        self.causal.ticket(op, archive_recovery::stamp())
+    }
     pub(crate) fn retain_archive(&self, operation: &Operation, ticket: ArchiveStamp) {
         if let Ok(mut memory) = self.volatile_archive.lock() {
             memory.retain_stamped(operation, ticket);
@@ -330,7 +338,7 @@ impl DataWorker {
     /// Already admitted ordinary archive facts wait for bounded queue capacity
     /// in the background. Cancellation intents still use request_admitted.
     pub(crate) async fn request_archive(&self, operation: Operation) -> Result<Output, DataError> {
-        let ticket = archive_recovery::stamp();
+        let ticket = self.archive_ticket(&operation);
         self.request_archive_stamped(operation, ticket).await
     }
     pub(crate) async fn request_archive_stamped(
@@ -338,35 +346,50 @@ impl DataWorker {
         operation: Operation,
         ticket: ArchiveStamp,
     ) -> Result<Output, DataError> {
-        let mut result = self.request_archive_once(operation.clone(), ticket).await;
+        let mut result = self
+            .request_archive_once(operation.clone(), ticket.clone())
+            .await;
         for delay in [100, 300, 1000] {
             if !result.as_ref().is_err_and(|e| e.code == "busy") {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            result = self.request_archive_once(operation.clone(), ticket).await;
+            result = self
+                .request_archive_once(operation.clone(), ticket.clone())
+                .await;
         }
         result
     }
     async fn request_archive_once(
         &self,
         operation: Operation,
-        ticket: archive_recovery::Stamp,
+        ticket: ArchiveStamp,
     ) -> Result<Output, DataError> {
         let backup = operation.clone();
         let root = self.root.clone();
         let journal = self.journal_io.clone();
         let intent = operation.clone();
         let active = self.lease_active.load(Ordering::Acquire);
+        let causal = self.causal.clone();
+        let file_ticket = ticket.clone();
         let receipt = tokio::task::spawn_blocking(move || {
             if !active {
                 return Err(DataError::new("unavailable"));
             }
             let _guard = journal.lock().map_err(|_| DataError::new("unavailable"))?;
-            archive_recovery::stage_stamped(&root, &intent, ticket)
+            if causal.superseded(&file_ticket)? {
+                return Err(DataError::new("supersededArchive"));
+            }
+            archive_recovery::stage_stamped(&root, &intent, file_ticket.stamp)
         })
         .await
         .map_err(|_| DataError::new("unavailable"))?;
+        if receipt
+            .as_ref()
+            .is_err_and(|e| e.code == "supersededArchive")
+        {
+            return archive_recovery::superseded_output(&backup);
+        }
         if receipt
             .as_ref()
             .is_err_and(|e| e.code == "conflict" || e.code == "staleArchive")
@@ -376,12 +399,12 @@ impl DataWorker {
         if matches!(&receipt, Ok(Some(_)))
             && let Ok(mut memory) = self.volatile_archive.lock()
         {
-            memory.forget(&backup, ticket);
+            memory.forget(&backup, &ticket);
         }
         if receipt.is_err()
             && let Ok(mut memory) = self.volatile_archive.lock()
         {
-            memory.retain_stamped(&backup, ticket);
+            memory.retain_stamped(&backup, ticket.clone());
         }
         let permit = tokio::time::timeout(std::time::Duration::from_secs(5), self.sender.reserve())
             .await
@@ -391,6 +414,7 @@ impl DataWorker {
         permit.send(Request {
             operation,
             archive: true,
+            ticket: Some(ticket.clone()),
             response,
             queued: Instant::now(),
         });
@@ -398,7 +422,7 @@ impl DataWorker {
         if result.is_ok()
             && let Ok(mut memory) = self.volatile_archive.lock()
         {
-            memory.forget(&backup, ticket);
+            memory.forget(&backup, &ticket);
         }
         if result.is_ok()
             && let Ok(Some(receipt)) = receipt
@@ -451,6 +475,7 @@ impl DataWorker {
                 .try_send(Request {
                     operation,
                     archive: false,
+                    ticket: None,
                     response,
                     queued: Instant::now(),
                 })
@@ -510,6 +535,7 @@ impl DataWorker {
             .send(Request {
                 operation: Operation::Drain,
                 archive: false,
+                ticket: None,
                 response,
                 queued: Instant::now(),
             })

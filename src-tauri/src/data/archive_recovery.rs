@@ -26,6 +26,92 @@ pub(crate) fn stamp() -> Stamp {
         revision: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
     }
 }
+#[derive(Default)]
+pub(super) struct Causal {
+    keys: std::sync::Mutex<std::collections::HashMap<String, (usize, Option<Stamp>)>>,
+}
+struct LiveKey {
+    owner: std::sync::Arc<Causal>,
+    key: String,
+}
+impl Drop for LiveKey {
+    fn drop(&mut self) {
+        if let Ok(mut keys) = self.owner.keys.lock()
+            && let Some((live, _)) = keys.get_mut(&self.key)
+        {
+            *live -= 1;
+            if *live == 0 {
+                keys.remove(&self.key);
+            }
+        }
+    }
+}
+#[derive(Clone)]
+pub(crate) struct Ticket {
+    pub(super) stamp: Stamp,
+    lease: Option<std::sync::Arc<LiveKey>>,
+}
+pub(crate) fn untracked_ticket() -> Ticket {
+    Ticket {
+        stamp: stamp(),
+        lease: None,
+    }
+}
+impl Causal {
+    pub fn ticket(self: &std::sync::Arc<Self>, op: &Operation, version: Stamp) -> Ticket {
+        let key = Fact::capture(op).and_then(|f| key(&f).ok());
+        let lease = key.and_then(|key| {
+            self.keys.lock().ok().map(|mut keys| {
+                keys.entry(key.clone()).or_default().0 += 1;
+                std::sync::Arc::new(LiveKey {
+                    owner: self.clone(),
+                    key,
+                })
+            })
+        });
+        Ticket {
+            stamp: version,
+            lease,
+        }
+    }
+    pub fn superseded(&self, ticket: &Ticket) -> Result<bool, DataError> {
+        let keys = self
+            .keys
+            .lock()
+            .map_err(|_| DataError::new("unavailable"))?;
+        Ok(ticket
+            .lease
+            .as_ref()
+            .and_then(|l| keys.get(&l.key))
+            .and_then(|(_, s)| *s)
+            .is_some_and(|s| s.epoch == ticket.stamp.epoch && s.revision > ticket.stamp.revision))
+    }
+    fn applied(&self, ticket: &Ticket) -> Result<(), DataError> {
+        let mut keys = self
+            .keys
+            .lock()
+            .map_err(|_| DataError::new("unavailable"))?;
+        if let Some(lease) = &ticket.lease
+            && let Some((_, known)) = keys.get_mut(&lease.key)
+            && known.is_none_or(|s| {
+                s.epoch != ticket.stamp.epoch || s.revision <= ticket.stamp.revision
+            })
+        {
+            *known = Some(ticket.stamp);
+        }
+        Ok(())
+    }
+}
+fn done(op: &Operation) -> Result<super::Output, DataError> {
+    match op {
+        Operation::History(_) => Ok(super::Output::History(h::DbOutput::Done)),
+        Operation::Processing(_) => Ok(super::Output::Processing(p::DbOutput::Done)),
+        _ => Err(DataError::new("invalid")),
+    }
+}
+pub(super) fn superseded_output(op: &Operation) -> Result<super::Output, DataError> {
+    done(op)
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Fact {
@@ -289,15 +375,15 @@ fn key(fact: &Fact) -> Result<String, DataError> {
 }
 #[derive(Default)]
 pub(super) struct Memory {
-    facts: std::collections::BTreeMap<String, (Operation, Vec<u8>, Stamp)>,
+    facts: std::collections::BTreeMap<String, (Operation, Vec<u8>, Ticket)>,
     bytes: usize,
 }
 impl Memory {
     #[cfg(test)]
     pub fn retain(&mut self, op: &Operation) {
-        self.retain_stamped(op, stamp());
+        self.retain_stamped(op, untracked_ticket());
     }
-    pub fn retain_stamped(&mut self, op: &Operation, ticket: Stamp) {
+    pub fn retain_stamped(&mut self, op: &Operation, ticket: Ticket) {
         let Some(fact) = Fact::capture(op) else {
             return;
         };
@@ -305,7 +391,9 @@ impl Memory {
             return;
         };
         if let Some((old, _, version)) = self.facts.get(&key) {
-            if version.epoch == ticket.epoch && version.revision > ticket.revision {
+            if version.stamp.epoch == ticket.stamp.epoch
+                && version.stamp.revision > ticket.stamp.revision
+            {
                 return;
             }
             if Fact::capture(old).is_some_and(|old| !old.compatible(&fact)) {
@@ -323,18 +411,16 @@ impl Memory {
         self.bytes = self.bytes - old + body.len();
         self.facts.insert(key, (op.clone(), body, ticket));
     }
-    pub fn forget(&mut self, op: &Operation, ticket: Stamp) {
+    pub fn forget(&mut self, op: &Operation, ticket: &Ticket) {
         let Some(fact) = Fact::capture(op) else {
             return;
         };
         let Ok(key) = key(&fact) else {
             return;
         };
-        if self
-            .facts
-            .get(&key)
-            .is_some_and(|(_, _, old)| old.epoch == ticket.epoch && old.revision <= ticket.revision)
-            && let Some((_, body, _)) = self.facts.remove(&key)
+        if self.facts.get(&key).is_some_and(|(_, _, old)| {
+            old.stamp.epoch == ticket.stamp.epoch && old.stamp.revision <= ticket.stamp.revision
+        }) && let Some((_, body, _)) = self.facts.remove(&key)
         {
             self.bytes -= body.len();
         }
@@ -398,7 +484,7 @@ impl Memory {
             .facts
             .iter()
             .filter_map(
-                |(key, (op, _, ticket))| match stage_stamped(root, op, *ticket) {
+                |(key, (op, _, ticket))| match stage_stamped(root, op, ticket.stamp) {
                     Ok(Some(_)) => Some(key.clone()),
                     Err(e) if e.code == "staleArchive" => Some(key.clone()),
                     _ => None,
@@ -561,11 +647,26 @@ fn record_owner(repo: &Repository, op: &Operation) -> Result<Option<String>, Dat
     })
 }
 /// Repository-state checks make retries safe even after a lost acknowledgement.
+#[cfg(test)]
 pub(super) fn apply(repo: &mut Repository, op: Operation) -> Result<super::Output, DataError> {
+    apply_stamped(repo, op, stamp())
+}
+pub(super) fn apply_stamped(
+    repo: &mut Repository,
+    op: Operation,
+    version: Stamp,
+) -> Result<super::Output, DataError> {
+    let ticket = repo.archive_causal.ticket(&op, version);
+    if repo.archive_causal.superseded(&ticket)? {
+        return done(&op);
+    }
     repo.connection
         .busy_timeout(std::time::Duration::ZERO)
         .map_err(db_error)?;
     let result = apply_inner(repo, op);
+    if result.is_ok() {
+        repo.archive_causal.applied(&ticket)?;
+    }
     if let Err(e) = repo
         .connection
         .busy_timeout(std::time::Duration::from_secs(5))
@@ -786,7 +887,8 @@ fn replay_batch(
     {
         visited += 1;
         let result = read_entry(path).and_then(|(body, entry)| {
-            apply(repo, entry.fact.operation()).and_then(|_| acknowledge(&(path.clone(), body)))
+            apply_stamped(repo, entry.fact.operation(), entry.stamp)
+                .and_then(|_| acknowledge(&(path.clone(), body)))
         });
         if let Err(e) = result {
             log::warn!(target:"sayweave","operation=archive_recovery result={}",e.code);
@@ -1257,13 +1359,13 @@ mod tests {
             attempt_id: p.attempt.id.clone(),
             text: "新的正文".into(),
         });
-        let a = stamp();
-        let b = stamp();
+        let a = untracked_ticket();
+        let b = untracked_ticket();
         let mut memory = Memory::default();
-        memory.retain_stamped(&old, a);
-        stage_stamped(temp.path(), &new, b).unwrap();
+        memory.retain_stamped(&old, a.clone());
+        stage_stamped(temp.path(), &new, b.stamp).unwrap();
         apply(&mut repo, new.clone()).unwrap();
-        memory.forget(&new, b);
+        memory.forget(&new, &b);
         memory.flush(temp.path());
         assert!(memory.facts.is_empty());
         assert_eq!(
@@ -1277,7 +1379,7 @@ mod tests {
             "新的正文"
         );
         assert_eq!(
-            stage_stamped(temp.path(), &old, a).unwrap_err().code,
+            stage_stamped(temp.path(), &old, a.stamp).unwrap_err().code,
             "staleArchive"
         );
     }

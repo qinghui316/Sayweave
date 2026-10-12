@@ -410,6 +410,7 @@ fn worker_authorization_recovery_and_bounded_queue() {
             deferred_cancellations: worker.deferred_cancellations.clone(),
             lease_active: worker.lease_active.clone(),
             volatile_archive: worker.volatile_archive.clone(),
+            causal: worker.causal.clone(),
         };
         for _ in 0..64 {
             let (response, _) = oneshot::channel();
@@ -417,6 +418,7 @@ fn worker_authorization_recovery_and_bounded_queue() {
                 .try_send(Request {
                     operation: Operation::Retry,
                     archive: false,
+                    ticket: None,
                     response,
                     queued: Instant::now(),
                 })
