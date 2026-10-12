@@ -1,4 +1,5 @@
 mod archive_recovery;
+pub(crate) use archive_recovery::{Stamp as ArchiveStamp, stamp as archive_stamp};
 mod cancellation;
 pub mod model;
 mod repositories;
@@ -313,9 +314,9 @@ impl DataWorker {
             .lock()
             .is_ok_and(|_guard| archive_recovery::pending_attempt(&self.root, attempt))
     }
-    pub(crate) fn retain_archive(&self, operation: &Operation) {
+    pub(crate) fn retain_archive(&self, operation: &Operation, ticket: ArchiveStamp) {
         if let Ok(mut memory) = self.volatile_archive.lock() {
-            memory.retain(operation);
+            memory.retain_stamped(operation, ticket);
         }
     }
     pub async fn request(&self, caller: &str, operation: Operation) -> Result<Output, DataError> {
@@ -330,6 +331,13 @@ impl DataWorker {
     /// in the background. Cancellation intents still use request_admitted.
     pub(crate) async fn request_archive(&self, operation: Operation) -> Result<Output, DataError> {
         let ticket = archive_recovery::stamp();
+        self.request_archive_stamped(operation, ticket).await
+    }
+    pub(crate) async fn request_archive_stamped(
+        &self,
+        operation: Operation,
+        ticket: ArchiveStamp,
+    ) -> Result<Output, DataError> {
         let mut result = self.request_archive_once(operation.clone(), ticket).await;
         for delay in [100, 300, 1000] {
             if !result.as_ref().is_err_and(|e| e.code == "busy") {

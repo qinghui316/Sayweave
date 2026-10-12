@@ -16,7 +16,7 @@ static QUEUES: LazyLock<Arc<tokio::sync::Semaphore>> =
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
 static FAILURES: AtomicUsize = AtomicUsize::new(0);
 struct Pending {
-    writes: VecDeque<(String, Operation, usize)>,
+    writes: VecDeque<(String, Operation, usize, crate::data::ArchiveStamp)>,
     bytes: usize,
     sealed: bool,
 }
@@ -90,9 +90,13 @@ impl Archive {
             task,
             Some(permit),
             Some(data.clone()),
-            move |operation| {
+            move |operation, ticket| {
                 let data = data.clone();
-                async move { data.request_archive(operation).await.map(|_| ()) }
+                async move {
+                    data.request_archive_stamped(operation, ticket)
+                        .await
+                        .map(|_| ())
+                }
             },
         ))
     }
@@ -102,7 +106,7 @@ impl Archive {
         F: Fn(Operation) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = bool> + Send,
     {
-        Self::with_permit(task, None, None, move |op| {
+        Self::with_permit(task, None, None, move |op, _ticket| {
             let result = write(op);
             async move {
                 if result.await {
@@ -120,7 +124,7 @@ impl Archive {
         write: F,
     ) -> Self
     where
-        F: Fn(Operation) -> Fut + Send + 'static,
+        F: Fn(Operation, crate::data::ArchiveStamp) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<(), crate::contracts::dictionary::DataError>>
             + Send,
     {
@@ -155,16 +159,16 @@ impl Archive {
                         break;
                     };
                     match pending.writes.pop_front() {
-                        Some((_, operation, size)) => {
+                        Some((_, operation, size, ticket)) => {
                             pending.bytes -= size;
-                            Some(operation)
+                            Some((operation, ticket))
                         }
                         None if pending.sealed => break,
                         None => None,
                     }
                 };
-                if let Some(operation) = item {
-                    if let Err(error) = write(operation).await {
+                if let Some((operation, ticket)) = item {
+                    if let Err(error) = write(operation, ticket).await {
                         log::warn!(target:"sayweave", "operation=archive_write task_id={} result={}", task, error.code);
                         state.failed.store(true, Ordering::Release);
                     }
@@ -186,6 +190,7 @@ impl Archive {
     /// Replace a pending checkpoint/unit only, never an already executing write.
     /// Terminal facts use seal_with, which has one reserved slot beyond capacity.
     pub fn enqueue(&self, key: String, operation: Operation) -> bool {
+        let ticket = crate::data::archive_stamp();
         let state = &self.producer.0;
         let Ok(mut pending) = state.pending.lock() else {
             return false;
@@ -198,11 +203,11 @@ impl Archive {
                 FAILURES.fetch_add(1, Ordering::AcqRel);
             }
             if let Some(data) = &state.fallback {
-                data.retain_archive(&operation);
+                data.retain_archive(&operation, ticket);
             }
             return false;
         }
-        let previous = pending.writes.iter().position(|(old, _, _)| old == &key);
+        let previous = pending.writes.iter().position(|(old, _, _, _)| old == &key);
         let size = bytes(&operation);
         let previous_size = previous.map_or(0, |index| pending.writes[index].2);
         if (previous.is_none() && pending.writes.len() >= CAPACITY)
@@ -210,7 +215,7 @@ impl Archive {
         {
             state.failed.store(true, Ordering::Release);
             if let Some(data) = &state.fallback {
-                data.retain_archive(&operation);
+                data.retain_archive(&operation, ticket);
             }
             return false;
         }
@@ -218,7 +223,7 @@ impl Archive {
             pending.writes.remove(index);
         }
         pending.bytes = pending.bytes - previous_size + size;
-        pending.writes.push_back((key, operation, size));
+        pending.writes.push_back((key, operation, size, ticket));
         state.wake.notify_one();
         true
     }
@@ -229,19 +234,22 @@ impl Archive {
                 return;
             }
             if let Some(operation) = terminal {
+                let ticket = crate::data::archive_stamp();
                 if state.unavailable {
                     if !state.failed.swap(true, Ordering::AcqRel) {
                         FAILURES.fetch_add(1, Ordering::AcqRel);
                     }
                     if let Some(data) = &state.fallback {
-                        data.retain_archive(&operation);
+                        data.retain_archive(&operation, ticket);
                     }
                     pending.sealed = true;
                     return;
                 }
                 let size = bytes(&operation);
                 pending.bytes += size;
-                pending.writes.push_back((String::new(), operation, size));
+                pending
+                    .writes
+                    .push_back((String::new(), operation, size, ticket));
             }
             pending.sealed = true;
         }
@@ -354,5 +362,100 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(5)).await;
         assert!(archive.finish().await);
         assert_eq!(completed.load(Ordering::Acquire), 3);
+    }
+    #[tokio::test]
+    async fn queued_old_checkpoint_cannot_retire_a_newer_capacity_fallback() {
+        use crate::contracts::history::{Attempt, DbOperation as H, DbOutput, Prepare};
+        let root = tempfile::tempdir().unwrap();
+        let data = DataWorker::start(root.path().into()).unwrap();
+        data.request_admitted(Operation::Retry).await.unwrap();
+        let record = uuid::Uuid::new_v4().to_string();
+        let attempt = uuid::Uuid::new_v4().to_string();
+        data.request_archive(Operation::History(H::Prepare(Prepare {
+            record_id: record.clone(),
+            attempt: Attempt {
+                id: attempt.clone(),
+                record_id: record.clone(),
+                kind: "live".into(),
+                config_id: uuid::Uuid::new_v4().to_string(),
+                config_name: "fixture".into(),
+                model_id: "fixture".into(),
+                service_host: "localhost".into(),
+                config_revision: 1,
+                created_at: crate::data::repository::now(),
+                ended_at: None,
+                status: "preparing".into(),
+                text: String::new(),
+                error_code: None,
+                elapsed_ms: 0,
+            },
+            audio: None,
+        })))
+        .await
+        .unwrap();
+        let held = Arc::new(Notify::new());
+        let began = Arc::new(Notify::new());
+        let writer = data.clone();
+        let target = attempt.clone();
+        let gate = held.clone();
+        let ready = began.clone();
+        let archive = Archive::with_permit(
+            "causal-fixture".into(),
+            None,
+            Some(data.clone()),
+            move |op, ticket| {
+                let (writer, target, gate, ready) =
+                    (writer.clone(), target.clone(), gate.clone(), ready.clone());
+                async move {
+                    match &op {
+                        Operation::Drain => {
+                            ready.notify_one();
+                            gate.notified().await;
+                            Ok(())
+                        }
+                        Operation::History(H::Checkpoint { attempt_id, .. })
+                            if *attempt_id == target =>
+                        {
+                            writer.request_archive_stamped(op, ticket).await.map(|_| ())
+                        }
+                        _ => Ok(()),
+                    }
+                }
+            },
+        );
+        archive.enqueue("held".into(), Operation::Drain);
+        began.notified().await;
+        assert!(archive.enqueue(
+            "checkpoint".into(),
+            Operation::History(H::Checkpoint {
+                attempt_id: attempt.clone(),
+                text: "旧".into()
+            })
+        ));
+        assert!(archive.enqueue(
+            "filler".into(),
+            Operation::History(H::Checkpoint {
+                attempt_id: uuid::Uuid::new_v4().to_string(),
+                text: "x".repeat(1024 * 1024)
+            })
+        ));
+        let latest = "n".repeat(1024 * 1024 - 8);
+        assert!(!archive.enqueue(
+            "checkpoint".into(),
+            Operation::History(H::Checkpoint {
+                attempt_id: attempt,
+                text: latest.clone()
+            })
+        ));
+        held.notify_one();
+        assert!(!archive.finish().await);
+        let crate::data::Output::History(DbOutput::Record(row)) = data
+            .request_admitted(Operation::History(H::Detail(record)))
+            .await
+            .unwrap()
+        else {
+            panic!("record")
+        };
+        assert_eq!(row.attempts[0].text, latest);
     }
 }

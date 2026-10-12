@@ -13,11 +13,11 @@ use std::{
 };
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct Stamp {
+pub(crate) struct Stamp {
     epoch: u64,
     revision: u64,
 }
-pub(super) fn stamp() -> Stamp {
+pub(crate) fn stamp() -> Stamp {
     static EPOCH: std::sync::LazyLock<u64> =
         std::sync::LazyLock::new(|| uuid::Uuid::new_v4().as_u128() as u64);
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -293,6 +293,7 @@ pub(super) struct Memory {
     bytes: usize,
 }
 impl Memory {
+    #[cfg(test)]
     pub fn retain(&mut self, op: &Operation) {
         self.retain_stamped(op, stamp());
     }
