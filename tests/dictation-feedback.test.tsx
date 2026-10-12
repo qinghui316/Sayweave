@@ -30,7 +30,7 @@ it('missing presentation detail cannot invent a recognition failure',()=>{
 it.each(['compositionDisconnected','compositionRejected'])('an empty recognition result does not mask the real input error %s',code=>{
  const value={...initialDictation(),source:'external' as const,taskId:'current',presentationId:'view',presentation:'error' as const,error:'emptyText',delivery:{state:'unconfirmed' as const,submission:'notSubmitted' as const,verification:'unavailable' as const,stage:'composition',submittedEvents:0,error:code,restoreError:false,elapsedMs:1}};
  expect(dictationFeedback(value,initialSpeech())).not.toBe('未识别到文字。');
- expect(dictationFeedback(value,initialSpeech())).toContain(code==='compositionDisconnected'?'输入组件连接中断':'实时草稿');
+ expect(dictationFeedback(value,initialSpeech())).toContain(code==='compositionDisconnected'?'输入组件连接中断':'实时输入已中断');
 });
 it('a fresh start failure remains visible while the previous trial terminal stays quiet',()=>{
  render(<Home quietTerminal phase="failed" speech={{...initialSpeech(),taskId:'old',error:'emptyText'}} failure="无法访问麦克风，请检查权限。" onShortcuts={()=>{}} onModels={()=>{}} start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);

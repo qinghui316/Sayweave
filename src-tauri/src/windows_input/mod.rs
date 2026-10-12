@@ -15,6 +15,8 @@ mod application;
 pub(crate) mod composition;
 #[cfg(windows)]
 mod native;
+#[cfg(windows)]
+mod runtime_module;
 pub async fn application_context(
     anchor: Option<Anchor>,
 ) -> crate::contracts::language::ApplicationContext {

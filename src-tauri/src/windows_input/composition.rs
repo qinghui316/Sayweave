@@ -666,6 +666,7 @@ impl Host {
                 error
             }
         })?;
+        super::runtime_module::verify(pid)?;
         super::native::composition_begin_target(&host.task, &host.anchor)?;
         host.exchange(Action::Begin, "", false)?;
         host.range_open = true;
