@@ -910,6 +910,7 @@ impl Host {
         let mut cleanup_failed = false;
         let mut handed_off = false;
         let mut already_settled = false;
+        let mut unwritten_retired = false;
         let result = if aborted {
             let settled =
                 completed_prefix(self.settled_empty_revision, self.revision, &self.text, "");
@@ -934,6 +935,18 @@ impl Host {
         } else if self.failure.is_some() {
             self.exchange(Action::Handoff, "", true)
                 .and(Err(Error::new(self.failure.as_deref().unwrap())))
+        } else if !self.attempted && !self.visible && self.text.is_empty() && text.is_empty() {
+            // Retire a prepared range without claiming a text commit. No focused
+            // editability/readback is required because no write has been attempted.
+            cancelled = !self.gate.commit();
+            let released = self.release_empty_write_lease();
+            unwritten_retired = released.is_ok();
+            cleanup_failed = released.is_err();
+            if cancelled {
+                released.and(Err(Error::new("cancelled")))
+            } else {
+                released
+            }
         } else {
             self.update(text).and_then(|_| {
                 // A successful empty-tail Settle already submitted the text
@@ -968,7 +981,8 @@ impl Host {
         // matching fresh UIA call can return the final Update's pre-commit cache.
         // There is no provider-correlated completion fence in this protocol, so
         // do not promote an acknowledged commit to independently confirmed input.
-        let committed = result.is_ok() && mode == Finish::Commit && !already_settled;
+        let committed =
+            result.is_ok() && mode == Finish::Commit && !already_settled && !unwritten_retired;
         log::info!(target:"sayweave", "operation=draft_proof task_id={} turn={} revision={} phase=confirm submitted={} already_settled={} confirmed=false completion_boundary=unavailable", self.task,self.turn,self.revision,committed || already_settled,already_settled);
         let mut delivery = Delivery::not_submitted(
             result

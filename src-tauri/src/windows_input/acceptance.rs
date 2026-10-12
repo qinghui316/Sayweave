@@ -186,6 +186,40 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
     let mut fixture = Fixture::open(exe, true)?;
     let _evidence = EvidenceLease::new()?;
     let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    // Initialize the provider in this same owned editor before capturing test ranges.
+    // First activation may emit selection events; production admission must reject them.
+    fixture.command(serde_json::json!({"action":"focus","text":"初始化正文","start":1,"end":1}))?;
+    let before = fixture.command(serde_json::json!({"action":"read"}))?;
+    let initialization = uuid::Uuid::new_v4().to_string();
+    let anchor = WindowsInputService::anchor().ok_or("fixture not foreground")?;
+    bind_watch(&initialization, &anchor, None).map_err(|e| e.code)?;
+    match runtime.block_on(Draft::begin(
+        initialization.clone(),
+        1,
+        anchor,
+        Arc::new(DeliveryGate::default()),
+    )) {
+        Ok(draft) => {
+            let outcome = runtime.block_on(draft.finish(String::new(), Finish::Commit));
+            if outcome.restore_error || outcome.submission != Submission::NotSubmitted {
+                return Err("owned initialization did not retire without mutation".into());
+            }
+        }
+        Err(error) if error.code == "targetChanged" => {
+            println!("SAYWEAVE_EDITOR_INITIALIZATION admission=rejected_before_Begin");
+        }
+        Err(error) => return Err(error.code),
+    }
+    release_watch(&initialization);
+    let after = fixture.command(serde_json::json!({"action":"read"}))?;
+    if !after["foreground"].as_bool().unwrap_or(false)
+        || ["text", "start", "end"]
+            .iter()
+            .any(|key| before[key] != after[key])
+    {
+        return Err("owned initialization changed body, selection or foreground".into());
+    }
+    println!("SAYWEAVE_EDITOR_INITIALIZATION body_selection_unchanged=true");
     for (start, end) in [(1, 1), (1, 3)] {
         for mode in [
             Finish::Commit,
