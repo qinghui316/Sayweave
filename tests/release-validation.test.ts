@@ -65,6 +65,9 @@ describe('retained package resume and partial upload',()=>{
  it('keeps original producer proof when a later rerun was rejected before build',()=>{
   const j=jobs();j.push({name:'draft',steps:[]});expect(validateProducerRun(f.identity,run(),j,producerId).runId).toBe(producerId);
  });
+ it('can resume preserved bytes when the first full-verifier execution failed',()=>{
+  const j=jobs();j[0]!.steps[4]!.conclusion='failure';expect(validateProducerRun(f.identity,run(),j,producerId).runId).toBe(producerId);
+ });
  it('reuses a tool from an earlier attempt without another tool build',()=>{
   const all=jobs()[0]!.steps;
   const attempts=[{name:'draft',steps:all.filter(s=>s.name==='Build full signature verifier once'||s.name==='Preserve full signature verifier')},{name:'draft',steps:all.filter(s=>s.name!=='Build full signature verifier once'&&s.name!=='Preserve full signature verifier')}];

@@ -103,6 +103,9 @@ export function verifyReusedChecks(root=process.cwd(),env=process.env){
 
 const sha256=bytes=>createHash('sha256').update(bytes).digest('hex');
 const exactId=id=>/^[1-9]\d*$/.test(String(id));
+function cargoFlags(env){
+ return Object.fromEntries(Object.entries(env).filter(([key])=>/^(?:RUSTC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|RUSTFLAGS|RUSTDOCFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_(?:TARGET|RUSTC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|RUSTFLAGS|INCREMENTAL)|CARGO_PROFILE_\w+|CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_\w+)$/.test(key)).sort(([a],[b])=>a.localeCompare(b)));
+}
 export const verifierArtifactName=identity=>`release-verifier-${identity.tag}-${identity.commit}`;
 export const packageArtifactName=identity=>`release-package-${identity.tag}-${identity.commit}`;
 export function cargoCacheKeys(context){
@@ -121,8 +124,8 @@ export function nativeSourceHash(root){
 export function cargoCacheContext(root=process.cwd(),env=process.env){
  const git=args=>execFileSync('git',args,{cwd:root,encoding:'utf8'}).trim();
  const configPaths=git(['ls-files']).split(/\r?\n/).filter(p=>/^(?:\.cargo\/|src-tauri\/(?:text-service\/)?\.cargo\/)|(?:^|\/)(?:Cargo\.toml|rust-toolchain\.toml|tauri\.[^/]+\.json)$/.test(p));
- const config={files:configPaths.map(p=>[p,sha256(readFileSync(join(root,p)))]),flags:Object.fromEntries(Object.entries(env).filter(([key])=>/^(?:RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_TARGET|CARGO_PROFILE_\w+|CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_\w+)$/.test(key)).sort(([a],[b])=>a.localeCompare(b)))};
- const context={platform:process.platform,arch:process.arch,toolchain:execFileSync('rustc',['-vV'],{cwd:root,env,encoding:'utf8'}).trim(),cargo:execFileSync('cargo',['-V'],{cwd:root,env,encoding:'utf8'}).trim(),image:`${env.ImageOS??'local'}:${env.ImageVersion??'local'}`,config:JSON.stringify(config),locks:JSON.stringify(['src-tauri/Cargo.lock','src-tauri/text-service/Cargo.lock'].map(p=>sha256(readFileSync(join(root,p))))),source:`${nativeSourceHash(root)}:${env.SAYWEAVE_BUILD_CHANNEL??'internal'}`};
+ const config={files:configPaths.map(p=>[p,sha256(readFileSync(join(root,p)))]),flags:cargoFlags(env)};
+ const context={platform:process.platform,arch:process.arch,toolchain:execFileSync(env.RUSTC??env.CARGO_BUILD_RUSTC??'rustc',['-vV'],{cwd:root,env,encoding:'utf8'}).trim(),cargo:execFileSync('cargo',['-V'],{cwd:root,env,encoding:'utf8'}).trim(),image:`${env.ImageOS??'local'}:${env.ImageVersion??'local'}`,config:JSON.stringify(config),locks:JSON.stringify(['src-tauri/Cargo.lock','src-tauri/text-service/Cargo.lock'].map(p=>sha256(readFileSync(join(root,p))))),source:`${nativeSourceHash(root)}:${env.SAYWEAVE_BUILD_CHANNEL??'internal'}`};
  return {...cargoCacheKeys(context),context};
 }
 export function validateProducerRun(identity,run,jobs,id,current=false){
@@ -131,7 +134,7 @@ export function validateProducerRun(identity,run,jobs,id,current=false){
   const draft=jobs.filter(j=>j.name==='draft');
   const passed=(job,names)=>names.every(name=>job.steps.filter(s=>s.name===name&&s.conclusion==='success').length===1);
   const tools=draft.filter(j=>passed(j,['Build full signature verifier once','Preserve full signature verifier']));
-  const packages=draft.filter(j=>passed(j,['Build signed NSIS package','Preserve signed release bytes before Release operations','Verify retained package with recorded full verifier']));
+  const packages=draft.filter(j=>passed(j,['Build signed NSIS package','Preserve signed release bytes before Release operations']));
   if(run.status!=='completed'||tools.length!==1||packages.length!==1)throw Error('Package/tool producer did not preserve a complete build');
  }
  return {runId:String(id),controllerCommit:run.head_sha,ref:`refs/tags/${run.head_branch}`,repository};
@@ -155,7 +158,7 @@ export function trustedProducer(identity,root,env=process.env){
 export function verifierBuildConfig(root,env){
  const git=args=>execFileSync('git',args,{cwd:root,encoding:'utf8'}).trim();
  const files=git(['ls-files']).split(/\r?\n/).filter(p=>/^(?:\.cargo\/|src-tauri\/\.cargo\/)/.test(p));
- return sha256(JSON.stringify({files:files.map(p=>[p,sha256(readFileSync(join(root,p)))]),flags:Object.fromEntries(Object.entries(env).filter(([key])=>/^(?:RUSTFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_BUILD_TARGET|CARGO_PROFILE_\w+|CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_\w+)$/.test(key)).sort(([a],[b])=>a.localeCompare(b)))}));
+ return sha256(JSON.stringify({files:files.map(p=>[p,sha256(readFileSync(join(root,p)))]),flags:cargoFlags(env),tauriConfig:env.TAURI_CONFIG??''}));
 }
 export function validateVerifierTool(identity,sourceHash,toolchain,buildConfig,receipt,bytes,producer){
  if(receipt?.schemaVersion!==1||receipt.productCommit!==identity.commit||receipt.productTag!==identity.tag||receipt.sourceSha256!==sourceHash||receipt.buildConfigSha256!==buildConfig||receipt.file!=='verify-update-signature.exe'||receipt.platform!=='windows-x86_64-msvc'||receipt.profile!=='release'||receipt.features!=='default'||receipt.buildChannel!=='stable'||receipt.toolchain!==toolchain||!receipt.rustc?.startsWith(`rustc ${toolchain} `)||!receipt.rustc.includes('host: x86_64-pc-windows-msvc')||receipt.size!==bytes.length||bytes.length===0||receipt.sha256!==sha256(bytes)||JSON.stringify(receipt.producer)!==JSON.stringify(producer))throw Error('Native verifier source, build identity or bytes differ');
@@ -217,10 +220,14 @@ export function preflightPackage(root=process.cwd(),env=process.env){
  }
  output({release_id:id,package_run:env.SAYWEAVE_PACKAGE_RUN||env.GITHUB_RUN_ID,reuse_tool:String(reuseTool)},env);
 }
-export function uploadRetainedPackage(root=process.cwd(),env=process.env){
+export async function uploadRetainedPackage(root=process.cwd(),env=process.env){
  const identity=currentIdentity(root,env),dir=resolve(root,env.SAYWEAVE_RELEASE_DIR??'release/sayweave'),assets=releaseAssets(dir);
  validateRelease(identity,JSON.parse(assets.get('latest.json')),JSON.parse(assets.get('release-receipt.json')),assets);
  if(env.EXPECTED_CHECKSUM&&sha256(assets.get('SHA256SUMS.txt'))!==env.EXPECTED_CHECKSUM)throw Error('Retained checksum differs');
+ // Even a direct controller call must pass the same full native signature gate.
+ // A prior runner's failed verification does not prevent safe re-verification.
+ const {verifyUpdateRelease}=await import('./verify-update-release.mjs');
+ verifyUpdateRelease(root,env);
  const id=env.EXPECTED_RELEASE_ID;
  // Artifact retention is a hard predecessor, including a tool usable by later jobs.
  const producer=trustedProducer(identity,root,env);
@@ -242,7 +249,7 @@ if(process.argv[1]&&pathToFileURL(resolve(process.argv[1])).href===import.meta.u
  else if(mode==='reuse-verification')verifyReusedChecks();
  else if(mode==='cargo-cache'){const {compileKey,compilePrefix,registryKey,registryPrefix}=cargoCacheContext();output({compileKey,compilePrefix,registryKey,registryPrefix},process.env);}
  else if(mode==='package-preflight')preflightPackage();
- else if(mode==='upload-package')uploadRetainedPackage();
+ else if(mode==='upload-package')uploadRetainedPackage().catch(error=>{console.error(error);process.exitCode=1;});
  else if(mode===undefined)runFrozenReleaseTests().catch(error=>{console.error(error);process.exitCode=1;});
  else throw Error('Unknown frozen release validation mode');
 }

@@ -28,10 +28,12 @@ export function buildVerifier(root=process.cwd(),env=process.env){
  const payload=resolve(root,'src-tauri/text-service/target/release/sayweave_text_service.dll');
  if(!existsSync(payload))throw Error('Build the ordinary component/package before the verifier');
  const sourceProducer=producer(identity,root,env);
+ const rustc=execFileSync(env.RUSTC??env.CARGO_BUILD_RUSTC??'rustc',['-vV'],{cwd:root,env,encoding:'utf8'}).trim();
+ if(!rustc.startsWith(`rustc ${toolchain} `)||!rustc.includes('host: x86_64-pc-windows-msvc'))throw Error('Actual verifier compiler differs from the pinned Windows toolchain');
  const buildEnv={...env,SAYWEAVE_BUILD_COMMIT:identity.commit,SAYWEAVE_TSF_PAYLOAD:payload};
  execFileSync('cargo',['build','--locked','--release','--manifest-path','src-tauri/Cargo.toml','--bin','verify-update-signature'],{cwd:root,env:buildEnv,stdio:'inherit',windowsHide:true});
  const file='verify-update-signature.exe',bytes=readPlainFile(join(root,'src-tauri/target/release',file));
- const receipt={schemaVersion:1,productTag:identity.tag,productCommit:identity.commit,sourceSha256:nativeSourceHash(root),buildConfigSha256:verifierBuildConfig(root,env),file,platform:'windows-x86_64-msvc',profile:'release',features:'default',buildChannel:'stable',toolchain,rustc:execFileSync('rustc',['-vV'],{cwd:root,env,encoding:'utf8'}).trim(),size:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex'),producer:sourceProducer};
+ const receipt={schemaVersion:1,productTag:identity.tag,productCommit:identity.commit,sourceSha256:nativeSourceHash(root),buildConfigSha256:verifierBuildConfig(root,env),file,platform:'windows-x86_64-msvc',profile:'release',features:'default',buildChannel:'stable',toolchain,rustc,size:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex'),producer:sourceProducer};
  mkdirSync(dir,{recursive:true});copyFileSync(join(root,'src-tauri/target/release',file),join(dir,file));
  writeFileSync(join(dir,'verifier-receipt.json'),JSON.stringify(receipt,null,2)+'\n',{flag:'wx'});
  console.log(JSON.stringify({verifierBuilds:1,...receipt}));

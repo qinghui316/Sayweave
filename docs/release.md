@@ -44,7 +44,7 @@ Sayweave 的源码开发使用 `main` 和短期功能分支；正式发布使用
 
 签名包及清单生成后立即保全为 `release-package-<tag>-<完整产品提交>` artifact，保存十四天；构建失败的现有 bundle 诊断保留七天。保全失败阻止 Release 操作。包已存在时，任何上传、权限、回下载或公开失败都继续使用这些原始字节，不重新打包。预构建只读权限/草稿查询发生在包产生前；包产生后的 Release 读写均排在持久保全之后。完整签名检查仍在上传前及每次回下载执行。
 
-`resume-package` 提供原 `release_tag`、`release_commit`、`release_id`、`checksum_sha256`、`package_run_id` 和有效 `verification_run_id`，从已审、合入的匹配诊断控制标签运行。生产 run 必须属于本仓库本 release 工作流，确实成功构建并保全包/工具及完整验签，且控制源码在主线上；查询该 run 全部 attempts，后来的失败重跑不能遮掉原生产证据。两份 artifact 必须存在且未过期。已有保全包时，包括同 run 的失败 job 重跑和 artifact 过期，都不自动重新打包；过期资料需找回原资产。恢复模式不安装依赖、编译程序、构建工具或重新打包，只核对来源、完整签名及所有资产后续传缺项。已经上传的每份资产须名称、大小和 GitHub SHA-256 digest 完全匹配；重复、外来、损坏、半上传或已公开资产拒绝处理，绝不 clobber。
+`resume-package` 提供原 `release_tag`、`release_commit`、`release_id`、`checksum_sha256`、`package_run_id` 和有效 `verification_run_id`，从已审、合入的匹配诊断控制标签运行。生产 run 必须属于本仓库本 release 工作流，确实成功构建并保全包/工具，且控制源码在主线上；查询该 run 全部 attempts，后来的失败重跑不能遮掉原生产证据。两份 artifact 必须存在且未过期。旧 runner 的首次验签若因 I/O 或权限失败，仍可读取原资料，并在当前恢复流程重新完整验签；上传控制器自身也强制调用同一原生验签，未通过不能操作 Release。已有保全包时，包括同 run 的失败 job 重跑和 artifact 过期，都不自动重新打包；过期资料需找回原资产。恢复模式不安装依赖、编译程序、构建工具或重新打包，只核对来源、完整签名及所有资产后续传缺项。已经上传的每份资产须名称、大小和 GitHub SHA-256 digest 完全匹配；重复、外来、损坏、半上传或已公开资产拒绝处理，绝不 clobber。
 
 本次 `v0.1.9` 原产品 `784e43172780255e83d5b652507c7bec666ff859` 的 run `38251026083` 已完成签名及完整验签，但保全缺失、runner 已结束、artifact 为零、owner 草稿为空。其包确实丢失，完整五项流水线修复审查/I2 后允许替代构建一次；后续重试复用这份替代包。历史同版本或其他提交包不充当该候选。
 
