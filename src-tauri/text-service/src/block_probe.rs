@@ -69,10 +69,9 @@ pub(super) fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let task = uuid::Uuid::new_v4().to_string();
     let id = uuid::Uuid::new_v4().to_string();
-    for (operation, revision, action, text) in [
-        (1, 0, Action::Begin, ""),
-        (2, 1, Action::Update, "周三开会"),
-    ] {
+    for (operation, revision, action, text) in
+        [(1, 0, Action::Begin, ""), (2, 1, Action::Update, "周三")]
+    {
         let result = exchange(
             pipe, capability, &task, 1, operation, revision, action, text, false,
         )?;
@@ -99,10 +98,24 @@ pub(super) fn run(
     )?)?;
     println!(
         "block bind body={} version={}",
-        initial.text == "周三开会",
+        initial.text == "周三",
         initial.version
     );
-    let handoff = exchange(pipe, capability, &task, 1, 4, 1, Action::Handoff, "", false)?;
+    let streamed = exchange(
+        pipe,
+        capability,
+        &task,
+        1,
+        4,
+        2,
+        Action::Update,
+        "周三开会",
+        false,
+    )?;
+    if !streamed.applied {
+        return Err(format!("bound block streaming update: {}", streamed.code).into());
+    }
+    let handoff = exchange(pipe, capability, &task, 1, 5, 2, Action::Handoff, "", false)?;
     if !handoff.applied {
         return Err(format!("block handoff: {}", handoff.code).into());
     }
@@ -110,7 +123,7 @@ pub(super) fn run(
         pipe,
         capability,
         &task,
-        5,
+        6,
         command(&initial, BlockAction::Read),
         "",
     )?;
@@ -123,7 +136,7 @@ pub(super) fn run(
             pipe,
             capability,
             &task,
-            6,
+            7,
             command(&initial, BlockAction::Release),
             "",
         )?;
@@ -154,7 +167,7 @@ pub(super) fn run(
         pipe,
         capability,
         &task,
-        6,
+        7,
         command(&handed, BlockAction::Read),
         "",
     )?)?;
@@ -165,7 +178,7 @@ pub(super) fn run(
         pipe,
         capability,
         &task,
-        7,
+        8,
         command(&handed, BlockAction::Acquire),
         "",
     )?;
@@ -181,7 +194,7 @@ pub(super) fn run(
         pipe,
         capability,
         &task,
-        8,
+        9,
         command(&edited, BlockAction::Read),
         "",
     )?)?;
@@ -189,7 +202,7 @@ pub(super) fn run(
         pipe,
         capability,
         &task,
-        9,
+        10,
         command(&current, BlockAction::Acquire),
         "",
     )?)?;
@@ -197,7 +210,7 @@ pub(super) fn run(
         pipe,
         capability,
         &task,
-        10,
+        11,
         command(&current, BlockAction::Acquire),
         "",
     )?)?;
@@ -208,7 +221,7 @@ pub(super) fn run(
         pipe,
         capability,
         &task,
-        11,
+        12,
         command(&lease, BlockAction::Apply),
         "过期正文",
     )?;
@@ -222,7 +235,7 @@ pub(super) fn run(
         pipe,
         capability,
         &task,
-        12,
+        13,
         command(&renewed, BlockAction::Apply),
         "周四下午开会",
     )?)?;

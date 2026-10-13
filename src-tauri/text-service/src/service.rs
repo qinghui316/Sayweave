@@ -2455,7 +2455,7 @@ impl ITfKeyEventSink_Impl for KeySink_Impl {
         if !focused.as_bool()
             && let Some(state) = self.state.upgrade()
         {
-            block_tracking::invalidate(&state);
+            block_tracking::invalidate(&state, "blockKeyFocus");
         }
         Ok(())
     }
@@ -2480,7 +2480,7 @@ impl ITfKeyEventSink_Impl for KeySink_Impl {
             if matches!(key.0, 0x59 | 0x5a)
                 && unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) < 0 }
             {
-                block_tracking::invalidate(&shared);
+                block_tracking::invalidate(&shared, "blockUndoRedo");
             }
             let observation = prepare_key_observation(&shared);
             let ended = end_owned_with_flags(&shared, TF_ES_SYNC);

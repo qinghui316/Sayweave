@@ -22,6 +22,7 @@ struct Data {
     operation: u64,
     text: String,
     valid: bool,
+    invalid_reason: &'static str,
     writable: bool,
     lease: u64,
     writing: bool,
@@ -101,6 +102,7 @@ impl Track {
                 operation: request.operation,
                 text: expected,
                 valid: true,
+                invalid_reason: "blockInvalid",
                 writable: false,
                 lease: 0,
                 writing: false,
@@ -152,38 +154,55 @@ impl Track {
         }
     }
 
-    unsafe fn snapshot(&self, ec: u32) -> windows::core::Result<BlockSnapshot> {
+    unsafe fn snapshot(
+        &self,
+        ec: u32,
+        phase: &mut &'static str,
+    ) -> windows::core::Result<BlockSnapshot> {
         unsafe {
             let version = self.data.borrow().version;
-            if !self.data.borrow().valid || !self.field.matches()? {
+            if !self.data.borrow().valid {
+                *phase = self.data.borrow().invalid_reason;
                 return Err(failure(TF_E_DISCONNECTED));
             }
+            *phase = "blockSnapshotField";
+            if !self.field.matches()? {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            *phase = "blockSnapshotForeground";
             let foreground = GetForegroundWindow();
             let mut process = 0;
             GetWindowThreadProcessId(foreground, Some(&mut process));
             if process != std::process::id() {
                 return Err(failure(TF_E_DISCONNECTED));
             }
+            *phase = "blockSnapshotView";
             let view = self.context.GetActiveView()?.GetWnd()?;
             if !view.0.is_null() && GetAncestor(view, GA_ROOT) != foreground {
                 return Err(failure(TF_E_DISCONNECTED));
             }
+            *phase = "blockSnapshotAccess";
             ensure_enabled_context(&self.context)?;
             if self.context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0
                 || password(&self.context, &self.range, ec)?
             {
                 return Err(failure(E_ACCESSDENIED));
             }
+            *phase = "blockSnapshotText";
             let text = range_text(&self.range, ec)?;
+            *phase = "blockSnapshotSelection";
             let (selection_start, selection_end) =
                 relative_selection(&self.context, &self.range, ec)?;
+            *phase = "blockSnapshotField";
             if !self.field.matches()? {
                 return Err(failure(TF_E_DISCONNECTED));
             }
+            *phase = "blockSnapshotVersion";
             let data = self.data.borrow();
             if !data.valid || data.version != version || text.is_empty() || data.text != text {
                 return Err(failure(TF_E_DISCONNECTED));
             }
+            *phase = "block";
             Ok(BlockSnapshot {
                 lease: data.lease,
                 id: data.id.clone(),
@@ -219,19 +238,24 @@ impl ITfTextEditSink_Impl for Sink_Impl {
         if !self.data.borrow().valid {
             return Ok(());
         }
+        let mut phase = "blockEditContext";
         let result = (|| unsafe {
             let context = context.as_ref().ok_or_else(|| failure(E_POINTER))?;
             // Own composition updates remain subject to native text proof; they
             // update tracking but must never become user-edit learning evidence.
             let own = context.InWriteSession(self.client)?.as_bool();
+            phase = "blockEditField";
             if !self.field.matches()? {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             let record = record.as_ref().ok_or_else(|| failure(E_POINTER))?;
+            phase = "blockEditOutside";
             if !updates_within(record, &self.range, ec)? {
                 return Err(failure(TF_E_DISCONNECTED));
             }
+            phase = "blockEditSelection";
             relative_selection(context, &self.range, ec)?;
+            phase = "blockEditText";
             let text = range_text(&self.range, ec)?;
             if text.is_empty() {
                 return Err(failure(TF_E_DISCONNECTED));
@@ -255,6 +279,7 @@ impl ITfTextEditSink_Impl for Sink_Impl {
             Err(_) => {
                 data.valid = false;
                 data.writable = false;
+                data.invalid_reason = phase;
             }
         }
         // Tracking refusal must not fail the user's edit.
@@ -280,9 +305,12 @@ pub(super) fn revoke(shared: &Shared) {
         data.writable = false;
     }
 }
-pub(super) fn invalidate(shared: &Shared) {
+pub(super) fn invalidate(shared: &Shared, reason: &'static str) {
     if let Some(track) = shared.borrow().block.as_ref() {
         let mut data = track.data.borrow_mut();
+        if data.valid {
+            data.invalid_reason = reason;
+        }
         data.valid = false;
         data.writable = false;
         data.lease += 1;
@@ -297,8 +325,11 @@ struct FocusSink {
     _lease: Lease,
 }
 impl FocusSink {
-    fn invalidate(&self) {
+    fn invalidate(&self, reason: &'static str) {
         let mut data = self.data.borrow_mut();
+        if data.valid {
+            data.invalid_reason = reason;
+        }
         data.valid = false;
         data.writable = false;
         data.lease += 1;
@@ -312,7 +343,7 @@ impl ITfThreadMgrEventSink_Impl for FocusSink_Impl {
         let _callback = Callback::enter();
         let _notification = TextNotification::enter(self.notifications.clone());
         if unsafe { self.context.GetDocumentMgr() }.ok().as_ref() == document.as_ref() {
-            self.invalidate();
+            self.invalidate("blockDocumentRetired");
         }
         Ok(())
     }
@@ -329,7 +360,7 @@ impl ITfThreadMgrEventSink_Impl for FocusSink_Impl {
             .as_ref()
             != Some(&self.context)
         {
-            self.invalidate();
+            self.invalidate("blockDocumentFocus");
         }
         Ok(())
     }
@@ -342,14 +373,14 @@ impl ITfThreadMgrEventSink_Impl for FocusSink_Impl {
             let own = unsafe { self.context.GetDocumentMgr() };
             let added = unsafe { context.GetDocumentMgr() };
             if own.is_err() || own.ok() == added.ok() {
-                self.invalidate();
+                self.invalidate("blockContextPushed");
             }
         }
         Ok(())
     }
     fn OnPopContext(&self, context: Ref<ITfContext>) -> windows::core::Result<()> {
         if context.as_ref() == Some(&self.context) {
-            self.invalidate();
+            self.invalidate("blockContextPopped");
         }
         Ok(())
     }
@@ -540,7 +571,7 @@ impl ITfEditSession_Impl for EditBlock_Impl {
             if command.action == BlockAction::Bind {
                 let epoch = shared.borrow().epoch;
                 let track = Rc::new(Track::bind(shared, &self.context, r, ec)?);
-                let snapshot = track.snapshot(ec)?;
+                let snapshot = track.snapshot(ec, &mut phase)?;
                 edit_authorized(shared, r, self.connection, self.generation)?;
                 let mut state = shared.borrow_mut();
                 if state.epoch != epoch
@@ -560,7 +591,7 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                 .block
                 .clone()
                 .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
-            let snapshot = track.snapshot(ec)?;
+            let snapshot = track.snapshot(ec, &mut phase)?;
             if track.task != r.task
                 || snapshot.id != command.id
                 || snapshot.epoch != command.epoch
@@ -617,7 +648,7 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                     let end = map_endpoint(&snapshot.text, &r.text, snapshot.selection_end)
                         .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
                     phase = "block";
-                    let before = track.snapshot(ec)?;
+                    let before = track.snapshot(ec, &mut phase)?;
                     if before != snapshot {
                         return Err(failure(TF_E_DISCONNECTED));
                     }
@@ -672,7 +703,7 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                 BlockAction::Read => (),
                 _ => return Err(failure(E_INVALIDARG)),
             }
-            track.snapshot(ec)
+            track.snapshot(ec, &mut phase)
         })();
         match &result {
             Ok(snapshot) => {
