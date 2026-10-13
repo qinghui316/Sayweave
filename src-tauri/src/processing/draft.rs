@@ -310,10 +310,31 @@ impl Block {
     }
 
     pub fn handoff(&mut self) {
+        if self.suspended {
+            return;
+        }
         self.suspended = true;
         self.source_epoch += 1;
         self.preview = None;
         self.attempted = None;
+    }
+
+    /// A refreshed lease/selection is not evidence of user-authored text.
+    /// Fold the already confirmed preview without changing its source kind.
+    pub fn resume_unchanged(&mut self, selection: Range<usize>) -> Result<(), ProcessingError> {
+        if !self.suspended
+            || selection.start > selection.end
+            || !boundary(&self.confirmed_visible, selection.start)
+            || !boundary(&self.confirmed_visible, selection.end)
+        {
+            return Err(ProcessingError::new("sourceBoundary"));
+        }
+        self.baseline = self.confirmed_visible.clone();
+        self.insertion = selection;
+        self.speech.clear();
+        self.stable = 0;
+        self.suspended = false;
+        Ok(())
     }
 
     /// Only a native, version-checked read may supply this editor baseline.
@@ -524,5 +545,25 @@ mod tests {
         assert_eq!(b.confirmed().1, "周四");
         assert!(b.write().is_none());
         assert!(b.snapshot(true).is_none());
+    }
+    #[test]
+    fn repeated_handoff_and_selection_refresh_do_not_invent_user_text() {
+        let mut b = Block::new("b".into());
+        b.observe("周三开会".into(), 4).unwrap();
+        let first = b.snapshot(false).unwrap();
+        b.accept(first, "周三开会。".into()).unwrap();
+        let (rev, text) = b.write().unwrap();
+        b.acknowledge(rev, text).unwrap();
+        b.handoff();
+        let epoch = b.source_epoch;
+        b.handoff();
+        assert_eq!(b.source_epoch, epoch);
+        b.resume_unchanged(5..5).unwrap();
+        assert_eq!(b.confirmed().1, "周三开会。");
+        assert!(b.snapshot(true).is_none());
+        b.observe("改成周四".into(), 4).unwrap();
+        let next = b.snapshot(true).unwrap();
+        assert_eq!(next.text, "周三开会。改成周四");
+        assert_ne!(next.baseline_kind, BaselineKind::EditorSnapshot);
     }
 }

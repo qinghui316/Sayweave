@@ -428,7 +428,11 @@ async fn bound_preview(
 }
 #[tokio::test]
 async fn manual_edit_rebases_same_block_and_new_speech_never_replays_the_old_turn() {
-    let fixture = Fixture::start(vec![response("周五下午开会。")]);
+    let fixture = Fixture::start(vec![
+        response("周五下午开会。"),
+        response("下周一开会。"),
+        response("下周一下午\n开会。"),
+    ]);
     let root = tempfile::tempdir().unwrap();
     let data = crate::data::DataWorker::start(root.path().to_path_buf()).unwrap();
     let context = Context::fixture(fixture.provider.clone(), fixture.input(), data.clone());
@@ -453,8 +457,8 @@ async fn manual_edit_rebases_same_block_and_new_speech_never_replays_the_old_tur
         .ok()
         .unwrap();
     acknowledge(&actor, &mut state).await;
-    assert_eq!(state.turn, 2);
-    assert!(state.latest.text.is_empty());
+    assert_eq!(state.turn, 1);
+    assert_eq!(state.latest.text, "周三开会");
     let edited = sayweave_text_service::wire::BlockSnapshot {
         id,
         epoch: 1,
@@ -475,8 +479,13 @@ async fn manual_edit_rebases_same_block_and_new_speech_never_replays_the_old_tur
             )
             .is_none()
     );
-    let mut next = snapshot(1, vec![segment(42, "不对改为周五", true)]);
-    next.turn = 2;
+    let next = snapshot(
+        2,
+        vec![
+            segment(1, "周三开会", true),
+            segment(42, "不对改为周五", true),
+        ],
+    );
     actor.observe(&mut state, next);
     state.merge_at = Some(Instant::now() - Duration::from_millis(151));
     actor.start_generation(&mut state).unwrap();
@@ -489,14 +498,14 @@ async fn manual_edit_rebases_same_block_and_new_speech_never_replays_the_old_tur
     assert_eq!(source.draft.as_ref().unwrap().asr_sources[0].segment, 42);
     generated(&mut state).await;
     actor.schedule(&mut state).unwrap();
-    let Command::Block(_, _, request, _, _, reply) = command(&native).await else {
+    let Command::Acquire(_, request, _, _, reply) = command(&native).await else {
         panic!("acquire")
     };
     assert_eq!(
         request.action,
         sayweave_text_service::wire::BlockAction::Acquire
     );
-    let lease = sayweave_text_service::wire::BlockSnapshot {
+    let mut lease = sayweave_text_service::wire::BlockSnapshot {
         id: request.id,
         epoch: 1,
         version: 2,
@@ -509,26 +518,96 @@ async fn manual_edit_rebases_same_block_and_new_speech_never_replays_the_old_tur
     reply
         .send(Ok(block_reply(&actor.task, Some(lease.clone()), true)))
         .unwrap();
-    let Command::Block(_, _, request, text, _, reply) = command(&native).await else {
-        panic!("apply")
-    };
-    assert_eq!(
-        request.action,
-        sayweave_text_service::wire::BlockAction::Apply
-    );
-    assert_eq!(request.lease, 3);
-    assert_eq!(text, "周五下午开会。");
-    let mut delivered = lease;
-    delivered.text = text;
-    delivered.version = 3;
-    delivered.selection_start = 7;
-    delivered.selection_end = 7;
-    reply
-        .send(Ok(block_reply(&actor.task, Some(delivered), true)))
-        .unwrap();
     acknowledge(&actor, &mut state).await;
-    assert_eq!(state.report.raw, "周三开会");
+    assert!(state.draft.is_some());
+    actor.schedule(&mut state).unwrap();
+    let Command::Replace(_, text, _, _, reply) = command(&native).await else {
+        panic!("shared Draft update")
+    };
+    assert_eq!(text, "周五下午开会。");
+    reply.send(Ok(())).unwrap();
+    acknowledge(&actor, &mut state).await;
+    assert!(state.report.raw.is_empty());
     assert!(state.report.text.is_empty());
+    let mut sources = vec![
+        segment(1, "周三开会", true),
+        segment(42, "不对改为周五", true),
+    ];
+    for (round, baseline, spoken, expected) in [
+        (0, "周五开会。", "改成下周一", "下周一开会。"),
+        (1, "下周一\n开会。", "改成下午", "下周一下午\n开会。"),
+    ] {
+        state.revisable.as_mut().unwrap().handoff();
+        state.handoff = true;
+        actor.schedule(&mut state).unwrap();
+        let Command::Finish(_, _, mode, _, _, reply) = command(&native).await else {
+            panic!("later handoff")
+        };
+        assert!(matches!(mode, Finish::Handoff(_)));
+        reply
+            .send(FinishOutcome {
+                delivery: Delivery::not_submitted("editing"),
+                committed: false,
+                handed_off: true,
+                cancelled: false,
+                rollback_failed: false,
+            })
+            .ok()
+            .unwrap();
+        acknowledge(&actor, &mut state).await;
+        let previous = lease.clone();
+        let edited = sayweave_text_service::wire::BlockSnapshot {
+            version: previous.version + 2,
+            lease: previous.lease + 2,
+            text: baseline.into(),
+            selection_start: baseline.encode_utf16().count() as u32,
+            selection_end: baseline.encode_utf16().count() as u32,
+            writable: false,
+            ..previous
+        };
+        actor.native_done(
+            &mut state,
+            &NativeKind::Revisable(revisable::Effect::Read { activity }),
+            NativeValue::block(Ok(block_reply(&actor.task, Some(edited), true))),
+        );
+        assert_eq!(state.turn, 1);
+        // A changed-length revision of absorbed ASR must not restore deleted text.
+        sources[0] = segment(1, "周三下午开会", true);
+        sources.push(segment(43 + round, spoken, true));
+        actor.observe(&mut state, snapshot(3 + round, sources.clone()));
+        state.merge_at = Some(Instant::now() - Duration::from_millis(151));
+        actor.start_generation(&mut state).unwrap();
+        assert_eq!(
+            state.unit.as_ref().unwrap().source().text,
+            format!("{baseline}{spoken}")
+        );
+        generated(&mut state).await;
+        actor.schedule(&mut state).unwrap();
+        let Command::Acquire(_, request, _, _, reply) = command(&native).await else {
+            panic!("later acquire")
+        };
+        lease = sayweave_text_service::wire::BlockSnapshot {
+            id: request.id,
+            epoch: request.epoch,
+            version: request.version,
+            lease: request.lease + 1,
+            text: request.expected,
+            selection_start: request.selection_start,
+            selection_end: request.selection_end,
+            writable: true,
+        };
+        reply
+            .send(Ok(block_reply(&actor.task, Some(lease.clone()), true)))
+            .unwrap();
+        acknowledge(&actor, &mut state).await;
+        actor.schedule(&mut state).unwrap();
+        let Command::Replace(_, text, _, _, reply) = command(&native).await else {
+            panic!("later shared writer")
+        };
+        assert_eq!(text, expected);
+        reply.send(Ok(())).unwrap();
+        acknowledge(&actor, &mut state).await;
+    }
     drop(state);
     drop(actor);
     data.shutdown().await;

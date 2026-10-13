@@ -47,7 +47,7 @@ async function command(file,args){const child=start(file,args);let output='';chi
 function requestFixture(child){let buffer='',pending;child.stdout.on('data',data=>{buffer+=data.toString('utf8');let index;while((index=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,index);buffer=buffer.slice(index+1);if(line&&pending){const resolve=pending;pending=null;resolve(JSON.parse(line));}}});return async value=>{if(pending)throw Error('One owned fixture request at a time');const response=new Promise(resolve=>{pending=resolve;});child.stdin.write(JSON.stringify(value)+'\n');const timeout=wait(5000).then(()=>{throw Error('Owned focus helper timeout');});return Promise.race([response,timeout]);};}
 try{
  if(process.platform!=='win32')throw Error('Windows TSF prefix acceptance requires Windows');
- await command('cargo',['build','--manifest-path','src-tauri/text-service/Cargo.toml','--bin','tsf-probe']);
+ await command('cargo',['build','--manifest-path','src-tauri/text-service/Cargo.toml','--bin','tsf-probe',...(process.env.SAYWEAVE_BLOCK_REGRESSION==='1'?['--features','acceptance']:[])]);
  await command('cargo',['build','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance','--bin','input-fixture']);
  helper=start(path.join(root,'src-tauri/target/debug/input-fixture.exe'),['composition'],{SAYWEAVE_INPUT_ACCEPTANCE:'1'});
  const focus=requestFixture(helper);await wait(400);
@@ -69,6 +69,10 @@ try{
  await page.setContent('<input id="input"><textarea id="area"></textarea><div id="editable" contenteditable="true"></div>');
  const bundle=await build({configFile:false,logLevel:'error',build:{write:false,lib:{entry:path.join(root,'tests/fixtures/input-target.ts'),name:'InputFixture',formats:['iife']}}});
  await page.addScriptTag({content:(Array.isArray(bundle)?bundle[0]:bundle).output[0].code});
+ if(process.env.SAYWEAVE_BLOCK_REGRESSION==='1'){
+  const {runBlockRegression}=await import('./test-richtext-block.mjs');
+  await runBlockRegression({page,pid,focus,start,root,folder,report});
+ }else{
  const cases=[...['input','area','editable','ProseMirror'].map(control=>({control,multiline:false})),...['area','editable','ProseMirror','ProseMirrorInline'].map(control=>({control,multiline:true}))];
  const selected=process.argv[2]==='all'?null:process.argv[2];
  if(selected&&!cases.some(item=>`${item.control}-${item.multiline?'multiline':'single'}`===selected))throw Error('Unknown owned prefix case');
@@ -210,6 +214,7 @@ try{
    report.cases.at(-1).editProtected=interfered&&refused&&actual===protectedText;
    if(!report.cases.at(-1).editProtected)throw Error('Owned external edit was not protected');
   }else if(code!==0||!liveAsr||!firstPrefix||!growingTail||(!abortTail&&!secondPrefix)||actual!==expected||(suffixCase&&!interfered))throw Error('Owned '+control+' actual prefix/tail text assertions failed');
+ }
  }
  report.passed=true;
 }catch(error){report.error=String(error);process.exitCode=1;}

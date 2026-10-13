@@ -3,7 +3,7 @@ use super::*;
 use sha2::{Digest, Sha256};
 
 const MAX_UNITS: usize = 64 * 1024;
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct Fingerprint {
     units: usize,
     hash: [u8; 32],
@@ -73,6 +73,7 @@ pub(super) struct BoundaryProof {
     suffix: ITfRange,
     before: Fingerprint,
     after: Fingerprint,
+    represented: RefCell<Option<(Fingerprint, Fingerprint)>>,
 }
 unsafe fn fingerprint(
     context: &ITfContext,
@@ -111,6 +112,30 @@ unsafe fn fingerprint(
     }
 }
 impl BoundaryProof {
+    fn expected(&self) -> (Fingerprint, Fingerprint) {
+        self.represented
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| (self.before.clone(), self.after.clone()))
+    }
+    // Caller holds the write lock and has just revalidated the immutable
+    // semantic outside proof and original contiguous native anchors. Only a
+    // shrink within that proven range is permitted before this operation.
+    pub(super) unsafe fn follow_verified_representation(
+        &self,
+        context: &ITfContext,
+        block: &ITfRange,
+        ec: u32,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            let mut phase = "blockRepresentationBoundary".into();
+            let current = Self::capture(context, block, ec, &mut phase)?;
+            self.prefix.ShiftEndToRange(ec, block, TF_ANCHOR_START)?;
+            self.suffix.ShiftStartToRange(ec, block, TF_ANCHOR_END)?;
+            *self.represented.borrow_mut() = Some((current.before, current.after));
+            Ok(())
+        }
+    }
     pub(super) unsafe fn follow_owned_write(
         &self,
         context: &ITfContext,
@@ -120,7 +145,8 @@ impl BoundaryProof {
         unsafe {
             let mut phase = "blockGuardCapture".into();
             let current = Self::capture(context, block, ec, &mut phase)?;
-            if current.before != self.before || current.after != self.after {
+            let (before, after) = self.expected();
+            if current.before != before || current.after != after {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             self.prefix
@@ -162,10 +188,11 @@ impl BoundaryProof {
                 suffix,
                 before,
                 after,
+                represented: RefCell::new(None),
             })
         }
     }
-    pub(super) unsafe fn matches(
+    pub(super) unsafe fn anchors_match(
         &self,
         context: &ITfContext,
         block: &ITfRange,
@@ -199,10 +226,25 @@ impl BoundaryProof {
             {
                 return Ok(false);
             }
+            Ok(true)
+        }
+    }
+    pub(super) unsafe fn matches(
+        &self,
+        context: &ITfContext,
+        block: &ITfRange,
+        ec: u32,
+        phase: &mut String,
+    ) -> windows::core::Result<bool> {
+        unsafe {
+            if !self.anchors_match(context, block, ec, phase)? {
+                return Ok(false);
+            }
+            let (expected_before, expected_after) = self.expected();
             *phase = "blockPrefixText".into();
             let before = fingerprint(context, &self.prefix, ec, MAX_UNITS, phase)?;
-            if before != self.before {
-                *phase = self.before.mismatch(&before, "Prefix");
+            if before != expected_before {
+                *phase = expected_before.mismatch(&before, "Prefix");
                 return Ok(false);
             }
             *phase = "blockSuffixText".into();
@@ -210,11 +252,11 @@ impl BoundaryProof {
                 context,
                 &self.suffix,
                 ec,
-                MAX_UNITS - self.before.units,
+                MAX_UNITS - expected_before.units,
                 phase,
             )?;
-            if after != self.after {
-                *phase = self.after.mismatch(&after, "Suffix");
+            if after != expected_after {
+                *phase = expected_after.mismatch(&after, "Suffix");
                 return Ok(false);
             }
             *phase = "block".into();

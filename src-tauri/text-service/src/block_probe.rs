@@ -67,6 +67,9 @@ pub(super) fn run(
     capability: &str,
     module: windows::Win32::Foundation::HMODULE,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("SAYWEAVE_BLOCK_FIXTURE").as_deref() == Ok("unified") {
+        return unified(editor, pipe, capability);
+    }
     let task = uuid::Uuid::new_v4().to_string();
     let id = uuid::Uuid::new_v4().to_string();
     for (operation, revision, action, text) in
@@ -662,4 +665,231 @@ fn timing_cases(
         "block scheduling-failure/retry/queued-stop/late-callback/started-effect-receipt=true"
     );
     Ok(current)
+}
+
+/// Actual native input on the existing owned control, using ordinary Update
+/// after Acquire. Checks are repeated after pumping host notifications.
+fn unified(editor: HWND, pipe: &Pipe, capability: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // These sentinels are outside the owned composition in every round.
+    unsafe {
+        SendMessageW(
+            editor,
+            WM_SETTEXT,
+            None,
+            Some(LPARAM(windows::core::w!("左右").as_ptr() as isize)),
+        );
+        SendMessageW(editor, 0xB1, Some(WPARAM(1)), Some(LPARAM(1)));
+    }
+    pump(Duration::from_millis(30));
+    let task = uuid::Uuid::new_v4().to_string();
+    let mut op = 0;
+    let mut rev = 0;
+    let mut send = |action, text: &str| -> Result<Reply, Box<dyn std::error::Error>> {
+        op += 1;
+        if action == Action::Update {
+            rev += 1;
+        }
+        let reply = exchange(pipe, capability, &task, 1, op, rev, action, text, false)?;
+        if !reply.applied {
+            return Err(format!("unified native {action:?}: {}", reply.code).into());
+        }
+        Ok(reply)
+    };
+    send(Action::Begin, "")?;
+    send(Action::Update, "周三开会")?;
+    drop(send);
+    op += 1;
+    let mut current = snapshot(request(
+        pipe,
+        capability,
+        &task,
+        op,
+        BlockCommand {
+            lease: 0,
+            id: uuid::Uuid::new_v4().to_string(),
+            action: BlockAction::Bind,
+            epoch: 0,
+            version: 0,
+            expected: String::new(),
+            selection_start: 0,
+            selection_end: 0,
+        },
+        "",
+    )?)?;
+    for (round, edit_start, edit_end, typed, expected, updates) in [
+        (
+            0,
+            1,
+            2,
+            "五",
+            "周五开会",
+            vec![
+                "周五开会，不对",
+                "周五开会，不对，改成下周一上午开会",
+                "下周一上午开会",
+            ],
+        ),
+        (
+            1,
+            3,
+            5,
+            "下午",
+            "下周一下午开会",
+            vec!["下周一下午开会，改成三点", "下周一下午三点开会"],
+        ),
+        (
+            2,
+            3,
+            5,
+            "",
+            "下周一三点开会",
+            vec!["下周一三点开会，线上", "下周一三点线上开会"],
+        ),
+        (
+            3,
+            5,
+            5,
+            "\r",
+            "下周一三点\r线上开会",
+            vec!["下周一三点\n线上开会，改成四点", "下周一四点\n线上开会🙂"],
+        ),
+    ] {
+        op += 1;
+        let handoff = exchange(
+            pipe,
+            capability,
+            &task,
+            1,
+            op,
+            rev,
+            Action::Handoff,
+            "",
+            false,
+        )?;
+        if !handoff.applied {
+            return Err(format!("unified handoff: {}", handoff.code).into());
+        }
+        pump(Duration::from_millis(30));
+        unsafe {
+            let typed: Vec<u16> = typed.encode_utf16().chain(Some(0)).collect();
+            SendMessageW(
+                editor,
+                0xB1,
+                Some(WPARAM(edit_start + 1)),
+                Some(LPARAM(edit_end + 1)),
+            );
+            SendMessageW(
+                editor,
+                0xC2,
+                Some(WPARAM(1)),
+                Some(LPARAM(typed.as_ptr() as isize)),
+            );
+            SendMessageW(
+                editor,
+                0xB1,
+                Some(WPARAM(expected.encode_utf16().count() + 1)),
+                Some(LPARAM(expected.encode_utf16().count() as isize + 1)),
+            );
+        }
+        pump(Duration::from_millis(40));
+        if editor_text(editor)?.replace("\r\n", "\r") != format!("左{expected}右") {
+            return Err(format!(
+                "unified user edit {round} differs: {:?}",
+                editor_text(editor)?
+            )
+            .into());
+        }
+        op += 1;
+        current = snapshot(request(
+            pipe,
+            capability,
+            &task,
+            op,
+            command(&current, BlockAction::Read),
+            "",
+        )?)?;
+        if current.text != expected {
+            return Err(format!("unified baseline {round} differs").into());
+        }
+        op += 1;
+        current = snapshot(request(
+            pipe,
+            capability,
+            &task,
+            op,
+            command(&current, BlockAction::Acquire),
+            "",
+        )?)?;
+        for text in updates {
+            op += 1;
+            rev += 1;
+            let reply = exchange(
+                pipe,
+                capability,
+                &task,
+                1,
+                op,
+                rev,
+                Action::Update,
+                text,
+                false,
+            )?;
+            if !reply.applied {
+                return Err(format!("unified write {round}: {}", reply.code).into());
+            }
+            for delay in [0, 30, 70] {
+                pump(Duration::from_millis(delay));
+                // These fixed requests contain no literal U+2028. The shared
+                // writer marks only their requested line breaks until handoff.
+                let actual = editor_text(editor)?
+                    .replace("\r\n", "\n")
+                    .replace(['\r', '\u{2028}'], "\n");
+                if actual != format!("左{text}右") {
+                    return Err(format!(
+                        "unified post-event body {round} delay {delay} differs: {:?}",
+                        editor_text(editor)?
+                    )
+                    .into());
+                }
+            }
+        }
+        println!("unified block round={round} actual_body_checked=true");
+    }
+    op += 1;
+    let done = exchange(
+        pipe,
+        capability,
+        &task,
+        1,
+        op,
+        rev,
+        Action::Handoff,
+        "",
+        false,
+    )?;
+    if !done.applied {
+        return Err("unified final handoff failed".into());
+    }
+    op += 1;
+    if !request(
+        pipe,
+        capability,
+        &task,
+        op,
+        command(&current, BlockAction::Release),
+        "",
+    )?
+    .applied
+    {
+        return Err("unified tracking release failed".into());
+    }
+    pump(Duration::from_millis(100));
+    if editor_text(editor)?
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        != "左下周一四点\n线上开会🙂右"
+    {
+        return Err("unified final body differs".into());
+    }
+    Ok(())
 }

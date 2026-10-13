@@ -58,6 +58,7 @@ pub struct Control {
     requested: watch::Sender<Route>,
     ready: watch::Sender<u64>,
     stopping: Arc<AtomicBool>,
+    input_held: Arc<AtomicBool>,
     transition: Arc<Mutex<()>>,
     draft_activity: Arc<AtomicU64>,
     draft_armed: Arc<AtomicBool>,
@@ -75,6 +76,7 @@ impl Control {
             requested,
             ready,
             stopping: Arc::new(AtomicBool::new(false)),
+            input_held: Arc::new(AtomicBool::new(false)),
             transition: Arc::new(Mutex::new(())),
             draft_activity: Arc::new(AtomicU64::new(0)),
             draft_armed: Arc::new(AtomicBool::new(false)),
@@ -89,6 +91,32 @@ impl Control {
         self.requested.send_replace(Route::default());
         self.ready.send_replace(0);
     }
+    /// Suspend audio admission while retaining the same recognition connection.
+    /// Refreshing an input lease is not a new recognition source turn.
+    pub fn hold_input(&self) {
+        let Ok(_transition) = self.transition.lock() else {
+            return;
+        };
+        self.input_held.store(true, Ordering::Release);
+        self.audio.set(Route::default());
+    }
+    pub fn resume_retained(&self, turn: u64, activity: u64) {
+        let Ok(_transition) = self.transition.lock() else {
+            return;
+        };
+        if self.stopping() {
+            return;
+        }
+        self.input_held.store(false, Ordering::Release);
+        let route = Route { turn, activity };
+        if self.requested.borrow().turn == turn && *self.ready.borrow() == turn {
+            self.requested.send_replace(route);
+            self.audio.set(route);
+        } else {
+            self.audio.set(Route::default());
+            self.requested.send_replace(route);
+        }
+    }
     pub fn resume(&self, turn: u64, activity: u64) {
         let Ok(_transition) = self.transition.lock() else {
             return;
@@ -96,6 +124,7 @@ impl Control {
         if self.stopping() {
             return;
         }
+        self.input_held.store(false, Ordering::Release);
         self.audio.set(Route::default());
         self.requested.send_replace(Route { turn, activity });
     }
@@ -187,7 +216,9 @@ impl Control {
             return;
         };
         if !self.stopping() && *self.requested.borrow() == route {
-            self.audio.set(route);
+            if !self.input_held.load(Ordering::Acquire) {
+                self.audio.set(route);
+            }
             self.ready.send_replace(route.turn);
             self.trace(route.turn, "ready");
         }
@@ -569,6 +600,28 @@ impl Drop for Continuous {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_connection_ready_cannot_reopen_audio_during_proof() {
+        let control = Control::new(Arc::new(AtomicU64::new(0)));
+        let route = Route {
+            turn: 1,
+            activity: 0,
+        };
+        control.resume(1, 0);
+        control.hold_input();
+        // Opening a socket can complete after the editor revoked the lease.
+        control.enabled(route);
+        assert_eq!(control.audio.current(), 0);
+        assert_eq!(*control.ready.borrow(), 1);
+        assert_eq!(control.requested.borrow().turn, 1);
+        control.resume_retained(1, 0);
+        assert_eq!(control.audio.current(), 1);
+        assert_eq!(*control.ready.borrow(), 1);
+        control.request_finish();
+        control.hold_input();
+        control.resume_retained(1, 0);
+        assert_eq!(control.audio.current(), 0);
+    }
     #[test]
     fn edit_evidence_retains_raw_history_before_async_handoff() {
         let evidence = Arc::new(AtomicU64::new(3));

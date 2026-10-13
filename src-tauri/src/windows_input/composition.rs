@@ -30,6 +30,13 @@ mod retirement;
 use retirement::{Retirement, WorkerCompletion};
 
 pub(crate) enum Command {
+    Acquire(
+        u64,
+        BlockCommand,
+        Arc<AtomicBool>,
+        u64,
+        oneshot::Sender<Result<Reply, Error>>,
+    ),
     Block(
         u64,
         Option<Anchor>,
@@ -177,6 +184,34 @@ pub struct Draft {
     closed: AtomicBool,
     source_sequence: AtomicU64,
 }
+pub(crate) enum ReacquireOutcome {
+    Ready {
+        draft: Arc<Draft>,
+        snapshot: BlockSnapshot,
+    },
+    AwaitingProof,
+    Invalidated,
+    Uncertain,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockRefusal {
+    AwaitingProof,
+    Invalidated,
+    Uncertain,
+}
+pub(crate) fn block_refusal(reply: &Reply) -> BlockRefusal {
+    if reply.mutation != Mutation::NotAttempted {
+        BlockRefusal::Uncertain
+    } else if reply.code.starts_with("blockAwaitingRepresentation:")
+        || reply.code.starts_with("blockInputMethodBusy:")
+        || reply.code.starts_with("blockSnapshotChanged:")
+        || reply.code.ends_with(":80040500")
+    {
+        BlockRefusal::AwaitingProof
+    } else {
+        BlockRefusal::Invalidated
+    }
+}
 /// One apartment, activation lease and authenticated pipe for the entire session.
 /// Editing retires only the range; it does not toggle the process-wide TSF service.
 pub(crate) struct Connection {
@@ -184,6 +219,53 @@ pub(crate) struct Connection {
     retirement: Arc<Retirement>,
 }
 impl Connection {
+    pub(crate) async fn reacquire_block(
+        self: &Arc<Self>,
+        turn: u64,
+        snapshot: BlockSnapshot,
+        permit: Arc<AtomicBool>,
+        remaining: Duration,
+    ) -> Result<ReacquireOutcome, Error> {
+        let request = BlockCommand {
+            action: BlockAction::Acquire,
+            id: snapshot.id.clone(),
+            epoch: snapshot.epoch,
+            version: snapshot.version,
+            lease: snapshot.lease,
+            expected: snapshot.text.clone(),
+            selection_start: snapshot.selection_start,
+            selection_end: snapshot.selection_end,
+        };
+        let deadline = unsafe { GetTickCount64() }
+            .saturating_add(remaining.as_millis().min(u64::MAX as u128) as u64);
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Command::Acquire(turn, request, permit, deadline, send))
+            .map_err(|_| Error::new("compositionWorker"))?;
+        let reply = receive
+            .await
+            .map_err(|_| Error::new("compositionWorker"))??;
+        if !reply.applied {
+            return Ok(match block_refusal(&reply) {
+                BlockRefusal::AwaitingProof => ReacquireOutcome::AwaitingProof,
+                BlockRefusal::Invalidated => ReacquireOutcome::Invalidated,
+                BlockRefusal::Uncertain => ReacquireOutcome::Uncertain,
+            });
+        }
+        let snapshot = reply
+            .block
+            .filter(|b| b.writable)
+            .ok_or_else(|| Error::new("compositionProtocol"))?;
+        Ok(ReacquireOutcome::Ready {
+            draft: Arc::new(Draft {
+                connection: self.clone(),
+                turn,
+                closed: AtomicBool::new(false),
+                source_sequence: AtomicU64::new(0),
+            }),
+            snapshot,
+        })
+    }
     pub(crate) async fn block(
         &self,
         turn: u64,
@@ -291,7 +373,11 @@ impl Draft {
                     pump();
                     match commands.recv_timeout(Duration::from_millis(5)) {
                         Ok(Command::Block(turn,anchor,command,text,permit,reply))=>{
-                            let result=host.block(turn,anchor,command,&text,&permit);
+                            let result=host.block(turn,anchor,command,&text,&permit,None);
+                            let _=reply.send(result);
+                        },
+                        Ok(Command::Acquire(turn,command,permit,deadline,reply))=>{
+                            let result=host.block(turn,None,command,"",&permit,Some(deadline));
                             let _=reply.send(result);
                         },
                         Ok(Command::Observe(sink,reply))=>{let ready=host.observe(sink);let _=reply.send(ready);},
@@ -554,6 +640,7 @@ impl Host {
         command: BlockCommand,
         text: &str,
         permit: &AtomicBool,
+        deadline: Option<u64>,
     ) -> Result<Reply, Error> {
         if let Some(anchor) = anchor {
             if self.range_open
@@ -582,7 +669,7 @@ impl Host {
             None,
             matches!(action, BlockAction::Read | BlockAction::Release),
             Some(permit),
-            Some(command),
+            Some((command, deadline)),
         )?;
         if reply.applied {
             if action == BlockAction::Release {
@@ -593,6 +680,18 @@ impl Host {
             if action == BlockAction::Apply {
                 self.text = text.into();
                 self.visible = true;
+            }
+            if action == BlockAction::Acquire {
+                self.text = reply
+                    .block
+                    .as_ref()
+                    .ok_or_else(|| Error::new("compositionProtocol"))?
+                    .text
+                    .clone();
+                self.range_open = true;
+                self.visible = true;
+                self.failure = None;
+                self.settled_empty_revision = None;
             }
         }
         Ok(reply)
@@ -1167,8 +1266,11 @@ impl Host {
         prefix: Option<Prefix>,
         cleanup: bool,
         permission: Option<&AtomicBool>,
-        block: Option<BlockCommand>,
+        block: Option<(BlockCommand, Option<u64>)>,
     ) -> Result<Reply, Error> {
+        let (block, deadline) = block.map_or((None, None), |(command, deadline)| {
+            (Some(command), deadline)
+        });
         self.transport_attempted = false;
         self.acknowledge_receipt()?;
         let optional = matches!(
@@ -1185,7 +1287,11 @@ impl Host {
             super::native::composition_begin_target(&self.task, &self.anchor)?;
         }
         self.operation += 1;
-        if matches!(action, Action::Update | Action::Settle) {
+        if matches!(action, Action::Update | Action::Settle)
+            || block
+                .as_ref()
+                .is_some_and(|b| b.action == BlockAction::Apply)
+        {
             self.revision += 1;
         }
         let request = Request {
@@ -1198,7 +1304,9 @@ impl Host {
             turn: self.turn,
             operation: self.operation,
             revision: self.revision,
-            deadline_tick: unsafe { GetTickCount64() } + 2000,
+            deadline_tick: deadline
+                .unwrap_or(u64::MAX)
+                .min(unsafe { GetTickCount64() } + 2000),
             action,
             text: text.into(),
             prefix,
@@ -1443,8 +1551,6 @@ impl Host {
             .and_then(|r| {
                 if r.applied {
                     Ok(())
-                } else if permit.is_some() && r.mutation == Mutation::NotAttempted {
-                    Err(Error::new("staleSnapshot"))
                 } else if r.mutation != Mutation::NotAttempted {
                     Err(Error::new("compositionPartial"))
                 } else {
@@ -1453,11 +1559,12 @@ impl Host {
             });
         if result.is_ok() {
             self.text = text.into();
-        } else if result
-            .as_ref()
-            .err()
-            .is_some_and(|e| e.code != "staleSnapshot")
-        {
+        } else if result.as_ref().err().is_some_and(|e| {
+            !matches!(
+                e.code.as_str(),
+                "staleSnapshot" | "editing" | "inputComposition" | "selectionMapping"
+            )
+        }) {
             self.failure = result.as_ref().err().map(|e| e.code.clone());
         }
         result
@@ -1599,7 +1706,7 @@ impl Host {
                 selection_start: 0,
                 selection_end: 0,
             };
-            self.block(self.turn, None, command, "", &AtomicBool::new(true))
+            self.block(self.turn, None, command, "", &AtomicBool::new(true), None)
                 .and_then(|r| {
                     if r.applied {
                         Ok(())
@@ -1648,6 +1755,20 @@ fn completed_prefix(receipt: Option<u64>, revision: u64, stored: &str, requested
     receipt == Some(revision) && stored.is_empty() && requested.is_empty()
 }
 fn reply_error(code: &str) -> &'static str {
+    if code.starts_with("edit:selectionMapping:") {
+        return "selectionMapping";
+    }
+    if [
+        "edit:expected:",
+        "edit:selection:",
+        "edit:lease:",
+        "edit:updateLease:",
+    ]
+    .iter()
+    .any(|prefix| code.starts_with(prefix))
+    {
+        return "editing";
+    }
     if code == "keyboardHandoffFailed" {
         return "compositionHandoffFailed";
     }
@@ -1717,6 +1838,28 @@ fn pump() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn block_refusals_keep_wait_boundary_and_uncertain_effect_separate() {
+        let mut reply: Reply = serde_json::from_value(serde_json::json!({
+            "engine":{"proxy_instance":uuid::Uuid::new_v4().to_string(),"engine_generation":1},
+            "task":uuid::Uuid::new_v4().to_string(),"turn":1,"operation":1,"revision":1,
+            "applied":false,"code":"blockAwaitingRepresentation:80040500","mutation":"notAttempted"
+        }))
+        .unwrap();
+        for phase in [
+            "blockAwaitingRepresentation",
+            "blockInputMethodBusy",
+            "blockSnapshotChanged",
+        ] {
+            reply.code = format!("{phase}:80040500:diagnostic");
+            assert_eq!(block_refusal(&reply), BlockRefusal::AwaitingProof);
+        }
+        reply.code = "blockScopeInvalid:800401fd".into();
+        assert_eq!(block_refusal(&reply), BlockRefusal::Invalidated);
+        reply.code = "blockSnapshotChanged:80040500".into();
+        reply.mutation = Mutation::Uncertain;
+        assert_eq!(block_refusal(&reply), BlockRefusal::Uncertain);
+    }
     #[test]
     fn ack_wait_preserves_current_write_and_late_optional_identity() {
         let engine = EngineBinding {

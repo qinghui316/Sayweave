@@ -1,5 +1,6 @@
 //! Pure source units and prompt/quality policies. No windows, capture or database.
 pub mod draft;
+pub mod draft_source;
 pub mod prompt;
 pub mod quality;
 pub mod render;

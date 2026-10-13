@@ -7,6 +7,41 @@ use windows::{
     },
     core::{IUnknown, Interface, Result},
 };
+#[path = "block_representation.rs"]
+mod block_representation;
+
+/// Immutable outside semantic evidence, subordinate to native anchor continuity.
+#[derive(Clone)]
+pub(super) struct SemanticBoundary {
+    identity: IUnknown,
+    before: SemanticFingerprint,
+    after: SemanticFingerprint,
+}
+#[derive(Clone, PartialEq, Eq)]
+struct SemanticFingerprint {
+    bytes: usize,
+    hash: [u8; 32],
+}
+impl SemanticFingerprint {
+    fn of(text: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            bytes: text.len(),
+            hash: Sha256::digest(text.as_bytes()).into(),
+        }
+    }
+}
+pub(super) struct SemanticBlock {
+    pub text: String,
+    pub native_end: i32,
+    pub selection_start: u32,
+    pub selection_end: u32,
+    pub boundary: SemanticBoundary,
+}
+pub(super) enum BlockReadError {
+    Unproven,
+    OutsideScope,
+}
 
 struct Array(*mut SAFEARRAY);
 /// Identity-only focus evidence. No name, value, text, URL or title is read.
@@ -28,6 +63,11 @@ enum FragmentIdentity {
     Window(usize),
 }
 impl FocusIdentity {
+    pub(super) fn native_identity_text(&self) -> bool {
+        // Only the explicitly identified native controls use TSF text itself
+        // as semantic text. A failed rich-text provider read is not evidence.
+        self.object.is_none()
+    }
     pub(super) fn capture() -> Result<Self> {
         unsafe {
             let window = GetFocus();
@@ -320,6 +360,47 @@ pub struct Evidence {
     pub end: i32,
 }
 impl Evidence {
+    pub(super) fn semantic_block(
+        &self,
+        start: i32,
+        end: i32,
+        original: Option<&SemanticBoundary>,
+    ) -> std::result::Result<SemanticBlock, BlockReadError> {
+        let mapping = block_representation::map(
+            &self.all,
+            &self.tsf,
+            start,
+            end,
+            original.is_some_and(|v| v.after.bytes == 0),
+        )
+        .ok_or(BlockReadError::Unproven)?;
+        let boundary = SemanticBoundary {
+            identity: self.identity.clone(),
+            before: SemanticFingerprint::of(&self.all[..mapping.start]),
+            after: SemanticFingerprint::of(&self.all[mapping.end..]),
+        };
+        if original.is_some_and(|old| {
+            old.identity != boundary.identity
+                || old.before != boundary.before
+                || old.after != boundary.after
+        }) {
+            return Err(BlockReadError::OutsideScope);
+        }
+        let selected_start = self.before.len();
+        let selected_end = selected_start + self.picked.len();
+        if selected_start < mapping.start || selected_end > mapping.end {
+            return Err(BlockReadError::OutsideScope);
+        }
+        Ok(SemanticBlock {
+            text: self.all[mapping.start..mapping.end].into(),
+            native_end: mapping.native_end,
+            selection_start: self.all[mapping.start..selected_start]
+                .encode_utf16()
+                .count() as u32,
+            selection_end: self.all[mapping.start..selected_end].encode_utf16().count() as u32,
+            boundary,
+        })
+    }
     // Diagnostic only. Coordinates never create or move a native write range.
     pub(super) fn block_projection(&self, start: i32, end: i32) -> BlockProjection {
         use sha2::{Digest, Sha256};

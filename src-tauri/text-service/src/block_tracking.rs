@@ -5,6 +5,8 @@ use unicode_segmentation::UnicodeSegmentation;
 #[path = "block_boundary.rs"]
 mod boundary;
 use boundary::BoundaryProof;
+#[path = "block_content.rs"]
+mod content;
 #[path = "block_evidence.rs"]
 mod evidence;
 
@@ -33,6 +35,9 @@ struct Data {
     lease: u64,
     writing: bool,
     evidence: evidence::Record,
+    semantic_boundary: Option<initial_selection::SemanticBoundary>,
+    pending_proof: bool,
+    reacquired: bool,
 }
 impl Drop for Track {
     fn drop(&mut self) {
@@ -62,27 +67,34 @@ pub(super) unsafe fn owned_update(
     context: &ITfContext,
     range: &ITfRange,
     ec: u32,
-) -> Option<OwnedUpdate> {
+) -> windows::core::Result<Option<OwnedUpdate>> {
     let track = {
         let state = shared.borrow();
-        let track = state.block.clone()?;
+        let Some(track) = state.block.clone() else {
+            return Ok(None);
+        };
         if state.context.as_ref() != Some(context)
             || state.composition.is_none()
             || state.version.task != track.task
         {
-            return None;
+            return Err(failure(TF_E_DISCONNECTED));
         }
         track
     };
     if !track.data.borrow().valid || track.data.borrow().writing {
-        return None;
+        return Err(failure(TF_E_DISCONNECTED));
     }
     let matched = (|| unsafe {
         let mut phase = "blockOwnedBaseline".into();
-        let snapshot = track.snapshot(ec, &mut phase)?;
+        if let Some(boundary) = &track.boundary
+            && !boundary.matches(context, &track.range, ec, &mut phase)?
+        {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        let raw = track.data.borrow().text.clone();
         if track.range.CompareStart(ec, range, TF_ANCHOR_START)? != 0
             || track.range.CompareEnd(ec, range, TF_ANCHOR_END)? != 0
-            || range_text(range, ec)? != snapshot.text
+            || range_text(range, ec)? != raw
         {
             return Err(failure(TF_E_DISCONNECTED));
         }
@@ -95,15 +107,15 @@ pub(super) unsafe fn owned_update(
         }
         data.valid = false;
         data.writable = false;
-        return None;
+        return Err(failure(TF_E_DISCONNECTED));
     }
     let version = data.version;
     drop(data);
-    Some(OwnedUpdate {
+    Ok(Some(OwnedUpdate {
         track,
         version,
         armed: std::cell::Cell::new(false),
-    })
+    }))
 }
 impl OwnedUpdate {
     pub(super) fn arm(&self) -> bool {
@@ -262,6 +274,9 @@ impl Track {
                 lease: 0,
                 writing: false,
                 evidence: evidence::Record::default(),
+                semantic_boundary: None,
+                pending_proof: false,
+                reacquired: false,
             }));
             let sink: ITfTextEditSink = Sink {
                 field: field.clone(),
@@ -310,6 +325,13 @@ impl Track {
                 boundary,
                 _lease: Lease::new(),
             };
+            // Capture outside semantic evidence only while the original owned
+            // range is known. A later failed read cannot invent this baseline.
+            if let Ok((_, boundary)) =
+                content::capture(context, &track.range, &track.field, None, ec, 1)
+            {
+                track.data.borrow_mut().semantic_boundary = Some(boundary);
+            }
             evidence::capture(
                 context,
                 &track.range,
@@ -319,6 +341,70 @@ impl Track {
                 ("bind", "block", None),
             );
             Ok(track)
+        }
+    }
+
+    unsafe fn verified_content(
+        &self,
+        ec: u32,
+        phase: &mut String,
+    ) -> windows::core::Result<content::VerifiedBlockContent> {
+        unsafe {
+            let (version, original) = {
+                let data = self.data.borrow();
+                (data.version, data.semantic_boundary.clone())
+            };
+            if let Some(boundary) = &self.boundary
+                && !boundary.anchors_match(&self.context, &self.range, ec, phase)?
+            {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            if let Some(original) = original {
+                *phase = "blockAwaitingRepresentation".into();
+                let (verified, _) = content::capture(
+                    &self.context,
+                    &self.range,
+                    &self.field,
+                    Some(&original),
+                    ec,
+                    version,
+                )
+                .inspect_err(|error| {
+                    if error.code() == TF_E_DISCONNECTED {
+                        *phase = "blockScopeInvalid".into();
+                        let mut data = self.data.borrow_mut();
+                        data.valid = false;
+                        data.writable = false;
+                        data.invalid_reason.clone_from(phase);
+                    }
+                })?;
+                if self.data.borrow().version != version || !self.data.borrow().valid {
+                    return Err(failure(TF_E_DISCONNECTED));
+                }
+                return Ok(verified);
+            }
+            // Native controls without a semantic provider retain strict raw
+            // boundaries. Missing semantic evidence never relaxes a mismatch.
+            if !self.field.native_identity_text() {
+                *phase = "blockAwaitingRepresentation".into();
+                return Err(failure(TF_E_LOCKED));
+            }
+            if let Some(boundary) = &self.boundary
+                && !boundary.matches(&self.context, &self.range, ec, phase)?
+            {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            let native_text = range_text(&self.range, ec)?;
+            let (selection_start, selection_end) =
+                relative_selection(&self.context, &self.range, ec)?;
+            Ok(content::VerifiedBlockContent {
+                semantic_text: native_text.clone(),
+                native_text,
+                native_end: range_position(&self.context, &self.range, ec)?.end,
+                selection_start,
+                selection_end,
+                content_version: version,
+            })
         }
     }
 
@@ -352,37 +438,37 @@ impl Track {
             {
                 return Err(failure(E_ACCESSDENIED));
             }
-            *phase = "blockSnapshotText".into();
-            let text = range_text(&self.range, ec)?;
-            *phase = "blockSnapshotSelection".into();
-            let (selection_start, selection_end) =
-                relative_selection(&self.context, &self.range, ec)?;
-            *phase = "blockSnapshotBoundary".into();
-            if let Some(boundary) = &self.boundary
-                && !boundary.matches(&self.context, &self.range, ec, phase)?
-            {
-                return Err(failure(TF_E_DISCONNECTED));
-            }
+            let verified = self.verified_content(ec, phase)?;
+            let text = verified.native_text;
+            let selection_start = verified.selection_start;
+            let selection_end = verified.selection_end;
             *phase = "blockSnapshotField".into();
             if !self.field.matches()? {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             *phase = "blockSnapshotVersion".into();
-            let data = self.data.borrow();
+            let mut data = self.data.borrow_mut();
             if !data.valid {
                 *phase = data.invalid_reason.clone();
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            if data.version != version || text.is_empty() || data.text != text {
+            if data.version != version || verified.semantic_text.is_empty() {
                 return Err(failure(TF_E_DISCONNECTED));
             }
+            if data.text != text {
+                data.text = text;
+                data.version += 1;
+                data.writable = false;
+                data.lease += 1;
+            }
+            data.pending_proof = false;
             *phase = "block".into();
             Ok(BlockSnapshot {
                 lease: data.lease,
                 id: data.id.clone(),
                 epoch: data.epoch,
-                version,
-                text,
+                version: data.version,
+                text: verified.semantic_text,
                 selection_start,
                 selection_end,
                 writable: data.writable,
@@ -481,8 +567,13 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                 if data.valid {
                     data.invalid_reason = phase.clone();
                 }
-                data.valid = false;
+                let representation_pending = data.semantic_boundary.is_some()
+                    && (phase.starts_with("blockSuffixText:")
+                        || phase.starts_with("blockPrefixText:"));
+                data.pending_proof = representation_pending;
+                data.valid = representation_pending;
                 data.writable = false;
+                data.lease += 1;
             }
         }
         drop(data);
@@ -757,6 +848,282 @@ pub(super) fn dispatch(shared: &Shared, request: &Request, connection: u64) {
     }
 }
 
+#[implement(ITfCompositionSink)]
+struct AcquisitionSink {
+    delegate: ITfCompositionSink,
+    published: Rc<Cell<bool>>,
+    terminated: Rc<Cell<bool>>,
+    _lease: Lease,
+}
+
+#[cfg(test)]
+mod acquisition_tests {
+    use super::*;
+    #[implement(ITfCompositionSink)]
+    struct Delegate(Rc<Cell<u32>>);
+    impl ITfCompositionSink_Impl for Delegate_Impl {
+        fn OnCompositionTerminated(
+            &self,
+            _: u32,
+            _: Ref<ITfComposition>,
+        ) -> windows::core::Result<()> {
+            self.0.set(self.0.get() + 1);
+            Ok(())
+        }
+    }
+    #[test]
+    fn synchronous_termination_is_retained_before_publication() {
+        let callbacks = Rc::new(Cell::new(0));
+        let published = Rc::new(Cell::new(false));
+        let terminated = Rc::new(Cell::new(false));
+        let sink: ITfCompositionSink = AcquisitionSink {
+            delegate: Delegate(callbacks.clone()).into(),
+            published: published.clone(),
+            terminated: terminated.clone(),
+            _lease: Lease::new(),
+        }
+        .into();
+        unsafe {
+            sink.OnCompositionTerminated(0, None).unwrap();
+        }
+        assert!(terminated.get());
+        assert_eq!(callbacks.get(), 0);
+        published.set(true);
+        unsafe {
+            sink.OnCompositionTerminated(0, None).unwrap();
+        }
+        assert_eq!(callbacks.get(), 1);
+    }
+}
+impl ITfCompositionSink_Impl for AcquisitionSink_Impl {
+    fn OnCompositionTerminated(
+        &self,
+        ec: u32,
+        composition: Ref<ITfComposition>,
+    ) -> windows::core::Result<()> {
+        let _callback = Callback::enter();
+        if !self.published.get() {
+            // The provider can terminate the composition before returning its
+            // object. No unregistered object may become a live Draft afterward.
+            self.terminated.set(true);
+            return Ok(());
+        }
+        unsafe {
+            self.delegate
+                .OnCompositionTerminated(ec, composition.as_ref())
+        }
+    }
+}
+
+unsafe fn acquire_composition(
+    edit: &EditBlock_Impl,
+    track: &Track,
+    snapshot: &BlockSnapshot,
+    ec: u32,
+    mutation: &mut Mutation,
+    phase: &mut String,
+    acquired_epoch: &mut Option<u64>,
+) -> windows::core::Result<()> {
+    unsafe {
+        let shared = &edit.shared;
+        let r = &edit.request;
+        let context = &edit.context;
+        let verified = track.verified_content(ec, phase)?;
+        if verified.semantic_text != snapshot.text
+            || verified.content_version != snapshot.version
+            || verified.selection_start != snapshot.selection_start
+            || verified.selection_end != snapshot.selection_end
+        {
+            *phase = "blockSnapshotChanged".into();
+            return Err(failure(TF_E_LOCKED));
+        }
+        let original = range_position(context, &track.range, ec)?;
+        if verified.native_end < original.start || verified.native_end > original.end {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        // Last paired read precedes any range change. No text is changed here.
+        if track.verified_content(ec, phase)? != verified {
+            return Err(failure(TF_E_LOCKED));
+        }
+        edit_authorized(shared, r, edit.connection, edit.generation)?;
+        if verified.native_end != original.end {
+            let mut moved = 0;
+            let delta = verified.native_end - original.end;
+            track
+                .range
+                .ShiftEnd(ec, delta, &mut moved, std::ptr::null())?;
+            if moved != delta {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+        }
+        if let Some(boundary) = &track.boundary {
+            boundary.follow_verified_representation(context, &track.range, ec)?;
+        }
+        let native = range_text(&track.range, ec)?;
+        let text = CompositionText::from_verified(&verified.semantic_text, &native)
+            .ok_or_else(|| failure(TF_E_LOCKED))?;
+        let selected = selection(context, ec)?;
+        let selected_position = range_position(context, &selected, ec)?;
+        edit_authorized(shared, r, edit.connection, edit.generation)?;
+        let epoch = COMPOSITION_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
+        let text_sink: ITfTextEditSink = TextSink {
+            state: shared.clone(),
+            epoch,
+            _lease: Lease::new(),
+        }
+        .into();
+        let source: ITfSource = context.cast()?;
+        let cookie = source.AdviseSink(&ITfTextEditSink::IID, &text_sink)?;
+        if let Err(error) = edit_authorized(shared, r, edit.connection, edit.generation) {
+            let _ = source.UnadviseSink(cookie);
+            return Err(error);
+        }
+        {
+            let mut state = shared.borrow_mut();
+            if state.composition.is_some() || state.text_cookie.is_some() || state.version.owned {
+                drop(state);
+                let _ = source.UnadviseSink(cookie);
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            state.epoch = epoch;
+            *acquired_epoch = Some(epoch);
+            state.context = Some(context.clone());
+            state.text_cookie = Some(cookie);
+            state.expected = native.clone();
+            state.text = Some(text);
+            state.selection = Some(selected);
+            state.backup = None; // Reacquisition can never erase the user's baseline.
+            state.prepared = None;
+            state.empty_range = None;
+            state.native_position = None;
+            state.own_change = None;
+            state.ownership_loss = None;
+            state.ownership_detail = None;
+            state.key_handoff = false;
+            state.materialize_allowed = true;
+            state.preserved_attributes.clear();
+            state.version = DraftVersion {
+                task: r.task.clone(),
+                turn: r.turn,
+                revision: r.revision,
+                operation: r.operation,
+                owned: true,
+            };
+        }
+        *phase = "blockStartComposition".into();
+        *mutation = Mutation::Uncertain;
+        let delegate: ITfCompositionSink = CompositionSink {
+            state: shared.clone(),
+            epoch,
+            _lease: Lease::new(),
+        }
+        .into();
+        let published = Rc::new(Cell::new(false));
+        let terminated = Rc::new(Cell::new(false));
+        let sink: ITfCompositionSink = AcquisitionSink {
+            delegate,
+            published: published.clone(),
+            terminated: terminated.clone(),
+            _lease: Lease::new(),
+        }
+        .into();
+        let owner: ITfContextComposition = context.cast()?;
+        // The Windows wrapper rejects a successful HRESULT with a null object.
+        let composition = owner.StartComposition(ec, &track.range, &sink)?;
+        // StartComposition may synchronously terminate the candidate or reenter
+        // the service. Never attach its returned object to a newer owner.
+        let still_owned = {
+            let state = shared.borrow();
+            !terminated.get()
+                && state.epoch == epoch
+                && state.generation == edit.generation
+                && state.version.owned
+                && state.version.operation == r.operation
+                && state.version.task == r.task
+                && state.composition.is_none()
+        };
+        if !still_owned {
+            // This object is ours, but it cannot authorize a write. Retain it
+            // for the existing retirement path if ending it fails.
+            if composition.EndComposition(ec).is_err() {
+                let mut state = shared.borrow_mut();
+                if state.epoch == epoch && state.composition.is_none() {
+                    state.composition = Some(composition);
+                }
+            }
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        shared.borrow_mut().composition = Some(composition.clone());
+        published.set(true);
+        edit_authorized(shared, r, edit.connection, edit.generation)?;
+        let actual = composition.GetRange()?;
+        if actual.CompareStart(ec, &track.range, TF_ANCHOR_START)? != 0
+            || actual.CompareEnd(ec, &track.range, TF_ANCHOR_END)? != 0
+            || range_text(&actual, ec)? != native
+        {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        let after_selection = range_position(context, &selection(context, ec)?, ec)?;
+        if after_selection.start != selected_position.start
+            || after_selection.end != selected_position.end
+            || track.data.borrow().lease != snapshot.lease
+        {
+            *phase = "blockSnapshotChanged".into();
+            *mutation = Mutation::NotAttempted;
+            return Err(failure(TF_E_LOCKED));
+        }
+        edit_authorized(shared, r, edit.connection, edit.generation)?;
+        let mut data = track.data.borrow_mut();
+        if !data.valid || data.version != snapshot.version {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        data.text = native;
+        data.lease += 1;
+        data.writable = true;
+        data.reacquired = true;
+        *mutation = Mutation::NotAttempted;
+        Ok(())
+    }
+}
+
+pub(super) unsafe fn selection_for_write(
+    shared: &Shared,
+    context: &ITfContext,
+    range: &ITfRange,
+    ec: u32,
+    next: &str,
+) -> windows::core::Result<Option<u32>> {
+    unsafe {
+        let (track, before) = {
+            let state = shared.borrow();
+            let Some(track) = state.block.clone() else {
+                return Ok(None);
+            };
+            if !track.data.borrow().reacquired {
+                return Ok(None);
+            }
+            (
+                track,
+                state
+                    .text
+                    .clone()
+                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
+            )
+        };
+        if !track.data.borrow().valid {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        let native = range_text(range, ec)?;
+        let (_, end) = relative_selection(context, range, ec)?;
+        let at = before
+            .position(&native, end, false)
+            .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
+        map_endpoint(&before.semantic, next, at)
+            .map(Some)
+            .ok_or_else(|| failure(TF_E_DISCONNECTED))
+    }
+}
+
 #[implement(ITfEditSession)]
 struct EditBlock {
     generation: u64,
@@ -771,6 +1138,7 @@ impl ITfEditSession_Impl for EditBlock_Impl {
         let _callback = Callback::enter();
         let mut mutation = Mutation::NotAttempted;
         let mut phase = "block".into();
+        let mut acquired_epoch = None;
         let result = (|| unsafe {
             let shared = &self.shared;
             let r = &self.request;
@@ -795,7 +1163,7 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                     || state.version.task != r.task
                     || state.version.turn != r.turn
                     || state.block.is_some()
-                    || state.expected != snapshot.text
+                    || state.expected != track.data.borrow().text
                 {
                     return Err(failure(TF_E_DISCONNECTED));
                 }
@@ -816,12 +1184,13 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             if matches!(command.action, BlockAction::Acquire | BlockAction::Apply) {
+                phase = "blockSnapshotChanged".into();
                 if snapshot.version != command.version
                     || snapshot.text != command.expected
                     || snapshot.selection_start != command.selection_start
                     || snapshot.selection_end != command.selection_end
-                    || shared.borrow().version.owned
-                    || shared.borrow().composition.is_some()
+                    || (command.action == BlockAction::Acquire
+                        && (shared.borrow().version.owned || shared.borrow().composition.is_some()))
                 {
                     return Err(failure(TF_E_DISCONNECTED));
                 }
@@ -831,7 +1200,8 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                 owner
                     .EnumCompositions()?
                     .Next(&mut compositions, &mut fetched)?;
-                if fetched != 0 {
+                if command.action == BlockAction::Acquire && fetched != 0 {
+                    phase = "blockInputMethodBusy".into();
                     return Err(failure(TF_E_LOCKED));
                 }
             }
@@ -847,9 +1217,24 @@ impl ITfEditSession_Impl for EditBlock_Impl {
             track.data.borrow_mut().operation = r.operation;
             match command.action {
                 BlockAction::Acquire => {
-                    let mut data = track.data.borrow_mut();
-                    data.lease += 1;
-                    data.writable = true;
+                    acquire_composition(
+                        self,
+                        &track,
+                        &snapshot,
+                        ec,
+                        &mut mutation,
+                        &mut phase,
+                        &mut acquired_epoch,
+                    )?;
+                    // Do not re-read UIA inside compositionstart. The exact native
+                    // readback above confirms this acquisition; later writes
+                    // still require the normal live Draft lease.
+                    let data = track.data.borrow();
+                    return Ok(BlockSnapshot {
+                        lease: data.lease,
+                        writable: true,
+                        ..snapshot
+                    });
                 }
                 BlockAction::Apply => {
                     if !track.data.borrow().writable
@@ -858,63 +1243,41 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                     {
                         return Err(failure(TF_E_DISCONNECTED));
                     }
-                    // Only map endpoints outside the changed interval. An
-                    // ambiguous caret refuses the replacement before SetText.
-                    phase = "blockSelectionMapping".into();
-                    let end = map_endpoint(&snapshot.text, &r.text, snapshot.selection_end)
+                    let composition = shared
+                        .borrow()
+                        .composition
+                        .clone()
                         .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
-                    phase = "block".into();
-                    let before = track.snapshot(ec, &mut phase)?;
-                    if before != snapshot {
-                        return Err(failure(TF_E_DISCONNECTED));
-                    }
-                    edit_authorized(shared, r, self.connection, self.generation)?;
-                    start_effect(shared, r)?;
-                    track.data.borrow_mut().writing = true;
-                    mutation = Mutation::Uncertain;
-                    let write = track.range.SetText(
+                    let range = composition.GetRange()?;
+                    let epoch = shared.borrow().epoch;
+                    let mut update = r.clone();
+                    update.action = Action::Update;
+                    update.block = None;
+                    let mut writer_phase = "blockUpdate";
+                    write_composing(
+                        shared,
+                        &self.context,
+                        &range,
+                        &update,
+                        self.generation,
+                        epoch,
                         ec,
-                        TF_ST_CORRECTION,
-                        &r.text.encode_utf16().collect::<Vec<_>>(),
-                    );
-                    track.data.borrow_mut().writing = false;
-                    write?;
-                    edit_authorized(shared, r, self.connection, self.generation)?;
-                    let text = range_text(&track.range, ec)?;
-                    if !equivalent_native_text(&text, &r.text) {
-                        return Err(failure(TF_E_DISCONNECTED));
-                    }
-                    let end = equivalent_position(&r.text, &text, end)
-                        .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
-                    let caret = track.range.Clone()?;
-                    caret.Collapse(ec, TF_ANCHOR_START)?;
-                    let mut moved = 0;
-                    caret.ShiftEnd(ec, end as i32, &mut moved, std::ptr::null())?;
-                    if moved != end as i32 {
-                        return Err(failure(TF_E_DISCONNECTED));
-                    }
-                    caret.ShiftStart(ec, end as i32, &mut moved, std::ptr::null())?;
-                    if moved != end as i32 {
-                        return Err(failure(TF_E_DISCONNECTED));
-                    }
-                    edit_authorized(shared, r, self.connection, self.generation)?;
-                    let mut selected = TF_SELECTION {
-                        range: ManuallyDrop::new(Some(caret)),
-                        style: TF_SELECTIONSTYLE {
-                            ase: TF_AE_NONE,
-                            fInterimChar: false.into(),
-                        },
-                    };
-                    let result = self
-                        .context
-                        .SetSelection(ec, std::slice::from_ref(&selected));
-                    ManuallyDrop::drop(&mut selected.range);
-                    result?;
-                    edit_authorized(shared, r, self.connection, self.generation)?;
-                    mutation = Mutation::Changed;
-                    let mut data = track.data.borrow_mut();
-                    data.text = text;
-                    data.version += 1;
+                        &mut mutation,
+                        &mut writer_phase,
+                        &r.text,
+                        true,
+                    )
+                    .inspect_err(|_| phase = writer_phase.into())?;
+                    let data = track.data.borrow();
+                    return Ok(BlockSnapshot {
+                        text: r.text.clone(),
+                        version: data.version,
+                        lease: data.lease,
+                        writable: false,
+                        selection_start: r.text.encode_utf16().count() as u32,
+                        selection_end: r.text.encode_utf16().count() as u32,
+                        ..snapshot
+                    });
                 }
                 BlockAction::Read => (),
                 _ => return Err(failure(E_INVALIDARG)),
@@ -960,6 +1323,17 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                     mutation,
                     None,
                 );
+                let cleanup_ours = {
+                    let state = self.shared.borrow();
+                    acquired_epoch == Some(state.epoch)
+                        && state.generation == self.generation
+                        && state.version.task == self.request.task
+                        && state.version.turn == self.request.turn
+                        && state.version.operation == self.request.operation
+                };
+                if cleanup_ours {
+                    end_owned(&self.shared);
+                }
             }
         }
         result.map(|_| ())
@@ -1009,34 +1383,4 @@ fn map_endpoint(before: &str, after: &str, at: u32) -> Option<u32> {
         return None;
     };
     boundary(after, mapped).then_some(mapped)
-}
-fn equivalent_position(requested: &str, actual: &str, at: u32) -> Option<u32> {
-    fn tokens(text: &str) -> Vec<(char, u32)> {
-        let mut chars = text.chars().peekable();
-        let mut end = 0;
-        let mut result = vec![];
-        while let Some(c) = chars.next() {
-            end += c.len_utf16() as u32;
-            if c == '\r' {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
-                    end += 1;
-                }
-                result.push(('\n', end));
-            } else {
-                result.push((c, end));
-            }
-        }
-        result
-    }
-    let from = tokens(requested);
-    let to = tokens(actual);
-    if from.iter().map(|p| p.0).ne(to.iter().map(|p| p.0)) {
-        return None;
-    }
-    if at == 0 {
-        return Some(0);
-    }
-    let index = from.iter().position(|p| p.1 == at)?;
-    Some(to[index].1)
 }

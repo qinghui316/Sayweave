@@ -270,6 +270,7 @@ enum NativeKind {
     Close,
 }
 enum NativeValue {
+    Reacquired(Result<windows_input::composition::ReacquireOutcome, Error>),
     Block(Result<Box<sayweave_text_service::wire::Reply>, Error>),
     Replaced(Result<(), Error>),
     Settled(PrefixOutcome),
@@ -574,7 +575,11 @@ impl SessionDraft {
             return;
         }
         self.control.handoff_started();
-        self.control.pause();
+        if s.revisable.is_some() {
+            self.control.hold_input();
+        } else {
+            self.control.pause();
+        }
         self.cancel_generation(s);
         if let Some(revised) = &mut s.revisable {
             revised.handoff();
