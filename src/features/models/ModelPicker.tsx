@@ -12,7 +12,7 @@ export function ModelPicker({id,value,ids,loading,error,onOpen,onRefresh,onChang
    {manual?<TextInput {...accessibility} id={id} value={value} placeholder="填写模型 ID" onChange={e=>onChange(e.target.value)}/>:<SelectionTrigger {...accessibility} id={id} className={s.modelTrigger} aria-haspopup="dialog" aria-expanded={open} onClick={()=>{setOpen(true);setQuery('');onOpen();}}>{value||'选择文字模型'}</SelectionTrigger>}
    <Button variant="quiet" onClick={()=>setManual(v=>!v)}>{manual?'从列表选择':'手动填写'}</Button>
   </div>
-  <Dialog open={open} onOpenChange={setOpen} title="选择文字模型" description="搜索服务返回的模型，选择后可主动测试连接。" className={s.modelDialog}>
+  <Dialog showTitle open={open} onOpenChange={setOpen} title="选择文字模型" description="搜索服务返回的模型，选择后可主动测试连接。" className={s.modelDialog}>
    <div className={s.modelSearch}><TextInput aria-label="搜索模型" placeholder="搜索模型" value={query} onChange={e=>setQuery(e.target.value)}/><Button loading={loading} onClick={onRefresh}>刷新</Button></div>
    {error&&<p role="alert" className={s.meta}>{error}</p>}
    {loading&&<p role="status" className={s.meta}>正在同步模型…</p>}
