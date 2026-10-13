@@ -13,26 +13,18 @@ pub(crate) struct CompositionText {
     verified: Option<(String, Vec<(u32, u32)>)>,
 }
 impl CompositionText {
-    /// Called only after the paired document proof and range check succeed.
-    /// Store exact endpoints; this does not normalize later editor snapshots.
+    /// Reacquisition requires identity; provider stability alone cannot prove
+    /// which differing characters belong to the user. Own writes use new().
     pub fn from_verified(semantic: &str, native: &str) -> Option<Self> {
-        let doubled = if semantic == native {
-            false
-        } else if semantic.replace('\n', "\n\n") == native {
-            true
-        } else {
+        if semantic != native {
             return None;
-        };
+        }
         let mut semantic_at = 0;
         let mut native_at = 0;
         let mut endpoints = vec![(0, 0)];
         for c in semantic.chars() {
             semantic_at += c.len_utf16() as u32;
-            native_at += if doubled && c == '\n' {
-                2
-            } else {
-                c.len_utf16() as u32
-            };
+            native_at += c.len_utf16() as u32;
             endpoints.push((semantic_at, native_at));
         }
         let mut text = Self::new(semantic);
@@ -142,15 +134,15 @@ pub(crate) fn equivalent_native_text(actual: &str, expected: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn verified_host_mapping_preserves_user_break_and_utf16_endpoints() {
-        let text = CompositionText::from_verified("甲\n🙂", "甲\n\n🙂").unwrap();
-        assert_eq!(text.position("甲\n\n🙂", 3, false), Some(2));
-        assert_eq!(text.position("甲\n\n🙂", 4, true), Some(5));
-        assert_eq!(text.position("甲\n\n🙂", 2, false), None);
-        assert_eq!(text.position("甲\n\n🙂", 4, false), None);
-        assert_eq!(text.position("甲\n\n🙂\n", 5, false), None);
+    fn verified_identity_preserves_user_break_and_utf16_endpoints() {
+        let text = CompositionText::from_verified("甲\n🙂", "甲\n🙂").unwrap();
+        assert_eq!(text.position("甲\n🙂", 2, false), Some(2));
+        assert_eq!(text.position("甲\n🙂", 4, true), Some(4));
+        assert_eq!(text.position("甲\n🙂", 3, false), None);
+        assert_eq!(text.position("甲\n🙂\n", 4, false), None);
         assert_eq!(text.semantic, "甲\n🙂");
         assert!(CompositionText::from_verified("甲", "甲\n").is_none());
+        assert!(CompositionText::from_verified("甲\n🙂", "甲\n\n🙂").is_none());
     }
     #[test]
     fn marked_breaks_preserve_original_text_and_real_line_separators() {

@@ -984,6 +984,10 @@ unsafe fn acquire_composition(
         }
         edit_authorized(shared, r, edit.connection, edit.generation)?;
         let native = range_text(&track.range, ec)?;
+        if native != verified.native_text {
+            *phase = "blockSnapshotChanged".into();
+            return Err(failure(TF_E_LOCKED));
+        }
         let text = CompositionText::from_verified(&verified.semantic_text, &native)
             .ok_or_else(|| failure(TF_E_LOCKED))?;
         let selected = selection(context, ec)?;
