@@ -74,6 +74,21 @@ pub(super) struct BoundaryProof {
     before: Fingerprint,
     after: Fingerprint,
 }
+#[derive(PartialEq, Eq, Debug)]
+pub(super) enum BoundaryState {
+    Matched,
+    Pending,
+    Outside,
+}
+fn suffix_state(original: &Fingerprint, current: &Fingerprint) -> BoundaryState {
+    if original == current {
+        BoundaryState::Matched
+    } else if original.paragraphs_only && current.paragraphs_only {
+        BoundaryState::Pending
+    } else {
+        BoundaryState::Outside
+    }
+}
 unsafe fn fingerprint(
     context: &ITfContext,
     range: &ITfRange,
@@ -171,7 +186,7 @@ impl BoundaryProof {
         block: &ITfRange,
         ec: u32,
         phase: &mut String,
-    ) -> windows::core::Result<bool> {
+    ) -> windows::core::Result<BoundaryState> {
         unsafe {
             // Check original anchors, not offsets or a text search. Collapsed,
             // rebased or non-contiguous guards cannot revive the block.
@@ -181,15 +196,15 @@ impl BoundaryProof {
                 .CompareStart(ec, &context.GetStart(ec)?, TF_ANCHOR_START)?
                 != 0
             {
-                return Ok(false);
+                return Ok(BoundaryState::Outside);
             }
             *phase = "blockPrefixAnchor".into();
             if self.prefix.CompareEnd(ec, block, TF_ANCHOR_START)? != 0 {
-                return Ok(false);
+                return Ok(BoundaryState::Outside);
             }
             *phase = "blockSuffixAnchor".into();
             if self.suffix.CompareStart(ec, block, TF_ANCHOR_END)? != 0 {
-                return Ok(false);
+                return Ok(BoundaryState::Outside);
             }
             *phase = "blockSuffixDocument".into();
             if self
@@ -197,13 +212,13 @@ impl BoundaryProof {
                 .CompareEnd(ec, &context.GetEnd(ec)?, TF_ANCHOR_END)?
                 != 0
             {
-                return Ok(false);
+                return Ok(BoundaryState::Outside);
             }
             *phase = "blockPrefixText".into();
             let before = fingerprint(context, &self.prefix, ec, MAX_UNITS, phase)?;
             if before != self.before {
                 *phase = self.before.mismatch(&before, "Prefix");
-                return Ok(false);
+                return Ok(BoundaryState::Outside);
             }
             *phase = "blockSuffixText".into();
             let after = fingerprint(
@@ -215,10 +230,19 @@ impl BoundaryProof {
             )?;
             if after != self.after {
                 *phase = self.after.mismatch(&after, "Suffix");
-                return Ok(false);
+                let state = suffix_state(&self.after, &after);
+                if state == BoundaryState::Pending {
+                    // Unconfirmed representation is readonly. Only exact
+                    // original raw evidence can ever return Matched later.
+                    *phase = format!(
+                        "blockRepresentationPending:{}",
+                        self.after.mismatch(&after, "Suffix")
+                    );
+                }
+                return Ok(state);
             }
             *phase = "block".into();
-            Ok(true)
+            Ok(BoundaryState::Matched)
         }
     }
 }
@@ -265,6 +289,26 @@ mod tests {
         assert_ne!(
             digest(&["\n"]).normalized_hash,
             digest(&["\n\n"]).normalized_hash
+        );
+    }
+    #[test]
+    fn terminal_mismatch_never_grants_permission_even_if_other_provider_is_stale() {
+        let original = digest(&["\n"]);
+        assert_eq!(
+            suffix_state(&original, &digest(&["\n\n"])),
+            BoundaryState::Pending
+        );
+        assert_eq!(
+            suffix_state(&original, &digest(&["\n"])),
+            BoundaryState::Matched
+        );
+        assert_eq!(
+            suffix_state(&original, &digest(&["外\n"])),
+            BoundaryState::Outside
+        );
+        assert_eq!(
+            suffix_state(&digest(&["右\n"]), &digest(&["右\n\n"])),
+            BoundaryState::Outside
         );
     }
 }

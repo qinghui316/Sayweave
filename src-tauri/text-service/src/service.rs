@@ -2305,6 +2305,7 @@ fn materialize(
     }
     let permitted = || {
         guard()?;
+        block_tracking::ensure_write_ready(shared)?;
         if !shared.borrow().materialize_allowed {
             return Err(failure(TF_E_DISCONNECTED));
         }
@@ -3683,6 +3684,7 @@ fn write_composing(
         lease(shared, r, generation, context)?;
         let tracking = block_tracking::owned_update(shared, context, range, ec);
         lease(shared, r, generation, context)?;
+        block_tracking::ensure_write_ready(shared)?;
         *mutation = Mutation::Uncertain;
         *phase = "updateText";
         let text = CompositionText::new(text);
