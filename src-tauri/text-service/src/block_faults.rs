@@ -13,6 +13,11 @@ pub fn coarse_notification(text_changed: bool) -> bool {
             .compare_exchange(5, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
 }
+pub fn stale_tracking_range() -> bool {
+    FAULT
+        .compare_exchange(6, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
 pub fn request(
     context: &ITfContext,
     client: u32,

@@ -101,6 +101,18 @@ pub(super) fn run(
         initial.text == "周三",
         initial.version
     );
+    let fault: unsafe extern "system" fn(u32) = unsafe {
+        std::mem::transmute(
+            windows::Win32::System::LibraryLoader::GetProcAddress(
+                module,
+                windows::core::s!("SayweaveBlockFixtureFault"),
+            )
+            .ok_or("missing range fixture hook")?,
+        )
+    };
+    unsafe {
+        fault(6);
+    }
     let streamed = exchange(
         pipe,
         capability,

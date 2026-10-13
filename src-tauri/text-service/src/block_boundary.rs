@@ -54,6 +54,28 @@ unsafe fn fingerprint(
     }
 }
 impl BoundaryProof {
+    pub(super) unsafe fn follow_owned_write(
+        &self,
+        context: &ITfContext,
+        block: &ITfRange,
+        ec: u32,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            let current = Self::capture(context, block, ec)?;
+            if current.before != self.before || current.after != self.after {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            self.prefix
+                .ShiftStartToRange(ec, &current.prefix, TF_ANCHOR_START)?;
+            self.prefix
+                .ShiftEndToRange(ec, &current.prefix, TF_ANCHOR_END)?;
+            self.suffix
+                .ShiftStartToRange(ec, &current.suffix, TF_ANCHOR_START)?;
+            self.suffix
+                .ShiftEndToRange(ec, &current.suffix, TF_ANCHOR_END)?;
+            Ok(())
+        }
+    }
     pub(super) unsafe fn capture(
         context: &ITfContext,
         block: &ITfRange,

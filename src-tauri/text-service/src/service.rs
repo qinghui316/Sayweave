@@ -2348,6 +2348,11 @@ fn materialize(
         }
         *mutation = Mutation::Uncertain;
         let semantic = text.commit_text();
+        let tracking = block_tracking::owned_update(shared, context, &range, ec);
+        permitted()?;
+        if tracking.as_ref().is_some_and(|t| !t.arm()) {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
         range.SetText(
             ec,
             TF_ST_CORRECTION,
@@ -2408,6 +2413,10 @@ fn materialize(
         let current = selection(context, ec)?;
         permitted()?;
         shared.borrow_mut().selection = Some(current);
+        if let Some(tracking) = tracking {
+            tracking.follow(context, &range, ec, permitted);
+        }
+        permitted()?;
     }
     Ok(())
 }
@@ -3672,9 +3681,14 @@ fn write_composing(
         }
         *phase = "updateLease";
         lease(shared, r, generation, context)?;
+        let tracking = block_tracking::owned_update(shared, context, range, ec);
+        lease(shared, r, generation, context)?;
         *mutation = Mutation::Uncertain;
         *phase = "updateText";
         let text = CompositionText::new(text);
+        if tracking.as_ref().is_some_and(|t| !t.arm()) {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
         start_effect(shared, r)?;
         range.SetText(
             ec,
@@ -3740,8 +3754,15 @@ fn write_composing(
             return Err(failure(TF_E_DISCONNECTED));
         }
         s.selection = Some(next_selection);
+        drop(s);
+        if let Some(tracking) = tracking {
+            #[cfg(feature = "acceptance")]
+            tracking.stale_fixture(ec)?;
+            tracking.follow(context, range, ec, || lease(shared, r, generation, context));
+        }
+        lease(shared, r, generation, context)?;
         if advance {
-            s.version.applied(r);
+            shared.borrow_mut().version.applied(r);
         }
         Ok(())
     }

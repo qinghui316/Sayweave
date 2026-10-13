@@ -40,6 +40,137 @@ impl Drop for Track {
     }
 }
 
+// The composition and the independent tracking clone are different native
+// ranges. Refresh from the proven writer, never from offsets or a text search.
+pub(super) struct OwnedUpdate {
+    track: Rc<Track>,
+    version: u64,
+    armed: std::cell::Cell<bool>,
+}
+impl Drop for OwnedUpdate {
+    fn drop(&mut self) {
+        if self.armed.get() {
+            self.track.data.borrow_mut().writing = false;
+        }
+    }
+}
+pub(super) unsafe fn owned_update(
+    shared: &Shared,
+    context: &ITfContext,
+    range: &ITfRange,
+    ec: u32,
+) -> Option<OwnedUpdate> {
+    let track = {
+        let state = shared.borrow();
+        let track = state.block.clone()?;
+        if state.context.as_ref() != Some(context)
+            || state.composition.is_none()
+            || state.version.task != track.task
+        {
+            return None;
+        }
+        track
+    };
+    if !track.data.borrow().valid || track.data.borrow().writing {
+        return None;
+    }
+    let matched = (|| unsafe {
+        let mut phase = "blockOwnedBaseline";
+        let snapshot = track.snapshot(ec, &mut phase)?;
+        if track.range.CompareStart(ec, range, TF_ANCHOR_START)? != 0
+            || track.range.CompareEnd(ec, range, TF_ANCHOR_END)? != 0
+            || range_text(range, ec)? != snapshot.text
+        {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        Ok::<_, windows::core::Error>(())
+    })();
+    let mut data = track.data.borrow_mut();
+    if matched.is_err() || !data.valid {
+        if data.valid {
+            data.invalid_reason = "blockOwnedBaseline";
+        }
+        data.valid = false;
+        data.writable = false;
+        return None;
+    }
+    let version = data.version;
+    drop(data);
+    Some(OwnedUpdate {
+        track,
+        version,
+        armed: std::cell::Cell::new(false),
+    })
+}
+impl OwnedUpdate {
+    pub(super) fn arm(&self) -> bool {
+        let mut data = self.track.data.borrow_mut();
+        if !data.valid || data.version != self.version || data.writing {
+            return false;
+        }
+        data.writing = true;
+        data.writable = false;
+        data.lease += 1;
+        self.armed.set(true);
+        true
+    }
+    #[cfg(feature = "acceptance")]
+    pub(super) unsafe fn stale_fixture(&self, ec: u32) -> windows::core::Result<()> {
+        unsafe {
+            if block_faults::stale_tracking_range() {
+                self.track.range.Collapse(ec, TF_ANCHOR_START)?;
+            }
+            Ok(())
+        }
+    }
+    pub(super) unsafe fn follow(
+        &self,
+        context: &ITfContext,
+        range: &ITfRange,
+        ec: u32,
+        authority: impl Fn() -> windows::core::Result<()>,
+    ) {
+        let result = (|| unsafe {
+            authority()?;
+            let valid = self.track.data.borrow().valid;
+            if !valid || !self.track.field.matches()? {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            if let Some(boundary) = &self.track.boundary {
+                boundary.follow_owned_write(context, range, ec)?;
+            }
+            authority()?;
+            self.track
+                .range
+                .ShiftStartToRange(ec, range, TF_ANCHOR_START)?;
+            self.track.range.ShiftEndToRange(ec, range, TF_ANCHOR_END)?;
+            let text = range_text(&self.track.range, ec)?;
+            relative_selection(context, &self.track.range, ec)?;
+            authority()?;
+            if !self.track.field.matches()? {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            let mut data = self.track.data.borrow_mut();
+            if !data.valid {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            if data.text != text {
+                data.text = text;
+                data.version += 1;
+            }
+            Ok::<_, windows::core::Error>(())
+        })();
+        if result.is_err() {
+            let mut data = self.track.data.borrow_mut();
+            if data.valid {
+                data.invalid_reason = "blockOwnedFollow";
+            }
+            data.valid = false;
+            data.writable = false;
+        }
+    }
+}
+
 unsafe fn relative_selection(
     context: &ITfContext,
     range: &ITfRange,
@@ -258,6 +389,13 @@ impl ITfTextEditSink_Impl for Sink_Impl {
         let _callback = Callback::enter();
         let _notification = TextNotification::enter(self.notifications.clone());
         if !self.data.borrow().valid {
+            return Ok(());
+        }
+        let writing = self.data.borrow().writing;
+        if writing {
+            // Intermediate geometry is not a user edit. The writer's own
+            // guard and final readback remain authoritative; focus/context
+            // sinks still invalidate the capability during this interval.
             return Ok(());
         }
         let mut phase = "blockEditContext";
