@@ -700,7 +700,15 @@ pub(super) fn apply_stamped(
 }
 fn pending_run(root: &Path, run: &str) -> Result<bool, DataError> {
     for path in paths(root)? {
-        let (_, entry) = read_entry(&path)?;
+        let (_, entry) = match read_entry(&path) {
+            Ok(value) => value,
+            Err(error) => {
+                // An unparseable retained fact has no authenticated run owner.
+                // Keep it for recovery diagnostics; do not block unrelated runs.
+                log::warn!(target:"sayweave", "operation=archive_dependency result=unattributed error={}", error.code);
+                continue;
+            }
+        };
         if matches!(&entry.fact, Fact::Run(r) if r.id == run)
             || matches!(&entry.fact, Fact::Unit(u) if u.run_id == run)
             || matches!(&entry.fact, Fact::Draft(d) if d.run_id == run)
@@ -1262,6 +1270,61 @@ mod tests {
             .query_row("SELECT count(*) FROM speech_records", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+    #[test]
+    fn unrelated_corrupt_recovery_file_is_retained_without_blocking_normal_run_finish() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut repo = Repository::open(temp.path()).unwrap();
+        let mut prepared = prepare();
+        prepared.attempt.record_id = prepared.record_id.clone();
+        apply(
+            &mut repo,
+            Operation::History(h::DbOperation::Prepare(prepared.clone())),
+        )
+        .unwrap();
+        let run = uuid::Uuid::new_v4().to_string();
+        apply(
+            &mut repo,
+            Operation::Processing(p::DbOperation::Prepare(p::RunMetadata {
+                mode: "native".into(),
+                id: run.clone(),
+                attempt_id: prepared.attempt.id,
+                task_id: uuid::Uuid::new_v4().to_string(),
+                config_id: String::new(),
+                config_name: "口述结果".into(),
+                model_id: String::new(),
+                config_revision: 1,
+                prompt_version: "native-v1".into(),
+                settings_revision: 1,
+                dictionary_version: "terms".into(),
+            })),
+        )
+        .unwrap();
+        let unknown = directory(temp.path())
+            .unwrap()
+            .join(format!("{}-4.json", uuid::Uuid::new_v4()));
+        fs::write(&unknown, b"damaged unrelated fact").unwrap();
+        apply(
+            &mut repo,
+            Operation::Processing(p::DbOperation::Finish {
+                id: run.clone(),
+                text: "正常保留结果".into(),
+                state: "success".into(),
+                error: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            repo.connection
+                .query_row(
+                    "SELECT text FROM processing_runs WHERE id=?1",
+                    [&run],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "正常保留结果"
+        );
+        assert!(unknown.exists());
     }
     #[test]
     fn delete_invalidates_pending_creation_and_terminal_facts() {

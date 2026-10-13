@@ -115,6 +115,15 @@ impl Block {
     pub fn stable_covers_all(&self) -> bool {
         self.stable == self.speech.chars().count()
     }
+    pub fn native_speech_capacity(&self, limit: usize) -> usize {
+        limit.saturating_sub(
+            self.baseline.encode_utf16().count().saturating_sub(
+                slice(&self.baseline, self.insertion.clone())
+                    .encode_utf16()
+                    .count(),
+            ),
+        )
+    }
     pub fn speech_capacity(&self) -> usize {
         BLOCK_LIMIT.saturating_sub(
             self.baseline

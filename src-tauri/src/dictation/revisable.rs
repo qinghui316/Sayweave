@@ -167,7 +167,8 @@ pub(super) fn observe(
     // Indivisible long source is delivered literally; never sent beyond the
     // model budget. Native admission still enforces its independent capacity.
     let candidate = units::slice(&tail, 0..end);
-    let transport_boundary = native_capacity_boundary(&candidate, 14 * 1024);
+    let transport_boundary =
+        native_capacity_boundary(&candidate, r.block.native_speech_capacity(14 * 1024));
     let end = transport_boundary.unwrap_or(end);
     r.capacity = boundary.is_some() || transport_boundary.is_some();
     let text = units::slice(&tail, 0..end);
@@ -1133,6 +1134,40 @@ mod tests {
         assert_eq!(r.block.visible(), body[..14 * 1024]);
         start_generation(&actor, &mut s, &mut r).unwrap();
         assert!(matches!(s.unit, Some(UnitSlot::Ready(_, Err(_)))));
+    }
+    #[tokio::test]
+    async fn native_budget_includes_unicode_editor_baseline_and_excludes_replaced_selection() {
+        let (actor, mut s, _) = actor(None);
+        s.draft = None;
+        let mut r = State::new();
+        let text = "🙂".repeat(1900);
+        baseline(&mut r, &text);
+        let body = format!("https://example.com/{}", "x".repeat(22000));
+        observe(
+            &actor,
+            &mut s,
+            &mut r,
+            NativeTranscript {
+                task_id: actor.task.clone(),
+                turn: 1,
+                sequence: 1,
+                text: body.clone(),
+                segments: vec![crate::contracts::processing::SourceSegment {
+                    id: 1,
+                    revision: 1,
+                    text: body.clone(),
+                    confirmed: true,
+                }],
+            },
+        );
+        assert!(r.capacity);
+        assert!(s.stop_error.is_none());
+        assert_eq!(r.block.visible().encode_utf16().count(), 14 * 1024);
+        assert!(r.block.visible().starts_with(&text));
+        assert_eq!(r.block.state_snapshot().speech_end, 14 * 1024 - 3800);
+        r.handoff();
+        r.block.rebase_retained(text, 1800..1900).unwrap();
+        assert_eq!(r.block.native_speech_capacity(14 * 1024), 14 * 1024 - 3600);
     }
     #[tokio::test]
     async fn tracked_capacity_rollover_replays_tail_even_when_finish_has_arrived() {
