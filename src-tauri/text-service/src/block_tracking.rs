@@ -26,7 +26,7 @@ struct Data {
     operation: u64,
     text: String,
     valid: bool,
-    invalid_reason: &'static str,
+    invalid_reason: String,
     writable: bool,
     lease: u64,
     writing: bool,
@@ -75,7 +75,7 @@ pub(super) unsafe fn owned_update(
         return None;
     }
     let matched = (|| unsafe {
-        let mut phase = "blockOwnedBaseline";
+        let mut phase = "blockOwnedBaseline".into();
         let snapshot = track.snapshot(ec, &mut phase)?;
         if track.range.CompareStart(ec, range, TF_ANCHOR_START)? != 0
             || track.range.CompareEnd(ec, range, TF_ANCHOR_END)? != 0
@@ -88,7 +88,7 @@ pub(super) unsafe fn owned_update(
     let mut data = track.data.borrow_mut();
     if matched.is_err() || !data.valid {
         if data.valid {
-            data.invalid_reason = "blockOwnedBaseline";
+            data.invalid_reason = "blockOwnedBaseline".into();
         }
         data.valid = false;
         data.writable = false;
@@ -163,7 +163,7 @@ impl OwnedUpdate {
         if result.is_err() {
             let mut data = self.track.data.borrow_mut();
             if data.valid {
-                data.invalid_reason = "blockOwnedFollow";
+                data.invalid_reason = "blockOwnedFollow".into();
             }
             data.valid = false;
             data.writable = false;
@@ -232,7 +232,7 @@ impl Track {
             range.SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_FORWARD)?;
             // Unavailable/oversized outside evidence keeps the original strict
             // notification rule. It does not block ordinary composition input.
-            let mut boundary_reason = "blockBoundaryUnavailable";
+            let mut boundary_reason = "blockBoundaryUnavailable".into();
             let boundary = BoundaryProof::capture(context, &range, ec, &mut boundary_reason)
                 .ok()
                 .map(Rc::new);
@@ -243,7 +243,7 @@ impl Track {
                 operation: request.operation,
                 text: expected,
                 valid: true,
-                invalid_reason: "blockInvalid",
+                invalid_reason: "blockInvalid".into(),
                 writable: false,
                 lease: 0,
                 writing: false,
@@ -298,65 +298,61 @@ impl Track {
         }
     }
 
-    unsafe fn snapshot(
-        &self,
-        ec: u32,
-        phase: &mut &'static str,
-    ) -> windows::core::Result<BlockSnapshot> {
+    unsafe fn snapshot(&self, ec: u32, phase: &mut String) -> windows::core::Result<BlockSnapshot> {
         unsafe {
             let version = self.data.borrow().version;
             if !self.data.borrow().valid {
-                *phase = self.data.borrow().invalid_reason;
+                *phase = self.data.borrow().invalid_reason.clone();
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            *phase = "blockSnapshotField";
+            *phase = "blockSnapshotField".into();
             if !self.field.matches()? {
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            *phase = "blockSnapshotForeground";
+            *phase = "blockSnapshotForeground".into();
             let foreground = GetForegroundWindow();
             let mut process = 0;
             GetWindowThreadProcessId(foreground, Some(&mut process));
             if process != std::process::id() {
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            *phase = "blockSnapshotView";
+            *phase = "blockSnapshotView".into();
             let view = self.context.GetActiveView()?.GetWnd()?;
             if !view.0.is_null() && GetAncestor(view, GA_ROOT) != foreground {
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            *phase = "blockSnapshotAccess";
+            *phase = "blockSnapshotAccess".into();
             ensure_enabled_context(&self.context)?;
             if self.context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0
                 || password(&self.context, &self.range, ec)?
             {
                 return Err(failure(E_ACCESSDENIED));
             }
-            *phase = "blockSnapshotText";
+            *phase = "blockSnapshotText".into();
             let text = range_text(&self.range, ec)?;
-            *phase = "blockSnapshotSelection";
+            *phase = "blockSnapshotSelection".into();
             let (selection_start, selection_end) =
                 relative_selection(&self.context, &self.range, ec)?;
-            *phase = "blockSnapshotBoundary";
+            *phase = "blockSnapshotBoundary".into();
             if let Some(boundary) = &self.boundary
                 && !boundary.matches(&self.context, &self.range, ec, phase)?
             {
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            *phase = "blockSnapshotField";
+            *phase = "blockSnapshotField".into();
             if !self.field.matches()? {
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            *phase = "blockSnapshotVersion";
+            *phase = "blockSnapshotVersion".into();
             let data = self.data.borrow();
             if !data.valid {
-                *phase = data.invalid_reason;
+                *phase = data.invalid_reason.clone();
                 return Err(failure(TF_E_DISCONNECTED));
             }
             if data.version != version || text.is_empty() || data.text != text {
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            *phase = "block";
+            *phase = "block".into();
             Ok(BlockSnapshot {
                 lease: data.lease,
                 id: data.id.clone(),
@@ -379,7 +375,7 @@ struct Sink {
     data: Rc<RefCell<Data>>,
     notifications: Rc<TextNotifications>,
     boundary: Option<Rc<BoundaryProof>>,
-    boundary_reason: &'static str,
+    boundary_reason: String,
     _lease: Lease,
 }
 impl ITfTextEditSink_Impl for Sink_Impl {
@@ -401,18 +397,18 @@ impl ITfTextEditSink_Impl for Sink_Impl {
             // sinks still invalidate the capability during this interval.
             return Ok(());
         }
-        let mut phase = "blockEditContext";
+        let mut phase = "blockEditContext".into();
         let result = (|| unsafe {
             let context = context.as_ref().ok_or_else(|| failure(E_POINTER))?;
             // Own composition updates remain subject to native text proof; they
             // update tracking but must never become user-edit learning evidence.
             let own = context.InWriteSession(self.client)?.as_bool();
-            phase = "blockEditField";
+            phase = "blockEditField".into();
             if !self.field.matches()? {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             let record = record.as_ref().ok_or_else(|| failure(E_POINTER))?;
-            phase = "blockEditUpdates";
+            phase = "blockEditUpdates".into();
             let within = updates_within(record, &self.range, ec)?;
             #[cfg(feature = "acceptance")]
             let within = {
@@ -422,7 +418,7 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                 within && !coarse
             };
             if !within {
-                phase = self.boundary_reason;
+                phase = self.boundary_reason.clone();
                 if !self.boundary.as_ref().is_some_and(|boundary| {
                     boundary
                         .matches(context, &self.range, ec, &mut phase)
@@ -431,9 +427,9 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                     return Err(failure(TF_E_DISCONNECTED));
                 }
             }
-            phase = "blockEditSelection";
+            phase = "blockEditSelection".into();
             relative_selection(context, &self.range, ec)?;
-            phase = "blockEditText";
+            phase = "blockEditText".into();
             let text = range_text(&self.range, ec)?;
             if text.is_empty() {
                 return Err(failure(TF_E_DISCONNECTED));
@@ -489,7 +485,7 @@ pub(super) fn invalidate(shared: &Shared, reason: &'static str) {
     if let Some(track) = shared.borrow().block.as_ref() {
         let mut data = track.data.borrow_mut();
         if data.valid {
-            data.invalid_reason = reason;
+            data.invalid_reason = reason.into();
         }
         data.valid = false;
         data.writable = false;
@@ -508,7 +504,7 @@ impl FocusSink {
     fn invalidate(&self, reason: &'static str) {
         let mut data = self.data.borrow_mut();
         if data.valid {
-            data.invalid_reason = reason;
+            data.invalid_reason = reason.into();
         }
         data.valid = false;
         data.writable = false;
@@ -734,7 +730,7 @@ impl ITfEditSession_Impl for EditBlock_Impl {
     fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
         let _callback = Callback::enter();
         let mut mutation = Mutation::NotAttempted;
-        let mut phase = "block";
+        let mut phase = "block".into();
         let result = (|| unsafe {
             let shared = &self.shared;
             let r = &self.request;
@@ -824,10 +820,10 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                     }
                     // Only map endpoints outside the changed interval. An
                     // ambiguous caret refuses the replacement before SetText.
-                    phase = "blockSelectionMapping";
+                    phase = "blockSelectionMapping".into();
                     let end = map_endpoint(&snapshot.text, &r.text, snapshot.selection_end)
                         .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
-                    phase = "block";
+                    phase = "block".into();
                     let before = track.snapshot(ec, &mut phase)?;
                     if before != snapshot {
                         return Err(failure(TF_E_DISCONNECTED));
