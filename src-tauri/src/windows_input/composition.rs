@@ -30,6 +30,14 @@ mod retirement;
 use retirement::{Retirement, WorkerCompletion};
 
 pub(crate) enum Command {
+    ReplaceTracked(
+        u64,
+        String,
+        Option<String>,
+        String,
+        Arc<AtomicBool>,
+        oneshot::Sender<Result<BlockSnapshot, Error>>,
+    ),
     Acquire(
         u64,
         BlockCommand,
@@ -386,6 +394,14 @@ impl Draft {
                             if result.is_ok(){host.remember_tail(raw);}
                             let _=reply.send(result);
                         },
+                        Ok(Command::ReplaceTracked(turn,text,raw,id,permit,reply))=>{
+                            let result=if turn==host.turn {
+                                host.update_scoped(&text,Some(&permit),Some(id))
+                                    .and_then(|snapshot|snapshot.ok_or_else(||Error::new("compositionPartial")))
+                            }else{Err(Error::new("staleSession"))};
+                            if result.is_ok(){host.remember_tail(raw);}
+                            let _=reply.send(result);
+                        },
                         Ok(Command::Settle(turn,prefix,tail,source,permit,reply))=>{
                             let outcome=if turn!=host.turn {PrefixOutcome {prefix:Mutation::NotAttempted,tail_owned:false,error:Some("staleSession".into())}}
                             else if !permit.load(Ordering::Acquire) {PrefixOutcome {prefix:Mutation::NotAttempted,tail_owned:false,error:Some("staleSnapshot".into())}}
@@ -472,6 +488,29 @@ impl Draft {
         self.connection
             .sender
             .try_send(Command::Replace(self.turn, text, raw, permit, reply))
+            .map_err(|_| Error::new("compositionWorker"))?;
+        result.await.map_err(|_| Error::new("compositionWorker"))?
+    }
+    pub(crate) async fn replace_tracked(
+        &self,
+        sequence: u64,
+        text: String,
+        raw: Option<String>,
+        id: String,
+        permit: Arc<AtomicBool>,
+    ) -> Result<BlockSnapshot, Error> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::new("staleSession"));
+        }
+        if sequence == 0 || sequence <= self.source_sequence.fetch_max(sequence, Ordering::AcqRel) {
+            return Err(Error::new("staleSnapshot"));
+        }
+        let (reply, result) = oneshot::channel();
+        self.connection
+            .sender
+            .try_send(Command::ReplaceTracked(
+                self.turn, text, raw, id, permit, reply,
+            ))
             .map_err(|_| Error::new("compositionWorker"))?;
         result.await.map_err(|_| Error::new("compositionWorker"))?
     }
@@ -1539,18 +1578,48 @@ impl Host {
         self.update_guarded(text, None)
     }
     fn update_guarded(&mut self, text: &str, permit: Option<&AtomicBool>) -> Result<(), Error> {
+        self.update_scoped(text, permit, None).map(|_| ())
+    }
+    fn update_scoped(
+        &mut self,
+        text: &str,
+        permit: Option<&AtomicBool>,
+        block_id: Option<String>,
+    ) -> Result<Option<BlockSnapshot>, Error> {
         if permit.is_some_and(|p| !p.load(Ordering::Acquire)) {
             return Err(Error::new("staleSnapshot"));
         }
-        if text == self.text {
-            return Ok(());
+        if text == self.text && block_id.is_none() {
+            return Ok(None);
         }
         self.settled_empty_revision = None;
+        let block = block_id.as_ref().map(|id| {
+            (
+                BlockCommand {
+                    id: id.clone(),
+                    action: BlockAction::Bind,
+                    epoch: 0,
+                    version: 0,
+                    lease: 0,
+                    expected: String::new(),
+                    selection_start: 0,
+                    selection_end: 0,
+                },
+                None,
+            )
+        });
         let result = self
-            .exchange_reply(Action::Update, text, None, false, permit)
+            .exchange_block_reply(Action::Update, text, None, false, permit, block)
             .and_then(|r| {
                 if r.applied {
-                    Ok(())
+                    if let Some(id) = &block_id
+                        && r.block.as_ref().is_none_or(|b| {
+                            b.id != *id || b.epoch == 0 || b.text != text || b.writable
+                        })
+                    {
+                        return Err(Error::new("compositionPartial"));
+                    }
+                    Ok(r.block)
                 } else if r.mutation != Mutation::NotAttempted {
                     Err(Error::new("compositionPartial"))
                 } else {
@@ -1559,6 +1628,9 @@ impl Host {
             });
         if result.is_ok() {
             self.text = text.into();
+            if let Ok(Some(snapshot)) = &result {
+                log::info!(target:"sayweave", "operation=draft_block_bound task_id={} turn={} block={} epoch={}", self.task,self.turn,snapshot.id,snapshot.epoch);
+            }
         } else if result.as_ref().err().is_some_and(|e| {
             !matches!(
                 e.code.as_str(),

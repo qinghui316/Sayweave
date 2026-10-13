@@ -851,7 +851,7 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
         revoke_operation(shared, &r, connection);
         return;
     }
-    if r.block.is_some() {
+    if r.block.is_some() && r.action == Action::Inspect {
         block_tracking::dispatch(shared, &r, connection);
         return;
     }
@@ -3136,6 +3136,13 @@ impl ITfEditSession_Impl for Edit_Impl {
 
         let result =
             lease(&self.state, &self.request, self.generation, &self.context).and_then(|()| {
+                if self.request.block.is_some() {
+                    let mut state = self.state.borrow_mut();
+                    if state.block.is_some() {
+                        return Err(failure(TF_E_DISCONNECTED));
+                    }
+                    state.block_reply = None;
+                }
                 apply(
                     &self.state,
                     &self.context,
@@ -3145,7 +3152,22 @@ impl ITfEditSession_Impl for Edit_Impl {
                     &mut mutation,
                     &mut phase,
                     &mut settlement,
-                )
+                )?;
+                if self.request.block.is_some() {
+                    phase = "writeTracking";
+                    let snapshot = unsafe {
+                        block_tracking::bind_owned(
+                            &self.state,
+                            &self.context,
+                            &self.request,
+                            self.connection,
+                            self.generation,
+                            ec,
+                        )?
+                    };
+                    self.state.borrow_mut().block_reply = Some(snapshot);
+                }
+                Ok(())
             });
         match &result {
             Ok(()) => complete(

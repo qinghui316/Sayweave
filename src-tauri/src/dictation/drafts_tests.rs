@@ -174,42 +174,13 @@ async fn revisable_preview_does_not_commit_and_next_request_rewrites_full_block(
         matches!(state.unit, Some(UnitSlot::Generating(_))),
         "scheduling must retain the running request"
     );
-    let Command::Replace(_, text, _, _, reply) = command(&native).await else {
-        panic!("real-time preview expected")
+    let Command::ReplaceTracked(_, text, _, id, _, reply) = command(&native).await else {
+        panic!("tracked real-time preview expected")
     };
     assert_eq!(text, "周三开会");
-    reply.send(Ok(())).unwrap();
+    reply.send(Ok(tracked_snapshot(&id, &text))).unwrap();
     acknowledge(&actor, &mut state).await;
     generated(&mut state).await;
-    actor.schedule(&mut state).unwrap();
-    let Command::Block(_, _, request, _, _, reply) = command(&native).await else {
-        panic!("range binding expected")
-    };
-    reply
-        .send(Ok(sayweave_text_service::wire::Reply {
-            block: None,
-            engine: sayweave_text_service::wire::EngineBinding {
-                proxy_instance: uuid::Uuid::new_v4().to_string(),
-                engine_generation: 1,
-            },
-            task: actor.task.clone(),
-            turn: 1,
-            operation: 1,
-            revision: 1,
-            applied: false,
-            code: "unsupportedTracker".into(),
-            mutation: Mutation::NotAttempted,
-            runtime: None,
-            range_epoch: 0,
-            settlement: None,
-            edit_observation: None,
-        }))
-        .unwrap();
-    assert_eq!(
-        request.action,
-        sayweave_text_service::wire::BlockAction::Bind
-    );
-    acknowledge(&actor, &mut state).await;
     actor.schedule(&mut state).unwrap();
     let Command::Replace(_, text, _, _, reply) = command(&native).await else {
         panic!("model preview must replace, never Settle")
@@ -256,11 +227,11 @@ async fn revisable_stop_uses_handoff_and_does_not_append_unshown_tail() {
     state.revisable = Some(revisable::State::new());
     actor.observe(&mut state, snapshot(1, vec![segment(1, "已经显示", false)]));
     actor.schedule(&mut state).unwrap();
-    let Command::Replace(_, text, _, _, reply) = command(&native).await else {
+    let Command::ReplaceTracked(_, text, _, id, _, reply) = command(&native).await else {
         panic!("preview expected")
     };
     assert_eq!(text, "已经显示");
-    reply.send(Ok(())).unwrap();
+    reply.send(Ok(tracked_snapshot(&id, &text))).unwrap();
     acknowledge(&actor, &mut state).await;
     actor.observe(
         &mut state,
@@ -275,7 +246,7 @@ async fn revisable_stop_uses_handoff_and_does_not_append_unshown_tail() {
     });
     state.stopping = true;
     actor.schedule(&mut state).unwrap();
-    // Stop skips tracker creation and never turns the product X into native Abort.
+    // Stop retains the already tracked visible text and never calls native Abort.
     let Command::Finish(_, text, mode, _, keep, reply) = command(&native).await else {
         panic!("retained handoff expected")
     };
@@ -291,6 +262,18 @@ async fn revisable_stop_uses_handoff_and_does_not_append_unshown_tail() {
             rollback_failed: false,
         })
         .ok()
+        .unwrap();
+    acknowledge(&actor, &mut state).await;
+    actor.schedule(&mut state).unwrap();
+    let Command::Block(_, _, request, _, _, reply) = command(&native).await else {
+        panic!("release tracked stopped block")
+    };
+    assert_eq!(
+        request.action,
+        sayweave_text_service::wire::BlockAction::Release
+    );
+    reply
+        .send(Ok(block_reply(&actor.task, None, true)))
         .unwrap();
     acknowledge(&actor, &mut state).await;
     actor.schedule(&mut state).unwrap();
@@ -390,6 +373,18 @@ pub(super) fn block_reply(
         edit_observation: None,
     }
 }
+fn tracked_snapshot(id: &str, text: &str) -> sayweave_text_service::wire::BlockSnapshot {
+    sayweave_text_service::wire::BlockSnapshot {
+        id: id.into(),
+        epoch: 1,
+        version: 1,
+        lease: 0,
+        text: text.into(),
+        selection_start: text.encode_utf16().count() as u32,
+        selection_end: text.encode_utf16().count() as u32,
+        writable: false,
+    }
+}
 async fn bound_preview(
     actor: &SessionDraft,
     state: &mut State,
@@ -399,33 +394,11 @@ async fn bound_preview(
     state.revisable = Some(revisable::State::new());
     actor.observe(state, snapshot(1, vec![segment(1, body, false)]));
     actor.schedule(state).unwrap();
-    let Command::Replace(_, text, _, _, reply) = command(native).await else {
-        panic!("preview")
+    let Command::ReplaceTracked(_, text, _, id, _, reply) = command(native).await else {
+        panic!("atomic tracked preview")
     };
     assert_eq!(text, body);
-    reply.send(Ok(())).unwrap();
-    acknowledge(actor, state).await;
-    actor.schedule(state).unwrap();
-    let Command::Block(_, _, request, _, _, reply) = command(native).await else {
-        panic!("bind")
-    };
-    let id = request.id;
-    reply
-        .send(Ok(block_reply(
-            &actor.task,
-            Some(sayweave_text_service::wire::BlockSnapshot {
-                id: id.clone(),
-                epoch: 1,
-                version: 1,
-                lease: 0,
-                text: body.into(),
-                selection_start: body.encode_utf16().count() as u32,
-                selection_end: body.encode_utf16().count() as u32,
-                writable: false,
-            }),
-            true,
-        )))
-        .unwrap();
+    reply.send(Ok(tracked_snapshot(&id, body))).unwrap();
     acknowledge(actor, state).await;
     id
 }
@@ -624,18 +597,22 @@ async fn capacity_delivers_one_block_and_keeps_the_same_dictation_open() {
     actor.observe(&mut state, snapshot(1, vec![segment(1, &whole, true)]));
     actor.start_generation(&mut state).unwrap();
     actor.schedule(&mut state).unwrap();
-    let Command::Replace(_, text, _, _, reply) = command(&native).await else {
-        panic!("first preview")
+    let Command::ReplaceTracked(_, text, _, id, _, reply) = command(&native).await else {
+        panic!("first tracked preview")
     };
     assert_eq!(text, first);
-    reply.send(Ok(())).unwrap();
+    reply.send(Ok(tracked_snapshot(&id, &first))).unwrap();
     acknowledge(&actor, &mut state).await;
     actor.schedule(&mut state).unwrap();
-    let Command::Block(_, _, _, _, _, reply) = command(&native).await else {
-        panic!("bind")
+    let Command::Block(_, _, request, _, _, reply) = command(&native).await else {
+        panic!("release prior block")
     };
+    assert_eq!(
+        request.action,
+        sayweave_text_service::wire::BlockAction::Release
+    );
     reply
-        .send(Ok(block_reply(&actor.task, None, false)))
+        .send(Ok(block_reply(&actor.task, None, true)))
         .unwrap();
     acknowledge(&actor, &mut state).await;
     actor.schedule(&mut state).unwrap();
@@ -657,11 +634,11 @@ async fn capacity_delivers_one_block_and_keeps_the_same_dictation_open() {
     assert!(state.draft.is_some());
     assert_eq!(state.report.text, first);
     actor.schedule(&mut state).unwrap();
-    let Command::Replace(_, text, _, _, reply) = command(&native).await else {
-        panic!("continuing tail")
+    let Command::ReplaceTracked(_, text, _, id, _, reply) = command(&native).await else {
+        panic!("continuing tracked tail")
     };
     assert_eq!(text, "后续文字");
-    reply.send(Ok(())).unwrap();
+    reply.send(Ok(tracked_snapshot(&id, &text))).unwrap();
     acknowledge(&actor, &mut state).await;
     assert!(!state.stopping);
     assert_eq!(state.report.raw, first);

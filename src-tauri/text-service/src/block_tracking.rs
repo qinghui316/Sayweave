@@ -268,6 +268,98 @@ unsafe fn relative_selection(
     }
 }
 
+// Runs inside the owning write lock, before its Update receipt can escape.
+pub(super) unsafe fn bind_owned(
+    shared: &Shared,
+    context: &ITfContext,
+    r: &Request,
+    connection: u64,
+    generation: u64,
+    ec: u32,
+) -> windows::core::Result<BlockSnapshot> {
+    unsafe {
+        let epoch = shared.borrow().epoch;
+        let manager = shared
+            .borrow()
+            .manager
+            .clone()
+            .ok_or_else(|| failure(E_FAIL))?;
+        if manager.GetFocus()?.GetTop()? != *context {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        let track = Rc::new(Track::bind(shared, context, r, ec)?);
+        // Binding records an already-owned write, not an external
+        // editor baseline. Its provenance is the active composition
+        // and this writer's exact text/position map; UIA may still be
+        // publishing the previous renderer snapshot here.
+        let (composition, written) = {
+            let state = shared.borrow();
+            (
+                state
+                    .composition
+                    .clone()
+                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
+                state
+                    .text
+                    .clone()
+                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
+            )
+        };
+        let owned = composition.GetRange()?;
+        if owned.CompareStart(ec, &track.range, TF_ANCHOR_START)? != 0
+            || owned.CompareEnd(ec, &track.range, TF_ANCHOR_END)? != 0
+        {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        let actual = range_text(&owned, ec)?;
+        let (start, end) = relative_selection(context, &owned, ec)?;
+        let start = written
+            .position(&actual, start, false)
+            .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
+        let end = written
+            .position(&actual, end, false)
+            .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
+        let snapshot = {
+            let data = track.data.borrow();
+            if !data.valid || data.text != actual {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            BlockSnapshot {
+                id: data.id.clone(),
+                epoch: data.epoch,
+                version: data.version,
+                lease: data.lease,
+                text: written.semantic,
+                selection_start: start,
+                selection_end: end,
+                writable: false,
+            }
+        };
+        if manager.GetFocus()?.GetTop()? != *context || !track.field.matches()? {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        edit_authorized(shared, r, connection, generation)?;
+        let mut state = shared.borrow_mut();
+        let tracked = track.data.borrow();
+        if state.epoch != epoch
+            || !state.version.owned
+            || state.version.task != r.task
+            || state.version.turn != r.turn
+            || state.block.is_some()
+            || state.composition.as_ref() != Some(&composition)
+            || !tracked.valid
+            || tracked.version != snapshot.version
+            || tracked.lease != snapshot.lease
+            || state.expected != tracked.text
+        {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        drop(tracked);
+        state.block = Some(track);
+        Ok(snapshot)
+    }
+}
+
 impl Track {
     unsafe fn bind(
         shared: &Shared,
@@ -1364,68 +1456,14 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             if command.action == BlockAction::Bind {
-                let epoch = shared.borrow().epoch;
-                let track = Rc::new(Track::bind(shared, &self.context, r, ec)?);
-                // Binding records an already-owned write, not an external
-                // editor baseline. Its provenance is the active composition
-                // and this writer's exact text/position map; UIA may still be
-                // publishing the previous renderer snapshot here.
-                let (composition, written) = {
-                    let state = shared.borrow();
-                    (
-                        state
-                            .composition
-                            .clone()
-                            .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
-                        state
-                            .text
-                            .clone()
-                            .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
-                    )
-                };
-                let owned = composition.GetRange()?;
-                if owned.CompareStart(ec, &track.range, TF_ANCHOR_START)? != 0
-                    || owned.CompareEnd(ec, &track.range, TF_ANCHOR_END)? != 0
-                {
-                    return Err(failure(TF_E_DISCONNECTED));
-                }
-                let actual = range_text(&owned, ec)?;
-                let (start, end) = relative_selection(&self.context, &owned, ec)?;
-                let start = written
-                    .position(&actual, start, false)
-                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
-                let end = written
-                    .position(&actual, end, false)
-                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
-                let snapshot = {
-                    let data = track.data.borrow();
-                    if !data.valid || data.text != actual {
-                        return Err(failure(TF_E_DISCONNECTED));
-                    }
-                    BlockSnapshot {
-                        id: data.id.clone(),
-                        epoch: data.epoch,
-                        version: data.version,
-                        lease: data.lease,
-                        text: written.semantic,
-                        selection_start: start,
-                        selection_end: end,
-                        writable: false,
-                    }
-                };
-                edit_authorized(shared, r, self.connection, self.generation)?;
-                let mut state = shared.borrow_mut();
-                if state.epoch != epoch
-                    || !state.version.owned
-                    || state.version.task != r.task
-                    || state.version.turn != r.turn
-                    || state.block.is_some()
-                    || state.expected != track.data.borrow().text
-                {
-                    return Err(failure(TF_E_DISCONNECTED));
-                }
-                state.block = Some(track);
-                return Ok(snapshot);
+                return bind_owned(
+                    shared,
+                    &self.context,
+                    r,
+                    self.connection,
+                    self.generation,
+                    ec,
+                );
             }
             let track = shared
                 .borrow()

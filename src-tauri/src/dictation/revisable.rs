@@ -105,7 +105,6 @@ pub(super) enum Effect {
         text: String,
         raw: String,
     },
-    Bind,
     Acquire,
     Read {
         activity: u64,
@@ -673,30 +672,6 @@ pub(super) fn schedule(
         }
         return Ok(());
     }
-    if s.draft.is_some() && !r.bound && !r.stopped && !r.block.confirmed().1.is_empty() {
-        r.bound = true;
-        let request = BlockCommand {
-            id: r.block.id().into(),
-            action: BlockAction::Bind,
-            epoch: 0,
-            version: 0,
-            lease: 0,
-            expected: String::new(),
-            selection_start: 0,
-            selection_end: 0,
-        };
-        let connection = actor.connection.clone();
-        let turn = s.turn;
-        let permit = r.permit.clone();
-        job(s, Effect::Bind, async move {
-            NativeValue::block(
-                connection
-                    .block(turn, None, request, String::new(), permit)
-                    .await,
-            )
-        });
-        return Ok(());
-    }
     if !r.read_needed
         && !r.stopped
         && s.stop_error.is_none()
@@ -717,6 +692,7 @@ pub(super) fn schedule(
             .map(|coverage| (revision, coverage));
             let sequence = r.sequence;
             let permit = r.permit.clone();
+            let initial_block = (!r.bound).then(|| r.block.id().to_owned());
             job(
                 s,
                 Effect::Write {
@@ -726,6 +702,13 @@ pub(super) fn schedule(
                     raw,
                 },
                 async move {
+                    if let Some(id) = initial_block {
+                        return NativeValue::TrackedReplaced(
+                            draft
+                                .replace_tracked(sequence, body, Some(source), id, permit)
+                                .await,
+                        );
+                    }
                     NativeValue::Replaced(
                         draft
                             .replace_guarded(sequence, body, Some(source), Some(permit))
@@ -871,6 +854,17 @@ pub(super) fn native_done(
             value,
         ) => {
             let result = match value {
+                NativeValue::TrackedReplaced(result) => result.and_then(|snapshot| {
+                    if snapshot.id != r.block.id() {
+                        return Err(Error::new("compositionProtocol"));
+                    }
+                    // The native tracker already observed any edits made while
+                    // this receipt was in flight. Keep its identity even when
+                    // the old write permit has since been revoked.
+                    r.bound = true;
+                    r.snapshot = Some(snapshot);
+                    Ok(())
+                }),
                 NativeValue::Replaced(result) => result,
                 _ => Err(Error::new("compositionProtocol")),
             };
@@ -958,12 +952,6 @@ pub(super) fn native_done(
                 Err(error) => s.record_failure(&actor.task, error.code),
             }
         }
-        (NativeKind::Revisable(Effect::Bind), NativeValue::Block(result)) => match result {
-            Ok(reply) if reply.applied => r.snapshot = reply.block,
-            Ok(reply) if reply.mutation == Mutation::NotAttempted => {}
-            Ok(_) => s.record_failure(&actor.task, "compositionPartial".into()),
-            Err(error) => s.record_failure(&actor.task, error.code),
-        },
         (NativeKind::Revisable(Effect::Handoff), NativeValue::HandedOff(outcome)) => {
             if !outcome.handed_off {
                 s.record_failure(&actor.task, "compositionCleanup".into());
@@ -1511,11 +1499,18 @@ mod tests {
             NativeValue::Begun(Ok(draft)),
         );
         schedule(&actor, &mut s, &mut r).unwrap();
-        let Command::Replace(_, body, _, _, reply) = command(&native).await else {
+        let Command::ReplaceTracked(_, body, _, id, _, reply) = command(&native).await else {
             panic!("remaining tail")
         };
         assert_eq!(body, "乙。".repeat(50));
-        reply.send(Ok(())).unwrap();
+        let mut tracked = r
+            .snapshot
+            .clone()
+            .unwrap_or_else(|| baseline(&mut State::new(), &body));
+        tracked.id = id;
+        tracked.text = body;
+        tracked.writable = false;
+        reply.send(Ok(tracked)).unwrap();
         let value = SessionDraft::native_value(&mut s.native).await.unwrap();
         let completed = s.native.take().unwrap();
         native_done(&actor, &mut s, &mut r, &completed.kind, value);

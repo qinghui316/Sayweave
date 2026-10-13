@@ -190,13 +190,24 @@ impl Request {
                 _ => false,
             }
             && self.block.as_ref().is_none_or(|block| {
-                self.action == Action::Inspect
+                (self.action == Action::Inspect
+                    || self.action == Action::Update
+                        && block.action == BlockAction::Bind
+                        && !self.text.is_empty()
+                        && block.epoch == 0
+                        && block.version == 0
+                        && block.lease == 0
+                        && block.expected.is_empty()
+                        && block.selection_start == 0
+                        && block.selection_end == 0)
                     && self.prefix.is_none()
                     && uuid::Uuid::parse_str(&block.id).is_ok()
                     && block.selection_start <= block.selection_end
                     && block.expected.encode_utf16().count() <= MAX_TEXT_UTF16
                     && (block.action == BlockAction::Bind || block.epoch > 0)
-                    && (block.action == BlockAction::Apply || self.text.is_empty())
+                    && (self.action == Action::Update
+                        || block.action == BlockAction::Apply
+                        || self.text.is_empty())
             })
             && self.engine.valid()
             && uuid::Uuid::parse_str(&self.task).is_ok()
@@ -436,6 +447,40 @@ mod tests {
         r.text.push('a');
         assert!(!r.valid());
         assert!(serde_json::from_str::<Request>("{\"window\":42}").is_err());
+    }
+    #[test]
+    fn initial_update_accepts_only_empty_bind_metadata() {
+        let mut r = request(Action::Update, 2, 1);
+        r.text = "正文".into();
+        r.block = Some(BlockCommand {
+            action: BlockAction::Bind,
+            id: uuid::Uuid::new_v4().to_string(),
+            epoch: 0,
+            version: 0,
+            lease: 0,
+            expected: String::new(),
+            selection_start: 0,
+            selection_end: 0,
+        });
+        assert!(r.valid());
+        for action in [
+            BlockAction::Read,
+            BlockAction::Acquire,
+            BlockAction::Apply,
+            BlockAction::Release,
+        ] {
+            let mut invalid = r.clone();
+            invalid.block.as_mut().unwrap().action = action;
+            assert!(!invalid.valid());
+        }
+        let mut invalid = r.clone();
+        invalid.block.as_mut().unwrap().epoch = 1;
+        assert!(!invalid.valid());
+        let mut invalid = r.clone();
+        invalid.block.as_mut().unwrap().expected = "旧正文".into();
+        assert!(!invalid.valid());
+        r.text.clear();
+        assert!(!r.valid());
     }
     #[test]
     fn requests_have_a_bounded_execution_deadline() {

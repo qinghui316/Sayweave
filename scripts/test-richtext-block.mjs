@@ -151,7 +151,7 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
  try{
   report.actorIdentity=await receive();
   const earlyEdit=process.env.SAYWEAVE_BLOCK_EARLY_EDIT==='1';
-  report.actorScenario=earlyEdit?'edit-before-bind':'edit-after-bind';
+  report.actorScenario=earlyEdit?'edit-before-tracking-receipt':'edit-after-tracking-receipt';
   segments.push({id:1,revision:1,text:'周三开会',confirmed:false});
   await command({action:'asr',segments});await expectBody('actor first input','周三开会');
   if(earlyEdit){
@@ -161,15 +161,15 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
     await command({action:'status'});await settled();
    }
   }
-  // This scenario edits a tracked first block. Wait for that production
-  // acknowledgment, rather than race the asynchronous initial Bind request.
+  // Update now installs native tracking before returning its receipt. Keep
+  // both timings: edit before the client consumes that receipt, or after it.
   const bindDeadline=Date.now()+5000;
-  while(!earlyEdit&&!diagnostics.includes('code=blockReady')){
+  while(!earlyEdit&&!diagnostics.includes('operation=draft_block_bound')){
    if(Date.now()>=bindDeadline)throw Error('Production initial block did not bind');
    await command({action:'status'});await settled();
   }
-  report.actorBindReadyBeforeEdit=diagnostics.includes('code=blockReady');
-  if(earlyEdit&&report.actorBindReadyBeforeEdit)throw Error('Early-edit timing not exercised: Bind already completed');
+  report.actorTrackingReceiptBeforeEdit=diagnostics.includes('operation=draft_block_bound');
+  if(earlyEdit&&report.actorTrackingReceiptBeforeEdit)throw Error('Early-edit timing not exercised: tracking receipt already consumed');
   for(const [index,replacement,tail,final]of [[0,'周五开会','，不对，改成下周一上午开会','下周一上午开会'],[1,'下周一开会','，改成下午三点开会','下周一下午三点开会'],[2,'下周一下午两点开会','，不对，改成线上四点开会','下周一下午四点线上开会']]){
    const before=await read();if(before.text!==lastBody)throw Error('Late actor body change before edit');
    let left=0,right=0;while(left<Math.min(before.text.length,replacement.length)&&before.text[left]===replacement[left])left++;while(right<Math.min(before.text.length,replacement.length)-left&&before.text.at(-1-right)===replacement.at(-1-right))right++;
@@ -185,8 +185,8 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
    await page.evaluate(({left,end,text,caret})=>{window.fixtureEditor.edit(left,end,text);window.fixtureEditor.select(caret);},{left,end:before.text.length-right,text:replacement.slice(left,replacement.length-right),caret:replacement.length});
    const edited=await settled();trace.push({label:'actor manual edit '+index,settled:edited});if(edited.text!==replacement)throw Error('Actor manual edit differs');
    if(index===0){
-    report.actorBindReadyAfterEdit=diagnostics.includes('code=blockReady');
-    if(earlyEdit&&report.actorBindReadyAfterEdit)throw Error('Early-edit timing ambiguous: Bind completed during edit');
+    report.actorTrackingReceiptAfterEdit=diagnostics.includes('operation=draft_block_bound');
+    if(earlyEdit&&report.actorTrackingReceiptAfterEdit)throw Error('Early-edit timing ambiguous: tracking receipt consumed during edit');
     if(earlyEdit)await command({action:'release-bind'});
    }
    segments.forEach(s=>s.confirmed=true);

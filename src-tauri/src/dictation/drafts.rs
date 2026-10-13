@@ -270,6 +270,7 @@ enum NativeKind {
     Close,
 }
 enum NativeValue {
+    TrackedReplaced(Result<sayweave_text_service::wire::BlockSnapshot, Error>),
     Reacquired(Result<windows_input::composition::ReacquireOutcome, Error>),
     Block(Result<Box<sayweave_text_service::wire::Reply>, Error>),
     Replaced(Result<(), Error>),
