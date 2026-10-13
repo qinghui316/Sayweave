@@ -29,6 +29,7 @@ struct Data {
     version: u64,
     operation: u64,
     text: String,
+    position: RangePosition,
     valid: bool,
     invalid_reason: String,
     writable: bool,
@@ -38,6 +39,52 @@ struct Data {
     semantic_boundary: Option<initial_selection::SemanticBoundary>,
     pending_proof: bool,
     reacquired: bool,
+    notification: u64,
+    notification_depth: u32,
+}
+struct EditNotification {
+    data: Rc<RefCell<Data>>,
+    serial: u64,
+    version: u64,
+    lease: Cell<u64>,
+}
+impl EditNotification {
+    fn enter(data: &Rc<RefCell<Data>>) -> Self {
+        let mut state = data.borrow_mut();
+        state.notification += 1;
+        state.notification_depth += 1;
+        Self {
+            data: data.clone(),
+            serial: state.notification,
+            version: state.version,
+            lease: Cell::new(state.lease),
+        }
+    }
+    fn current(&self) -> bool {
+        let state = self.data.borrow();
+        state.valid
+            && state.notification == self.serial
+            && state.version == self.version
+            && state.lease == self.lease.get()
+    }
+    fn commit_outside(&self) -> bool {
+        if !self.current() {
+            return false;
+        }
+        // Called only after the boundary has finished all COM reads. This
+        // lease revocation and the outside evidence commit have no reentry
+        // point between them; a later superseding notification cannot undo it.
+        let mut state = self.data.borrow_mut();
+        state.writable = false;
+        state.lease += 1;
+        self.lease.set(state.lease);
+        true
+    }
+}
+impl Drop for EditNotification {
+    fn drop(&mut self) {
+        self.data.borrow_mut().notification_depth -= 1;
+    }
 }
 impl Drop for Track {
     fn drop(&mut self) {
@@ -173,6 +220,9 @@ impl OwnedUpdate {
                 data.text = text;
                 data.version += 1;
             }
+            drop(data);
+            let position = range_position(context, &self.track.range, ec)?;
+            self.track.data.borrow_mut().position = position;
             Ok::<_, windows::core::Error>(())
         })();
         if result.is_err() {
@@ -268,6 +318,7 @@ impl Track {
                 version: 1,
                 operation: request.operation,
                 text: expected,
+                position: range_position(context, &range, ec)?,
                 valid: true,
                 invalid_reason: "blockInvalid".into(),
                 writable: false,
@@ -277,6 +328,8 @@ impl Track {
                 semantic_boundary: None,
                 pending_proof: false,
                 reacquired: false,
+                notification: 0,
+                notification_depth: 0,
             }));
             let sink: ITfTextEditSink = Sink {
                 field: field.clone(),
@@ -358,6 +411,41 @@ impl Track {
                 && !boundary.anchors_match(&self.context, &self.range, ec, phase)?
             {
                 return Err(failure(TF_E_DISCONNECTED));
+            }
+            // Native scope and edit continuity, not whole-field UIA equality,
+            // authorize this exact inline text. The outside suffix is never
+            // read into the baseline. Paragraph/object representations require
+            // the separate semantic proof below; no character is trimmed.
+            let native = range_text(&self.range, ec)?;
+            let position = range_position(&self.context, &self.range, ec)?;
+            let continuous = {
+                let data = self.data.borrow();
+                data.valid
+                    && data.notification_depth == 0
+                    && data.version == version
+                    && data.text == native
+                    && data.position == position
+            };
+            if !continuous {
+                *phase = "blockSnapshotChanged".into();
+                return Err(failure(TF_E_LOCKED));
+            }
+            if content::inline_identity(&native)
+                && let Some(boundary) = &self.boundary
+            {
+                if !boundary.matches(&self.context, &self.range, ec, phase)? {
+                    return Err(failure(TF_E_LOCKED));
+                }
+                let (selection_start, selection_end) =
+                    relative_selection(&self.context, &self.range, ec)?;
+                return Ok(content::VerifiedBlockContent {
+                    semantic_text: native.clone(),
+                    native_text: native,
+                    native_end: position.end,
+                    selection_start,
+                    selection_end,
+                    content_version: version,
+                });
             }
             if let Some(original) = original {
                 // UIA has no revision shared with TSF. Semantic agreement
@@ -514,6 +602,7 @@ impl ITfTextEditSink_Impl for Sink_Impl {
             // sinks still invalidate the capability during this interval.
             return Ok(());
         }
+        let notification = EditNotification::enter(&self.data);
         let mut phase = "blockEditContext".into();
         let result = (|| unsafe {
             let context = context.as_ref().ok_or_else(|| failure(E_POINTER))?;
@@ -525,6 +614,20 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             let record = record.as_ref().ok_or_else(|| failure(E_POINTER))?;
+            let (previous, previous_position) = {
+                let data = self.data.borrow();
+                (data.text.clone(), data.position)
+            };
+            let text = range_text(&self.range, ec)?;
+            let position = range_position(context, &self.range, ec)?;
+            phase = "blockEditRangeDrift".into();
+            if position.start != previous_position.start
+                || position.end - position.start != text.encode_utf16().count() as i32
+            {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            phase = "blockEditSelection".into();
+            relative_selection(context, &self.range, ec)?;
             phase = "blockEditUpdates".into();
             let within = updates_within(record, &self.range, ec)?;
             #[cfg(feature = "acceptance")]
@@ -534,38 +637,60 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                 let coarse = block_faults::coarse_notification(changed);
                 within && !coarse
             };
+            let mut disjoint = false;
             if !within {
                 phase = self.boundary_reason.clone();
-                if !self.boundary.as_ref().is_some_and(|boundary| {
-                    boundary
-                        .matches(context, &self.range, ec, &mut phase)
-                        .unwrap_or(false)
-                }) {
+                let boundary = self
+                    .boundary
+                    .as_ref()
+                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
+                if !boundary.matches(context, &self.range, ec, &mut phase)? {
+                    disjoint = text == previous
+                        && position == previous_position
+                        && boundary.observe_disjoint_suffix(
+                            context,
+                            &self.range,
+                            record,
+                            ec,
+                            &mut phase,
+                            || notification.commit_outside(),
+                        )?;
+                } else {
+                    // Coarse notifications are covered by unchanged outside
+                    // bytes; this does not adopt a changed outside snapshot.
+                    disjoint = false;
+                }
+                if !disjoint && !boundary.matches(context, &self.range, ec, &mut phase)? {
                     return Err(failure(TF_E_DISCONNECTED));
                 }
             }
             phase = "blockEditSelection".into();
             relative_selection(context, &self.range, ec)?;
             phase = "blockEditTextRead".into();
-            let text = range_text(&self.range, ec)?;
             if text.is_empty() {
                 phase = "blockEditEmpty".into();
                 return Err(failure(TF_E_DISCONNECTED));
             }
             phase = "blockEditSelectionStatus".into();
             let changed = record.GetSelectionStatus()?.as_bool();
-            Ok((own, text, changed))
+            Ok((own, text, changed, position, disjoint))
         })();
         let error = result.as_ref().err().map(|e| e.code());
+        if !notification.current() {
+            // A nested edit/focus callback owns the newer truth. Never revive
+            // an invalid range or publish the outer callback's stale sample.
+            return Ok(());
+        }
         let mut data = self.data.borrow_mut();
         match result {
-            Ok((own, text, selection_changed)) => {
+            Ok((own, text, selection_changed, position, disjoint)) => {
+                data.position = position;
                 let text_changed = data.text != text;
                 if data.text != text {
                     data.text = text;
                     data.version += 1;
                 }
-                if !own && (text_changed || selection_changed) {
+                if disjoint || !own && (text_changed || selection_changed) {
                     data.writable = false;
                     data.lease += 1;
                 }
@@ -866,6 +991,54 @@ struct AcquisitionSink {
 #[cfg(test)]
 mod acquisition_tests {
     use super::*;
+    fn tracked_state() -> Rc<RefCell<Data>> {
+        Rc::new(RefCell::new(Data {
+            id: "owned-test".into(),
+            epoch: 1,
+            version: 1,
+            operation: 1,
+            text: "字".into(),
+            position: RangePosition { start: 0, end: 1 },
+            valid: true,
+            invalid_reason: "block".into(),
+            writable: true,
+            lease: 5,
+            writing: false,
+            evidence: evidence::Record::default(),
+            semantic_boundary: None,
+            pending_proof: false,
+            reacquired: true,
+            notification: 0,
+            notification_depth: 0,
+        }))
+    }
+    #[test]
+    fn outside_commit_revokes_lease_before_a_nested_notification_supersedes_it() {
+        let data = tracked_state();
+        let outer = EditNotification::enter(&data);
+        assert!(outer.commit_outside());
+        assert_eq!(data.borrow().lease, 6);
+        assert!(!data.borrow().writable);
+        assert!(outer.current());
+        let nested = EditNotification::enter(&data);
+        assert!(!outer.current());
+        drop(nested);
+        drop(outer);
+        assert_eq!(data.borrow().notification_depth, 0);
+        assert_eq!(data.borrow().lease, 6);
+        assert!(!data.borrow().writable);
+    }
+    #[test]
+    fn nested_invalidation_cannot_commit_an_outer_boundary_sample() {
+        let data = tracked_state();
+        let outer = EditNotification::enter(&data);
+        data.borrow_mut().valid = false;
+        assert!(!outer.commit_outside());
+        assert!(!outer.current());
+        drop(outer);
+        assert!(!data.borrow().valid);
+        assert_eq!(data.borrow().notification_depth, 0);
+    }
     #[implement(ITfCompositionSink)]
     struct Delegate(Rc<Cell<u32>>);
     impl ITfCompositionSink_Impl for Delegate_Impl {
@@ -1193,7 +1366,53 @@ impl ITfEditSession_Impl for EditBlock_Impl {
             if command.action == BlockAction::Bind {
                 let epoch = shared.borrow().epoch;
                 let track = Rc::new(Track::bind(shared, &self.context, r, ec)?);
-                let snapshot = track.snapshot(ec, &mut phase)?;
+                // Binding records an already-owned write, not an external
+                // editor baseline. Its provenance is the active composition
+                // and this writer's exact text/position map; UIA may still be
+                // publishing the previous renderer snapshot here.
+                let (composition, written) = {
+                    let state = shared.borrow();
+                    (
+                        state
+                            .composition
+                            .clone()
+                            .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
+                        state
+                            .text
+                            .clone()
+                            .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
+                    )
+                };
+                let owned = composition.GetRange()?;
+                if owned.CompareStart(ec, &track.range, TF_ANCHOR_START)? != 0
+                    || owned.CompareEnd(ec, &track.range, TF_ANCHOR_END)? != 0
+                {
+                    return Err(failure(TF_E_DISCONNECTED));
+                }
+                let actual = range_text(&owned, ec)?;
+                let (start, end) = relative_selection(&self.context, &owned, ec)?;
+                let start = written
+                    .position(&actual, start, false)
+                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
+                let end = written
+                    .position(&actual, end, false)
+                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
+                let snapshot = {
+                    let data = track.data.borrow();
+                    if !data.valid || data.text != actual {
+                        return Err(failure(TF_E_DISCONNECTED));
+                    }
+                    BlockSnapshot {
+                        id: data.id.clone(),
+                        epoch: data.epoch,
+                        version: data.version,
+                        lease: data.lease,
+                        text: written.semantic,
+                        selection_start: start,
+                        selection_end: end,
+                        writable: false,
+                    }
+                };
                 edit_authorized(shared, r, self.connection, self.generation)?;
                 let mut state = shared.borrow_mut();
                 if state.epoch != epoch

@@ -38,12 +38,12 @@ export async function runBlockRegression({page,pid,focus,start,root,folder,repor
   throw Error('Owned editor did not settle within the existing bounded read');
  });
  let revision=0,turn=1,snapshot,lastBody;
- const step=async(label,action,text='',block)=>{
+ const step=async(label,action,text='',block,requireApplied=true)=>{
   const before=await read();if(lastBody!==undefined&&before.text!==lastBody)throw Error('Late host body change before '+label);
   child.stdin.write(JSON.stringify({action,text,block,turn,revision})+'\n');
   const native=await next();const immediate=await read();const afterEvents=await settled();
   const row={label,before,native,immediate,settled:afterEvents};trace.push(row);lastBody=afterEvents.text;
-  if(!native.reply.applied){report.firstDivergence={label,kind:'nativeRefusal',code:native.reply.code};throw Error(label+': '+native.reply.code);}
+  if(requireApplied&&!native.reply.applied){report.firstDivergence={label,kind:'nativeRefusal',code:native.reply.code};throw Error(label+': '+native.reply.code);}
   if(native.reply.block)snapshot=native.reply.block;
   return row;
  };
@@ -51,6 +51,48 @@ export async function runBlockRegression({page,pid,focus,start,root,folder,repor
  const check=(row,expected)=>{if(row.settled.text!==expected){report.firstDivergence={label:row.label,kind:'body',expected,actual:row.settled.text};throw Error(row.label+': actual rich-text body differs');}};
  try{
   report.executionIdentity=await next();
+  if(process.env.SAYWEAVE_BLOCK_ACTOR_ONLY==='1'){
+   if(process.env.SAYWEAVE_BLOCK_BOUNDARIES==='1'){
+    report.boundaryCases=[];
+    const cases=['outside-suffix','range-drift','document-rebuild'];
+    const selected=process.env.SAYWEAVE_BLOCK_BOUNDARY_CASE;
+    if(selected&&!cases.includes(selected))throw Error('Unknown boundary case');
+    for(const mode of selected?[selected]:cases){
+     await page.evaluate(()=>window.fixtureEditor.set('左|#右',2,2));
+     lastBody=(await settled()).text;revision=0;
+     await step(mode+' inspect','inspect');await step(mode+' begin','begin');revision++;
+     check(await step(mode+' write','update','周三开会'),'左|周三开会#右');
+     await step(mode+' bind','inspect','',{lease:0,id:randomUUID(),action:'bind',epoch:0,version:0,expected:'',selectionStart:0,selectionEnd:0});
+     check(await step(mode+' handoff','handoff'),'左|周三开会#右');
+     await step(mode+' read','inspect','',command('read'));
+     await page.evaluate(mode=>{
+      if(mode==='outside-suffix'){window.fixtureEditor.edit(7,8,'外');window.fixtureEditor.select(6);}
+      else if(mode==='range-drift'){window.fixtureEditor.edit(0,0,'移');window.fixtureEditor.select(7);}
+      else {const old=document.querySelector('#prosemirror');const next=old.cloneNode(true);window.ownedReplacedEditor=old;old.replaceWith(next);(next.matches('[contenteditable]')?next:next.querySelector('[contenteditable]')).focus();}
+     },mode);
+     const changed=await settled();lastBody=changed.text;
+     const row=await step(mode+' acquire','inspect','',command('read'),mode==='outside-suffix');
+     if(mode==='outside-suffix'){
+      await step(mode+' resume','inspect','',command('acquire'));revision++;
+      check(await step(mode+' protected write','update','改好'),'左|改好#外');
+      check(await step(mode+' finish','handoff'),'左|改好#外');
+     }else{
+      if(row.native.reply.applied)throw Error(mode+' unexpectedly preserved capability');
+      if(row.settled.text!==changed.text)throw Error(mode+' refusal changed body');
+      if(mode==='document-rebuild'&&await page.evaluate(()=>document.querySelector('#prosemirror').textContent)!==changed.text)throw Error('Replacement editor body changed');
+     }
+     await step(mode+' release','inspect','',command('release'));
+     report.boundaryCases.push({mode,passed:true,body:lastBody,code:row.native.reply.code});
+     if(mode==='document-rebuild')await page.evaluate(()=>{document.querySelector('#prosemirror').replaceWith(window.ownedReplacedEditor);delete window.ownedReplacedEditor;window.fixtureEditor.select(0);});
+     turn++;
+    }
+   }
+   child.stdin.end('exit\n');
+   if(!ended)await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Native identity probe did not retire')),5000);child.once('exit',code=>{clearTimeout(timer);code===0?resolve():reject(Error('Native identity cleanup '+code));});});
+   if(process.env.SAYWEAVE_BLOCK_BOUNDARY_CASE)return;
+   await runActor({page,pid,focus,start,read,settled,trace,report});
+   return;
+  }
   await step('inspect','inspect');await step('begin','begin');revision++;
   check(await step('first native write','update','周三开会'),'周三开会');
   await step('bind first block','inspect','',{lease:0,id:randomUUID(),action:'bind',epoch:0,version:0,expected:'',selectionStart:0,selectionEnd:0});
@@ -80,7 +122,7 @@ export async function runBlockRegression({page,pid,focus,start,root,folder,repor
   if(report.finalBody.text!==lastBody)throw Error('Late host body change after release');
   child.stdin.end('exit\n');
   if(!ended)await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Native probe did not retire')),5000);child.once('exit',code=>{clearTimeout(timer);code===0?resolve():reject(Error('Native probe cleanup '+code));});});
-  await runActor({page,pid,start,read,settled,trace,report});
+  await runActor({page,pid,focus,start,read,settled,trace,report});
  }finally{
   report.blockEvents=await page.evaluate(()=>window.ownedBlockEvents);
   writeFileSync(path.join(folder,'block-trace.json'),JSON.stringify({trace,events:report.blockEvents,identity:report.executionIdentity,firstDivergence:report.firstDivergence,errors},null,2));
@@ -88,7 +130,7 @@ export async function runBlockRegression({page,pid,focus,start,root,folder,repor
  }
 }
 
-async function runActor({page,pid,start,read,settled,trace,report}){
+async function runActor({page,pid,focus,start,read,settled,trace,report}){
  const executable=process.env.SAYWEAVE_ACTOR_TEST_EXE;
  if(!executable||!path.isAbsolute(executable))throw Error('Built owned actor test executable required');
  await page.evaluate(()=>window.fixtureEditor.set('',0,0));
@@ -110,10 +152,25 @@ async function runActor({page,pid,start,read,settled,trace,report}){
   report.actorIdentity=await receive();
   segments.push({id:1,revision:1,text:'周三开会',confirmed:false});
   await command({action:'asr',segments});await expectBody('actor first input','周三开会');
+  // This scenario edits a tracked first block. Wait for that production
+  // acknowledgment, rather than race the asynchronous initial Bind request.
+  const bindDeadline=Date.now()+5000;
+  while(!diagnostics.includes('code=blockReady')){
+   if(Date.now()>=bindDeadline)throw Error('Production initial block did not bind');
+   await command({action:'status'});await settled();
+  }
   for(const [index,replacement,tail,final]of [[0,'周五开会','，不对，改成下周一上午开会','下周一上午开会'],[1,'下周一开会','，改成下午三点开会','下周一下午三点开会'],[2,'下周一下午两点开会','，不对，改成线上四点开会','下周一下午四点线上开会']]){
    const before=await read();if(before.text!==lastBody)throw Error('Late actor body change before edit');
    let left=0,right=0;while(left<Math.min(before.text.length,replacement.length)&&before.text[left]===replacement[left])left++;while(right<Math.min(before.text.length,replacement.length)-left&&before.text.at(-1-right)===replacement.at(-1-right))right++;
+   const eventWatermark=await page.evaluate(()=>window.ownedBlockEvents.length);
    await command({action:'edited'});
+   // End the native composition through the owned host's actual key route.
+   // Mutating ProseMirror while TSF still owns a stale composition bypasses
+   // normal editing and can itself manufacture an old-text commit on handoff.
+   for(const down of [true,false])await focus({action:'fixture-key',process:pid,key:'ArrowLeft',down});
+   await page.waitForFunction(at=>window.ownedBlockEvents.slice(at).some(e=>e.type==='compositionend'),eventWatermark,{timeout:5000});
+   const handedOff=await settled();trace.push({label:'actor edit handoff '+index,settled:handedOff});
+   if(handedOff.text!==before.text)throw Error('Native editing handoff changed body');
    await page.evaluate(({left,end,text,caret})=>{window.fixtureEditor.edit(left,end,text);window.fixtureEditor.select(caret);},{left,end:before.text.length-right,text:replacement.slice(left,replacement.length-right),caret:replacement.length});
    const edited=await settled();trace.push({label:'actor manual edit '+index,settled:edited});if(edited.text!==replacement)throw Error('Actor manual edit differs');
    segments.forEach(s=>s.confirmed=true);

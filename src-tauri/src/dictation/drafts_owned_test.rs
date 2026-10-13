@@ -3,9 +3,116 @@
 use super::*;
 use std::io::{BufRead, Write};
 
+/// Test-only bounded maintenance window. This never changes COM registration,
+/// profile enablement or the daily executable. A durable receipt precedes CAS.
+#[test]
+#[ignore = "requires explicit temporary deployment authorization and elevation"]
+fn richtext_core_window() {
+    use sayweave_text_service::deployment as deploy;
+    assert_eq!(
+        std::env::var("SAYWEAVE_INPUT_ACCEPTANCE").as_deref(),
+        Ok("1")
+    );
+    let directory = std::path::PathBuf::from(std::env::var("SAYWEAVE_CORE_WINDOW").unwrap());
+    assert!(directory.is_absolute() && directory.is_dir());
+    for name in ["ready", "stop", "result.txt", "receipt.json"] {
+        assert!(
+            !directory.join(name).exists(),
+            "fresh maintenance directory required"
+        );
+    }
+    let proxy = include_bytes!(concat!(env!("OUT_DIR"), "/text-service.dll"));
+    let core = include_bytes!(concat!(env!("OUT_DIR"), "/text-service-core.dll"));
+    assert!(!proxy.is_empty() && !core.is_empty());
+    let _guard = crate::installer::legacy_maintenance_guard(core).unwrap();
+    assert!(!deploy::core_update_pending().unwrap());
+    let before = deploy::current_engine()
+        .unwrap()
+        .expect("existing descriptor");
+    deploy::verified_core(&before).unwrap();
+    assert_eq!(before.proxy_sha256, deploy::version(proxy));
+    let (_, target) = deploy::prepare_engine(proxy, core).unwrap();
+    let mut receipt = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(directory.join("receipt.json"))
+        .unwrap();
+    serde_json::to_writer(
+        &mut receipt,
+        &serde_json::json!({"before":before,"target":target}),
+    )
+    .unwrap();
+    receipt.sync_all().unwrap();
+    // Restore on unwind as well as driver completion/timeout. Never overwrite a
+    // third-party descriptor; a failed restore remains explicit in the receipt.
+    struct Restore {
+        before: sayweave_text_service::lifecycle::CurrentEngine,
+        target: sayweave_text_service::lifecycle::CurrentEngine,
+        directory: std::path::PathBuf,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let result = match deploy::current_engine() {
+                Ok(Some(current)) if current == self.before => Ok(()),
+                Ok(Some(current)) if current == self.target => {
+                    deploy::publish_engine(Some(&self.target), Some(&self.before))
+                }
+                Ok(_) => Err(windows::core::Error::from_hresult(
+                    windows::Win32::Foundation::E_UNEXPECTED,
+                )),
+                Err(error) => Err(error),
+            };
+            let status = match result {
+                Ok(()) => "restored".to_owned(),
+                Err(e) => format!("restore failed: {e}"),
+            };
+            let written = (|| -> std::io::Result<()> {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(self.directory.join("result.txt"))?;
+                file.write_all(status.as_bytes())?;
+                file.sync_all()
+            })();
+            if let Err(error) = written {
+                eprintln!("maintenance receipt failure: {status}: {error}");
+            }
+        }
+    }
+    let restore = Restore {
+        before,
+        target,
+        directory: directory.clone(),
+    };
+    deploy::publish_engine(Some(&restore.before), Some(&restore.target)).unwrap();
+    std::fs::write(directory.join("ready"), b"ready").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    while !directory.join("stop").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(restore);
+    assert_eq!(
+        std::fs::read_to_string(directory.join("result.txt")).unwrap(),
+        "restored"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the owned rich-text fixture and matching installed core"]
 async fn richtext_actor() {
+    struct FixtureLog;
+    impl log::Log for FixtureLog {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            eprintln!("{}", record.args());
+        }
+        fn flush(&self) {}
+    }
+    static LOG: FixtureLog = FixtureLog;
+    log::set_logger(&LOG).unwrap();
+    log::set_max_level(log::LevelFilter::Info);
     assert_eq!(
         std::env::var("SAYWEAVE_INPUT_ACCEPTANCE").as_deref(),
         Ok("1")
@@ -70,7 +177,9 @@ async fn richtext_actor() {
     let mut latest = NativeTranscript::default();
     let mut finished = false;
     let result: Result<(), String> = async {
-        for _ in 0..80 {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        for _ in 0..2000 {
+            if Instant::now() >= deadline { return Err("owned actor deadline".into()); }
             let line = receiver.recv_timeout(Duration::from_secs(15)).map_err(|e|e.to_string())?;
             let command: serde_json::Value = serde_json::from_str(&line).map_err(|e|e.to_string())?;
             match command["action"].as_str() {

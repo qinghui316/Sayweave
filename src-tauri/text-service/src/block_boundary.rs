@@ -72,7 +72,8 @@ pub(super) struct BoundaryProof {
     prefix: ITfRange,
     suffix: ITfRange,
     before: Fingerprint,
-    after: Fingerprint,
+    after: RefCell<Fingerprint>,
+    revision: Cell<u64>,
 }
 unsafe fn fingerprint(
     context: &ITfContext,
@@ -112,7 +113,60 @@ unsafe fn fingerprint(
 }
 impl BoundaryProof {
     fn expected(&self) -> (Fingerprint, Fingerprint) {
-        (self.before.clone(), self.after.clone())
+        (self.before.clone(), self.after.borrow().clone())
+    }
+    // Advance outside evidence only from a native edit record which is wholly
+    // disjoint from an unchanged block. This never interprets or removes the
+    // changed characters, nor moves either endpoint of the authorized block.
+    pub(super) unsafe fn observe_disjoint_suffix(
+        &self,
+        context: &ITfContext,
+        block: &ITfRange,
+        record: &ITfEditRecord,
+        ec: u32,
+        phase: &mut String,
+        commit_outside: impl Fn() -> bool,
+    ) -> windows::core::Result<bool> {
+        unsafe {
+            let revision = self.revision.get();
+            if !self.anchors_match(context, block, ec, phase)? {
+                return Ok(false);
+            }
+            *phase = "blockOutsideEditRecord".into();
+            let updates = record.GetTextAndPropertyUpdates(TF_GTP_INCL_TEXT, &[])?;
+            let mut saw_update = false;
+            let mut complete = false;
+            for _ in 0..64 {
+                let mut ranges = [None];
+                let mut count = 0;
+                updates.Next(&mut ranges, &mut count)?;
+                if count == 0 {
+                    complete = true;
+                    break;
+                }
+                let changed = ranges[0].as_ref().ok_or_else(|| failure(E_FAIL))?;
+                // Equality is ambiguous: an edit at the block's end may be a
+                // user extension. It must not be adopted as an outside edit.
+                if changed.CompareStart(ec, block, TF_ANCHOR_END)? <= 0
+                    || changed.CompareEnd(ec, &self.suffix, TF_ANCHOR_END)? > 0
+                {
+                    return Ok(false);
+                }
+                saw_update = true;
+            }
+            if !complete || !saw_update {
+                return Ok(false);
+            }
+            let current = Self::capture(context, block, ec, phase)?;
+            if current.before != self.before || self.revision.get() != revision || !commit_outside()
+            {
+                return Ok(false);
+            }
+            *self.after.borrow_mut() = current.after.into_inner();
+            self.revision.set(revision + 1);
+            *phase = "blockDisjointOutsideEdit".into();
+            Ok(true)
+        }
     }
     pub(super) unsafe fn follow_owned_write(
         &self,
@@ -124,7 +178,7 @@ impl BoundaryProof {
             let mut phase = "blockGuardCapture".into();
             let current = Self::capture(context, block, ec, &mut phase)?;
             let (before, after) = self.expected();
-            if current.before != before || current.after != after {
+            if current.before != before || *current.after.borrow() != after {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             self.prefix
@@ -165,7 +219,8 @@ impl BoundaryProof {
                 prefix,
                 suffix,
                 before,
-                after,
+                after: RefCell::new(after),
+                revision: Cell::new(0),
             })
         }
     }

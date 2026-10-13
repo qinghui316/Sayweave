@@ -604,6 +604,7 @@ fn main() {
                         Some("AltRight") => Some(VK_RMENU),
                         Some("Backspace") => Some(VK_BACK),
                         Some("Delete") => Some(VK_DELETE),
+                        Some("ArrowLeft") => Some(VK_LEFT),
                         _ => None,
                     };
                     if let Some(key) = key {
@@ -617,7 +618,7 @@ fn main() {
                             KEYBD_EVENT_FLAGS(0)
                         } else {
                             KEYEVENTF_KEYUP
-                        } | if key == VK_RMENU || key == VK_DELETE {
+                        } | if key == VK_RMENU || key == VK_DELETE || key == VK_LEFT {
                             KEYEVENTF_EXTENDEDKEY
                         } else {
                             KEYBD_EVENT_FLAGS(0)

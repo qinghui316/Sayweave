@@ -7,11 +7,11 @@ const roots = new Set(['.gitattributes', '.gitignore', 'README.md', 'LICENSE', '
   'CONTRIBUTING.md', 'SECURITY.md', 'CHANGELOG.md', 'package.json', 'package-lock.json',
   'eslint.config.js', 'index.html', 'playwright.config.ts', 'rust-toolchain.toml',
   'tsconfig.json', 'vite.config.ts']);
-const docs = new Set(['architecture.md', 'development.md', 'design.md', 'testing.md', 'local-data.md', 'motion.md', 'models.md', 'speech.md', 'history.md', 'dictation.md', 'personalization.md', 'release.md','storage.md']);
+const docs = new Set(['architecture.md', 'revisable-draft.md', 'development.md', 'design.md', 'testing.md', 'local-data.md', 'motion.md', 'models.md', 'speech.md', 'history.md', 'dictation.md', 'personalization.md', 'release.md','storage.md']);
 const releaseNotes = /^release-notes\/v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.json$/;
 const publicWorkflow = file => ['windows-release.yml','windows-ci.yml'].includes(file.replace('.github/workflows/','')) && file.startsWith('.github/workflows/');
 const scripts = new Set(["windows-update-debug-policy.mjs",'release-validation.mjs','test-windows-installed-startup.mjs','windows-update-startup.mjs','windows-update-packages.mjs','windows-update-registration.mjs','windows-update-artifacts.mjs','reuse-windows-update-evidence.mjs','windows-update-fixtures.mjs','test-windows-update.mjs','test-windows-update.ps1','check-boundaries.mjs', 'check-native-boundaries.mjs', 'check-text.mjs', 'check-distribution.mjs', 'generate-update-manifest.mjs', 'verify-update-release.mjs',
-  'test-desktop.ps1', 'test-dictionary-desktop.mjs', 'test-models-desktop.mjs', 'test-speech-desktop.mjs', 'test-prefix-input.mjs', 'test-input.ps1', 'test-core-switch.ps1', 'build-text-service.mjs', 'desktop.mjs', 'test-language-actor.mjs', 'test-language-dashboard-live.mjs']);
+  'test-desktop.ps1', 'test-dictionary-desktop.mjs', 'test-models-desktop.mjs', 'test-speech-desktop.mjs', 'test-prefix-input.mjs', 'test-richtext-block.mjs', 'test-input.ps1', 'test-core-switch.ps1', 'build-text-service.mjs', 'desktop.mjs', 'test-language-actor.mjs', 'test-language-dashboard-live.mjs']);
 const testRoots = new Set(['contracts', 'e2e']);
 scripts.add('windows-update-metadata.cs');
 scripts.add('windows-update-metadata.ps1');

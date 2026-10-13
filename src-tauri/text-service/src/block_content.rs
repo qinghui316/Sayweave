@@ -1,6 +1,39 @@
 //! Read-only identity snapshot. UIA cannot prove non-identity representation.
 use super::*;
 
+// A scoped native string without paragraph/object representation characters
+// needs no cross-provider mapping. Keep ambiguous strings intact and read-only;
+// this predicate never decodes, truncates or removes user characters.
+pub(super) fn inline_identity(text: &str) -> bool {
+    !text.is_empty()
+        && !text
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{fffc}'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn inline_proof_never_decodes_paragraph_or_embedded_content() {
+        assert!(inline_identity("周五🙂e\u{301}开会"));
+        for text in [
+            "",
+            "用户\n",
+            "用户\r\n",
+            "甲\n\n乙",
+            "甲\u{2028}乙",
+            "甲\u{2029}乙",
+            "甲\u{fffc}乙",
+            "甲\u{000b}乙",
+        ] {
+            let original = text.to_owned();
+            assert!(!inline_identity(text));
+            assert_eq!(text, original);
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct VerifiedBlockContent {
     pub native_text: String,
