@@ -275,7 +275,9 @@ impl ITfTextEditSink_Impl for Sink_Impl {
             let within = updates_within(record, &self.range, ec)?;
             #[cfg(feature = "acceptance")]
             let within = {
-                let coarse = block_faults::coarse_notification();
+                let previous = self.data.borrow().text.clone();
+                let changed = range_text(&self.range, ec)? != previous;
+                let coarse = block_faults::coarse_notification(changed);
                 within && !coarse
             };
             phase = "blockEditOutside";

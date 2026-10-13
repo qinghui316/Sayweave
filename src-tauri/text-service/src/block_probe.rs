@@ -371,14 +371,20 @@ fn boundary_cases(
         )
     };
     unsafe {
-        fault(5);
         SendMessageW(editor, 0xB1, Some(WPARAM(2)), Some(LPARAM(3)));
+    }
+    pump(Duration::from_millis(20));
+    unsafe {
+        fault(5);
         SendMessageW(
             editor,
             0xC2,
             Some(WPARAM(1)),
             Some(LPARAM(windows::core::w!("五").as_ptr() as isize)),
         );
+    }
+    pump(Duration::from_millis(30));
+    unsafe {
         SendMessageW(editor, 0xB1, Some(WPARAM(5)), Some(LPARAM(5)));
     }
     pump(Duration::from_millis(50));
