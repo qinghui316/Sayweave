@@ -1,14 +1,36 @@
 import {useEffect,useRef,useState} from 'react';
-import {Button,Dialog,InlineMessage,Switch,ActionMenu} from '../../ui';
+import {Button,InlineMessage} from '../../ui';
 import {componentMessage,type TextServicePort,type TextServiceAction,type TextServiceStatus} from '../../contracts/text-service';
-import s from './settings.module.css';
+
 export function TextServiceSettings({port}:{port:TextServicePort}){
- const [status,setStatus]=useState<TextServiceStatus|null>(null),[busy,setBusy]=useState(false),[error,setError]=useState(''),[notice,setNotice]=useState(''),[confirm,setConfirm]=useState(false);
- const generation=useRef({value:0});
- const deploymentBlocked=status?.deploymentState==='pending'||status?.deploymentState==='failed';
- useEffect(()=>{const epoch=generation.current;const id=++epoch.value;void port.status().then(v=>{if(id===epoch.value)setStatus(v);}).catch(()=>{if(id===epoch.value)setError(componentMessage('componentUnavailable'));});return()=>{epoch.value++;};},[port]);
- async function act(action?:TextServiceAction){if(busy)return;const id=++generation.current.value;setBusy(true);setError('');setNotice('');try{const v=action?await port.act(action):await port.status();if(id===generation.current.value){setStatus(v);if(action==='install')setNotice(v.restartRequired?'组件已更新，请重新打开正在使用的输入应用一次。':'组件已更新。');if(action==='remove')setNotice('原位输入组件已移除。重新打开输入软件后生效。');}}catch(e){if(id===generation.current.value)setError(componentMessage(typeof e==='object'&&e&&'code'in e?String(e.code):'componentUnavailable'));}finally{if(id===generation.current.value)setBusy(false);}}
- return <section><div className={s.settingRow}><div><h3>原位输入</h3><p role="status">{busy?'处理中…':status?.deploymentState==='pending'?'正在准备':status?.deploymentState==='failed'?'需要恢复':!status?'正在读取':status.enabled?'已启用':status.installed?'已停用':'未安装'}</p></div><div className={s.componentActions}><Switch label="启用原位输入" checked={status?.enabled??false} disabled={!status||busy||deploymentBlocked||(!status.installed&&!status.payloadAvailable)} onCheckedChange={enabled=>void act(enabled?status?.installed?'enable':'install':'disable')}/><ActionMenu label="组件管理" items={[{label:'检查状态',disabled:busy,onSelect:()=>void act()},...((status?.updateAvailable&&!deploymentBlocked)||status?.maintenanceAvailable?[{label:'修复组件',disabled:busy,onSelect:()=>void act('install')}]:[]),...(status?.installed||status?.cleanupPending?[{label:status.cleanupPending?'重试清理':'移除组件',disabled:busy||deploymentBlocked,onSelect:()=>setConfirm(true)}]:[])]}/></div></div>
- {status?.error&&<InlineMessage status="error">{componentMessage(status.error)}</InlineMessage>}{busy&&<p role="status">正在处理输入组件…</p>}{notice&&<p role="status">{notice}</p>}{error&&<InlineMessage status="error">{error}<Button variant="quiet" disabled={busy} onClick={()=>void act()}>重新检查</Button></InlineMessage>}
- <Dialog confirmation open={confirm} onOpenChange={setConfirm} title="移除原位输入组件" description="移除后可以在这里重新安装。Windows 将请求管理员确认。"><Button autoFocus variant="quiet" onClick={()=>setConfirm(false)}>取消</Button><Button onClick={()=>{setConfirm(false);void act('remove');}}>移除</Button></Dialog></section>;
+ const [status,setStatus]=useState<TextServiceStatus|null>(null),[busy,setBusy]=useState(false),[error,setError]=useState(''),[restart,setRestart]=useState(false);
+ const generation=useRef({value:0}),pending=useRef(false);
+ useEffect(()=>{
+  const epoch=generation.current;const id=++epoch.value;pending.current=false;
+  void port.status().then(value=>{if(id===generation.current.value){setStatus(value);setError('');setBusy(false);setRestart(false);}}).catch(()=>{if(id===generation.current.value){setStatus(null);setBusy(false);setError(componentMessage('componentUnavailable'));}});
+  return()=>{epoch.value++;};
+ },[port]);
+ async function act(action?:TextServiceAction){
+  if(pending.current)return;
+  pending.current=true;const id=++generation.current.value;setBusy(true);setError('');
+  try{
+   const value=action?await port.act(action):await port.status();
+   if(id===generation.current.value){setStatus(value);setRestart(action==='install'&&value.restartRequired===true);}
+  }catch(e){if(id===generation.current.value)setError(componentMessage(typeof e==='object'&&e&&'code'in e?String(e.code):'componentUnavailable'));}
+  finally{if(id===generation.current.value){pending.current=false;setBusy(false);}}
+ }
+ const blocked=status?.deploymentState==='pending'||status?.deploymentState==='failed';
+ const unavailable=status&&(status.error||!status.installed||!status.enabled||status.updateAvailable||blocked);
+ if(!unavailable&&!error&&!restart)return null;
+ // An installer-owned operation is already in progress; opening settings must not start another.
+ if(status?.deploymentState==='pending'&&!status.error&&!error&&!status.maintenanceAvailable)return null;
+ const repair=status?.payloadAvailable&&((!blocked&&(!status.installed||status.updateAvailable))||status.maintenanceAvailable);
+ const enable=status?.installed&&!status.enabled&&!status.updateAvailable&&!blocked&&!status.error;
+ const recovery:TextServiceAction|undefined=repair?'install':enable?'enable':undefined;
+ const message=error||(status?.error?componentMessage(status.error):blocked?componentMessage('componentDeploymentPending'):unavailable?'语音输入暂不可用。':'');
+ return <section aria-label="输入恢复">
+  {message&&<InlineMessage status="error">{message}</InlineMessage>}
+  {restart&&<p role="status">请重新打开正在使用的输入应用一次。</p>}
+  {busy?<p role="status">正在恢复输入…</p>:recovery?<Button onClick={()=>void act(recovery)}>恢复输入</Button>:error?<Button variant="quiet" onClick={()=>void act()}>重新检查</Button>:null}
+ </section>;
 }

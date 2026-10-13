@@ -17,4 +17,4 @@
 .processing { margin-bottom:var(--space-20);padding-bottom:var(--space-16);border-bottom:1px solid var(--surface-key); }.processingRow { display:flex;align-items:center;justify-content:space-between;gap:var(--space-20); }.processingRow>div { min-width:0; }.processing h3 { font-size:var(--text-mode);line-height:var(--line-mode);font-weight:500; }.processing p { margin-top:var(--space-8);font-size:var(--text-small);line-height:var(--line-small);color:var(--text-secondary); }.processing .processingModel { overflow-wrap:anywhere; }.processing>button { margin-top:var(--space-12); }
 .processingRow + .processingRow { margin-top:var(--space-20); }
 
-.componentActions{display:flex;align-items:center;gap:var(--space-12);flex:none}.aboutRow{min-height:44px;margin-top:var(--space-24);margin-bottom:0}.settingRow>div:first-child{min-width:0}.deviceRow button{height:36px}.deviceRow{align-items:flex-end}
+.aboutRow{min-height:44px;margin-top:var(--space-24);margin-bottom:0}.settingRow>div:first-child{min-width:0}.deviceRow button{height:36px}.deviceRow{align-items:flex-end}

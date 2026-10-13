@@ -1,80 +1,63 @@
 import {act,render,screen,waitFor} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import {describe,expect,it,vi} from 'vitest';
-import {BrowserTextService} from '../src/adapters/dictation-tauri';
 import {TextServiceSettings} from '../src/features/settings/TextServiceSettings';
 import {parseTextService,type TextServicePort,type TextServiceStatus} from '../src/contracts/text-service';
-describe('component lifecycle',()=>{
- it('installs, disables, reenables and confirms removal with fixed operations',async()=>{
-  const port=new BrowserTextService(),action=vi.spyOn(port,'act'),user=userEvent.setup();
-  render(<TextServiceSettings port={port}/>);
-  await waitFor(()=>expect(screen.getByRole('switch',{name:'启用原位输入'})).toBeEnabled());await user.click(screen.getByRole('switch',{name:'启用原位输入'}));
-  await waitFor(()=>expect(screen.getByRole('switch')).toBeChecked());
-  await user.click(screen.getByRole('button',{name:'组件管理'}));await user.click(screen.getByRole('menuitem',{name:'检查状态'}));expect(action).toHaveBeenCalledTimes(1);
-  await user.click(screen.getByRole('switch'));
-  await waitFor(()=>expect(screen.getByRole('switch')).toBeEnabled());await user.click(screen.getByRole('switch'));
-  await user.click(screen.getByRole('button',{name:'组件管理'}));
-  await user.click(screen.getByRole('menuitem',{name:'移除组件'}));
-  expect(action).not.toHaveBeenCalledWith('remove');
-  await user.click(screen.getByRole('button',{name:'移除'}));
-  await waitFor(()=>expect(screen.getByRole('switch')).not.toBeChecked());
-  expect(action.mock.calls.map(c=>c[0])).toEqual(['install','disable','enable','remove']);
+const ready:TextServiceStatus={installed:true,enabled:true,updateAvailable:false,payloadAvailable:true,cleanupPending:false,deploymentState:'ready',error:null};
+function service(value:TextServiceStatus):TextServicePort{return {mode:'native',status:vi.fn().mockResolvedValue(value),act:vi.fn().mockResolvedValue(ready)};}
+describe('input recovery',()=>{
+ it('keeps healthy input invisible without maintenance or enable controls',async()=>{
+  const port=service(ready),view=render(<TextServiceSettings port={port}/>);
+  await act(async()=>{});
+  expect(view.container).toBeEmptyDOMElement();expect(port.act).not.toHaveBeenCalled();
  });
- it('keeps the user disabled after core repair and asks for restart only when native migration requires it',async()=>{
-  const value:TextServiceStatus={installed:true,enabled:false,updateAvailable:true,payloadAvailable:true,cleanupPending:false,maintenanceAvailable:true,restartRequired:false,deploymentState:'failed',error:null};
-  const port:TextServicePort={mode:'native',status:async()=>value,act:vi.fn().mockResolvedValue({...value,updateAvailable:false,deploymentState:'ready'})};
-  render(<TextServiceSettings port={port}/>);const user=userEvent.setup();
-  await user.click(screen.getByRole('button',{name:'组件管理'}));await user.click(screen.getByRole('menuitem',{name:'修复组件'}));
-  await screen.findByText('组件已更新。');expect(screen.getByRole('switch')).not.toBeChecked();
-  expect(()=>parseTextService({...value,restartRequired:'true'})).toThrow();
-  expect(()=>parseTextService({...value,maintenanceAvailable:1})).toThrow();
+ it('does not expose retired file cleanup as a user setting',async()=>{
+  const port=service({...ready,cleanupPending:true}),view=render(<TextServiceSettings port={port}/>);
+  await act(async()=>{});expect(view.container).toBeEmptyDOMElement();
  });
- it('retains the saved status after a failed action and ignores late replies after unmount',async()=>{
-  const value:TextServiceStatus={installed:true,enabled:false,updateAvailable:false,payloadAvailable:true,cleanupPending:false,deploymentState:'ready',error:null};
-  let resolve!:(v:TextServiceStatus)=>void;
-  const port:TextServicePort={mode:'native',status:async()=>value,act:vi.fn().mockRejectedValueOnce({code:'componentEnableFailed'}).mockImplementationOnce(()=>new Promise<TextServiceStatus>(r=>{resolve=r;}))};
-  const view=render(<TextServiceSettings port={port}/>),user=userEvent.setup();
-  await waitFor(()=>expect(screen.getByRole('switch')).toBeEnabled());await user.click(screen.getByRole('switch'));
-  await screen.findByText('未能启用输入组件，请重试。');
-  expect(screen.getByRole('switch')).toBeEnabled();
-  await user.click(screen.getByRole('switch'));
-  await waitFor(()=>expect(screen.getByRole('switch')).toBeDisabled());
-  view.unmount();await act(async()=>{resolve({...value,enabled:true});});
+ it('does not interrupt automatic installer work with another operation',async()=>{
+  const port=service({...ready,updateAvailable:true,deploymentState:'pending'}),view=render(<TextServiceSettings port={port}/>);
+  await act(async()=>{});expect(view.container).toBeEmptyDOMElement();expect(port.act).not.toHaveBeenCalled();
  });
- it('rejects impossible native state combinations',()=>{
-  expect(()=>parseTextService({installed:false,enabled:true,updateAvailable:false,payloadAvailable:true,cleanupPending:false,deploymentState:'ready',error:null})).toThrow();
-  expect(()=>parseTextService({installed:true,enabled:true,updateAvailable:true,payloadAvailable:false,cleanupPending:false,deploymentState:'ready',error:null})).toThrow();
+ it('requires explicit recovery before restoring a previously disabled choice',async()=>{
+  const port=service({...ready,enabled:false}),user=userEvent.setup(),view=render(<TextServiceSettings port={port}/>);
+  const button=await screen.findByRole('button',{name:'恢复输入'});
+  expect(port.act).not.toHaveBeenCalled();expect(screen.queryByRole('switch')).not.toBeInTheDocument();
+  await user.click(button);expect(port.act).toHaveBeenCalledExactlyOnceWith('enable');
+  await waitFor(()=>expect(view.container).toBeEmptyDOMElement());
  });
- it('keeps repair available when an owned registration has lost its module',async()=>{
-  const damaged:TextServiceStatus={installed:true,enabled:false,updateAvailable:true,payloadAvailable:true,cleanupPending:false,deploymentState:'required',error:'componentRegistration'};
-  const restored:TextServiceStatus={...damaged,enabled:true,updateAvailable:false,error:null};
-  const port:TextServicePort={mode:'native',status:async()=>damaged,act:vi.fn().mockResolvedValue(restored)};
-  render(<TextServiceSettings port={port}/>);const user=userEvent.setup();
-  await user.click(screen.getByRole('button',{name:'组件管理'}));await user.click(await screen.findByRole('menuitem',{name:'修复组件'}));
-  expect(port.act).toHaveBeenCalledWith('install');
-  await waitFor(()=>expect(screen.getByRole('switch')).toBeChecked());
-  expect(screen.queryByRole('menuitem',{name:'修复组件'})).not.toBeInTheDocument();
+ it('repairs a damaged owned registration and preserves native restart instructions',async()=>{
+  const port=service({...ready,enabled:false,updateAvailable:true,error:'componentRegistration'});
+  vi.mocked(port.act).mockResolvedValue({...ready,restartRequired:true});
+  render(<TextServiceSettings port={port}/>);await userEvent.click(await screen.findByRole('button',{name:'恢复输入'}));
+  expect(port.act).toHaveBeenCalledExactlyOnceWith('install');
+  await screen.findByText('请重新打开正在使用的输入应用一次。');
+  expect(screen.queryByRole('button',{name:'恢复输入'})).not.toBeInTheDocument();
  });
- it('offers exact cleanup again after registration removal leaves a mapped file',async()=>{
-  const value:TextServiceStatus={installed:false,enabled:false,updateAvailable:false,payloadAvailable:true,cleanupPending:true,deploymentState:'required',error:null};
-  const port:TextServicePort={mode:'native',status:async()=>value,act:vi.fn().mockResolvedValue({...value,cleanupPending:false})};
-  render(<TextServiceSettings port={port}/>);const user=userEvent.setup();
-  await user.click(screen.getByRole('button',{name:'组件管理'}));
-  await user.click(screen.getByRole('menuitem',{name:'重试清理'}));
-  expect(port.act).not.toHaveBeenCalled();
-  await user.click(screen.getByRole('button',{name:'移除'}));
-  await waitFor(()=>expect(screen.getByRole('switch')).toBeEnabled());
-  expect(port.act).toHaveBeenCalledWith('remove');
+ it('only offers failed transaction repair when the native owner allows it',async()=>{
+  const port=service({...ready,deploymentState:'failed'}),view=render(<TextServiceSettings port={port}/>);
+  await screen.findByText('输入组件维护未完成，请重新运行安装包恢复。');
+  expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  view.rerender(<TextServiceSettings port={service({...ready,deploymentState:'failed',maintenanceAvailable:true})}/>);
+  await screen.findByRole('button',{name:'恢复输入'});
  });
- it.each(['pending','failed'] as const)('keeps an unfinished %s deployment under installer recovery ownership',async(deploymentState)=>{
-  const value:TextServiceStatus={installed:true,enabled:true,updateAvailable:true,payloadAvailable:true,cleanupPending:false,deploymentState,error:null};
-  const port:TextServicePort={mode:'native',status:async()=>value,act:vi.fn()};
-  render(<TextServiceSettings port={port}/>);const user=userEvent.setup();
-  await waitFor(()=>expect(screen.getByRole('switch')).toBeChecked());
-  expect(screen.getByRole('switch')).toBeDisabled();
-  await user.click(screen.getByRole('button',{name:'组件管理'}));
-  expect(screen.queryByRole('menuitem',{name:'修复组件'})).not.toBeInTheDocument();
-  expect(screen.getByRole('menuitem',{name:'移除组件'})).toHaveAttribute('aria-disabled','true');
-  expect(port.act).not.toHaveBeenCalled();
+ it('shows failed recovery accurately and ignores replies after unmount',async()=>{
+  const port=service({...ready,enabled:false}),user=userEvent.setup();
+  let finish!:(v:TextServiceStatus)=>void;
+  vi.mocked(port.act).mockRejectedValueOnce({code:'componentEnableFailed'}).mockImplementationOnce(()=>new Promise(r=>{finish=r;}));
+  const view=render(<TextServiceSettings port={port}/>);
+  await user.click(await screen.findByRole('button',{name:'恢复输入'}));await screen.findByText('未能启用输入组件，请重试。');
+  await user.click(screen.getByRole('button',{name:'恢复输入'}));
+  expect(screen.queryByRole('button')).not.toBeInTheDocument();view.unmount();
+  await act(async()=>{finish(ready);});expect(port.act).toHaveBeenCalledTimes(2);
+ });
+ it('can retry a failed status read without performing a system mutation',async()=>{
+  const port=service(ready);vi.mocked(port.status).mockRejectedValueOnce(new Error('unavailable'));
+  const view=render(<TextServiceSettings port={port}/>);
+  await userEvent.click(await screen.findByRole('button',{name:'重新检查'}));
+  await waitFor(()=>expect(view.container).toBeEmptyDOMElement());expect(port.act).not.toHaveBeenCalled();
+ });
+ it('rejects impossible or malformed native status',()=>{
+  for(const invalid of [{...ready,installed:false},{...ready,updateAvailable:true,payloadAvailable:false},{...ready,restartRequired:'true'},{...ready,maintenanceAvailable:1}])expect(()=>parseTextService(invalid)).toThrow();
  });
 });
