@@ -199,7 +199,11 @@ impl Track {
             }
             *phase = "blockSnapshotVersion";
             let data = self.data.borrow();
-            if !data.valid || data.version != version || text.is_empty() || data.text != text {
+            if !data.valid {
+                *phase = data.invalid_reason;
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            if data.version != version || text.is_empty() || data.text != text {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             *phase = "block";
@@ -277,9 +281,11 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                 }
             }
             Err(_) => {
+                if data.valid {
+                    data.invalid_reason = phase;
+                }
                 data.valid = false;
                 data.writable = false;
-                data.invalid_reason = phase;
             }
         }
         // Tracking refusal must not fail the user's edit.
