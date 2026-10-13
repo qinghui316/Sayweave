@@ -967,14 +967,39 @@ pub(super) fn native_done(
                             .zip(scalar_position(&snapshot.text, snapshot.selection_end));
                         if let Some((start, end)) = range {
                             // Stop keeps editor text but must not grant new model permission.
-                            let stopped = r.stopped;
                             let identity = (snapshot.id.clone(), snapshot.epoch, snapshot.version);
                             let fresh = r.edit_identity.as_ref() != Some(&identity)
                                 && snapshot.text != r.block.confirmed().1;
+                            let source = r.pending_source.as_ref().unwrap_or(&s.latest);
+                            let finish_visible = !fresh
+                                && s.ending.as_ref().is_some_and(|e| e.mode == Finish::Commit)
+                                && s.unit.is_none()
+                                && source.task_id == actor.task
+                                && source.turn == s.turn
+                                && source.text == s.written_raw
+                                && r.visible_coverage.as_ref().is_some_and(|coverage| {
+                                    coverage.offset(&source.segments)
+                                        == Some(source.text.chars().count())
+                                });
+                            let mut stopped = r.stopped;
                             let rebased = if fresh {
                                 r.block.rebase_retained(snapshot.text.clone(), start..end)
+                            } else if stopped {
+                                // Ending unchanged editor text needs no source
+                                // insertion mapping and grants no write permit.
+                                Ok(())
                             } else {
                                 r.block.resume_unchanged(start..end)
+                            };
+                            let rebased = match rebased {
+                                Err(error) if error.code == "sourceSelection" && finish_visible => {
+                                    // Final ASR contains only already displayed source.
+                                    // Retain it without authorizing a new insertion.
+                                    r.stop();
+                                    stopped = true;
+                                    Ok(())
+                                }
+                                result => result,
                             };
                             if rebased.is_ok() {
                                 if fresh {
@@ -1006,10 +1031,15 @@ pub(super) fn native_done(
                                     observe(actor, s, r, pending);
                                 }
                             } else if rebased.is_err_and(|e| e.code == "sourceSelection") {
-                                // A caret-only move is not an editor baseline.
-                                // Retire this block if its source insertion cannot
-                                // be mapped, preserving the actual editor text.
-                                release(actor, s, r, true);
+                                // The native range is valid; only the ASR insertion
+                                // mapping is unavailable while the user positions
+                                // the caret to edit. Keep the read-only tracker,
+                                // revoked permit and original source watermark.
+                                // A later verified text edit can establish a new
+                                // baseline. The existing proof deadline still wins.
+                                r.snapshot = Some(snapshot);
+                                s.paused_at = Some(Instant::now());
+                                log::info!(target:"sayweave", "operation=draft_selection_wait task_id={} block={} reason=sourceSelection", actor.task,r.block.id());
                             } else {
                                 r.cleanup_failed = true;
                                 s.record_failure(&actor.task, "compositionProtocol".into());
@@ -1537,6 +1567,79 @@ mod tests {
             s.native.as_ref().unwrap().kind,
             NativeKind::Revisable(Effect::Close)
         ));
+    }
+
+    #[tokio::test]
+    async fn stopping_at_a_relocated_caret_needs_no_source_insertion_permission() {
+        for (commit, pending_tail) in [(false, false), (true, false), (true, true)] {
+            let (actor, mut s, _) = actor(None);
+            let mut r = State::new();
+            r.block.observe("周三开会".into(), 4).unwrap();
+            let (revision, text) = r.block.write().unwrap();
+            r.block.acknowledge(revision, text.clone()).unwrap();
+            r.handoff();
+            if commit {
+                ending(&mut s, false);
+                s.latest = NativeTranscript {
+                    task_id: actor.task.clone(),
+                    turn: s.turn,
+                    sequence: 1,
+                    text: text.clone(),
+                    segments: vec![crate::contracts::processing::SourceSegment {
+                        id: 1,
+                        revision: 1,
+                        text: text.clone(),
+                        confirmed: true,
+                    }],
+                };
+                s.written_raw = text.clone();
+                r.visible_coverage =
+                    crate::processing::draft_source::Watermark::capture(&s.latest.segments, 4);
+                if pending_tail {
+                    let mut pending = s.latest.clone();
+                    pending.sequence += 1;
+                    pending.text.push('后');
+                    pending
+                        .segments
+                        .push(crate::contracts::processing::SourceSegment {
+                            id: 2,
+                            revision: 1,
+                            text: "后".into(),
+                            confirmed: true,
+                        });
+                    r.pending_source = Some(pending);
+                }
+            } else {
+                r.stop();
+            }
+            let snapshot = BlockSnapshot {
+                id: r.block.id().into(),
+                epoch: 1,
+                version: 1,
+                lease: 2,
+                text: text.clone(),
+                selection_start: 1,
+                selection_end: 1,
+                writable: false,
+            };
+            r.snapshot = Some(snapshot.clone());
+            let deadline = r.proof_deadline;
+            native_done(
+                &actor,
+                &mut s,
+                &mut r,
+                &NativeKind::Revisable(Effect::Read {
+                    activity: input_state::activity(),
+                }),
+                NativeValue::block(Ok(block_reply(&actor.task, Some(snapshot), true))),
+            );
+            assert_eq!(r.read_needed, pending_tail);
+            assert_eq!(r.stopped, !pending_tail);
+            assert!(!r.permit.load(Ordering::Acquire));
+            assert_eq!(r.proof_deadline, deadline);
+            assert_eq!(r.block.confirmed().1, text);
+            assert!(s.native.is_none());
+        }
     }
     #[tokio::test]
     async fn edit_then_immediate_finish_keeps_baseline_without_regeneration() {

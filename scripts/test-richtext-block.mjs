@@ -182,6 +182,22 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
    await page.waitForFunction(at=>window.ownedBlockEvents.slice(at).some(e=>e.type==='compositionend'),eventWatermark,{timeout:5000});
    const handedOff=await settled();trace.push({label:'actor edit handoff '+index,settled:handedOff});
    if(handedOff.text!==before.text)throw Error('Native editing handoff changed body');
+   if(process.env.SAYWEAVE_BLOCK_SELECTION_PAUSE==='1'){
+    // Real editing starts by moving the caret/selection, before changing text.
+    // Keep this interval long enough for the production reader to see it.
+    await page.evaluate(at=>window.fixtureEditor.select(at),left);
+    const logStart=diagnostics.length,deadline=Date.now()+5000;
+    while(!diagnostics.slice(logStart).includes('operation=draft_selection_wait')){
+     if(diagnostics.slice(logStart).includes('code=blockReleased')){
+      report.firstDivergence={label:'selection before edit '+index,kind:'prematureBlockRelease',actual:(await read()).text};
+      throw Error('Caret-only positioning retired the original block before manual edit');
+     }
+     if(Date.now()>=deadline)throw Error('Caret-only read was not observed');
+     await command({action:'status'});await settled();
+    }
+    const positioned=await settled();trace.push({label:'actor selection before edit '+index,settled:positioned});
+    if(positioned.text!==before.text)throw Error('Caret-only positioning changed body');
+   }
    await page.evaluate(({left,end,text,caret})=>{window.fixtureEditor.edit(left,end,text);window.fixtureEditor.select(caret);},{left,end:before.text.length-right,text:replacement.slice(left,replacement.length-right),caret:replacement.length});
    const edited=await settled();trace.push({label:'actor manual edit '+index,settled:edited});if(edited.text!==replacement)throw Error('Actor manual edit differs');
    if(index===0){
@@ -195,7 +211,23 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
    segments.at(-1).revision++;segments.at(-1).text=tail;segments.at(-1).confirmed=true;
    await command({action:'asr',segments});await expectBody('actor model '+index,final);
   }
+  if(process.env.SAYWEAVE_BLOCK_FINISH_SELECTION==='1'){
+   const eventWatermark=await page.evaluate(()=>window.ownedBlockEvents.length);
+   await command({action:'edited'});
+   for(const down of [true,false])await focus({action:'fixture-key',process:pid,key:'ArrowLeft',down});
+   await page.waitForFunction(at=>window.ownedBlockEvents.slice(at).some(e=>e.type==='compositionend'),eventWatermark,{timeout:5000});
+   await page.evaluate(()=>window.fixtureEditor.select(1));
+   const logStart=diagnostics.length,deadline=Date.now()+5000;
+   while(!diagnostics.slice(logStart).includes('operation=draft_selection_wait')){
+    if(diagnostics.slice(logStart).includes('code=blockReleased'))throw Error('Final caret move discarded the block');
+    if(Date.now()>=deadline)throw Error('Final caret-only read was not observed');
+    await command({action:'status'});await settled();
+   }
+  }
+  const finishStarted=Date.now();
   report.actorDelivery=await command({action:'finish'});
+  report.actorFinishMs=Date.now()-finishStarted;
+  if(process.env.SAYWEAVE_BLOCK_FINISH_SELECTION==='1'&&report.actorFinishMs>3000)throw Error('Caret-only finish waited for another edit');
   if(!report.actorDelivery.finished||report.actorDelivery.error||report.actorDelivery.requests!==3)throw Error('Actor final settlement or request count differs');
   await expectBody('actor final settled',lastBody);
   actor.stdin.end();

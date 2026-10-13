@@ -435,6 +435,24 @@ async fn manual_edit_rebases_same_block_and_new_speech_never_replays_the_old_tur
     acknowledge(&actor, &mut state).await;
     assert_eq!(state.turn, 1);
     assert_eq!(state.latest.text, "周三开会");
+    // Clicking inside the block precedes the actual text edit. A successful
+    // native read of unchanged text must not discard the tracked block just
+    // because that caret is not the previous ASR insertion endpoint.
+    let mut positioned = tracked_snapshot(&id, "周三开会");
+    positioned.selection_start = 1;
+    positioned.selection_end = 1;
+    let activity = input_state::activity();
+    actor.native_done(
+        &mut state,
+        &NativeKind::Revisable(revisable::Effect::Read { activity }),
+        NativeValue::block(Ok(block_reply(&actor.task, Some(positioned), true))),
+    );
+    assert!(
+        state.native.is_none(),
+        "caret-only read must not release the block"
+    );
+    assert_eq!(state.turn, 1);
+    assert_eq!(state.latest.text, "周三开会");
     let edited = sayweave_text_service::wire::BlockSnapshot {
         id,
         epoch: 1,
