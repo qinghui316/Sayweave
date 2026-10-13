@@ -5,6 +5,8 @@ use unicode_segmentation::UnicodeSegmentation;
 #[path = "block_boundary.rs"]
 mod boundary;
 use boundary::BoundaryProof;
+#[path = "block_evidence.rs"]
+mod evidence;
 
 pub(super) struct Track {
     pub context: ITfContext,
@@ -30,6 +32,7 @@ struct Data {
     writable: bool,
     lease: u64,
     writing: bool,
+    evidence: evidence::Record,
 }
 impl Drop for Track {
     fn drop(&mut self) {
@@ -168,6 +171,17 @@ impl OwnedUpdate {
             data.valid = false;
             data.writable = false;
         }
+        let error = result.as_ref().err().map(|e| e.code());
+        unsafe {
+            evidence::capture(
+                context,
+                &self.track.range,
+                &self.track.field,
+                &self.track.data,
+                ec,
+                ("ownedFollow", "blockOwnedFollow", error),
+            );
+        }
     }
 }
 
@@ -247,6 +261,7 @@ impl Track {
                 writable: false,
                 lease: 0,
                 writing: false,
+                evidence: evidence::Record::default(),
             }));
             let sink: ITfTextEditSink = Sink {
                 field: field.clone(),
@@ -282,7 +297,7 @@ impl Track {
                         return Err(error);
                     }
                 };
-            Ok(Self {
+            let track = Self {
                 context: context.clone(),
                 range,
                 field,
@@ -294,7 +309,16 @@ impl Track {
                 notifications,
                 boundary,
                 _lease: Lease::new(),
-            })
+            };
+            evidence::capture(
+                context,
+                &track.range,
+                &track.field,
+                &track.data,
+                ec,
+                ("bind", "block", None),
+            );
+            Ok(track)
         }
     }
 
@@ -429,14 +453,17 @@ impl ITfTextEditSink_Impl for Sink_Impl {
             }
             phase = "blockEditSelection".into();
             relative_selection(context, &self.range, ec)?;
-            phase = "blockEditText".into();
+            phase = "blockEditTextRead".into();
             let text = range_text(&self.range, ec)?;
             if text.is_empty() {
+                phase = "blockEditEmpty".into();
                 return Err(failure(TF_E_DISCONNECTED));
             }
+            phase = "blockEditSelectionStatus".into();
             let changed = record.GetSelectionStatus()?.as_bool();
             Ok((own, text, changed))
         })();
+        let error = result.as_ref().err().map(|e| e.code());
         let mut data = self.data.borrow_mut();
         match result {
             Ok((own, text, selection_changed)) => {
@@ -452,10 +479,23 @@ impl ITfTextEditSink_Impl for Sink_Impl {
             }
             Err(_) => {
                 if data.valid {
-                    data.invalid_reason = phase;
+                    data.invalid_reason = phase.clone();
                 }
                 data.valid = false;
                 data.writable = false;
+            }
+        }
+        drop(data);
+        if let Some(context) = context.as_ref() {
+            unsafe {
+                evidence::capture(
+                    context,
+                    &self.range,
+                    &self.field,
+                    &self.data,
+                    ec,
+                    ("onEndEdit", &phase, error),
+                );
             }
         }
         // Tracking refusal must not fail the user's edit.
@@ -894,15 +934,33 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                     None,
                 );
             }
-            Err(error) => complete(
-                &self.shared,
-                &self.request,
-                self.connection,
-                false,
-                &format!("{phase}:{:08x}", error.code().0 as u32),
-                mutation,
-                None,
-            ),
+            Err(error) => {
+                let track = self.shared.borrow().block.clone();
+                let detail = if let Some(track) = track {
+                    unsafe {
+                        evidence::capture(
+                            &self.context,
+                            &track.range,
+                            &track.field,
+                            &track.data,
+                            ec,
+                            ("request", &phase, Some(error.code())),
+                        );
+                    }
+                    evidence::suffix(&track.data)
+                } else {
+                    String::new()
+                };
+                complete(
+                    &self.shared,
+                    &self.request,
+                    self.connection,
+                    false,
+                    &format!("{phase}:{:08x}{detail}", error.code().0 as u32),
+                    mutation,
+                    None,
+                );
+            }
         }
         result.map(|_| ())
     }

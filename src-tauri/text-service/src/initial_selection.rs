@@ -320,6 +320,32 @@ pub struct Evidence {
     pub end: i32,
 }
 impl Evidence {
+    // Diagnostic only. Coordinates never create or move a native write range.
+    pub(super) fn block_projection(&self, start: i32, end: i32) -> BlockProjection {
+        use sha2::{Digest, Sha256};
+        let mapped = diagnostic_block_mapping(&self.all, &self.tsf, start, end);
+        let (before, after) = mapped.map_or((None, None), |(a, b)| {
+            (Some(&self.all[..a]), Some(&self.all[b..]))
+        });
+        BlockProjection {
+            units: self.all.encode_utf16().count(),
+            document_terminal_units: self
+                .all
+                .chars()
+                .rev()
+                .take_while(|c| matches!(c, '\r' | '\n'))
+                .count(),
+            mapped: mapped.is_some(),
+            before_units: before.map(|v| v.encode_utf16().count()),
+            after_units: after.map(|v| v.encode_utf16().count()),
+            provider_equal: None,
+            before_equal: None,
+            after_equal: None,
+            identity: self.identity.clone(),
+            before_hash: before.map(|v| Sha256::digest(v.as_bytes()).into()),
+            after_hash: after.map(|v| Sha256::digest(v.as_bytes()).into()),
+        }
+    }
     pub fn selected_text(&self) -> &str {
         &self.picked
     }
@@ -360,6 +386,84 @@ impl Evidence {
             Ok(())
         }
     }
+}
+#[derive(serde::Serialize)]
+pub(super) struct BlockProjection {
+    units: usize,
+    document_terminal_units: usize,
+    mapped: bool,
+    before_units: Option<usize>,
+    after_units: Option<usize>,
+    provider_equal: Option<bool>,
+    before_equal: Option<bool>,
+    after_equal: Option<bool>,
+    #[serde(skip)]
+    identity: IUnknown,
+    #[serde(skip)]
+    before_hash: Option<[u8; 32]>,
+    #[serde(skip)]
+    after_hash: Option<[u8; 32]>,
+}
+impl BlockProjection {
+    pub(super) fn mapped(&self) -> bool {
+        self.mapped
+    }
+    pub(super) fn compare(&mut self, original: &Self) {
+        self.provider_equal = Some(self.identity == original.identity);
+        self.before_equal = self
+            .before_hash
+            .zip(original.before_hash)
+            .map(|(a, b)| a == b);
+        self.after_equal = self
+            .after_hash
+            .zip(original.after_hash)
+            .map(|(a, b)| a == b);
+    }
+}
+// Explain the complete document using existing representations, then report
+// boundaries only when every explaining representation agrees. Ambiguity and
+// splitting a doubled newline are deliberately unavailable, even for telemetry.
+fn diagnostic_block_mapping(raw: &str, tsf: &str, start: i32, end: i32) -> Option<(usize, usize)> {
+    if start < 0 || end < start {
+        return None;
+    }
+    let mut result = None;
+    for doubled in [false, true] {
+        let represented = if doubled {
+            raw.replace('\n', "\n\n")
+        } else {
+            raw.into()
+        };
+        if !tsf
+            .strip_prefix(&represented)
+            .is_some_and(|v| v.chars().all(|c| matches!(c, '\r' | '\n')))
+        {
+            continue;
+        }
+        let mut units = 0i32;
+        let mut a = (start == 0).then_some(0);
+        let mut b = (end == 0).then_some(0);
+        for (at, c) in raw.char_indices() {
+            units += if doubled && c == '\n' {
+                2
+            } else {
+                c.len_utf16() as i32
+            };
+            let byte = at + c.len_utf8();
+            if units == start {
+                a = Some(byte);
+            }
+            if units == end {
+                b = Some(byte);
+            }
+        }
+        let pair = (a?, b?);
+        if result.is_some_and(|previous| previous != pair) {
+            return None;
+        }
+        result = Some(pair);
+    }
+    result
 }
 fn mapped_document(raw: &str, before: &str, picked: &str, tsf: &str) -> Option<(i32, i32)> {
     let mut mapped = None;
@@ -548,6 +652,28 @@ unsafe fn provider_module(pattern: &ITextProvider) -> String {
 #[cfg(test)]
 mod tests {
     use super::mapped_document;
+    #[test]
+    fn diagnostic_projection_distinguishes_tail_representation_from_real_outside_text() {
+        use super::diagnostic_block_mapping as map;
+        assert_eq!(map("周五\n", "周五\n\n", 0, 2), Some((0, 6)));
+        assert_eq!(map("周五\n\n", "周五\n\n", 0, 2), Some((0, 6)));
+        // Same native anchors, different actual suffixes; diagnostic comparison
+        // must compare the original raw provider suffix, not erase newlines.
+        let (a, b) = map("周五\n", "周五\n\n", 0, 2).unwrap();
+        assert_eq!(&"周五\n"[a..b], "周五");
+        assert_ne!(&"周五\n"[b..], &"周五\n\n"[b..]);
+        assert_eq!(map("左🙂右\n", "左🙂右\n\n", 1, 3), Some((3, 7)));
+        assert_eq!(map("周五", "周四\n", 0, 2), None);
+    }
+    #[test]
+    fn diagnostic_projection_refuses_ambiguous_and_split_native_anchors() {
+        use super::diagnostic_block_mapping as map;
+        assert_eq!(map("a\n", "a\n\n", 0, 2), None);
+        assert_eq!(map("🙂", "🙂", 0, 1), None);
+        assert_eq!(map("a", "a", -1, 1), None);
+        assert_eq!(map("a", "a", 1, 0), None);
+        assert_eq!(map("a", "a", 0, 3), None);
+    }
     #[test]
     fn identity_array_bounds_are_bounded_before_allocation() {
         assert_eq!(super::identity_array_len(8, 8), Some(1));
