@@ -366,14 +366,8 @@ impl Evidence {
         end: i32,
         original: Option<&SemanticBoundary>,
     ) -> std::result::Result<SemanticBlock, BlockReadError> {
-        let mapping = block_representation::map(
-            &self.all,
-            &self.tsf,
-            start,
-            end,
-            original.is_some_and(|v| v.after.bytes == 0),
-        )
-        .ok_or(BlockReadError::Unproven)?;
+        let mapping = block_representation::map(&self.all, &self.tsf, start, end)
+            .ok_or(BlockReadError::Unproven)?;
         let boundary = SemanticBoundary {
             identity: self.identity.clone(),
             before: SemanticFingerprint::of(&self.all[..mapping.start]),

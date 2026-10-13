@@ -360,6 +360,13 @@ impl Track {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             if let Some(original) = original {
+                // UIA has no revision shared with TSF. Semantic agreement
+                // cannot replace original native outside fingerprints.
+                if let Some(boundary) = &self.boundary
+                    && !boundary.matches(&self.context, &self.range, ec, phase)?
+                {
+                    return Err(failure(TF_E_LOCKED));
+                }
                 *phase = "blockAwaitingRepresentation".into();
                 let (verified, _) = content::capture(
                     &self.context,
@@ -851,7 +858,7 @@ pub(super) fn dispatch(shared: &Shared, request: &Request, connection: u64) {
 #[implement(ITfCompositionSink)]
 struct AcquisitionSink {
     delegate: ITfCompositionSink,
-    published: Rc<Cell<bool>>,
+    attached: Rc<Cell<bool>>,
     terminated: Rc<Cell<bool>>,
     _lease: Lease,
 }
@@ -874,11 +881,11 @@ mod acquisition_tests {
     #[test]
     fn synchronous_termination_is_retained_before_publication() {
         let callbacks = Rc::new(Cell::new(0));
-        let published = Rc::new(Cell::new(false));
+        let attached = Rc::new(Cell::new(false));
         let terminated = Rc::new(Cell::new(false));
         let sink: ITfCompositionSink = AcquisitionSink {
             delegate: Delegate(callbacks.clone()).into(),
-            published: published.clone(),
+            attached: attached.clone(),
             terminated: terminated.clone(),
             _lease: Lease::new(),
         }
@@ -888,7 +895,9 @@ mod acquisition_tests {
         }
         assert!(terminated.get());
         assert_eq!(callbacks.get(), 0);
-        published.set(true);
+        // Attaching a failed candidate for retirement also enables terminal
+        // notifications; this flag never grants a write lease.
+        attached.set(true);
         unsafe {
             sink.OnCompositionTerminated(0, None).unwrap();
         }
@@ -902,7 +911,7 @@ impl ITfCompositionSink_Impl for AcquisitionSink_Impl {
         composition: Ref<ITfComposition>,
     ) -> windows::core::Result<()> {
         let _callback = Callback::enter();
-        if !self.published.get() {
+        if !self.attached.get() {
             // The provider can terminate the composition before returning its
             // object. No unregistered object may become a live Draft afterward.
             self.terminated.set(true);
@@ -966,27 +975,14 @@ unsafe fn acquire_composition(
             return Err(failure(TF_E_LOCKED));
         }
         let original = range_position(context, &track.range, ec)?;
-        if verified.native_end < original.start || verified.native_end > original.end {
+        if verified.native_end != original.end {
             return Err(failure(TF_E_DISCONNECTED));
         }
-        // Last paired read precedes any range change. No text is changed here.
+        // Paired reads may confirm identity, never justify moving endpoints.
         if track.verified_content(ec, phase)? != verified {
             return Err(failure(TF_E_LOCKED));
         }
         edit_authorized(shared, r, edit.connection, edit.generation)?;
-        if verified.native_end != original.end {
-            let mut moved = 0;
-            let delta = verified.native_end - original.end;
-            track
-                .range
-                .ShiftEnd(ec, delta, &mut moved, std::ptr::null())?;
-            if moved != delta {
-                return Err(failure(TF_E_DISCONNECTED));
-            }
-        }
-        if let Some(boundary) = &track.boundary {
-            boundary.follow_verified_representation(context, &track.range, ec)?;
-        }
         let native = range_text(&track.range, ec)?;
         let text = CompositionText::from_verified(&verified.semantic_text, &native)
             .ok_or_else(|| failure(TF_E_LOCKED))?;
@@ -1050,11 +1046,11 @@ unsafe fn acquire_composition(
             _lease: Lease::new(),
         }
         .into();
-        let published = Rc::new(Cell::new(false));
+        let attached = Rc::new(Cell::new(false));
         let terminated = Rc::new(Cell::new(false));
         let sink: ITfCompositionSink = AcquisitionSink {
             delegate,
-            published: published.clone(),
+            attached: attached.clone(),
             terminated: terminated.clone(),
             _lease: Lease::new(),
         }
@@ -1083,12 +1079,16 @@ unsafe fn acquire_composition(
                 let mut state = shared.borrow_mut();
                 if state.epoch == epoch && state.composition.is_none() {
                     state.composition = Some(composition);
+                    // It now belongs to the existing retirement owner. A later
+                    // real termination must release that owner's resources even
+                    // though this candidate never became writable.
+                    attached.set(true);
                 }
             }
             return Err(failure(TF_E_DISCONNECTED));
         }
         shared.borrow_mut().composition = Some(composition.clone());
-        published.set(true);
+        attached.set(true);
         edit_authorized(shared, r, edit.connection, edit.generation)?;
         let actual = composition.GetRange()?;
         if actual.CompareStart(ec, &track.range, TF_ANCHOR_START)? != 0

@@ -1,4 +1,4 @@
-//! Read-only paired snapshot. UIA explains representation, never grants a range.
+//! Read-only identity snapshot. UIA cannot prove non-identity representation.
 use super::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,8 +48,8 @@ pub(super) unsafe fn capture(
             return Err(failure(TF_E_LOCKED));
         }
         proof.revalidate(&range_text(&document, ec)?)?;
-        // A semantic boundary disagreement is permanent only after both
-        // representations, selection and provider proved stable together.
+        // Cross-provider identity is required by semantic_block. Separately
+        // stable reads do not establish the origin of differing characters.
         let mapped = mapped.map_err(|reason| {
             failure(match reason {
                 initial_selection::BlockReadError::Unproven => TF_E_LOCKED,
