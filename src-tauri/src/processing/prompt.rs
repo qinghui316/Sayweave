@@ -9,9 +9,12 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use unicode_segmentation::UnicodeSegmentation;
 
-pub const VERSION: &str = "faithful-v3";
+pub const VERSION: &str = "faithful-v4";
+pub const LEGACY_VERSION: &str = "faithful-v3";
+pub const LEGACY_RULES: &str = include_str!("faithful-v3.txt");
 const RULES: &str = r#"你为正在进行的口述做轻量文字整理。
 本次只能处理 input_text。previous_context 仅帮助理解连贯性，不属于本次输出。
+input_text 是当前完整有效草稿，可根据块内明确的后文纠正修改前文。它可能包含用户手动修改后的基线；以当前基线为准，没有后续明确依据时不得还原已删除或修改的内容。只返回当前块完整正文，不输出已交付的 previous_context。
 保留说话者表达的事实、意图、语气、否定、条件和程度。
 清理确属无意义的填充词、结巴重复和轻微语病，补充必要标点与自然分段，不把口语强改成正式文章。保留有实际语气、情绪或强调作用的词，包括句尾的吧、呢、啊、啦；保留核心句式和叙述顺序，不擅自总结或改成列表。
 当前语段中出现明确自我纠正时，采用最后明确的说法，删除被明确作废的说法和纠正过渡词，不因保留语气或叙述顺序而同时输出前后两种说法。不根据模糊推断改变姓名、日期、数字、单位、承诺或对象。
@@ -157,7 +160,47 @@ pub fn build_with_context(
     application: Option<&ApplicationContext>,
     preferences: &[Preference],
 ) -> Result<Prompt, ProcessingError> {
-    if input.is_empty() || input.chars().count() > 512 {
+    build_policy(
+        input,
+        previous,
+        dictionary,
+        application,
+        preferences,
+        RULES,
+        super::draft::BLOCK_LIMIT,
+        super::draft::MESSAGE_LIMIT,
+    )
+}
+pub fn build_legacy_with_context(
+    input: &str,
+    previous: &str,
+    dictionary: &DictionaryIndex,
+    application: Option<&ApplicationContext>,
+    preferences: &[Preference],
+) -> Result<Prompt, ProcessingError> {
+    build_policy(
+        input,
+        previous,
+        dictionary,
+        application,
+        preferences,
+        LEGACY_RULES,
+        512,
+        12 * 1024,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn build_policy(
+    input: &str,
+    previous: &str,
+    dictionary: &DictionaryIndex,
+    application: Option<&ApplicationContext>,
+    preferences: &[Preference],
+    rules: &str,
+    input_limit: usize,
+    message_limit: usize,
+) -> Result<Prompt, ProcessingError> {
+    if input.is_empty() || input.chars().count() > input_limit {
         return Err(ProcessingError::new("unitTooLarge"));
     }
     let mut dictionary = dictionary.select(input);
@@ -212,7 +255,7 @@ pub fn build_with_context(
         let messages = vec![
             Message {
                 role: "system",
-                content: RULES.into(),
+                content: rules.into(),
             },
             Message {
                 role: "user",
@@ -222,7 +265,7 @@ pub fn build_with_context(
         let bytes = serde_json::to_vec(&messages)
             .map_err(|_| ProcessingError::new("invalidPrompt"))?
             .len();
-        if bytes <= 12 * 1024 {
+        if bytes <= message_limit {
             return Ok(Prompt {
                 messages,
                 dictionary,
@@ -310,43 +353,7 @@ mod tests {
         );
         assert!(one.serialized_bytes <= 12 * 1024);
     }
-    #[test]
-    fn persisted_legacy_mapping_survives_term_only_processing_and_reopen() {
-        use crate::{contracts::dictionary::Input, data::repository::Repository};
-        let root = tempfile::tempdir().unwrap();
-        let mut repo = Repository::open(root.path()).unwrap();
-        let mapping = repo
-            .save(
-                Input {
-                    kind: Kind::Correction,
-                    original: "听写旧词".into(),
-                    replacement: Some("旧映射目标".into()),
-                    category: None,
-                },
-                None,
-            )
-            .unwrap();
-        let term = repo
-            .save(
-                Input {
-                    kind: Kind::Term,
-                    original: "Sayweave".into(),
-                    replacement: None,
-                    category: None,
-                },
-                None,
-            )
-            .unwrap();
-        let index = DictionaryIndex::new(vec![mapping.clone(), term]);
-        let prompt = super::build("听写旧词", "", &index).unwrap();
-        assert!(!prompt.messages[1].content.contains("旧映射目标"));
-        drop(repo);
-        let repo = Repository::open(root.path()).unwrap();
-        assert_eq!(
-            serde_json::to_value(repo.get(Kind::Correction, &mapping.id).unwrap()).unwrap(),
-            serde_json::to_value(mapping).unwrap()
-        );
-    }
+
     #[test]
     fn legacy_mapping_changes_do_not_affect_context_order_hotwords_or_fingerprint() {
         let terms = (0..40)

@@ -81,8 +81,18 @@ pub fn session(pid: u32) -> windows::core::Result<u32> {
     Ok(id)
 }
 pub fn name(pid: u32, thread: u32) -> windows::core::Result<Vec<u16>> {
+    // Direct owned fixtures coexist with the installed fixed proxy in their
+    // own process. Production builds never honor this isolated endpoint.
+    #[cfg(feature = "acceptance")]
+    let fixture = if std::env::var_os("SAYWEAVE_BLOCK_FIXTURE").is_some() {
+        ".BlockFixture"
+    } else {
+        ""
+    };
+    #[cfg(not(feature = "acceptance"))]
+    let fixture = "";
     Ok(format!(
-        "\\\\.\\pipe\\Sayweave.TSF.{}.{}.{}",
+        "\\\\.\\pipe\\Sayweave.TSF.{}.{}.{}{fixture}",
         session(pid)?,
         pid,
         thread

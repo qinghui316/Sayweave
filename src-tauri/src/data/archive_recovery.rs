@@ -149,6 +149,7 @@ enum Fact {
     },
     Run(p::RunMetadata),
     Unit(p::UnitRecord),
+    Draft(crate::contracts::draft::Checkpoint),
     FinishRun {
         id: String,
         text: String,
@@ -217,6 +218,7 @@ impl Fact {
             },
             Operation::Processing(p::DbOperation::Prepare(r)) => Self::Run(r.clone()),
             Operation::Processing(p::DbOperation::SaveUnit(u)) => Self::Unit(u.clone()),
+            Operation::Processing(p::DbOperation::SaveDraft(d)) => Self::Draft(d.clone()),
             Operation::Processing(p::DbOperation::Finish {
                 id,
                 text,
@@ -233,6 +235,9 @@ impl Fact {
     }
     fn compatible(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::Draft(a), Self::Draft(b)) => {
+                a.run_id == b.run_id && a.source.block == b.source.block && a.order == b.order
+            }
             (Self::Prepare { .. }, Self::Prepare { .. })
             | (Self::Retry(_), Self::Retry(_))
             | (Self::Run(_), Self::Run(_))
@@ -276,6 +281,7 @@ impl Fact {
             Self::Stage { attempt_id, .. } => (attempt_id, 2),
             Self::Checkpoint { attempt_id, .. } => (attempt_id, 3),
             Self::Unit(u) => (&u.id, 4),
+            Self::Draft(d) => (&d.source.block, 9),
             Self::Audio { id, .. } => (id, 5),
             Self::Finish { attempt_id, .. } => (attempt_id, 6),
             Self::FinishRun { id, .. } => (id, 7),
@@ -330,6 +336,7 @@ impl Fact {
             }
             Self::Run(r) => Operation::Processing(p::DbOperation::Prepare(r)),
             Self::Unit(u) => Operation::Processing(p::DbOperation::SaveUnit(u)),
+            Self::Draft(d) => Operation::Processing(p::DbOperation::SaveDraft(d)),
             Self::FinishRun {
                 id,
                 text,
@@ -425,6 +432,13 @@ impl Memory {
             self.bytes -= body.len();
         }
     }
+    pub fn pending_run(&self, run: &str) -> bool {
+        self.facts.values().any(|(op, _, _)| {
+            matches!(op, Operation::Processing(p::DbOperation::SaveUnit(u)) if u.run_id == run)
+                || matches!(op, Operation::Processing(p::DbOperation::SaveDraft(d)) if d.run_id == run)
+                || matches!(op, Operation::Processing(p::DbOperation::Prepare(r)) if r.id == run)
+        })
+    }
     #[cfg(test)]
     pub fn invalidate(&mut self, repo: &Repository, record: &str) -> Result<(), DataError> {
         let mut attempts = Vec::new();
@@ -463,6 +477,7 @@ impl Memory {
         for (key, (op, _, _)) in &self.facts {
             let mapped = match Fact::capture(op) {
                 Some(Fact::Unit(u)) => runs.contains(&u.run_id),
+                Some(Fact::Draft(d)) => runs.contains(&d.run_id),
                 Some(Fact::FinishRun { id, .. }) => runs.contains(&id),
                 Some(Fact::Audio { id, .. }) => audio.contains(&id),
                 Some(Fact::Delivery { attempt, .. }) => attempts.contains(&attempt),
@@ -513,7 +528,7 @@ pub(super) fn stage_stamped(
     };
     let key = key(&fact)?;
     let body = serde_json::to_vec(&Entry {
-        schema: 1,
+        schema: 2,
         key: key.clone(),
         created: super::repository::now(),
         fact: fact.clone(),
@@ -619,7 +634,7 @@ fn read_entry(path: &Path) -> Result<(Vec<u8>, Entry), DataError> {
     }
     let body = fs::read(path).map_err(|_| DataError::new("unavailable"))?;
     let entry: Entry = serde_json::from_slice(&body).map_err(|_| DataError::new("invalid"))?;
-    if entry.schema != 1
+    if !matches!(entry.schema, 1 | 2)
         || key(&entry.fact)? != entry.key
         || path.file_stem().is_none_or(|s| s != entry.key.as_str())
     {
@@ -643,6 +658,7 @@ fn record_owner(repo: &Repository, op: &Operation) -> Result<Option<String>, Dat
         Operation::History(h::DbOperation::AudioState { id, .. }) => repo.connection.query_row("SELECT record_id FROM audio_assets WHERE id=?1", [id], |r| r.get::<_, String>(0)).optional().map_err(db_error)?,
         Operation::Processing(p::DbOperation::Prepare(r)) => repo.connection.query_row("SELECT record_id FROM speech_attempts WHERE id=?1", [&r.attempt_id], |r| r.get::<_, String>(0)).optional().map_err(db_error)?,
         Operation::Processing(p::DbOperation::SaveUnit(p::UnitRecord { run_id: id, .. }) | p::DbOperation::Finish { id, .. }) => repo.connection.query_row("SELECT a.record_id FROM processing_runs p JOIN speech_attempts a ON a.id=p.attempt_id WHERE p.id=?1", [id], |r| r.get::<_, String>(0)).optional().map_err(db_error)?,
+        Operation::Processing(p::DbOperation::SaveDraft(d))=>repo.connection.query_row("SELECT a.record_id FROM processing_runs p JOIN speech_attempts a ON a.id=p.attempt_id WHERE p.id=?1", [&d.run_id], |r| r.get::<_, String>(0)).optional().map_err(db_error)?,
         _ => None,
     })
 }
@@ -660,6 +676,13 @@ pub(super) fn apply_stamped(
     if repo.archive_causal.superseded(&ticket)? {
         return done(&op);
     }
+    // A terminal run cannot seal out its still-pending attempt/checkpoint
+    // facts. File names and replay cursor order do not establish causality.
+    if let Operation::Processing(p::DbOperation::Finish { id, .. }) = &op
+        && pending_run(&repo.archive_root, id)?
+    {
+        return Err(DataError::new("busy"));
+    }
     repo.connection
         .busy_timeout(std::time::Duration::ZERO)
         .map_err(db_error)?;
@@ -674,6 +697,18 @@ pub(super) fn apply_stamped(
         log::warn!(target:"sayweave","operation=archive_timeout_restore result={:?}",e.sqlite_error_code());
     }
     result
+}
+fn pending_run(root: &Path, run: &str) -> Result<bool, DataError> {
+    for path in paths(root)? {
+        let (_, entry) = read_entry(&path)?;
+        if matches!(&entry.fact, Fact::Run(r) if r.id == run)
+            || matches!(&entry.fact, Fact::Unit(u) if u.run_id == run)
+            || matches!(&entry.fact, Fact::Draft(d) if d.run_id == run)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 fn known_attempt(repo: &Repository, a: &h::Attempt) -> Result<Option<bool>, DataError> {
     repo.connection.query_row("SELECT record_id=?2 AND kind=?3 AND config_id=?4 AND config_name=?5 AND model_id=?6 AND service_host=?7 AND config_revision=?8 AND created_at=?9 FROM speech_attempts WHERE id=?1",rusqlite::params![a.id,a.record_id,a.kind,a.config_id,a.config_name,a.model_id,a.service_host,a.config_revision,a.created_at],|r|r.get(0)).optional().map_err(db_error)
@@ -739,6 +774,41 @@ fn apply_inner(repo: &mut Repository, op: Operation) -> Result<super::Output, Da
         }
     }
     match &op {
+        Operation::Processing(p::DbOperation::SaveDraft(d)) => {
+            if !d.valid() {
+                return Err(DataError::new("invalid"));
+            }
+            let run: Option<String> = repo
+                .connection
+                .query_row(
+                    "SELECT state FROM processing_runs WHERE id=?1",
+                    [&d.run_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db_error)?;
+            if run.as_deref().is_some_and(|s| s != "running") && d.state == "preview" {
+                return Ok(super::Output::Processing(p::DbOutput::Done));
+            }
+            let known:Option<(String,i64,String,String)>=repo.connection.query_row("SELECT run_id,visible_revision,visible_text,state FROM processing_draft_blocks WHERE id=?1",[&d.source.block],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional().map_err(db_error)?;
+            if let Some((run, revision, text, state)) = known {
+                if run != d.run_id {
+                    return Err(DataError::new("conflict"));
+                }
+                if revision as u64 > d.visible_revision
+                    || state != "preview" && d.state == "preview"
+                {
+                    return Ok(super::Output::Processing(p::DbOutput::Done));
+                }
+                if state != "preview"
+                    && (text != d.visible_text
+                        || state != d.state
+                        || revision as u64 != d.visible_revision)
+                {
+                    return Err(DataError::new("conflict"));
+                }
+            }
+        }
         Operation::History(h::DbOperation::Prepare(v)) => {
             if v.attempt.record_id != v.record_id {
                 return Err(DataError::new("invalid"));
@@ -752,7 +822,7 @@ fn apply_inner(repo: &mut Repository, op: Operation) -> Result<super::Output, Da
             }
         }
         Operation::Processing(p::DbOperation::Prepare(v)) => {
-            let same:Option<bool>=repo.connection.query_row("SELECT attempt_id=?2 AND task_id=?3 AND config_id=?4 AND config_name=?5 AND model_id=?6 AND config_revision=?7 AND prompt_version=?8 AND settings_revision=?9 AND dictionary_version=?10 FROM processing_runs WHERE id=?1",rusqlite::params![v.id,v.attempt_id,v.task_id,v.config_id,v.config_name,v.model_id,v.config_revision,v.prompt_version,v.settings_revision,v.dictionary_version],|r|r.get(0)).optional().map_err(db_error)?;
+            let same:Option<bool>=repo.connection.query_row("SELECT attempt_id=?2 AND task_id=?3 AND config_id=?4 AND config_name=?5 AND model_id=?6 AND config_revision=?7 AND prompt_version=?8 AND settings_revision=?9 AND dictionary_version=?10 AND mode=?11 FROM processing_runs WHERE id=?1",rusqlite::params![v.id,v.attempt_id,v.task_id,v.config_id,v.config_name,v.model_id,v.config_revision,v.prompt_version,v.settings_revision,v.dictionary_version,v.mode],|r|r.get(0)).optional().map_err(db_error)?;
             if let Some(same) = same {
                 return if same {
                     Ok(super::Output::Processing(p::DbOutput::Done))
@@ -966,6 +1036,7 @@ impl Bindings {
             Fact::Retry(a) => a.record_id == self.record,
             Fact::Run(r) => self.attempts.contains(&r.attempt_id),
             Fact::Unit(u) => self.runs.contains(&u.run_id),
+            Fact::Draft(d) => self.runs.contains(&d.run_id),
             Fact::FinishRun { id, .. } => self.runs.contains(id),
             Fact::Delivery { attempt, .. } => self.attempts.contains(attempt),
             Fact::Audio { id, .. } => self.audio.contains(id),
@@ -1034,6 +1105,105 @@ fn invalidate_record(repo: &Repository, root: &Path, record: &str) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn draft_recovery_cannot_seal_run_before_pending_attempt_and_visible_checkpoint() {
+        use crate::contracts::draft::{Association, BaselineKind, Checkpoint, Snapshot};
+        let temp = tempfile::tempdir().unwrap();
+        let mut repo = Repository::open(temp.path()).unwrap();
+        let mut prepared = prepare();
+        prepared.attempt.record_id = prepared.record_id.clone();
+        apply(
+            &mut repo,
+            Operation::History(h::DbOperation::Prepare(prepared.clone())),
+        )
+        .unwrap();
+        let run = uuid::Uuid::from_u128(1).to_string();
+        apply(
+            &mut repo,
+            Operation::Processing(p::DbOperation::Prepare(p::RunMetadata {
+                mode: "native".into(),
+                id: run.clone(),
+                attempt_id: prepared.attempt.id,
+                task_id: uuid::Uuid::new_v4().to_string(),
+                config_id: String::new(),
+                config_name: "口述结果".into(),
+                model_id: String::new(),
+                config_revision: 1,
+                prompt_version: "native-v1".into(),
+                settings_revision: 1,
+                dictionary_version: "terms".into(),
+            })),
+        )
+        .unwrap();
+        let source = Snapshot {
+            block: uuid::Uuid::from_u128(300).to_string(),
+            version: 2,
+            source_epoch: 2,
+            baseline_kind: BaselineKind::EditorSnapshot,
+            text: "周四开会".into(),
+            speech_end: 0,
+            insertion_end: 4,
+        };
+        let association = Association::attempt(1, source.clone());
+        let unit = p::UnitRecord {
+            id: uuid::Uuid::from_u128(200).to_string(),
+            run_id: run.clone(),
+            turn: 1,
+            source_start: 0,
+            source_end: 4,
+            source_refs: serde_json::to_string(&association).unwrap(),
+            source_text: source.text.clone(),
+            candidate_text: None,
+            generation_state: "skipped".into(),
+            application_state: "notApplied".into(),
+            source_committed_end: None,
+            error_code: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            elapsed_ms: 0,
+        };
+        stage(
+            temp.path(),
+            &Operation::Processing(p::DbOperation::SaveUnit(unit)),
+        )
+        .unwrap();
+        let checkpoint = Checkpoint {
+            run_id: run.clone(),
+            order: 1,
+            source,
+            visible_revision: 3,
+            visible_text: "周四开会".into(),
+            state: "stopped".into(),
+        };
+        stage(
+            temp.path(),
+            &Operation::Processing(p::DbOperation::SaveDraft(checkpoint)),
+        )
+        .unwrap();
+        let finish = Operation::Processing(p::DbOperation::Finish {
+            id: run.clone(),
+            text: "周四开会".into(),
+            state: "success".into(),
+            error: None,
+        });
+        stage(temp.path(), &finish).unwrap();
+        assert_eq!(apply(&mut repo, finish).unwrap_err().code, "busy");
+        for _ in 0..12 {
+            replay_batch(
+                &mut repo,
+                temp.path(),
+                false,
+                std::time::Duration::from_secs(1),
+                1,
+            )
+            .unwrap();
+        }
+        assert!(entries(temp.path()).unwrap().is_empty());
+        let result:(String,i64,String) = repo.connection.query_row("SELECT state,(SELECT count(*) FROM processing_units WHERE run_id=?1),(SELECT visible_text FROM processing_draft_blocks WHERE run_id=?1) FROM processing_runs WHERE id=?1", [&run], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(result, ("success".into(), 1, "周四开会".into()));
+        replay(&mut repo, temp.path(), false).unwrap();
+        invalidate_record(&repo, temp.path(), &prepared.record_id).unwrap();
+    }
     fn prepare() -> h::Prepare {
         let id = || uuid::Uuid::new_v4().to_string();
         h::Prepare {
@@ -1258,6 +1428,7 @@ mod tests {
         let mut memory = Memory::default();
         memory.retain(&Operation::Processing(p::DbOperation::Prepare(
             p::RunMetadata {
+                mode: "model".into(),
                 id: run.clone(),
                 attempt_id: p.attempt.id,
                 task_id: uuid::Uuid::new_v4().to_string(),
@@ -1309,6 +1480,7 @@ mod tests {
             stage(
                 temp.path(),
                 &Operation::Processing(p::DbOperation::Prepare(p::RunMetadata {
+                    mode: "model".into(),
                     id: format!("00000000-0000-4000-8000-{n:012}"),
                     attempt_id: uuid::Uuid::new_v4().to_string(),
                     task_id: uuid::Uuid::new_v4().to_string(),
@@ -1397,6 +1569,7 @@ mod tests {
             .unwrap();
             let run = uuid::Uuid::new_v4().to_string();
             let parent = Operation::Processing(p::DbOperation::Prepare(p::RunMetadata {
+                mode: "model".into(),
                 id: run.clone(),
                 attempt_id: p.attempt.id,
                 task_id: uuid::Uuid::new_v4().to_string(),

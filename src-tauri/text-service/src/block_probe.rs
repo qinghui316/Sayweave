@@ -1,0 +1,478 @@
+//! Exercises only the owned fixture window, without machine registration.
+use super::*;
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+
+fn request(
+    pipe: &Pipe,
+    capability: &str,
+    task: &str,
+    operation: u64,
+    block: BlockCommand,
+    text: &str,
+) -> Result<Reply, Box<dyn std::error::Error>> {
+    let r = Request {
+        revoke: None,
+        block: Some(block),
+        engine: fixture_binding(),
+        protocol: PROTOCOL,
+        capability: capability.into(),
+        task: task.into(),
+        turn: 1,
+        operation,
+        revision: 1,
+        deadline_tick: unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+            + 2000,
+        action: Action::Inspect,
+        text: text.into(),
+        prefix: None,
+    };
+    pipe.send(&serde_json::to_vec(&r)?)?;
+    let started = Instant::now();
+    loop {
+        pump(Duration::from_millis(10));
+        if let Some(data) = pipe.receive()? {
+            let result: Reply = serde_json::from_slice(&data)?;
+            if result.operation != operation {
+                return Err("block operation mismatch".into());
+            }
+            return Ok(result);
+        }
+        if started.elapsed() > Duration::from_secs(2) {
+            return Err("block fixture timeout".into());
+        }
+    }
+}
+fn command(snapshot: &BlockSnapshot, action: BlockAction) -> BlockCommand {
+    BlockCommand {
+        lease: snapshot.lease,
+        id: snapshot.id.clone(),
+        action,
+        epoch: snapshot.epoch,
+        version: snapshot.version,
+        expected: snapshot.text.clone(),
+        selection_start: snapshot.selection_start,
+        selection_end: snapshot.selection_end,
+    }
+}
+fn snapshot(reply: Reply) -> Result<BlockSnapshot, Box<dyn std::error::Error>> {
+    if !reply.applied {
+        return Err(format!("block fixture rejected: {}", reply.code).into());
+    }
+    reply.block.ok_or_else(|| "missing block snapshot".into())
+}
+pub(super) fn run(
+    editor: HWND,
+    manager: &ITfThreadMgr,
+    pipe: &Pipe,
+    capability: &str,
+    module: windows::Win32::Foundation::HMODULE,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let task = uuid::Uuid::new_v4().to_string();
+    let id = uuid::Uuid::new_v4().to_string();
+    for (operation, revision, action, text) in [
+        (1, 0, Action::Begin, ""),
+        (2, 1, Action::Update, "周三开会"),
+    ] {
+        let result = exchange(
+            pipe, capability, &task, 1, operation, revision, action, text, false,
+        )?;
+        if !result.applied {
+            return Err(format!("block setup: {}", result.code).into());
+        }
+    }
+    let initial = snapshot(request(
+        pipe,
+        capability,
+        &task,
+        3,
+        BlockCommand {
+            lease: 0,
+            id,
+            action: BlockAction::Bind,
+            epoch: 0,
+            version: 0,
+            expected: String::new(),
+            selection_start: 0,
+            selection_end: 0,
+        },
+        "",
+    )?)?;
+    println!(
+        "block bind body={} version={}",
+        initial.text == "周三开会",
+        initial.version
+    );
+    let handoff = exchange(pipe, capability, &task, 1, 4, 1, Action::Handoff, "", false)?;
+    if !handoff.applied {
+        return Err(format!("block handoff: {}", handoff.code).into());
+    }
+    let handed_reply = request(
+        pipe,
+        capability,
+        &task,
+        5,
+        command(&initial, BlockAction::Read),
+        "",
+    )?;
+    if !handed_reply.applied && std::env::args().nth(3).as_deref() == Some("plain") {
+        if handed_reply.mutation != Mutation::NotAttempted || editor_text(editor)? != "周三开会"
+        {
+            return Err("unsupported legacy anchor changed body".into());
+        }
+        let released = request(
+            pipe,
+            capability,
+            &task,
+            6,
+            command(&initial, BlockAction::Release),
+            "",
+        )?;
+        if !released.applied {
+            return Err("unsupported legacy anchor cleanup failed".into());
+        }
+        println!(
+            "block legacy EDIT unsupported anchor safely refused; retained body/released track=true"
+        );
+        return Ok(());
+    }
+    let handed = snapshot(handed_reply)?;
+    if handed.text != "周三开会" || editor_text(editor)? != "周三开会" {
+        return Err("handoff changed body".into());
+    }
+    println!("block handoff anchors retained=true");
+    unsafe {
+        SendMessageW(editor, 0xB1, Some(WPARAM(1)), Some(LPARAM(2)));
+        SendMessageW(
+            editor,
+            0xC2,
+            Some(WPARAM(1)),
+            Some(LPARAM(windows::core::w!("四").as_ptr() as isize)),
+        );
+    }
+    pump(Duration::from_millis(50));
+    let edited = snapshot(request(
+        pipe,
+        capability,
+        &task,
+        6,
+        command(&handed, BlockAction::Read),
+        "",
+    )?)?;
+    if edited.text != "周四开会" || edited.version <= handed.version {
+        return Err("user edit not tracked".into());
+    }
+    let stale = request(
+        pipe,
+        capability,
+        &task,
+        7,
+        command(&handed, BlockAction::Acquire),
+        "",
+    )?;
+    if stale.applied || stale.mutation != Mutation::NotAttempted {
+        return Err("stale acquire accepted".into());
+    }
+    // Place the caret at a proven block boundary before the replacement.
+    unsafe {
+        SendMessageW(editor, 0xB1, Some(WPARAM(4)), Some(LPARAM(4)));
+    }
+    pump(Duration::from_millis(30));
+    let current = snapshot(request(
+        pipe,
+        capability,
+        &task,
+        8,
+        command(&edited, BlockAction::Read),
+        "",
+    )?)?;
+    let lease = snapshot(request(
+        pipe,
+        capability,
+        &task,
+        9,
+        command(&current, BlockAction::Acquire),
+        "",
+    )?)?;
+    let renewed = snapshot(request(
+        pipe,
+        capability,
+        &task,
+        10,
+        command(&current, BlockAction::Acquire),
+        "",
+    )?)?;
+    if lease.lease == renewed.lease {
+        return Err("acquire reused write lease".into());
+    }
+    let obsolete = request(
+        pipe,
+        capability,
+        &task,
+        11,
+        command(&lease, BlockAction::Apply),
+        "过期正文",
+    )?;
+    if obsolete.applied
+        || obsolete.mutation != Mutation::NotAttempted
+        || editor_text(editor)? != "周四开会"
+    {
+        return Err("previous lease wrote after reacquire".into());
+    }
+    let applied = snapshot(request(
+        pipe,
+        capability,
+        &task,
+        12,
+        command(&renewed, BlockAction::Apply),
+        "周四下午开会",
+    )?)?;
+    if editor_text(editor)? != "周四下午开会" || applied.text != "周四下午开会" {
+        return Err("actual block replacement mismatch".into());
+    }
+    let applied = timing_cases(editor, pipe, capability, &task, applied, module)?;
+    let acquired = snapshot(request(
+        pipe,
+        capability,
+        &task,
+        24,
+        command(&applied, BlockAction::Acquire),
+        "",
+    )?)?;
+    let multiline = "周四下午两点开会\n下一行 👩‍💻 e\u{301}";
+    let applied = snapshot(request(
+        pipe,
+        capability,
+        &task,
+        25,
+        command(&acquired, BlockAction::Apply),
+        multiline,
+    )?)?;
+    let normalize = |text: &str| text.replace("\r\n", "\n").replace('\r', "\n");
+    if normalize(&editor_text(editor)?) != multiline
+        || normalize(&applied.text) != multiline
+        || applied.selection_start != applied.text.encode_utf16().count() as u32
+        || applied.selection_end != applied.selection_start
+    {
+        return Err("multiline Unicode body/caret mismatch".into());
+    }
+    println!("block multiline/UTF16/grapheme-caret=true");
+    unsafe {
+        let original = manager.GetFocus()?;
+        let other = manager.CreateDocumentMgr()?;
+        manager.SetFocus(&other)?;
+        manager.SetFocus(&original)?;
+    }
+    let returned = request(
+        pipe,
+        capability,
+        &task,
+        26,
+        command(&applied, BlockAction::Acquire),
+        "",
+    )?;
+    if returned.applied
+        || returned.mutation != Mutation::NotAttempted
+        || normalize(&editor_text(editor)?) != multiline
+    {
+        return Err("leaving and returning revived block".into());
+    }
+    let release = request(
+        pipe,
+        capability,
+        &task,
+        27,
+        command(&applied, BlockAction::Release),
+        "",
+    )?;
+    if !release.applied {
+        return Err("block release failed".into());
+    }
+    println!(
+        "block manual-edit/read/stale-refusal/lease-rotation/reacquire/actual-write/focus-retirement/release=true"
+    );
+    Ok(())
+}
+fn frame(
+    capability: &str,
+    task: &str,
+    operation: u64,
+    block: Option<BlockCommand>,
+    action: Action,
+    text: &str,
+    revoke: Option<Revoke>,
+) -> Request {
+    Request {
+        protocol: PROTOCOL,
+        engine: fixture_binding(),
+        capability: capability.into(),
+        task: task.into(),
+        turn: 1,
+        operation,
+        revision: 1,
+        deadline_tick: unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+            + 2000,
+        block,
+        action,
+        text: text.into(),
+        prefix: None,
+        revoke,
+    }
+}
+fn pair(pipe: &Pipe, a: u64, b: u64) -> Result<(Reply, Reply), Box<dyn std::error::Error>> {
+    let started = Instant::now();
+    let mut first = None;
+    let mut second = None;
+    while first.is_none() || second.is_none() {
+        pump(Duration::from_millis(10));
+        if let Some(data) = pipe.receive()? {
+            let r: Reply = serde_json::from_slice(&data)?;
+            if r.operation == a {
+                first = Some(r);
+            } else if r.operation == b {
+                second = Some(r);
+            } else {
+                return Err("unexpected timing receipt".into());
+            }
+        }
+        if started.elapsed() > Duration::from_secs(2) {
+            return Err("timing receipts timeout".into());
+        }
+    }
+    Ok((first.unwrap(), second.unwrap()))
+}
+fn timing_cases(
+    editor: HWND,
+    pipe: &Pipe,
+    capability: &str,
+    task: &str,
+    mut current: BlockSnapshot,
+    module: windows::Win32::Foundation::HMODULE,
+) -> Result<BlockSnapshot, Box<dyn std::error::Error>> {
+    use windows::Win32::System::LibraryLoader::GetProcAddress;
+    let fault: unsafe extern "system" fn(u32) = unsafe {
+        std::mem::transmute(
+            GetProcAddress(module, windows::core::s!("SayweaveBlockFixtureFault"))
+                .ok_or("missing timing hook")?,
+        )
+    };
+    let flush: unsafe extern "system" fn() -> bool = unsafe {
+        std::mem::transmute(
+            GetProcAddress(module, windows::core::s!("SayweaveBlockFixtureFlush"))
+                .ok_or("missing timing flush")?,
+        )
+    };
+    for (kind, op) in [(3, 13), (4, 15)] {
+        unsafe {
+            fault(kind);
+        }
+        let denied = request(
+            pipe,
+            capability,
+            task,
+            op,
+            command(&current, BlockAction::Read),
+            "",
+        )?;
+        if denied.applied || denied.mutation != Mutation::NotAttempted {
+            return Err("edit scheduling fault reported success".into());
+        }
+        current = snapshot(request(
+            pipe,
+            capability,
+            task,
+            op + 1,
+            command(&current, BlockAction::Read),
+            "",
+        )?)?;
+    }
+    unsafe {
+        fault(1);
+    }
+    pipe.send(&serde_json::to_vec(&frame(
+        capability,
+        task,
+        17,
+        Some(command(&current, BlockAction::Apply)),
+        Action::Inspect,
+        "不应显示的尾部",
+        None,
+    ))?)?;
+    pump(Duration::from_millis(100));
+    if pipe.receive()?.is_some() {
+        return Err("deferred write already completed".into());
+    }
+    pipe.send(&serde_json::to_vec(&frame(
+        capability,
+        task,
+        18,
+        None,
+        Action::Revoke,
+        "",
+        Some(Revoke {
+            operation: 17,
+            revision: 1,
+        }),
+    ))?)?;
+    let (original, revoke) = pair(pipe, 17, 18)?;
+    if original.applied || original.mutation != Mutation::NotAttempted || !revoke.applied {
+        return Err("queued write not precisely revoked".into());
+    }
+    if !unsafe { flush() } {
+        return Err("deferred callback flush failed".into());
+    }
+    pump(Duration::from_millis(80));
+    if pipe.receive()?.is_some() || editor_text(editor)? != "周四下午开会" {
+        return Err("revoked late callback changed body or duplicated receipt".into());
+    }
+    current = snapshot(request(
+        pipe,
+        capability,
+        task,
+        19,
+        command(&current, BlockAction::Read),
+        "",
+    )?)?;
+    current = snapshot(request(
+        pipe,
+        capability,
+        task,
+        20,
+        command(&current, BlockAction::Acquire),
+        "",
+    )?)?;
+    unsafe {
+        fault(2);
+    }
+    pipe.send(&serde_json::to_vec(&frame(
+        capability,
+        task,
+        21,
+        Some(command(&current, BlockAction::Apply)),
+        Action::Inspect,
+        "周四下午两点开会",
+        None,
+    ))?)?;
+    let (original, revoke) = pair(pipe, 21, 22)?;
+    if !original.applied
+        || original.mutation != Mutation::Changed
+        || !revoke.applied
+        || revoke.code != "operationStarted"
+    {
+        return Err("started write lost its actual outcome".into());
+    }
+    current = snapshot(request(
+        pipe,
+        capability,
+        task,
+        23,
+        command(&current, BlockAction::Read),
+        "",
+    )?)?;
+    if editor_text(editor)? != "周四下午两点开会" {
+        return Err("started write body mismatch".into());
+    }
+    println!(
+        "block scheduling-failure/retry/queued-stop/late-callback/started-effect-receipt=true"
+    );
+    Ok(current)
+}

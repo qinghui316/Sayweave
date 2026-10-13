@@ -1,5 +1,7 @@
 # 骨架架构与边界
 
+持续草稿分支的依赖、协议与迁移契约见 [持续草稿与编辑接管](revisable-draft.md)，验收和合入状态以该 Change 为准。
+
 DictionaryPort、主窗限定命令及专用SQLite线程独立于Runtime，详见 [本地数据架构](local-data.md)。Runtime不持久化指窗口/语音演示快照；词典是真实持久化，两者职责分离。
 
 模型配置通过独立 ModelConfigPort 接入。模型服务复用数据线程，以系统凭据和异步客户端管理密钥及请求；词典与模型互不依赖。迁移、默认关系与恢复详见 [models.md](models.md)。主窗口退出协调网络取消与数据/凭据排空，最多等待 5 秒；Runtime 锁不跨这些操作。

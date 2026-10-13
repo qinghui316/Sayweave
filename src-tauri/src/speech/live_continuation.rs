@@ -181,7 +181,7 @@ async fn live_continuation() {
     let provider = Provider::new(Arc::new(crate::network::RequestCoordinator::default())).unwrap();
     let mut context = Context::fixture(Arc::new(provider), text.input.clone(), data.clone());
     context.task_id = task.clone();
-    context.configuration = Arc::new(text);
+    context.configuration = Some(Arc::new(text));
     context.attach(None, None).await.unwrap();
     let mut recognition = RecognitionSession::open(&speech, &task).await.unwrap();
     let mut editor = Editor::open();

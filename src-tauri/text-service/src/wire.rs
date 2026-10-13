@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::routing::{EngineBinding, MAX_FRAME, ModuleIdentity, Runtime};
 pub const MAX_TEXT_UTF16: usize = 16 * 1024;
-// v9 binds every text effect and observation to one stable proxy/core generation.
-pub const PROTOCOL: u32 = 9;
+// v10 adds independently authorized current-block tracking and compare/write.
+pub const PROTOCOL: u32 = 10;
 
 #[cfg(any(test, feature = "acceptance"))]
 pub fn fixture_binding() -> EngineBinding {
@@ -16,6 +16,10 @@ pub fn fixture_binding() -> EngineBinding {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoke: Option<Revoke>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<BlockCommand>,
     pub engine: EngineBinding,
     pub protocol: u32,
     pub capability: String,
@@ -39,6 +43,7 @@ pub struct Prefix {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum Action {
+    Revoke,
     Inspect,
     Begin,
     Update,
@@ -51,7 +56,15 @@ pub enum Action {
     ObserveStop,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Revoke {
+    pub operation: u64,
+    pub revision: u64,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Reply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block: Option<BlockSnapshot>,
     pub engine: EngineBinding,
     pub task: String,
     pub turn: u64,
@@ -68,6 +81,39 @@ pub struct Reply {
     pub settlement: Option<Settlement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edit_observation: Option<EditObservation>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BlockCommand {
+    pub lease: u64,
+    pub id: String,
+    pub action: BlockAction,
+    pub epoch: u64,
+    pub version: u64,
+    pub expected: String,
+    pub selection_start: u32,
+    pub selection_end: u32,
+}
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BlockAction {
+    Bind,
+    Read,
+    Acquire,
+    Apply,
+    Release,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockSnapshot {
+    pub lease: u64,
+    pub id: String,
+    pub epoch: u64,
+    pub version: u64,
+    pub text: String,
+    pub selection_start: u32,
+    pub selection_end: u32,
+    pub writable: bool,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct EditObservation {
@@ -130,6 +176,28 @@ pub enum Mutation {
 impl Request {
     pub fn valid(&self) -> bool {
         self.protocol == PROTOCOL
+            && match (&self.revoke, self.action) {
+                (Some(target), Action::Revoke) => {
+                    self.block.is_none()
+                        && self.prefix.is_none()
+                        && self.text.is_empty()
+                        && target.operation > 0
+                        && self.operation > target.operation
+                        && self.revision == target.revision
+                }
+                (None, Action::Revoke) => false,
+                (None, _) => true,
+                _ => false,
+            }
+            && self.block.as_ref().is_none_or(|block| {
+                self.action == Action::Inspect
+                    && self.prefix.is_none()
+                    && uuid::Uuid::parse_str(&block.id).is_ok()
+                    && block.selection_start <= block.selection_end
+                    && block.expected.encode_utf16().count() <= MAX_TEXT_UTF16
+                    && (block.action == BlockAction::Bind || block.epoch > 0)
+                    && (block.action == BlockAction::Apply || self.text.is_empty())
+            })
             && self.engine.valid()
             && uuid::Uuid::parse_str(&self.task).is_ok()
             && uuid::Uuid::parse_str(&self.capability).is_ok()
@@ -187,7 +255,7 @@ impl DraftVersion {
     }
     pub fn accepts(&self, request: &Request) -> bool {
         request.valid()
-            && request.action != Action::Inspect
+            && !matches!(request.action, Action::Inspect | Action::Revoke)
             && if request.action == Action::Begin {
                 // Operation counters belong to a turn, not to the lifetime of the
                 // loaded text service. A new host/turn starts its own counter.
@@ -223,6 +291,8 @@ mod tests {
     use super::*;
     fn request(action: Action, operation: u64, revision: u64) -> Request {
         Request {
+            revoke: None,
+            block: None,
             engine: fixture_binding(),
             protocol: crate::wire::PROTOCOL,
             capability: uuid::Uuid::new_v4().to_string(),
@@ -244,6 +314,7 @@ mod tests {
         r.protocol = 1;
         assert!(!r.valid());
         let mut reply = Reply {
+            block: None,
             engine: fixture_binding(),
             task: uuid::Uuid::new_v4().to_string(),
             turn: 1,

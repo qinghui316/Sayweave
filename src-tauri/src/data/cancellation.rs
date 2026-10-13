@@ -499,6 +499,7 @@ mod tests {
                 rusqlite::params![uuid::Uuid::new_v4().to_string(), record, "fixture.wav"],
             ).unwrap();
             let run = processing::RunMetadata {
+                mode: "model".into(),
                 id: uuid::Uuid::new_v4().to_string(),
                 attempt_id: attempt.clone(),
                 task_id: uuid::Uuid::new_v4().to_string(),
@@ -575,6 +576,7 @@ mod tests {
         let mut repo = Repository::open(root.path()).unwrap();
         let (record, attempt) = prepared(&mut repo);
         let run = processing::RunMetadata {
+            mode: "model".into(),
             id: uuid::Uuid::new_v4().to_string(),
             attempt_id: attempt.clone(),
             task_id: uuid::Uuid::new_v4().to_string(),

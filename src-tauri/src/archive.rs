@@ -40,6 +40,9 @@ fn bytes(operation: &Operation) -> usize {
                 + value.candidate_text.as_ref().map_or(0, String::len)
                 + 2048
         }
+        Operation::Processing(P::SaveDraft(value)) => {
+            value.source.text.len() + value.visible_text.len() + 2048
+        }
         _ => 1024,
     }
 }

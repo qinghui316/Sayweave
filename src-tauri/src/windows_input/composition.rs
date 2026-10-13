@@ -6,7 +6,10 @@ use sayweave_text_service::{
     lifecycle::{ControlAction, ControlReply, ControlRequest, ReceiptKey},
     registration,
     transport::Pipe,
-    wire::{Action, EngineBinding, Mutation, OutputRegion, Prefix, Reply, Request},
+    wire::{
+        Action, BlockAction, BlockCommand, BlockSnapshot, EngineBinding, Mutation, OutputRegion,
+        Prefix, Reply, Request, Revoke,
+    },
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -27,6 +30,14 @@ mod retirement;
 use retirement::{Retirement, WorkerCompletion};
 
 pub(crate) enum Command {
+    Block(
+        u64,
+        Option<Anchor>,
+        BlockCommand,
+        String,
+        Arc<AtomicBool>,
+        oneshot::Sender<Result<Reply, Error>>,
+    ),
     Observe(Arc<ObservationSink>, oneshot::Sender<bool>),
     Begin(u64, Anchor, oneshot::Sender<Result<(), Error>>),
     Finish(
@@ -41,6 +52,7 @@ pub(crate) enum Command {
         u64,
         String,
         Option<String>,
+        Option<Arc<AtomicBool>>,
         oneshot::Sender<Result<(), Error>>,
     ),
     Settle(
@@ -72,6 +84,11 @@ struct SourceReceipt {
     raw: String,
 }
 static RETAINED: Mutex<Option<Arc<Connection>>> = Mutex::new(None);
+pub(crate) fn retain_failed(connection: &Arc<Connection>) {
+    if let Ok(mut slot) = RETAINED.lock() {
+        slot.get_or_insert_with(|| connection.clone());
+    }
+}
 pub(crate) async fn stop_observer() -> Result<(), Error> {
     stop_observer_for(None).await
 }
@@ -167,6 +184,20 @@ pub(crate) struct Connection {
     retirement: Arc<Retirement>,
 }
 impl Connection {
+    pub(crate) async fn block(
+        &self,
+        turn: u64,
+        anchor: Option<Anchor>,
+        command: BlockCommand,
+        text: String,
+        permit: Arc<AtomicBool>,
+    ) -> Result<Reply, Error> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .try_send(Command::Block(turn, anchor, command, text, permit, reply))
+            .map_err(|_| Error::new("compositionWorker"))?;
+        result.await.map_err(|_| Error::new("compositionWorker"))?
+    }
     pub async fn begin_turn(
         self: &Arc<Self>,
         turn: u64,
@@ -259,9 +290,13 @@ impl Draft {
                     }
                     pump();
                     match commands.recv_timeout(Duration::from_millis(5)) {
+                        Ok(Command::Block(turn,anchor,command,text,permit,reply))=>{
+                            let result=host.block(turn,anchor,command,&text,&permit);
+                            let _=reply.send(result);
+                        },
                         Ok(Command::Observe(sink,reply))=>{let ready=host.observe(sink);let _=reply.send(ready);},
-                        Ok(Command::Replace(turn,text,raw,reply))=>{
-                            let result=if turn==host.turn {host.update(&text)}else{Err(Error::new("staleSession"))};
+                        Ok(Command::Replace(turn,text,raw,permit,reply))=>{
+                            let result=if turn==host.turn {host.update_guarded(&text,permit.as_deref())}else{Err(Error::new("staleSession"))};
                             if result.is_ok(){host.remember_tail(raw);}
                             let _=reply.send(result);
                         },
@@ -332,6 +367,15 @@ impl Draft {
         text: String,
         raw: Option<String>,
     ) -> Result<(), Error> {
+        self.replace_guarded(sequence, text, raw, None).await
+    }
+    pub(crate) async fn replace_guarded(
+        &self,
+        sequence: u64,
+        text: String,
+        raw: Option<String>,
+        permit: Option<Arc<AtomicBool>>,
+    ) -> Result<(), Error> {
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::new("staleSession"));
         }
@@ -341,7 +385,7 @@ impl Draft {
         let (reply, result) = oneshot::channel();
         self.connection
             .sender
-            .try_send(Command::Replace(self.turn, text, raw, reply))
+            .try_send(Command::Replace(self.turn, text, raw, permit, reply))
             .map_err(|_| Error::new("compositionWorker"))?;
         result.await.map_err(|_| Error::new("compositionWorker"))?
     }
@@ -466,6 +510,8 @@ impl Drop for Apartment {
     }
 }
 struct Host {
+    revoking_primary: Option<(u64, u64)>,
+    block: Option<BlockSnapshot>,
     supports_observation: bool,
     abandoned_optional: Vec<(u64, u64)>,
     optional_disabled: bool,
@@ -501,6 +547,56 @@ struct Host {
     _apartment: Apartment,
 }
 impl Host {
+    fn block(
+        &mut self,
+        turn: u64,
+        anchor: Option<Anchor>,
+        command: BlockCommand,
+        text: &str,
+        permit: &AtomicBool,
+    ) -> Result<Reply, Error> {
+        if let Some(anchor) = anchor {
+            if self.range_open
+                || turn < self.turn
+                || command.action != BlockAction::Read
+                || anchor.process != self.anchor.process
+                || anchor.lifetime != self.anchor.lifetime
+                || anchor.window != self.anchor.window
+                || anchor.capture_id != self.anchor.capture_id
+            {
+                return Err(Error::new("staleSession"));
+            }
+            // Consume genuine editor changes under the old observation identity
+            // before a new source turn or a model replacement can supersede it.
+            self.stop_observation();
+            self.anchor = anchor;
+            self.turn = turn;
+        }
+        if turn != self.turn {
+            return Err(Error::new("staleSession"));
+        }
+        let action = command.action;
+        let reply = self.exchange_block_reply(
+            Action::Inspect,
+            text,
+            None,
+            matches!(action, BlockAction::Read | BlockAction::Release),
+            Some(permit),
+            Some(command),
+        )?;
+        if reply.applied {
+            if action == BlockAction::Release {
+                self.block = None;
+            } else {
+                self.block = reply.block.clone();
+            }
+            if action == BlockAction::Apply {
+                self.text = text.into();
+                self.visible = true;
+            }
+        }
+        Ok(reply)
+    }
     fn retire(
         mut self,
         completion: &mut WorkerCompletion,
@@ -716,6 +812,8 @@ impl Host {
             operation: 0,
             revision: 0,
             range_epoch: 0,
+            revoking_primary: None,
+            block: None,
             transport_attempted: false,
             retained_ack: None,
             receipt_inbox: VecDeque::new(),
@@ -1006,7 +1104,8 @@ impl Host {
                         self.turn,
                         (self.operation, self.revision),
                         &self.abandoned_optional,
-                    ) || self.receipt_inbox.len() >= 4
+                    ) && self.revoking_primary != Some((reply.operation, reply.revision))
+                        || self.receipt_inbox.len() >= 4
                     {
                         return Err(Error::new("compositionProtocol"));
                     }
@@ -1059,6 +1158,17 @@ impl Host {
         cleanup: bool,
         permission: Option<&AtomicBool>,
     ) -> Result<Reply, Error> {
+        self.exchange_block_reply(action, text, prefix, cleanup, permission, None)
+    }
+    fn exchange_block_reply(
+        &mut self,
+        action: Action,
+        text: &str,
+        prefix: Option<Prefix>,
+        cleanup: bool,
+        permission: Option<&AtomicBool>,
+        block: Option<BlockCommand>,
+    ) -> Result<Reply, Error> {
         self.transport_attempted = false;
         self.acknowledge_receipt()?;
         let optional = matches!(
@@ -1079,6 +1189,8 @@ impl Host {
             self.revision += 1;
         }
         let request = Request {
+            revoke: None,
+            block: block.clone(),
             engine: self.engine.clone(),
             protocol: sayweave_text_service::wire::PROTOCOL,
             capability: self.capability.clone(),
@@ -1108,7 +1220,14 @@ impl Host {
                 Error::new("compositionDisconnected")
             })?;
         let at = Instant::now();
+        let mut revocation: Option<Request> = None;
+        let mut revoked = false;
+        let mut primary: Option<Reply> = None;
         loop {
+            if primary.is_some() && (revocation.is_none() || revoked) {
+                self.revoking_primary = None;
+                return Ok(primary.take().unwrap());
+            }
             pump();
             let frame = match self.receive_business() {
                 Ok(frame) => frame,
@@ -1139,6 +1258,18 @@ impl Host {
                     self.acknowledge_receipt()?;
                     continue;
                 }
+                if revocation
+                    .as_ref()
+                    .is_some_and(|r| r.operation == reply.operation && r.revision == reply.revision)
+                {
+                    self.retained_ack = ReceiptKey::from_frame(&frame);
+                    self.acknowledge_receipt()?;
+                    if !reply.applied {
+                        return Err(Error::new("compositionProtocol"));
+                    }
+                    revoked = true;
+                    continue;
+                }
                 if reply.operation != request.operation || reply.revision != request.revision {
                     return Err(Error::new("compositionProtocol"));
                 }
@@ -1149,7 +1280,7 @@ impl Host {
                 {
                     log::info!(target:"sayweave", "operation=retired_receipt_ack task_id={} result=pending error={}", self.task,error.code);
                 }
-                if action == Action::Inspect {
+                if action == Action::Inspect && block.is_none() {
                     self.supports_observation = reply
                         .edit_observation
                         .as_ref()
@@ -1170,9 +1301,53 @@ impl Host {
                     self.range_epoch = reply.range_epoch;
                 }
                 log::info!(target:"sayweave", "operation=composition_edit task_id={} turn={} revision={} action={:?} applied={} code={} mutation={:?} elapsed_ms={}", self.task, self.turn, request.revision, action, reply.applied, reply.code, reply.mutation, at.elapsed().as_millis());
-                return Ok(reply);
+                primary = Some(reply);
+                continue;
+            }
+            if revocation.is_none()
+                && primary.is_none()
+                && permission.is_some_and(|p| !p.load(Ordering::Acquire))
+            {
+                self.operation += 1;
+                let revoke = Request {
+                    revoke: Some(Revoke {
+                        operation: request.operation,
+                        revision: request.revision,
+                    }),
+                    block: None,
+                    engine: self.engine.clone(),
+                    protocol: request.protocol,
+                    capability: self.capability.clone(),
+                    task: self.task.clone(),
+                    turn: self.turn,
+                    operation: self.operation,
+                    revision: request.revision,
+                    deadline_tick: unsafe { GetTickCount64() } + 2000,
+                    action: Action::Revoke,
+                    text: String::new(),
+                    prefix: None,
+                };
+                self.revoking_primary = Some((request.operation, request.revision));
+                self.pipe
+                    .send(
+                        &serde_json::to_vec(&revoke)
+                            .map_err(|_| Error::new("compositionProtocol"))?,
+                    )
+                    .map_err(|_| Error::new("compositionDisconnected"))?;
+                revocation = Some(revoke);
             }
             if at.elapsed() >= Duration::from_secs(2) {
+                if let Some(reply) = primary.take() {
+                    if let Some(revoke) = revocation {
+                        if self.abandoned_optional.len() >= 16 {
+                            return Err(Error::new("compositionProtocol"));
+                        }
+                        self.abandoned_optional
+                            .push((revoke.operation, revoke.revision));
+                    }
+                    self.revoking_primary = None;
+                    return Ok(reply);
+                }
                 if optional {
                     self.abandoned_optional
                         .push((request.operation, request.revision));
@@ -1253,14 +1428,36 @@ impl Host {
         outcome
     }
     fn update(&mut self, text: &str) -> Result<(), Error> {
+        self.update_guarded(text, None)
+    }
+    fn update_guarded(&mut self, text: &str, permit: Option<&AtomicBool>) -> Result<(), Error> {
+        if permit.is_some_and(|p| !p.load(Ordering::Acquire)) {
+            return Err(Error::new("staleSnapshot"));
+        }
         if text == self.text {
             return Ok(());
         }
         self.settled_empty_revision = None;
-        let result = self.exchange(Action::Update, text, false);
+        let result = self
+            .exchange_reply(Action::Update, text, None, false, permit)
+            .and_then(|r| {
+                if r.applied {
+                    Ok(())
+                } else if permit.is_some() && r.mutation == Mutation::NotAttempted {
+                    Err(Error::new("staleSnapshot"))
+                } else if r.mutation != Mutation::NotAttempted {
+                    Err(Error::new("compositionPartial"))
+                } else {
+                    Err(Error::new(reply_error(&r.code)))
+                }
+            });
         if result.is_ok() {
             self.text = text.into();
-        } else {
+        } else if result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.code != "staleSnapshot")
+        {
             self.failure = result.as_ref().err().map(|e| e.code.clone());
         }
         result
@@ -1391,13 +1588,35 @@ impl Host {
     }
     fn close(&mut self) -> Result<(), Error> {
         let receipt = self.acknowledge_receipt();
+        let block = if let Some(snapshot) = self.block.clone() {
+            let command = BlockCommand {
+                id: snapshot.id,
+                action: BlockAction::Release,
+                epoch: snapshot.epoch,
+                version: snapshot.version,
+                lease: snapshot.lease,
+                expected: String::new(),
+                selection_start: 0,
+                selection_end: 0,
+            };
+            self.block(self.turn, None, command, "", &AtomicBool::new(true))
+                .and_then(|r| {
+                    if r.applied {
+                        Ok(())
+                    } else {
+                        Err(Error::new("compositionCleanup"))
+                    }
+                })
+        } else {
+            Ok(())
+        };
         self.stop_observation();
         self.sink = None;
         let closed = self
             .profile
             .close()
             .map_err(|_| Error::new("compositionCleanup"));
-        receipt.and(closed)
+        receipt.and(block).and(closed)
     }
 }
 fn pending_business_receipt(

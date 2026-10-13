@@ -17,7 +17,7 @@ use tokio::sync::watch;
 pub struct Context {
     pub task_id: String,
     pub provider: Arc<crate::models::provider::Provider>,
-    pub configuration: Arc<ExecutableConfiguration>,
+    pub configuration: Option<Arc<ExecutableConfiguration>>,
     pub dictionary: Arc<prompt::DictionaryIndex>,
     pub language: Option<crate::contracts::language::Snapshot>,
     pub settings: Settings,
@@ -35,7 +35,10 @@ pub async fn settings(
 ) -> Result<DbOutput, crate::contracts::dictionary::DataError> {
     let archive = matches!(
         operation,
-        DbOperation::Prepare(_) | DbOperation::SaveUnit(_) | DbOperation::Finish { .. }
+        DbOperation::Prepare(_)
+            | DbOperation::SaveUnit(_)
+            | DbOperation::SaveDraft(_)
+            | DbOperation::Finish { .. }
     );
     let operation = Operation::Processing(operation);
     let output = if archive {
@@ -59,6 +62,21 @@ pub async fn dictionary(
     Ok(Arc::new(prompt::DictionaryIndex::new(records)))
 }
 impl Context {
+    pub(crate) fn model_ready(&self) -> bool {
+        self.settings.enabled && self.configuration.is_some()
+    }
+    pub(crate) fn checkpoint(&self, mut checkpoint: crate::contracts::draft::Checkpoint) {
+        let Some(Some(run)) = self.run.get() else {
+            return;
+        };
+        checkpoint.run_id = run.metadata.id.clone();
+        if !self.archive.enqueue(
+            format!("draft:{}", checkpoint.source.block),
+            Operation::Processing(DbOperation::SaveDraft(checkpoint)),
+        ) {
+            self.save_error.store(true, Ordering::Release);
+        }
+    }
     #[cfg(test)]
     pub(crate) fn fixture(
         provider: Arc<crate::models::provider::Provider>,
@@ -68,12 +86,12 @@ impl Context {
         Self {
             task_id: "actor-test".into(),
             provider,
-            configuration: Arc::new(ExecutableConfiguration {
+            configuration: Some(Arc::new(ExecutableConfiguration {
                 id: "fixture".into(),
                 input,
                 key: "fixture-key".into(),
                 revision: 1,
-            }),
+            })),
             dictionary: Arc::new(prompt::DictionaryIndex::new(vec![])),
             language: None,
             settings: Settings {
@@ -99,19 +117,22 @@ impl Context {
             let DbOutput::Settings(config) = settings(&data, DbOperation::Settings).await? else {
                 return Err(ModelError::new("unavailable"));
             };
-            if !config.enabled {
-                return Ok(None);
-            }
             let models = app.state::<ModelService>();
-            let configuration = match models.text_config().await {
-                Ok(value) => value,
-                Err(error) if error.code == "notConfigured" => return Ok(None),
-                Err(error) => return Err(error),
+            let configuration = if config.enabled {
+                match models.text_config().await {
+                    Ok(value) => Some(Arc::new(value)),
+                    Err(error) => {
+                        log::info!(target:"sayweave","operation=processing_config task_id={task_id} mode=native error={}",error.code);
+                        None
+                    }
+                }
+            } else {
+                None
             };
             Ok(Some(Self {
                 task_id: task_id.into(),
                 provider: models.provider.clone(),
-                configuration: Arc::new(configuration),
+                configuration,
                 dictionary,
                 language,
                 settings: config,
@@ -136,7 +157,16 @@ impl Context {
         context: &str,
         deadline: tokio::time::Instant,
     ) -> Result<GeneratedText, ModelError> {
-        let prompt = prompt::build_with_context(
+        let configuration = self
+            .configuration
+            .as_ref()
+            .ok_or_else(|| ModelError::new("preserveRaw"))?;
+        let build = if unit.draft.is_some() {
+            prompt::build_with_context
+        } else {
+            prompt::build_legacy_with_context
+        };
+        let prompt = build(
             &unit.text,
             context,
             &self.dictionary,
@@ -153,16 +183,27 @@ impl Context {
         log::info!(target:"sayweave","operation=processing_request task_id={} unit_id={} turn={} prompt_version={} settings_revision={} source_chars={} prompt_bytes={} context_chars={} dictionary_items={}",self.task_id,unit.id,unit.turn,prompt::VERSION,self.settings.revision,unit.text.chars().count(),prompt.serialized_bytes,prompt.context_chars,prompt.dictionary.terms.len());
         let mut record = self.unit_record(unit)?;
         self.persist(&record);
-        let result = self
-            .provider
-            .generate_unit(
-                &self.configuration.input,
-                &self.configuration.key,
-                &unit.id,
-                &prompt.messages,
-                deadline,
-            )
-            .await;
+        let result = if unit.draft.is_some() {
+            self.provider
+                .generate_draft_unit(
+                    &configuration.input,
+                    &configuration.key,
+                    &unit.id,
+                    &prompt.messages,
+                    deadline,
+                )
+                .await
+        } else {
+            self.provider
+                .generate_unit(
+                    &configuration.input,
+                    &configuration.key,
+                    &unit.id,
+                    &prompt.messages,
+                    deadline,
+                )
+                .await
+        };
         match &result {
             Ok(value) => {
                 record.candidate_text = Some(value.text.clone());
@@ -196,14 +237,38 @@ impl Context {
         let value = match (record, attempt) {
             (Some(_record), Some(attempt)) => {
                 let metadata = RunMetadata {
+                    mode: if self.configuration.is_some() {
+                        "model"
+                    } else {
+                        "native"
+                    }
+                    .into(),
                     id: uuid::Uuid::new_v4().to_string(),
                     attempt_id: attempt.into(),
                     task_id: self.task_id.clone(),
-                    config_id: self.configuration.id.clone(),
-                    config_name: self.configuration.input.name.clone(),
-                    model_id: self.configuration.input.model_id.clone(),
-                    config_revision: self.configuration.revision,
-                    prompt_version: prompt::VERSION.into(),
+                    config_id: self
+                        .configuration
+                        .as_ref()
+                        .map_or_else(String::new, |c| c.id.clone()),
+                    config_name: self
+                        .configuration
+                        .as_ref()
+                        .map_or_else(|| "口述结果".into(), |c| c.input.name.clone()),
+                    model_id: self
+                        .configuration
+                        .as_ref()
+                        .map_or_else(String::new, |c| c.input.model_id.clone()),
+                    config_revision: self.configuration.as_ref().map_or(1, |c| c.revision),
+                    prompt_version: if self.configuration.is_some() {
+                        if std::env::var("SAYWEAVE_DRAFT_STRATEGY").as_deref() == Ok("segmented") {
+                            prompt::LEGACY_VERSION
+                        } else {
+                            prompt::VERSION
+                        }
+                    } else {
+                        "native-v1"
+                    }
+                    .into(),
                     settings_revision: self.settings.revision,
                     dictionary_version: self.dictionary.version.clone(),
                 };
@@ -234,7 +299,13 @@ impl Context {
             turn: unit.turn,
             source_start: unit.chars.start,
             source_end: unit.chars.end,
-            source_refs: serde_json::to_string(&unit.source)
+            source_refs: unit
+                .draft
+                .as_ref()
+                .map_or_else(
+                    || serde_json::to_string(&unit.source),
+                    serde_json::to_string,
+                )
                 .map_err(|_| ModelError::new("invalid"))?,
             source_text: unit.text.clone(),
             candidate_text: None,
@@ -272,12 +343,15 @@ impl Context {
                     value.candidate_text = result.candidate.clone();
                     value.generation_state = result.generation.clone();
                     value.application_state = result.application.clone();
+                    if report.revisable && value.application_state == "pending" {
+                        value.application_state = "notApplied".into();
+                    }
                     value.source_committed_end = result.source_committed_end;
                     value.error_code = result.error.clone();
                     value.prompt_tokens = result.input_tokens;
                     value.completion_tokens = result.output_tokens;
                     value.elapsed_ms = result.elapsed_ms;
-                    if report.cancelled {
+                    if report.cancelled && result.unit.draft.is_none() {
                         crate::processing::retention::cancelled(
                             value,
                             result.applied_text.as_deref(),
@@ -349,13 +423,21 @@ impl Context {
         }
         // These exact immutable receipts have all been saved above. Finishing
         // this run must not depend on a history read guarded by another cancel.
-        let text = crate::processing::render::text(sources, &retained);
-        let state =
-            if report.error.is_some() || report.units.iter().any(|u| u.generation == "failed") {
-                "partial"
-            } else {
-                "success"
-            };
+        let text = if report.revisable {
+            report.text.clone()
+        } else {
+            crate::processing::render::text(sources, &retained)
+        };
+        let state = if report.error.is_some()
+            || report
+                .units
+                .iter()
+                .any(|u| u.generation == "failed" || u.application == "uncertain")
+        {
+            "partial"
+        } else {
+            "success"
+        };
         settings(
             &self.data,
             DbOperation::Finish {

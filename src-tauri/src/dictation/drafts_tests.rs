@@ -154,7 +154,186 @@ fn segment(id: u64, text: &str, confirmed: bool) -> SourceSegment {
         confirmed,
     }
 }
-fn actor(
+
+#[tokio::test]
+async fn revisable_preview_does_not_commit_and_next_request_rewrites_full_block() {
+    let fixture = Fixture::start(vec![response("周三开会。"), response("周四开会。")]);
+    let root = tempfile::tempdir().unwrap();
+    let data = crate::data::DataWorker::start(root.path().to_path_buf()).unwrap();
+    let context = Context::fixture(fixture.provider.clone(), fixture.input(), data.clone());
+    let (actor, mut state, native) = actor(Some(context));
+    state.revisable = Some(revisable::State::new());
+    actor.observe(&mut state, snapshot(1, vec![segment(1, "周三开会", true)]));
+    state.merge_at = Some(Instant::now() - Duration::from_millis(151));
+    actor.start_generation(&mut state).unwrap();
+    actor.schedule(&mut state).unwrap();
+    assert!(
+        matches!(state.unit, Some(UnitSlot::Generating(_))),
+        "scheduling must retain the running request"
+    );
+    let Command::Replace(_, text, _, _, reply) = command(&native).await else {
+        panic!("real-time preview expected")
+    };
+    assert_eq!(text, "周三开会");
+    reply.send(Ok(())).unwrap();
+    acknowledge(&actor, &mut state).await;
+    generated(&mut state).await;
+    actor.schedule(&mut state).unwrap();
+    let Command::Block(_, _, request, _, _, reply) = command(&native).await else {
+        panic!("range binding expected")
+    };
+    reply
+        .send(Ok(sayweave_text_service::wire::Reply {
+            block: None,
+            engine: sayweave_text_service::wire::EngineBinding {
+                proxy_instance: uuid::Uuid::new_v4().to_string(),
+                engine_generation: 1,
+            },
+            task: actor.task.clone(),
+            turn: 1,
+            operation: 1,
+            revision: 1,
+            applied: false,
+            code: "unsupportedTracker".into(),
+            mutation: Mutation::NotAttempted,
+            runtime: None,
+            range_epoch: 0,
+            settlement: None,
+            edit_observation: None,
+        }))
+        .unwrap();
+    assert_eq!(
+        request.action,
+        sayweave_text_service::wire::BlockAction::Bind
+    );
+    acknowledge(&actor, &mut state).await;
+    actor.schedule(&mut state).unwrap();
+    let Command::Replace(_, text, _, _, reply) = command(&native).await else {
+        panic!("model preview must replace, never Settle")
+    };
+    assert_eq!(text, "周三开会。");
+    reply.send(Ok(())).unwrap();
+    acknowledge(&actor, &mut state).await;
+    assert!(state.submitted.is_empty());
+    assert!(state.report.text.is_empty());
+    actor.observe(
+        &mut state,
+        snapshot(
+            2,
+            vec![segment(1, "周三开会", true), segment(2, "不对是周四", true)],
+        ),
+    );
+    state.merge_at = Some(Instant::now() - Duration::from_millis(151));
+    actor.start_generation(&mut state).unwrap();
+    assert_eq!(
+        state.unit.as_ref().unwrap().source().text,
+        "周三开会不对是周四"
+    );
+    generated(&mut state).await;
+    actor.schedule(&mut state).unwrap();
+    let Command::Replace(_, text, _, _, reply) = command(&native).await else {
+        panic!("whole corrected preview expected")
+    };
+    assert_eq!(text, "周四开会。");
+    reply.send(Ok(())).unwrap();
+    acknowledge(&actor, &mut state).await;
+    assert_eq!(fixture.seen.lock().unwrap().len(), 2);
+    assert!(
+        state.report.text.is_empty(),
+        "pause/preview must not finalize a block"
+    );
+    drop(state);
+    drop(actor);
+    data.shutdown().await;
+}
+
+#[tokio::test]
+async fn revisable_stop_uses_handoff_and_does_not_append_unshown_tail() {
+    let (actor, mut state, native) = actor(None);
+    state.revisable = Some(revisable::State::new());
+    actor.observe(&mut state, snapshot(1, vec![segment(1, "已经显示", false)]));
+    actor.schedule(&mut state).unwrap();
+    let Command::Replace(_, text, _, _, reply) = command(&native).await else {
+        panic!("preview expected")
+    };
+    assert_eq!(text, "已经显示");
+    reply.send(Ok(())).unwrap();
+    acknowledge(&actor, &mut state).await;
+    actor.observe(
+        &mut state,
+        snapshot(2, vec![segment(1, "已经显示尚未显示", false)]),
+    );
+    let (reply, _) = oneshot::channel();
+    state.ending = Some(Ending {
+        mode: Finish::Abort,
+        reply,
+        deadline: Instant::now() + Duration::from_secs(15),
+        expired: false,
+    });
+    state.stopping = true;
+    actor.schedule(&mut state).unwrap();
+    // Stop skips tracker creation and never turns the product X into native Abort.
+    let Command::Finish(_, text, mode, _, keep, reply) = command(&native).await else {
+        panic!("retained handoff expected")
+    };
+    assert!(text.is_empty());
+    assert!(matches!(mode, Finish::Handoff(_)));
+    assert!(keep);
+    reply
+        .send(FinishOutcome {
+            delivery: Delivery::not_submitted("editing"),
+            committed: false,
+            handed_off: true,
+            cancelled: false,
+            rollback_failed: false,
+        })
+        .ok()
+        .unwrap();
+    acknowledge(&actor, &mut state).await;
+    actor.schedule(&mut state).unwrap();
+    assert_eq!(state.report.text, "已经显示");
+    assert_eq!(state.report.raw, "已经显示");
+}
+#[tokio::test]
+async fn older_equal_preview_cannot_skip_the_final_append_snapshot() {
+    let fixture = Fixture::start(vec![response("周三开会"), response("周四开会")]);
+    let root = tempfile::tempdir().unwrap();
+    let data = crate::data::DataWorker::start(root.path().to_path_buf()).unwrap();
+    let context = Context::fixture(fixture.provider.clone(), fixture.input(), data.clone());
+    let (actor, mut state, native) = actor(Some(context));
+    bound_preview(&actor, &mut state, &native, "周三开会").await;
+    actor.observe(&mut state, snapshot(2, vec![segment(1, "周三开会", true)]));
+    state.merge_at = Some(Instant::now() - Duration::from_millis(151));
+    actor.start_generation(&mut state).unwrap();
+    generated(&mut state).await;
+    actor.observe(
+        &mut state,
+        snapshot(
+            3,
+            vec![segment(1, "周三开会", true), segment(2, "不对周四", true)],
+        ),
+    );
+    let (reply, _) = oneshot::channel();
+    state.ending = Some(Ending {
+        mode: Finish::Commit,
+        reply,
+        deadline: Instant::now() + Duration::from_secs(15),
+        expired: false,
+    });
+    state.stopping = true;
+    actor.schedule(&mut state).unwrap();
+    assert!(matches!(state.unit, Some(UnitSlot::Generating(_))));
+    assert_eq!(
+        state.unit.as_ref().unwrap().source().text,
+        "周三开会不对周四"
+    );
+    generated(&mut state).await;
+    assert_eq!(fixture.seen.lock().unwrap().len(), 2);
+    drop(state);
+    drop(actor);
+    data.shutdown().await;
+}
+pub(super) fn actor(
     context: Option<Context>,
 ) -> (Arc<SessionDraft>, State, std::sync::mpsc::Receiver<Command>) {
     let (draft, native) = Draft::fixture();
@@ -180,8 +359,230 @@ fn actor(
         context,
         None,
     );
-    let (state, _) = actor.initial.lock().unwrap().take().unwrap();
+    let (mut state, _) = actor.initial.lock().unwrap().take().unwrap();
+    state.revisable = None; // Legacy policy remains an independently tested rollback.
     (actor, state, native)
+}
+pub(super) fn block_reply(
+    task: &str,
+    snapshot: Option<sayweave_text_service::wire::BlockSnapshot>,
+    applied: bool,
+) -> sayweave_text_service::wire::Reply {
+    sayweave_text_service::wire::Reply {
+        block: snapshot,
+        engine: sayweave_text_service::wire::EngineBinding {
+            proxy_instance: uuid::Uuid::new_v4().to_string(),
+            engine_generation: 1,
+        },
+        task: task.into(),
+        turn: 1,
+        operation: 1,
+        revision: 1,
+        applied,
+        code: "blockFixture".into(),
+        mutation: Mutation::NotAttempted,
+        runtime: None,
+        range_epoch: 0,
+        settlement: None,
+        edit_observation: None,
+    }
+}
+async fn bound_preview(
+    actor: &SessionDraft,
+    state: &mut State,
+    native: &std::sync::mpsc::Receiver<Command>,
+    body: &str,
+) -> String {
+    state.revisable = Some(revisable::State::new());
+    actor.observe(state, snapshot(1, vec![segment(1, body, false)]));
+    actor.schedule(state).unwrap();
+    let Command::Replace(_, text, _, _, reply) = command(native).await else {
+        panic!("preview")
+    };
+    assert_eq!(text, body);
+    reply.send(Ok(())).unwrap();
+    acknowledge(actor, state).await;
+    actor.schedule(state).unwrap();
+    let Command::Block(_, _, request, _, _, reply) = command(native).await else {
+        panic!("bind")
+    };
+    let id = request.id;
+    reply
+        .send(Ok(block_reply(
+            &actor.task,
+            Some(sayweave_text_service::wire::BlockSnapshot {
+                id: id.clone(),
+                epoch: 1,
+                version: 1,
+                lease: 0,
+                text: body.into(),
+                selection_start: body.encode_utf16().count() as u32,
+                selection_end: body.encode_utf16().count() as u32,
+                writable: false,
+            }),
+            true,
+        )))
+        .unwrap();
+    acknowledge(actor, state).await;
+    id
+}
+#[tokio::test]
+async fn manual_edit_rebases_same_block_and_new_speech_never_replays_the_old_turn() {
+    let fixture = Fixture::start(vec![response("周五下午开会。")]);
+    let root = tempfile::tempdir().unwrap();
+    let data = crate::data::DataWorker::start(root.path().to_path_buf()).unwrap();
+    let context = Context::fixture(fixture.provider.clone(), fixture.input(), data.clone());
+    let (actor, mut state, native) = actor(Some(context));
+    let id = bound_preview(&actor, &mut state, &native, "周三开会").await;
+    state.revisable.as_mut().unwrap().handoff();
+    state.handoff = true;
+    state.paused_at = Some(Instant::now());
+    actor.schedule(&mut state).unwrap();
+    let Command::Finish(_, _, mode, _, _, reply) = command(&native).await else {
+        panic!("handoff")
+    };
+    assert!(matches!(mode, Finish::Handoff(_)));
+    reply
+        .send(FinishOutcome {
+            delivery: Delivery::not_submitted("editing"),
+            committed: false,
+            handed_off: true,
+            cancelled: false,
+            rollback_failed: false,
+        })
+        .ok()
+        .unwrap();
+    acknowledge(&actor, &mut state).await;
+    assert_eq!(state.turn, 2);
+    assert!(state.latest.text.is_empty());
+    let edited = sayweave_text_service::wire::BlockSnapshot {
+        id,
+        epoch: 1,
+        version: 2,
+        lease: 2,
+        text: "周四下午开会".into(),
+        selection_start: 6,
+        selection_end: 6,
+        writable: false,
+    };
+    let activity = input_state::activity();
+    assert!(
+        actor
+            .native_done(
+                &mut state,
+                &NativeKind::Revisable(revisable::Effect::Read { activity }),
+                NativeValue::block(Ok(block_reply(&actor.task, Some(edited), true)))
+            )
+            .is_none()
+    );
+    let mut next = snapshot(1, vec![segment(42, "不对改为周五", true)]);
+    next.turn = 2;
+    actor.observe(&mut state, next);
+    state.merge_at = Some(Instant::now() - Duration::from_millis(151));
+    actor.start_generation(&mut state).unwrap();
+    let source = state.unit.as_ref().unwrap().source();
+    assert_eq!(source.text, "周四下午开会不对改为周五");
+    assert_eq!(
+        source.draft.as_ref().unwrap().source.baseline_kind,
+        crate::processing::draft::BaselineKind::EditorSnapshot
+    );
+    assert_eq!(source.draft.as_ref().unwrap().asr_sources[0].segment, 42);
+    generated(&mut state).await;
+    actor.schedule(&mut state).unwrap();
+    let Command::Block(_, _, request, _, _, reply) = command(&native).await else {
+        panic!("acquire")
+    };
+    assert_eq!(
+        request.action,
+        sayweave_text_service::wire::BlockAction::Acquire
+    );
+    let lease = sayweave_text_service::wire::BlockSnapshot {
+        id: request.id,
+        epoch: 1,
+        version: 2,
+        lease: 3,
+        text: request.expected,
+        selection_start: 6,
+        selection_end: 6,
+        writable: true,
+    };
+    reply
+        .send(Ok(block_reply(&actor.task, Some(lease.clone()), true)))
+        .unwrap();
+    let Command::Block(_, _, request, text, _, reply) = command(&native).await else {
+        panic!("apply")
+    };
+    assert_eq!(
+        request.action,
+        sayweave_text_service::wire::BlockAction::Apply
+    );
+    assert_eq!(request.lease, 3);
+    assert_eq!(text, "周五下午开会。");
+    let mut delivered = lease;
+    delivered.text = text;
+    delivered.version = 3;
+    delivered.selection_start = 7;
+    delivered.selection_end = 7;
+    reply
+        .send(Ok(block_reply(&actor.task, Some(delivered), true)))
+        .unwrap();
+    acknowledge(&actor, &mut state).await;
+    assert_eq!(state.report.raw, "周三开会");
+    assert!(state.report.text.is_empty());
+    drop(state);
+    drop(actor);
+    data.shutdown().await;
+}
+#[tokio::test]
+async fn capacity_delivers_one_block_and_keeps_the_same_dictation_open() {
+    let (actor, mut state, native) = actor(None);
+    state.revisable = Some(revisable::State::new());
+    let first = "甲。".repeat(1000);
+    let whole = format!("{first}后续文字");
+    actor.observe(&mut state, snapshot(1, vec![segment(1, &whole, true)]));
+    actor.start_generation(&mut state).unwrap();
+    actor.schedule(&mut state).unwrap();
+    let Command::Replace(_, text, _, _, reply) = command(&native).await else {
+        panic!("first preview")
+    };
+    assert_eq!(text, first);
+    reply.send(Ok(())).unwrap();
+    acknowledge(&actor, &mut state).await;
+    actor.schedule(&mut state).unwrap();
+    let Command::Block(_, _, _, _, _, reply) = command(&native).await else {
+        panic!("bind")
+    };
+    reply
+        .send(Ok(block_reply(&actor.task, None, false)))
+        .unwrap();
+    acknowledge(&actor, &mut state).await;
+    actor.schedule(&mut state).unwrap();
+    let Command::Settle(_, prefix, tail, _, _, reply) = command(&native).await else {
+        panic!("capacity settlement")
+    };
+    assert_eq!(prefix, first);
+    assert!(tail.is_empty());
+    reply
+        .send(PrefixOutcome {
+            prefix: Mutation::Changed,
+            tail_owned: true,
+            error: None,
+        })
+        .ok()
+        .unwrap();
+    acknowledge(&actor, &mut state).await;
+    assert!(!state.stopping);
+    assert!(state.draft.is_some());
+    assert_eq!(state.report.text, first);
+    actor.schedule(&mut state).unwrap();
+    let Command::Replace(_, text, _, _, reply) = command(&native).await else {
+        panic!("continuing tail")
+    };
+    assert_eq!(text, "后续文字");
+    reply.send(Ok(())).unwrap();
+    acknowledge(&actor, &mut state).await;
+    assert!(!state.stopping);
+    assert_eq!(state.report.raw, first);
 }
 async fn generated(state: &mut State) {
     let result = tokio::time::timeout(
@@ -200,7 +601,7 @@ async fn generated(state: &mut State) {
     );
     state.unit = Some(UnitSlot::Ready(g.unit.clone(), result));
 }
-async fn command(native: &std::sync::mpsc::Receiver<Command>) -> Command {
+pub(super) async fn command(native: &std::sync::mpsc::Receiver<Command>) -> Command {
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if let Ok(command) = native.try_recv() {
@@ -212,7 +613,7 @@ async fn command(native: &std::sync::mpsc::Receiver<Command>) -> Command {
     .await
     .unwrap()
 }
-async fn acknowledge(actor: &SessionDraft, state: &mut State) {
+pub(super) async fn acknowledge(actor: &SessionDraft, state: &mut State) {
     let value = SessionDraft::native_value(&mut state.native).await.unwrap();
     let job = state.native.take().unwrap();
     assert!(actor.native_done(state, &job.kind, value).is_none());
@@ -485,7 +886,7 @@ async fn same_body_confirmation_keeps_source_revision_and_avoids_duplicate_nativ
         snapshot(1, vec![segment(1, "测试文字。", false)]),
     );
     actor.schedule(&mut state).unwrap();
-    let Command::Replace(_, text, _, reply) = command(&native).await else {
+    let Command::Replace(_, text, _, _, reply) = command(&native).await else {
         panic!("ASR expected")
     };
     assert_eq!(text, "测试文字。");

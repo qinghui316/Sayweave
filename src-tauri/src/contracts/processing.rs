@@ -1,5 +1,7 @@
 //! Internal model wire values. Neither requests nor results are diagnostic DTOs.
 use serde::{Deserialize, Serialize};
+pub const MESSAGE_LIMIT: usize = 32 * 1024;
+pub const OUTPUT_TOKENS: u32 = 4096;
 #[derive(Clone, PartialEq, Eq)]
 pub struct SourceSegment {
     pub id: u64,
@@ -46,6 +48,7 @@ pub enum DbOperation {
     DictionarySnapshot,
     Prepare(RunMetadata),
     SaveUnit(UnitRecord),
+    SaveDraft(super::draft::Checkpoint),
     Finish {
         id: String,
         text: String,
@@ -70,6 +73,8 @@ pub enum DbOutput {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunMetadata {
+    #[serde(default = "model_mode", skip_serializing_if = "is_model_mode")]
+    pub mode: String,
     pub id: String,
     pub attempt_id: String,
     pub task_id: String,
@@ -103,6 +108,7 @@ pub struct UnitRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRecord {
+    pub mode: String,
     pub id: String,
     pub attempt_id: String,
     pub config_name: String,
@@ -112,4 +118,10 @@ pub struct RunRecord {
     pub revision: i64,
     pub error_code: Option<String>,
     pub units: Vec<UnitRecord>,
+}
+fn model_mode() -> String {
+    "model".into()
+}
+fn is_model_mode(value: &str) -> bool {
+    value == "model"
 }

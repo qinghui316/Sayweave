@@ -6,6 +6,8 @@ mod latency;
 #[cfg(all(test, target_os = "windows"))]
 mod live_acceptance;
 #[cfg(all(test, target_os = "windows"))]
+mod live_draft_acceptance;
+#[cfg(all(test, target_os = "windows"))]
 mod live_language_acceptance;
 pub mod provider;
 mod streaming;

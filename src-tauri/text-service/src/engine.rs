@@ -41,7 +41,8 @@ fn status_of(engine: &Engine) -> EngineStatusV1 {
             s.version.owned
                 || s.composition.is_some()
                 || s.prepared.is_some()
-                || s.empty_range.is_some(),
+                || s.empty_range.is_some()
+                || s.block.is_some(),
         ),
         pending: u32::from(
             s.pending.is_some() || !engine.output.borrow().is_empty() || s.reply_recovery.is_some(),
@@ -72,15 +73,18 @@ unsafe extern "system" fn dispatch_frame(
 ) -> i32 {
     guard(|| {
         let engine = unsafe { instance(handle)? };
-        if !engine.output.borrow().is_empty() || engine.state.borrow().reply_recovery.is_some() {
-            return Err(failure(HRESULT(BUSY)));
-        }
         if data.is_null() || length == 0 || length > MAX_FRAME {
             return Err(failure(E_INVALIDARG));
         }
         let request: Request =
             serde_json::from_slice(unsafe { std::slice::from_raw_parts(data, length) })
                 .map_err(|_| failure(E_INVALIDARG))?;
+        if request.action != Action::Revoke
+            && (!engine.output.borrow().is_empty()
+                || engine.state.borrow().reply_recovery.is_some())
+        {
+            return Err(failure(HRESULT(BUSY)));
+        }
         if !request.valid() || !request.live(unsafe { GetTickCount64() }) {
             return Err(failure(E_INVALIDARG));
         }

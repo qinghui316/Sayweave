@@ -133,13 +133,24 @@ impl Provider {
         key: &str,
         messages: &[Message],
     ) -> Result<GeneratedText, ModelError> {
+        self.generate_budget(input, key, messages, 2048, 12 * 1024)
+            .await
+    }
+    async fn generate_budget(
+        &self,
+        input: &ConfigInput,
+        key: &str,
+        messages: &[Message],
+        tokens: u32,
+        bytes: usize,
+    ) -> Result<GeneratedText, ModelError> {
         if !executable(input, &Usage::Text) || messages.is_empty() {
             return Err(ModelError::new("unsupported"));
         }
         if serde_json::to_vec(messages)
             .map_err(|_| ModelError::new("invalid"))?
             .len()
-            > 12 * 1024
+            > bytes
         {
             return Err(ModelError::new("promptTooLarge"));
         }
@@ -150,7 +161,7 @@ impl Provider {
                     input,
                     key,
                     json!({"model":input.model_id,"messages":messages,"stream":true}),
-                    2048,
+                    tokens,
                 )
                 .await?;
             let content_type = response
@@ -275,6 +286,28 @@ impl Provider {
         let mut request = self.requests.register_until(request_id, deadline).await?;
         request
             .run_until(deadline, self.generate(input, key, messages))
+            .await
+    }
+    pub async fn generate_draft_unit(
+        &self,
+        input: &ConfigInput,
+        key: &str,
+        request_id: &str,
+        messages: &[Message],
+        deadline: tokio::time::Instant,
+    ) -> Result<GeneratedText, ModelError> {
+        let mut request = self.requests.register_until(request_id, deadline).await?;
+        request
+            .run_until(
+                deadline,
+                self.generate_budget(
+                    input,
+                    key,
+                    messages,
+                    crate::contracts::processing::OUTPUT_TOKENS,
+                    crate::contracts::processing::MESSAGE_LIMIT,
+                ),
+            )
             .await
     }
 }

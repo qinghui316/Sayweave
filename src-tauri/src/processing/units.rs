@@ -1,17 +1,12 @@
 use super::{ProcessingError, quality::protected_ranges};
+pub use crate::contracts::draft::SourceSpan;
 pub use crate::contracts::processing::SourceSegment as Segment;
-use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, ops::Range};
 use unicode_segmentation::UnicodeSegmentation;
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SourceSpan {
-    pub segment: u64,
-    pub revision: u64,
-    pub chars: Range<usize>,
-}
 #[derive(Clone)]
 pub struct Unit {
+    pub draft: Option<crate::contracts::draft::Association>,
     pub id: String,
     pub turn: u64,
     pub chars: Range<usize>,
@@ -193,6 +188,7 @@ pub fn next(
         position += len;
     }
     Ok(Some(Unit {
+        draft: None,
         id: uuid::Uuid::new_v4().to_string(),
         turn,
         chars: range,
@@ -227,6 +223,7 @@ mod tests {
                 let text = "字".repeat(length);
                 segments.push(seg(id, &text, true));
                 units.push(Unit {
+                    draft: None,
                     id: id.to_string(),
                     turn: 1,
                     chars: start..start + length,

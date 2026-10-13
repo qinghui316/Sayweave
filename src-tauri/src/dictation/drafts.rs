@@ -1,4 +1,6 @@
 //! One serial owner. Network/native effects complete back into this loop.
+#[path = "revisable.rs"]
+mod revisable;
 #[cfg(test)]
 #[path = "drafts_tests.rs"]
 mod tests;
@@ -150,6 +152,7 @@ fn separator_only_unit_keeps_its_source_when_a_later_prefix_is_submitted() {
     let record =
         |id: u64, start: usize, text: &str, application: &str, applied: Option<&str>| UnitResult {
             unit: Unit {
+                draft: None,
                 id: id.to_string(),
                 turn: 1,
                 chars: start..start + text.chars().count(),
@@ -188,6 +191,7 @@ fn separator_only_unit_keeps_its_source_when_a_later_prefix_is_submitted() {
 }
 #[derive(Clone, Default)]
 pub(crate) struct Report {
+    pub revisable: bool,
     pub text: String,
     pub raw: String,
     pub recovery_raw: String,
@@ -198,7 +202,7 @@ pub(crate) struct Report {
 }
 impl Report {
     pub(crate) fn cancellation_raw(&self) -> &str {
-        if self.rollback_failed {
+        if self.rollback_failed || self.revisable && !self.recovery_raw.is_empty() {
             &self.recovery_raw
         } else {
             &self.raw
@@ -227,6 +231,7 @@ impl UnitSlot {
     }
 }
 enum NativeKind {
+    Revisable(revisable::Effect),
     Replace {
         sequence: u64,
         raw: String,
@@ -252,12 +257,18 @@ enum NativeKind {
     Close,
 }
 enum NativeValue {
+    Block(Result<Box<sayweave_text_service::wire::Reply>, Error>),
     Replaced(Result<(), Error>),
     Settled(PrefixOutcome),
     Begun(Result<Arc<Draft>, Error>),
     HandedOff(FinishOutcome),
     Finalized(FinishOutcome),
     Closed(Result<(), Error>),
+}
+impl NativeValue {
+    fn block(result: Result<sayweave_text_service::wire::Reply, Error>) -> Self {
+        Self::Block(result.map(Box::new))
+    }
 }
 struct NativeJob {
     kind: NativeKind,
@@ -280,6 +291,7 @@ struct Ending {
     expired: bool,
 }
 struct State {
+    revisable: Option<revisable::State>,
     draft: Option<Arc<Draft>>,
     turn: u64,
     activity: u64,
@@ -381,6 +393,7 @@ impl SessionDraft {
             ends,
             initial: Mutex::new(Some((
                 State {
+                    revisable: revisable::State::configured(),
                     draft: Some(draft),
                     turn: 1,
                     activity: anchor.activity,
@@ -466,6 +479,11 @@ impl SessionDraft {
         }
     }
     fn observe(&self, s: &mut State, value: NativeTranscript) {
+        if let Some(mut revised) = s.revisable.take() {
+            revisable::observe(self, s, &mut revised, value);
+            s.revisable = Some(revised);
+            return;
+        }
         if value.task_id != self.task
             || value.turn != s.turn
             || value.sequence <= s.latest.sequence
@@ -527,6 +545,11 @@ impl SessionDraft {
         )
     }
     fn cancel_generation(&self, s: &mut State) {
+        if let Some(mut revised) = s.revisable.take() {
+            revisable::cancel(self, s, &mut revised);
+            s.revisable = Some(revised);
+            return;
+        }
         if let Some(UnitSlot::Generating(g)) = s.unit.take()
             && let Some(c) = &self.context
         {
@@ -540,6 +563,9 @@ impl SessionDraft {
         self.control.handoff_started();
         self.control.pause();
         self.cancel_generation(s);
+        if let Some(revised) = &mut s.revisable {
+            revised.handoff();
+        }
         s.handoff = true;
         s.paused_at = Some(Instant::now());
         if let Some(NativeJob {
@@ -579,6 +605,11 @@ impl SessionDraft {
         s.handoff = false;
     }
     fn start_generation(&self, s: &mut State) -> Result<(), Error> {
+        if let Some(mut revised) = s.revisable.take() {
+            let result = revisable::start_generation(self, s, &mut revised);
+            s.revisable = Some(revised);
+            return result;
+        }
         if s.stop_error.is_some()
             || s.ending
                 .as_ref()
@@ -832,6 +863,11 @@ impl SessionDraft {
         Ok(())
     }
     fn schedule(&self, s: &mut State) -> Result<(), Error> {
+        if let Some(mut revised) = s.revisable.take() {
+            let result = revisable::schedule(self, s, &mut revised);
+            s.revisable = Some(revised);
+            return result;
+        }
         if s.native.is_some() {
             return Ok(());
         }
@@ -934,6 +970,9 @@ impl SessionDraft {
             return Ok(());
         };
         let mut mode = ending.mode.clone();
+        if mode == Finish::Abort {
+            mode = Finish::Handoff("cancelled".into());
+        }
         if let Some(error) = &s.stop_error
             && mode == Finish::Commit
         {
@@ -1002,6 +1041,11 @@ impl SessionDraft {
         kind: &NativeKind,
         value: NativeValue,
     ) -> Option<Delivery> {
+        if let Some(mut revised) = s.revisable.take() {
+            let result = revisable::native_done(self, s, &mut revised, kind, value);
+            s.revisable = Some(revised);
+            return result;
+        }
         match (kind, value) {
             (NativeKind::Replace { sequence, raw }, NativeValue::Replaced(result)) => {
                 match result {
@@ -1154,8 +1198,13 @@ impl SessionDraft {
             }
             (NativeKind::Final { mode, raw, text }, NativeValue::Finalized(outcome)) => {
                 let delivery = outcome.delivery;
-                let cancelled = *mode == Finish::Abort || outcome.cancelled;
-                if cancelled {
+                let retained_stop = matches!(mode,Finish::Handoff(reason) if reason=="cancelled")
+                    && s.ending.as_ref().is_some_and(|e| e.mode == Finish::Abort);
+                let cancelled = *mode == Finish::Abort || outcome.cancelled || retained_stop;
+                if retained_stop {
+                    self.archive_turn(s, raw, text);
+                    s.report.cancelled = true;
+                } else if cancelled {
                     if outcome.rollback_failed {
                         s.report.rollback_failed = true;
                         s.report.recovery_raw = if s.report.raw.is_empty() {
@@ -1240,6 +1289,7 @@ impl SessionDraft {
                 _=edits.changed()=>{self.request_handoff(&mut s);if !s.stopping{publish(Presentation::Editing);}},
                 _=cancel.changed()=>{
                     s.stopping=*cancel.borrow()>0;
+                    if *cancel.borrow()>=2 && let Some(revised)=&mut s.revisable { revised.stop(); }
                     if *cancel.borrow()>=2{self.cancel_generation(&mut s);if let Some(NativeJob {kind:NativeKind::Settle{permit,..},..})=&s.native {permit.store(false,Ordering::Release);}
                     if let Some(e)=&mut s.ending{e.mode=finish_for_signal(e.mode.clone(),*cancel.borrow());}}
                 },
@@ -1280,6 +1330,9 @@ impl SessionDraft {
                 }
                 if let Some(e) = &mut s.ending {
                     e.expired = true;
+                }
+                if let Some(revised) = &mut s.revisable {
+                    revised.expire();
                 }
             }
             if !s.stopping || s.ending.is_some() {

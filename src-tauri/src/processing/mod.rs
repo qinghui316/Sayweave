@@ -1,4 +1,5 @@
 //! Pure source units and prompt/quality policies. No windows, capture or database.
+pub mod draft;
 pub mod prompt;
 pub mod quality;
 pub mod render;
@@ -14,3 +15,6 @@ impl ProcessingError {
         Self { code }
     }
 }
+
+#[cfg(test)]
+mod prompt_tests;

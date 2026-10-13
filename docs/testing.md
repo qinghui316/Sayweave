@@ -1,5 +1,7 @@
 # 测试与覆盖边界
 
+持续草稿分支的 `processing/draft`、`dictation/drafts` 回放和 `data/archive_recovery` 回归覆盖同块重整、编辑基线、容量收尾、撤销许可与兼容恢复。`SAYWEAVE_BLOCK_FIXTURE=1` 下运行验收构建的 `tsf-probe fixture`，只操作自有 RichEdit，证明范围、正文、租约与回调事实；不会修改机器登记。普通构建不包含该夹具或故障入口。`live_revisable_draft_comparison` 是显式忽略的真实供应商对照，仅读取日常选定配置，以合成语料记录真实用量和请求耗时，不证明麦克风或目标显示时间。分支契约见 [持续草稿与编辑接管](revisable-draft.md)。
+
 安装环境见 [开发说明](development.md)。测试在项目根目录执行，不依赖个人启动器或私有工具安装脚本。
 
 ## 常规检查

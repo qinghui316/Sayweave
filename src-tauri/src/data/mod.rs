@@ -204,7 +204,12 @@ impl DataWorker {
                                     archive_recovery::invalidate_all(repo,&root,id,&mut memory)?;
                                 }
                                 drop(deferred);
-                                if request.archive { return archive_recovery::apply_stamped(repo, request.operation,request.ticket.as_ref().ok_or_else(||DataError::new("invalid"))?.stamp); }
+                                if request.archive {
+                                    if let Operation::Processing(crate::contracts::processing::DbOperation::Finish { id, .. }) = &request.operation
+                                        && thread_volatile.lock().map_err(|_|DataError::new("unavailable"))?.pending_run(id)
+                                    { return Err(DataError::new("busy")); }
+                                    return archive_recovery::apply_stamped(repo, request.operation,request.ticket.as_ref().ok_or_else(||DataError::new("invalid"))?.stamp);
+                                }
                                 drop(_journal);
                                 match request.operation {
                                     Operation::List(query) => repo.list(query).map(Output::Page),

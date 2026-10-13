@@ -41,6 +41,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "learning_controls_v1",
         include_str!("migrations/009_learning_controls.sql"),
     ),
+    (
+        "revisable_drafts_v1",
+        include_str!("migrations/010_revisable_drafts.sql"),
+    ),
 ];
 pub fn now() -> i64 {
     SystemTime::now()
@@ -210,6 +214,7 @@ pub fn migrate(
 }
 pub struct Repository {
     pub connection: Connection,
+    pub(super) archive_root: std::path::PathBuf,
     pub(super) archive_cursor: [usize; 2],
     pub(super) archive_causal: std::sync::Arc<super::archive_recovery::Causal>,
 }
@@ -234,6 +239,7 @@ impl Repository {
         configure(&connection)?;
         let mut repository = Self {
             connection,
+            archive_root: root.to_path_buf(),
             archive_cursor: [0, 0],
             archive_causal,
         };

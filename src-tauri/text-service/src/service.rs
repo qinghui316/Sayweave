@@ -1,4 +1,9 @@
 //! All TSF state stays on the target apartment. IPC never carries COM pointers.
+#[cfg(feature = "acceptance")]
+#[path = "block_faults.rs"]
+mod block_faults;
+#[path = "block_tracking.rs"]
+mod block_tracking;
 #[path = "edit_observation.rs"]
 mod edit_observation;
 #[path = "initial_selection.rs"]
@@ -75,6 +80,8 @@ fn module() -> windows::core::Result<HINSTANCE> {
 }
 #[derive(Clone)]
 struct Pending {
+    request: Option<Request>,
+    started: bool,
     operation: u64,
     revision: u64,
     task: String,
@@ -85,6 +92,8 @@ struct Pending {
 }
 #[derive(Default)]
 struct State {
+    block: Option<Rc<block_tracking::Track>>,
+    block_reply: Option<BlockSnapshot>,
     // Hosted engines never create a pipe, window or timer; the stable proxy owns them.
     hosted: bool,
     host_guard: Option<crate::engine_abi::HostGuardV1>,
@@ -695,6 +704,7 @@ impl ITfTextInputProcessor_Impl for Service_Impl {
     fn Deactivate(&self) -> windows::core::Result<()> {
         unsafe {
             end_owned(&self.state);
+            block_tracking::release(&self.state);
             stop_observations(&self.state);
             let (manager, client, key_sink, window) = {
                 let mut s = self.state.borrow_mut();
@@ -744,6 +754,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, w: WPARAM, l: LP
     }
 }
 fn disconnect(shared: &Shared) {
+    block_tracking::release(shared);
     stop_observations(shared);
     {
         let mut s = shared.borrow_mut();
@@ -835,6 +846,14 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
         if !state.hosted {
             state.binding = r.engine.clone();
         }
+    }
+    if r.action == Action::Revoke {
+        revoke_operation(shared, &r, connection);
+        return;
+    }
+    if r.block.is_some() {
+        block_tracking::dispatch(shared, &r, connection);
+        return;
     }
     if matches!(
         r.action,
@@ -969,7 +988,9 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
             );
             return;
         }
-        if shared.borrow().prepared.as_ref().is_some_and(|p| p.writing) {
+        if shared.borrow().prepared.as_ref().is_some_and(|p| p.writing)
+            || block_tracking::writing(shared)
+        {
             // COM may reenter while SetText/StartComposition is in progress.
             // It is no longer a no-write cancellation. Do not retire its backup
             // or pretend that the in-flight operation had no external effect.
@@ -984,6 +1005,7 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
             return;
         }
         {
+            block_tracking::revoke(shared);
             let mut s = shared.borrow_mut();
             s.generation = next_generation();
             s.pending = None;
@@ -1143,6 +1165,126 @@ fn dispatch(shared: &Shared, r: Request, connection: u64) {
         );
     }
 }
+fn revoke_operation(shared: &Shared, r: &Request, connection: u64) {
+    if block_tracking::authorized(shared, r, connection).is_err() {
+        reply(
+            shared,
+            r,
+            connection,
+            false,
+            "revokeUnauthorized",
+            Mutation::NotAttempted,
+        );
+        return;
+    }
+    let pending = shared.borrow().pending.clone();
+    let target = r.revoke.as_ref().expect("validated revoke");
+    if let Some(p) = pending {
+        let matched = p.task == r.task
+            && p.turn == r.turn
+            && p.connection == connection
+            && p.capability == r.capability
+            && p.operation == target.operation
+            && p.revision == target.revision;
+        let cancellable = p.request.as_ref().is_some_and(|request| {
+            matches!(request.action, Action::Update | Action::Settle)
+                || request.block.as_ref().is_some_and(|b| {
+                    matches!(
+                        b.action,
+                        BlockAction::Apply | BlockAction::Acquire | BlockAction::Bind
+                    )
+                })
+        });
+        if !matched || !cancellable {
+            reply(
+                shared,
+                r,
+                connection,
+                false,
+                "revokeNotMatched",
+                Mutation::NotAttempted,
+            );
+            return;
+        }
+        if p.started {
+            reply(
+                shared,
+                r,
+                connection,
+                true,
+                "operationStarted",
+                Mutation::NotAttempted,
+            );
+            return;
+        }
+        {
+            let mut state = shared.borrow_mut();
+            state.generation = next_generation();
+            state.pending = None;
+        }
+        block_tracking::revoke(shared);
+        if let Some(request) = p.request {
+            settle_observation(shared, &request, connection, false, None);
+            reply(
+                shared,
+                &request,
+                connection,
+                false,
+                "operationRevoked",
+                Mutation::NotAttempted,
+            );
+        }
+        reply(
+            shared,
+            r,
+            connection,
+            true,
+            "operationRevoked",
+            Mutation::NotAttempted,
+        );
+    } else {
+        reply(
+            shared,
+            r,
+            connection,
+            true,
+            "operationNotPending",
+            Mutation::NotAttempted,
+        );
+    }
+}
+fn start_effect(shared: &Shared, r: &Request) -> windows::core::Result<()> {
+    let mut state = shared.borrow_mut();
+    let p = state
+        .pending
+        .as_mut()
+        .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
+    if p.task != r.task
+        || p.turn != r.turn
+        || p.operation != r.operation
+        || p.revision != r.revision
+        || p.capability != r.capability
+    {
+        return Err(failure(TF_E_DISCONNECTED));
+    }
+    p.started = true;
+    drop(state);
+    #[cfg(feature = "acceptance")]
+    block_faults::started(shared, r);
+    Ok(())
+}
+unsafe fn request_native_edit(
+    context: &ITfContext,
+    client: u32,
+    edit: &ITfEditSession,
+    flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS,
+) -> windows::core::Result<HRESULT> {
+    #[cfg(feature = "acceptance")]
+    if let Some(result) = block_faults::request(context, client, edit, flags) {
+        return result;
+    }
+    unsafe { context.RequestEditSession(client, edit, flags) }
+}
 fn apply_terminal_then_retire(
     shared: &Shared,
     request: &Request,
@@ -1222,6 +1364,11 @@ fn send_reply(
     }
     if s.pipe.is_some() || s.output.is_some() {
         let reply = Reply {
+            block: if r.block.is_some() {
+                s.block_reply.take()
+            } else {
+                None
+            },
             engine: s.binding.clone(),
             task: r.task.clone(),
             turn: r.turn,
@@ -1787,6 +1934,8 @@ fn schedule(
             }
             .into();
             shared.borrow_mut().pending = Some(Pending {
+                request: Some(r.clone()),
+                started: false,
                 operation: r.operation,
                 revision: r.revision,
                 task: r.task.clone(),
@@ -1795,9 +1944,9 @@ fn schedule(
                 capability: r.capability.clone(),
                 settlement: inherited_settlement,
             });
-            let result = owned
-                .RequestEditSession(client, &edit, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE)
-                .map_err(|e| ("ownedRelease", e))?;
+            let result =
+                request_native_edit(&owned, client, &edit, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE)
+                    .map_err(|e| ("ownedRelease", e))?;
             if shared
                 .borrow()
                 .pending
@@ -1823,6 +1972,8 @@ fn schedule(
         }
         .into();
         shared.borrow_mut().pending = Some(Pending {
+            request: Some(r.clone()),
+            started: false,
             operation: r.operation,
             revision: r.revision,
             task: r.task.clone(),
@@ -1831,9 +1982,13 @@ fn schedule(
             capability: r.capability.clone(),
             settlement: inherited_settlement,
         });
-        let session = context
-            .RequestEditSession(client, &edit, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE)
-            .map_err(|e| ("requestEdit", e))?;
+        let session = request_native_edit(
+            &context,
+            client,
+            &edit,
+            TF_ES_ASYNCDONTCARE | TF_ES_READWRITE,
+        )
+        .map_err(|e| ("requestEdit", e))?;
         // Synchronous DoEditSession owns its acknowledgement, including failure.
         // Its HRESULT must not produce a second reply for the same operation.
         if shared
@@ -1845,15 +2000,6 @@ fn schedule(
             session.ok().map_err(|e| ("requestEditResult", e))?;
         }
         Ok(())
-    }
-}
-fn unwatch(context: Option<&ITfContext>, cookie: Option<u32>) {
-    if let (Some(context), Some(cookie)) = (context, cookie) {
-        unsafe {
-            if let Ok(source) = context.cast::<ITfSource>() {
-                let _ = source.UnadviseSink(cookie);
-            }
-        }
     }
 }
 fn drain_text_watches(shared: &Shared) {
@@ -1880,14 +2026,21 @@ fn drain_text_watches(shared: &Shared) {
 #[derive(Default)]
 struct TextNotifications {
     depth: Cell<u32>,
-    retired: RefCell<Vec<(ITfContext, u32)>>,
+    retired: RefCell<Vec<(ITfSource, u32)>>,
 }
 impl TextNotifications {
     fn retire(&self, context: ITfContext, cookie: u32) {
+        if let Ok(source) = context.cast::<ITfSource>() {
+            self.retire_source(source, cookie);
+        }
+    }
+    fn retire_source(&self, source: ITfSource, cookie: u32) {
         if self.depth.get() != 0 {
-            self.retired.borrow_mut().push((context, cookie));
+            self.retired.borrow_mut().push((source, cookie));
         } else {
-            unwatch(Some(&context), Some(cookie));
+            unsafe {
+                let _ = source.UnadviseSink(cookie);
+            }
         }
     }
     fn drain(&self) {
@@ -1895,8 +2048,10 @@ impl TextNotifications {
             return;
         }
         let retired = std::mem::take(&mut *self.retired.borrow_mut());
-        for (context, cookie) in retired {
-            unwatch(Some(&context), Some(cookie));
+        for (source, cookie) in retired {
+            unsafe {
+                let _ = source.UnadviseSink(cookie);
+            }
         }
     }
 }
@@ -1971,6 +2126,8 @@ fn release_composition_with_failure(
 }
 fn reply_interrupted_prefix(shared: &Shared, pending: &Pending) {
     let request = Request {
+        revoke: None,
+        block: None,
         engine: shared.borrow().binding.clone(),
         protocol: PROTOCOL,
         capability: pending.capability.clone(),
@@ -2282,14 +2439,24 @@ impl KeySink {
                     s.context.as_ref() == context.as_ref()
                 );
             }
-            s.active && s.version.owned && !s.cleanup && s.context.as_ref() == context.as_ref()
+            s.active
+                && !s.cleanup
+                && ((s.version.owned && s.context.as_ref() == context.as_ref())
+                    || s.block
+                        .as_ref()
+                        .is_some_and(|b| Some(&b.context) == context.as_ref()))
         };
         owns.then_some(shared)
     }
 }
 impl ITfKeyEventSink_Impl for KeySink_Impl {
-    fn OnSetFocus(&self, _: BOOL) -> windows::core::Result<()> {
+    fn OnSetFocus(&self, focused: BOOL) -> windows::core::Result<()> {
         let _callback = Callback::enter();
+        if !focused.as_bool()
+            && let Some(state) = self.state.upgrade()
+        {
+            block_tracking::invalidate(&state);
+        }
         Ok(())
     }
     fn OnTestKeyDown(
@@ -2309,6 +2476,12 @@ impl ITfKeyEventSink_Impl for KeySink_Impl {
     ) -> windows::core::Result<BOOL> {
         let _callback = Callback::enter();
         if let Some(shared) = self.owns_key(context, key) {
+            block_tracking::revoke(&shared);
+            if matches!(key.0, 0x59 | 0x5a)
+                && unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) < 0 }
+            {
+                block_tracking::invalidate(&shared);
+            }
             let observation = prepare_key_observation(&shared);
             let ended = end_owned_with_flags(&shared, TF_ES_SYNC);
             shared.borrow_mut().key_handoff = ended;
@@ -2354,6 +2527,8 @@ fn prepare_key_observation(shared: &Shared) -> Option<Request> {
             return None;
         }
         let request = Request {
+            revoke: None,
+            block: None,
             action: Action::Handoff,
             prefix: None,
             text: String::new(),
@@ -3116,6 +3291,7 @@ fn settle_prefix(
         let combined = format!("{committed}{}", tail.marked);
         *phase = "settleText";
         *mutation = Mutation::Uncertain;
+        start_effect(shared, r)?;
         range.SetText(
             ec,
             TF_ST_CORRECTION,
@@ -3242,6 +3418,8 @@ fn settle_prefix(
                 dispatch(
                     shared,
                     Request {
+                        revoke: None,
+                        block: None,
                         action: Action::Abort,
                         operation: r.operation + 1,
                         text: String::new(),
@@ -3497,6 +3675,7 @@ fn write_composing(
         *mutation = Mutation::Uncertain;
         *phase = "updateText";
         let text = CompositionText::new(text);
+        start_effect(shared, r)?;
         range.SetText(
             ec,
             TF_ST_CORRECTION,
@@ -4191,6 +4370,7 @@ fn apply(
                 release_composition(shared, epoch, Some(&composition));
             }
             Action::Begin
+            | Action::Revoke
             | Action::Inspect
             | Action::ObserveStart
             | Action::ObservePoll
@@ -4231,6 +4411,8 @@ fn inject_initial_abort(shared: &Shared, request: &Request) {
     dispatch(
         shared,
         Request {
+            revoke: None,
+            block: None,
             action: Action::Abort,
             operation: request.operation + 1,
             text: String::new(),
@@ -4261,6 +4443,8 @@ fn settle_checkpoint(
         1 => {
             let connection = shared.borrow().connection;
             let abort = Request {
+                revoke: None,
+                block: None,
                 action: Action::Abort,
                 operation: request.operation + 1,
                 text: String::new(),
@@ -4368,6 +4552,8 @@ mod tests {
         let old = uuid::Uuid::new_v4().to_string();
         let newer = uuid::Uuid::new_v4().to_string();
         let request = Request {
+            revoke: None,
+            block: None,
             engine: crate::wire::fixture_binding(),
             protocol: PROTOCOL,
             capability: uuid::Uuid::new_v4().to_string(),
@@ -4416,6 +4602,8 @@ mod tests {
         .unwrap();
         assert!(server.connect());
         let request = Request {
+            revoke: None,
+            block: None,
             engine: crate::wire::fixture_binding(),
             protocol: PROTOCOL,
             task: uuid::Uuid::new_v4().to_string(),
@@ -4445,6 +4633,8 @@ mod tests {
                 owned: true,
             },
             pending: Some(Pending {
+                request: None,
+                started: false,
                 task: request.task.clone(),
                 turn: 1,
                 operation: 3,
@@ -4461,6 +4651,8 @@ mod tests {
         }));
         for action in [Action::Settle, Action::Inspect] {
             let duplicate = Request {
+                revoke: None,
+                block: None,
                 action,
                 prefix: if action == Action::Inspect {
                     None
@@ -4534,6 +4726,8 @@ mod tests {
                     owned: true,
                 },
                 pending: Some(Pending {
+                    request: None,
+                    started: false,
                     task: task.clone(),
                     turn: 1,
                     operation: 3,
@@ -4551,6 +4745,8 @@ mod tests {
             dispatch(
                 &shared,
                 Request {
+                    revoke: None,
+                    block: None,
                     engine: crate::wire::fixture_binding(),
                     protocol: PROTOCOL,
                     task,
@@ -4622,6 +4818,8 @@ mod tests {
         let old_task = uuid::Uuid::new_v4().to_string();
         let new_task = uuid::Uuid::new_v4().to_string();
         let request = Request {
+            revoke: None,
+            block: None,
             engine: crate::wire::fixture_binding(),
             protocol: PROTOCOL,
             capability: capability.clone(),
@@ -4740,6 +4938,8 @@ mod tests {
         let capability = uuid::Uuid::new_v4().to_string();
         let task = uuid::Uuid::new_v4().to_string();
         let request = Request {
+            revoke: None,
+            block: None,
             engine: crate::wire::fixture_binding(),
             protocol: PROTOCOL,
             capability: capability.clone(),
@@ -4769,6 +4969,8 @@ mod tests {
                 owned: true,
             },
             pending: Some(Pending {
+                request: None,
+                started: false,
                 task,
                 capability,
                 turn: 1,
@@ -4791,6 +4993,8 @@ mod tests {
         assert!(current.prefix_end.is_none());
         current.version.applied(&request);
         assert!(current.version.accepts(&Request {
+            revoke: None,
+            block: None,
             action: Action::Update,
             operation: 4,
             revision: 3,
@@ -5008,6 +5212,8 @@ mod tests {
             connection: 42,
             capability: Some(capability.clone()),
             pending: Some(Pending {
+                request: None,
+                started: false,
                 operation: 1,
                 revision: 0,
                 task: task.clone(),
@@ -5019,6 +5225,8 @@ mod tests {
             ..Default::default()
         }));
         let old = Request {
+            revoke: None,
+            block: None,
             engine: crate::wire::fixture_binding(),
             protocol: crate::wire::PROTOCOL,
             capability: uuid::Uuid::new_v4().to_string(),

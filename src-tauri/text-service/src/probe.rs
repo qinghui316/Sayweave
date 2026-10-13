@@ -16,6 +16,9 @@ fn fixture_binding() -> EngineBinding {
 }
 struct Apartment;
 #[cfg(feature = "acceptance")]
+#[path = "block_probe.rs"]
+mod block_probe;
+#[cfg(feature = "acceptance")]
 #[path = "core_switch_probe.rs"]
 mod core_switch_probe;
 impl Drop for Apartment {
@@ -401,6 +404,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         return Err("target foreground changed; stopped without retry".into());
                     }
                     let r = Request {
+                        revoke: None,
+                        block: None,
                         engine: fixture_binding(),
                         protocol: sayweave_text_service::wire::PROTOCOL,
                         capability: capability.clone(),
@@ -993,6 +998,9 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
                 context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0
             );
             let pipe = Pipe::client(std::process::id(), GetCurrentThreadId())?;
+            if !installed && std::env::var_os("SAYWEAVE_BLOCK_FIXTURE").is_some() {
+                return block_probe::run(editor, &manager, &pipe, &capability, component);
+            }
             if plain && !installed && std::env::var_os("SAYWEAVE_EDIT_SETTLEMENT_TRACE").is_some() {
                 return trace_native_initial_settlement(editor, &context, &pipe, &capability);
             }
@@ -1008,6 +1016,8 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
             ] {
                 let operation = operation + u64::from(observation && operation > 1);
                 let request = Request {
+                    revoke: None,
+                    block: None,
                     engine: fixture_binding(),
                     protocol: sayweave_text_service::wire::PROTOCOL,
                     capability: capability.clone(),
@@ -1887,6 +1897,8 @@ fn observation_ranges_fixture(
                     let inject: unsafe extern "system" fn(usize) = std::mem::transmute(entry);
                     inject(6);
                     let request = Request {
+                        revoke: None,
+                        block: None,
                         engine: fixture_binding(),
                         protocol: PROTOCOL,
                         capability: capability.into(),
@@ -1936,6 +1948,8 @@ fn observation_ranges_fixture(
                     false,
                 )?;
                 let request = Request {
+                    revoke: None,
+                    block: None,
                     engine: fixture_binding(),
                     protocol: PROTOCOL,
                     capability: capability.into(),
@@ -2657,6 +2671,8 @@ fn exchange(
 ) -> Result<Reply, Box<dyn std::error::Error>> {
     let now = unsafe { windows::Win32::System::SystemInformation::GetTickCount64() };
     let r = Request {
+        revoke: None,
+        block: None,
         engine: fixture_binding(),
         protocol: sayweave_text_service::wire::PROTOCOL,
         capability: capability.into(),
@@ -2754,6 +2770,8 @@ fn prefix_fixture(
             );
         }
         let settle = Request {
+            revoke: None,
+            block: None,
             engine: fixture_binding(),
             protocol: PROTOCOL,
             capability: capability.into(),
@@ -2774,6 +2792,8 @@ fn prefix_fixture(
         // The old trailing-LF request must be rejected without touching the
         // live composition, target text, caret or operation version.
         let rejected_request = Request {
+            revoke: None,
+            block: None,
             prefix: Some(Prefix {
                 text: format!("{committed}\n"),
                 expected_revision: 1,
@@ -2927,6 +2947,8 @@ fn prefix_fixture(
             .into());
         }
         let next = Request {
+            revoke: None,
+            block: None,
             operation: 5,
             revision: 4,
             deadline_tick: unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
@@ -3176,6 +3198,8 @@ fn initial_selection_fixture(
             }
             inject(mode);
             let request = Request {
+                revoke: None,
+                block: None,
                 engine: fixture_binding(),
                 protocol: sayweave_text_service::wire::PROTOCOL,
                 capability: capability.into(),
@@ -3328,6 +3352,8 @@ fn prefix_fault_fixture(
                 "原文尾🙂"
             };
             let request = Request {
+                revoke: None,
+                block: None,
                 engine: fixture_binding(),
                 protocol: PROTOCOL,
                 capability: capability.into(),

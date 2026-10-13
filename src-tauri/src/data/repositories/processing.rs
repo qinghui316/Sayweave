@@ -7,8 +7,32 @@ use rusqlite::{OptionalExtension, params};
 impl Repository {
     pub fn processing_operation(&mut self, operation: DbOperation) -> Result<DbOutput, DataError> {
         match operation {
+            DbOperation::SaveDraft(checkpoint) => {
+                if !checkpoint.valid() {
+                    return Err(DataError::new("invalid"));
+                }
+                let source = serde_json::to_string(&checkpoint.source)
+                    .map_err(|_| DataError::new("invalid"))?;
+                let revision = i64::try_from(checkpoint.visible_revision)
+                    .map_err(|_| DataError::new("invalid"))?;
+                let order =
+                    i64::try_from(checkpoint.order).map_err(|_| DataError::new("invalid"))?;
+                let changed=self.connection.execute("INSERT INTO processing_draft_blocks(id,run_id,ordinal,source_snapshot,visible_revision,visible_text,state) SELECT ?1,?2,?3,?4,?5,?6,?7 WHERE EXISTS(SELECT 1 FROM processing_runs WHERE id=?2 AND (state='running' OR ?7!='preview')) ON CONFLICT(id) DO UPDATE SET source_snapshot=excluded.source_snapshot,visible_revision=excluded.visible_revision,visible_text=excluded.visible_text,state=excluded.state WHERE processing_draft_blocks.run_id=excluded.run_id AND processing_draft_blocks.ordinal=excluded.ordinal AND (processing_draft_blocks.state='preview' AND processing_draft_blocks.visible_revision<excluded.visible_revision OR processing_draft_blocks.visible_revision=excluded.visible_revision AND (processing_draft_blocks.visible_text=excluded.visible_text AND processing_draft_blocks.state='preview' OR processing_draft_blocks.state=excluded.state AND processing_draft_blocks.source_snapshot=excluded.source_snapshot AND processing_draft_blocks.visible_text=excluded.visible_text))",params![checkpoint.source.block,checkpoint.run_id,order,source,revision,checkpoint.visible_text,checkpoint.state]).map_err(db_error)?;
+                if changed != 1 {
+                    return Err(DataError::new("conflict"));
+                }
+                Ok(DbOutput::Done)
+            }
             DbOperation::Prepare(run) => {
-                for id in [&run.id, &run.attempt_id, &run.task_id, &run.config_id] {
+                if !["model", "native"].contains(&run.mode.as_str())
+                    || run.mode == "native" && !run.config_id.is_empty()
+                {
+                    return Err(DataError::new("invalid"));
+                }
+                for id in [&run.id, &run.attempt_id, &run.task_id]
+                    .into_iter()
+                    .chain((run.mode == "model").then_some(&run.config_id))
+                {
                     if uuid::Uuid::parse_str(id).is_err() {
                         return Err(DataError::new("invalid"));
                     }
@@ -16,7 +40,7 @@ impl Repository {
                 if run.config_revision < 1 || run.settings_revision < 1 {
                     return Err(DataError::new("invalid"));
                 }
-                self.connection.execute("INSERT INTO processing_runs(id,attempt_id,task_id,config_id,config_name,model_id,config_revision,prompt_version,settings_revision,dictionary_version,state,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'running',?11)",params![run.id,run.attempt_id,run.task_id,run.config_id,run.config_name,run.model_id,run.config_revision,run.prompt_version,run.settings_revision,run.dictionary_version,now()]).map_err(db_error)?;
+                self.connection.execute("INSERT INTO processing_runs(id,attempt_id,task_id,config_id,config_name,model_id,config_revision,prompt_version,settings_revision,dictionary_version,state,created_at,mode) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'running',?11,?12)",params![run.id,run.attempt_id,run.task_id,run.config_id,run.config_name,run.model_id,run.config_revision,run.prompt_version,run.settings_revision,run.dictionary_version,now(),run.mode]).map_err(db_error)?;
                 Ok(DbOutput::Done)
             }
             DbOperation::SaveUnit(unit) => {
@@ -63,13 +87,27 @@ impl Repository {
                 }
                 let tx = self.connection.transaction().map_err(db_error)?;
                 let (attempt,record):(String,String)=tx.query_row("SELECT p.attempt_id,a.record_id FROM processing_runs p JOIN speech_attempts a ON a.id=p.attempt_id WHERE p.id=?1 AND p.state='running'",[&id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(db_error)?;
-                tx.execute("DELETE FROM processing_units WHERE run_id=?1", [&id])
+                let revisable: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM processing_draft_blocks WHERE run_id=?1)",
+                        [&id],
+                        |r| r.get(0),
+                    )
                     .map_err(db_error)?;
+                if revisable {
+                    tx.execute("UPDATE processing_units SET application_state=CASE WHEN application_state='pending' THEN 'notApplied' ELSE application_state END,generation_state=CASE WHEN generation_state='pending' THEN 'interrupted' ELSE generation_state END WHERE run_id=?1",[&id]).map_err(db_error)?;
+                } else {
+                    tx.execute("DELETE FROM processing_units WHERE run_id=?1", [&id])
+                        .map_err(db_error)?;
+                }
                 for unit in units {
                     validate_unit(&unit)?;
                     if unit.run_id != id
-                        || !["applied", "handedOff", "uncertain"]
-                            .contains(&unit.application_state.as_str())
+                        || crate::contracts::draft::read(&unit.source_refs)
+                            .map_err(|_| DataError::new("invalid"))?
+                            .is_none()
+                            && !["applied", "handedOff", "uncertain"]
+                                .contains(&unit.application_state.as_str())
                     {
                         return Err(DataError::new("invalid"));
                     }
@@ -86,7 +124,7 @@ impl Repository {
                         i64::try_from(unit.source_start).map_err(|_| DataError::new("invalid"))?;
                     let end =
                         i64::try_from(unit.source_end).map_err(|_| DataError::new("invalid"))?;
-                    tx.execute("INSERT INTO processing_units(id,run_id,turn,source_start,source_end,source_refs,source_text,candidate_text,generation_state,application_state,source_committed_end,error_code,prompt_tokens,completion_tokens,elapsed_ms,created_at,ended_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?16)",params![unit.id,id,turn,start,end,unit.source_refs,unit.source_text,unit.candidate_text,unit.generation_state,unit.application_state,committed,unit.error_code,prompt_tokens,completion_tokens,elapsed,now()]).map_err(db_error)?;
+                    tx.execute("INSERT INTO processing_units(id,run_id,turn,source_start,source_end,source_refs,source_text,candidate_text,generation_state,application_state,source_committed_end,error_code,prompt_tokens,completion_tokens,elapsed_ms,created_at,ended_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?16) ON CONFLICT(id) DO UPDATE SET candidate_text=excluded.candidate_text,generation_state=excluded.generation_state,application_state=excluded.application_state,source_committed_end=excluded.source_committed_end,error_code=excluded.error_code,prompt_tokens=excluded.prompt_tokens,completion_tokens=excluded.completion_tokens,elapsed_ms=excluded.elapsed_ms,ended_at=excluded.ended_at WHERE processing_units.run_id=excluded.run_id AND processing_units.turn=excluded.turn AND processing_units.source_start=excluded.source_start AND processing_units.source_end=excluded.source_end AND processing_units.source_refs=excluded.source_refs AND processing_units.source_text=excluded.source_text",params![unit.id,id,turn,start,end,unit.source_refs,unit.source_text,unit.candidate_text,unit.generation_state,unit.application_state,committed,unit.error_code,prompt_tokens,completion_tokens,elapsed,now()]).map_err(db_error)?;
                 }
                 tx.execute(
                     "UPDATE speech_attempts SET text=?2,search_key=?3 WHERE id=?1",
@@ -127,6 +165,34 @@ impl Repository {
             }
             DbOperation::Recover => {
                 let tx = self.connection.transaction().map_err(db_error)?;
+                let runs: Vec<String> = {
+                    let mut query = tx
+                        .prepare("SELECT id FROM processing_runs WHERE state='running'")
+                        .map_err(db_error)?;
+                    query
+                        .query_map([], |r| r.get(0))
+                        .map_err(db_error)?
+                        .collect::<Result<_, _>>()
+                        .map_err(db_error)?
+                };
+                for run in runs {
+                    let bodies: Vec<String> = {
+                        let mut query=tx.prepare("SELECT visible_text FROM processing_draft_blocks WHERE run_id=?1 AND state!='uncertain' ORDER BY ordinal").map_err(db_error)?;
+                        query
+                            .query_map([&run], |r| r.get(0))
+                            .map_err(db_error)?
+                            .collect::<Result<_, _>>()
+                            .map_err(db_error)?
+                    };
+                    if !bodies.is_empty() {
+                        let text = bodies.concat();
+                        tx.execute(
+                            "UPDATE processing_runs SET text=?2,search_key=?3 WHERE id=?1",
+                            params![run, text, crate::contracts::dictionary::key(&text)],
+                        )
+                        .map_err(db_error)?;
+                    }
+                }
                 tx.execute("UPDATE processing_units SET application_state=CASE WHEN application_state='pending' THEN 'uncertain' ELSE application_state END,generation_state=CASE WHEN generation_state='pending' THEN 'interrupted' ELSE generation_state END,error_code=coalesce(error_code,'interrupted'),ended_at=coalesce(ended_at,?1) WHERE run_id IN (SELECT id FROM processing_runs WHERE state='running')",[now()]).map_err(db_error)?;
                 tx.execute("UPDATE processing_runs SET state='interrupted',error_code='interrupted',ended_at=?1,revision=revision+1 WHERE state='running'",[now()]).map_err(db_error)?;
                 tx.commit().map_err(db_error)?;
@@ -185,10 +251,11 @@ pub(super) fn read_runs(
     connection: &rusqlite::Connection,
     record: &str,
 ) -> Result<Vec<RunRecord>, DataError> {
-    let mut query=connection.prepare("SELECT p.id,p.attempt_id,p.config_name,p.model_id,p.state,p.text,p.revision,p.error_code FROM processing_runs p JOIN speech_attempts a ON a.id=p.attempt_id WHERE a.record_id=?1 ORDER BY p.created_at DESC,p.id ASC").map_err(db_error)?;
+    let mut query=connection.prepare("SELECT p.id,p.attempt_id,p.config_name,p.model_id,p.state,p.text,p.revision,p.error_code,p.mode FROM processing_runs p JOIN speech_attempts a ON a.id=p.attempt_id WHERE a.record_id=?1 ORDER BY p.created_at DESC,p.id ASC").map_err(db_error)?;
     let mut runs = query
         .query_map([record], |r| {
             Ok(RunRecord {
+                mode: r.get(8)?,
                 id: r.get(0)?,
                 attempt_id: r.get(1)?,
                 config_name: r.get(2)?,
@@ -235,6 +302,12 @@ pub(super) fn read_runs(
 }
 
 fn validate_unit(unit: &UnitRecord) -> Result<(), DataError> {
+    if let Some(draft) =
+        crate::contracts::draft::read(&unit.source_refs).map_err(|_| DataError::new("invalid"))?
+        && draft.source.text != unit.source_text
+    {
+        return Err(DataError::new("invalid"));
+    }
     if uuid::Uuid::parse_str(&unit.id).is_err()
         || uuid::Uuid::parse_str(&unit.run_id).is_err()
         || unit.turn == 0

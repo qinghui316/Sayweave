@@ -38,6 +38,7 @@ pub fn text(turns: &[SourceTurn], records: &[UnitRecord]) -> String {
                 continue;
             };
             let unit = Unit {
+                draft: None,
                 id: record.id.clone(),
                 turn: record.turn,
                 chars: record.source_start..record.source_end,

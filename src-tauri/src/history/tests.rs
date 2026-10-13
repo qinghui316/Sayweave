@@ -5,6 +5,112 @@ use rusqlite::{Connection, params};
 fn id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
+
+#[test]
+fn revisable_history_associates_overlapping_attempts_and_retains_only_actual_final_body() {
+    use crate::contracts::processing::{DbOperation as P, RunMetadata, UnitRecord};
+    use crate::{contracts::draft::Association, processing::draft::Block};
+    let root = tempfile::tempdir().unwrap();
+    let mut repo = Repository::open(root.path()).unwrap();
+    let (rid, attempt, _) = prepare(&mut repo, false);
+    let run = RunMetadata {
+        mode: "model".into(),
+        id: id(),
+        attempt_id: attempt.id.clone(),
+        task_id: id(),
+        config_id: id(),
+        config_name: "测试".into(),
+        model_id: "fixture".into(),
+        config_revision: 1,
+        prompt_version: "faithful-v4".into(),
+        settings_revision: 1,
+        dictionary_version: "terms".into(),
+    };
+    repo.processing_operation(P::Prepare(run.clone())).unwrap();
+    let mut block = Block::new(id());
+    block.observe("周三开会".into(), 4).unwrap();
+    let first = block.snapshot(false).unwrap();
+    let make = |source: crate::processing::draft::Snapshot, body: &str, delivery: bool| {
+        let mut a = Association::attempt(1, source.clone());
+        a.delivery = delivery;
+        if delivery {
+            a.visible_revision = Some(3);
+        }
+        UnitRecord {
+            id: id(),
+            run_id: run.id.clone(),
+            turn: 1,
+            source_start: 0,
+            source_end: source.text.chars().count(),
+            source_refs: serde_json::to_string(&a).unwrap(),
+            source_text: source.text,
+            candidate_text: Some(body.into()),
+            generation_state: if delivery { "skipped" } else { "success" }.into(),
+            application_state: if delivery { "applied" } else { "notApplied" }.into(),
+            source_committed_end: None,
+            error_code: None,
+            prompt_tokens: Some(30),
+            completion_tokens: Some(6),
+            elapsed_ms: 10,
+        }
+    };
+    let old = make(first, "周三开会。", false);
+    repo.processing_operation(P::SaveUnit(old.clone())).unwrap();
+    block.observe("周三开会不对周四".into(), 8).unwrap();
+    let next = block.snapshot(false).unwrap();
+    let revised = make(next.clone(), "周四开会。", false);
+    let delivered = make(next, "周四开会。", true);
+    repo.processing_operation(P::SaveUnit(revised.clone()))
+        .unwrap();
+    repo.processing_operation(P::SaveUnit(delivered.clone()))
+        .unwrap();
+    let counts:(i64,i64)=repo.connection.query_row("SELECT (SELECT count(*) FROM processing_draft_blocks),(SELECT count(*) FROM processing_draft_versions)",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(counts, (1, 3));
+    let mut collision = old.clone();
+    collision.id = id();
+    let mut association = crate::contracts::draft::read(&collision.source_refs)
+        .unwrap()
+        .unwrap();
+    association.order = 2;
+    collision.source_refs = serde_json::to_string(&association).unwrap();
+    assert!(
+        repo.processing_operation(P::SaveUnit(collision.clone()))
+            .is_err()
+    );
+    assert!(
+        !repo
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM processing_units WHERE id=?1)",
+                [collision.id],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap(),
+        "association and unit must be atomic"
+    );
+    repo.processing_operation(P::Cancel {
+        id: run.id.clone(),
+        text: "周四开会。".into(),
+        raw: "周三开会不对周四".into(),
+        rollback_failed: false,
+        units: vec![old, revised, delivered],
+    })
+    .unwrap();
+    let saved = record(&mut repo, &rid);
+    assert_eq!(saved.processing[0].text, "周四开会。");
+    assert_eq!(saved.processing[0].state, "cancelled");
+    assert_eq!(saved.processing[0].units.len(), 3);
+    assert_eq!(
+        repo.connection
+            .query_row(
+                "SELECT count(*) FROM processing_draft_versions WHERE is_delivery=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+}
 #[test]
 fn cancelled_partial_attempt_retains_text_without_poisoning_record_state() {
     let root = tempfile::tempdir().unwrap();
@@ -33,6 +139,7 @@ fn processed_history_reference_search_and_source_versions_remain_independent() {
     let (rid, attempt, _) = prepare(&mut repo, false);
     finish(&mut repo, &attempt, "success", "呃，赛维原文。");
     let run = RunMetadata {
+        mode: "model".into(),
         id: id(),
         attempt_id: attempt.id.clone(),
         task_id: id(),
@@ -110,6 +217,7 @@ fn cancelled_processing_atomically_drops_pending_tail_and_queues_audio_cleanup()
     let (rid, attempt, resource) = prepare(&mut repo, true);
     finish(&mut repo, &attempt, "success", "前段。未提交尾部。");
     let run = RunMetadata {
+        mode: "model".into(),
         id: id(),
         attempt_id: attempt.id.clone(),
         task_id: id(),

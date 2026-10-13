@@ -29,6 +29,18 @@ it('rejects processing records with unrelated source identity or invalid receipt
  expect(()=>parseRecord({...r,processing:[{...r.processing![0],attemptId:'another'}]})).toThrow();
  expect(()=>parseRecord({...r,processing:[{...r.processing![0],units:[{id:'u',runId:'other'}]}]})).toThrow();
 });
+it('shows retained native draft results without inventing a text model',async()=>{
+ const r=record(1,'识别原文');
+ r.processing=[{id:'native-draft',attemptId:r.currentAttempt!,mode:'native',configName:'口述结果',modelId:'',state:'success',text:'用户修改后的结果',revision:1,errorCode:null,units:[]}];
+ expect(parseRecord(r).processing?.[0]?.mode).toBe('native');
+ expect(()=>parseRecord({...r,processing:[{...r.processing![0],mode:'unknown'}]})).toThrow();
+ const f=fixture([r]);
+ render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
+ expect(await screen.findByText('用户修改后的结果')).toBeVisible();
+ const user=userEvent.setup();screen.getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');
+ await user.click(await screen.findByRole('menuitem',{name:'识别版本'}));
+ expect((await screen.findAllByText('口述结果')).length).toBeGreaterThan(0);
+});
 it('refreshes late delivery confirmation without changing the recognition record',async()=>{
  const r=record(),f=fixture([r]);let state='delivering';
  const port=Object.assign(Object.create(f.port) as import('../src/contracts/history').HistoryPort,{delivery:vi.fn(async()=>[{attemptId:r.currentAttempt!,state,error:null,updatedAt:1}])});

@@ -81,6 +81,8 @@ impl Control {
         text: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let request = Request {
+            revoke: None,
+            block: None,
             engine: EngineBinding {
                 proxy_instance: uuid::Uuid::from_bytes(self.status()?.instance).to_string(),
                 engine_generation: generation,
@@ -420,6 +422,8 @@ pub(super) fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
                 let stale = Request {
+                    revoke: None,
+                    block: None,
                     engine: EngineBinding {
                         proxy_instance: uuid::Uuid::from_bytes(status.instance).to_string(),
                         engine_generation: status.generation.saturating_sub(1),
@@ -463,6 +467,8 @@ pub(super) fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 windows::Win32::System::Threading::GetCurrentThreadId(),
             )?;
             let request = |operation, revision, action, text: &str| Request {
+                revoke: None,
+                block: None,
                 engine: binding.clone(),
                 protocol: sayweave_text_service::wire::PROTOCOL,
                 capability: capability.clone(),
