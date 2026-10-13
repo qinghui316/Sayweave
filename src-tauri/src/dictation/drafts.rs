@@ -30,6 +30,19 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 type Generation =
     Result<crate::contracts::processing::GeneratedText, crate::models::types::ModelError>;
+fn normal_preparation_refusal(code: &str) -> bool {
+    matches!(
+        code,
+        "targetReadonlyContext"
+            | "targetChanged"
+            | "targetLost"
+            | "targetClosed"
+            | "editing"
+            | "inputComposition"
+            | "staleSession"
+            | "staleSnapshot"
+    )
+}
 fn finish_for_signal(mode: Finish, signal: u8) -> Finish {
     if mode == Finish::Abort {
         return mode;
@@ -1139,17 +1152,7 @@ impl SessionDraft {
                 }
                 Err(e)
                     if (s.stopping || self.control.stopping())
-                        && matches!(
-                            e.code.as_str(),
-                            "targetReadonlyContext"
-                                | "targetChanged"
-                                | "targetLost"
-                                | "targetClosed"
-                                | "editing"
-                                | "inputComposition"
-                                | "staleSession"
-                                | "staleSnapshot"
-                        ) =>
+                        && normal_preparation_refusal(&e.code) =>
                 {
                     // Begin has not written text. A retired preparation may
                     // reject its lease after Finish; it cannot restart or fail

@@ -248,6 +248,7 @@ pub(super) fn start_generation(
     r: &mut State,
 ) -> Result<(), Error> {
     if r.stopped
+        || (s.stopping || actor.control.stopping()) && s.ending.is_none()
         || r.read_needed
         || s.handoff
         || s.stop_error.is_some()
@@ -535,6 +536,11 @@ pub(super) fn schedule(
         }
         return Ok(());
     }
+    // Finish intent is synchronous; its final ASR/End envelope can arrive later.
+    // Release an already handed-off range above, but do not arrange fresh writes.
+    if (s.stopping || actor.control.stopping()) && s.ending.is_none() {
+        return Ok(());
+    }
     if s.ending.as_ref().is_some_and(|e| e.mode != Finish::Commit) {
         r.stop();
         cancel(actor, s, r);
@@ -815,6 +821,26 @@ pub(super) fn native_done(
                     actor.control.resume(*turn, *activity);
                 }
             }
+            Err(error)
+                if (s.stopping || actor.control.stopping())
+                    && normal_preparation_refusal(&error.code) =>
+            {
+                r.stop();
+                cancel(actor, s, r);
+                log::info!(target:"sayweave", "operation=composition_prepare_retired task_id={} turn={} error={}", actor.task, turn, error.code);
+            }
+            Err(error) if error.code == "inputComposition" => {
+                actor.control.pause();
+                s.paused_at = Some(Instant::now());
+                log::info!(target:"sayweave", "operation=composition_prepare_wait task_id={} turn={} reason=inputComposition", actor.task, turn);
+            }
+            Err(error) if error.code == "editing" => {
+                actor.control.pause();
+                r.handoff();
+                cancel(actor, s, r);
+                s.handoff = true;
+                s.paused_at = Some(Instant::now());
+            }
             Err(error) => s.record_failure(&actor.task, error.code),
         },
         (
@@ -1056,6 +1082,105 @@ mod tests {
     use super::super::tests::{actor, block_reply, command};
     use super::*;
     use crate::windows_input::composition::Command;
+    #[test]
+    fn resumed_ime_composition_waits_without_failing_and_can_recover_same_turn() {
+        let (actor, mut s, _) = actor(None);
+        let draft = s.draft.take().unwrap();
+        let mut r = State::new();
+        let turn = s.turn;
+        let activity = s.activity;
+        s.report.text = "已交付的正文".into();
+        native_done(
+            &actor,
+            &mut s,
+            &mut r,
+            &NativeKind::Begin { turn, activity },
+            NativeValue::Begun(Err(Error::new("inputComposition"))),
+        );
+        assert!(s.stop_error.is_none());
+        assert!(s.paused_at.is_some());
+        assert!(!actor.control.stopping());
+        assert_eq!(s.turn, turn);
+        assert_eq!(s.report.text, "已交付的正文");
+        native_done(
+            &actor,
+            &mut s,
+            &mut r,
+            &NativeKind::Begin { turn, activity },
+            NativeValue::Begun(Ok(draft)),
+        );
+        assert!(s.draft.is_some());
+        assert!(s.paused_at.is_none());
+        assert!(s.stop_error.is_none());
+    }
+    #[tokio::test]
+    async fn rejected_resume_during_a_new_edit_revokes_the_old_source_before_retry() {
+        let (actor, mut s, _) = actor(None);
+        s.draft = None;
+        let mut r = State::new();
+        r.block.observe("旧尾部".into(), 3).unwrap();
+        let old = r.block.snapshot(true).unwrap();
+        let turn = s.turn;
+        let activity = s.activity;
+        native_done(
+            &actor,
+            &mut s,
+            &mut r,
+            &NativeKind::Begin { turn, activity },
+            NativeValue::Begun(Err(Error::new("editing"))),
+        );
+        assert!(s.handoff);
+        assert!(!r.block.matches(&old));
+        assert!(!r.permit.load(Ordering::Acquire));
+        assert!(s.stop_error.is_none());
+        schedule(&actor, &mut s, &mut r).unwrap();
+        assert_eq!(s.turn, turn + 1);
+        assert!(s.latest.text.is_empty());
+    }
+    #[tokio::test]
+    async fn finish_intent_blocks_revisable_writes_until_final_source_arrives() {
+        let (actor, mut s, native) = actor(None);
+        let mut r = State::new();
+        r.block.observe("尚未显示的尾部".into(), 7).unwrap();
+        actor.control.request_finish();
+        start_generation(&actor, &mut s, &mut r).unwrap();
+        schedule(&actor, &mut s, &mut r).unwrap();
+        assert!(s.unit.is_none());
+        assert!(s.native.is_none());
+        assert!(native.try_recv().is_err());
+        ending(&mut s, false);
+        schedule(&actor, &mut s, &mut r).unwrap();
+        assert!(matches!(
+            s.native.as_ref().unwrap().kind,
+            NativeKind::Revisable(Effect::Write { .. })
+        ));
+    }
+    #[test]
+    fn ending_busy_prepare_is_quiet_but_cleanup_failure_remains_real() {
+        for code in [
+            "inputComposition",
+            "editing",
+            "targetChanged",
+            "compositionCleanup",
+        ] {
+            let (actor, mut s, _) = actor(None);
+            let mut r = State::new();
+            ending(&mut s, false);
+            let turn = s.turn;
+            let activity = s.activity;
+            native_done(
+                &actor,
+                &mut s,
+                &mut r,
+                &NativeKind::Begin { turn, activity },
+                NativeValue::Begun(Err(Error::new(code))),
+            );
+            assert_eq!(s.stop_error.is_some(), code == "compositionCleanup");
+            if code != "compositionCleanup" {
+                assert!(r.stopped);
+            }
+        }
+    }
     #[test]
     fn native_receipt_classifies_known_and_uncertain_effects_as_unverified_display() {
         for uncertain in [false, true] {
