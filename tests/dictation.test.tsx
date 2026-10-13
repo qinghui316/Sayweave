@@ -170,7 +170,7 @@ it('reports rejected live admission without a copy card and exposes settings',as
  render(<VoiceSurface presentation={state.presentation} phase="failed" error="请在设置中启用实时输入组件。" configure={settings} dismiss={()=>{}} start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
  expect(screen.queryByRole('region',{name:'口述结果'})).not.toBeInTheDocument();
  expect(screen.queryByRole('button',{name:'复制'})).not.toBeInTheDocument();
- await user.click(screen.getByRole('button',{name:'设置'}));expect(settings).toHaveBeenCalledOnce();
+ await user.click(screen.getByRole('button',{name:'打开设置'}));expect(settings).toHaveBeenCalledOnce();
  expect(()=>parseDictation({...state,inputRoute:'paste'})).toThrow();
  expect(()=>parseDictation({...state,admission:'unknown'})).toThrow();
 });

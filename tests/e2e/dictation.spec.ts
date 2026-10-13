@@ -73,3 +73,23 @@ test('device and shortcut controls fit both window sizes with shared styles and 
   await expect(dialog.getByRole('button',{name:'保存快捷键'})).toHaveCount(0);
  }
 });
+
+for(const scale of [1,1.5])test(`error overlay actions remain readable and operable at scale ${scale}`,async({browser})=>{
+ const context=await browser.newContext({viewport:{width:384,height:112},deviceScaleFactor:scale,reducedMotion:'reduce'});
+ const page=await context.newPage();
+ await page.goto('/tests/fixtures/voice-recovery.html?presentation=error');
+ await page.evaluate(()=>document.fonts.ready);
+ const settings=page.getByRole('button',{name:'打开设置'}),close=page.getByRole('button',{name:'关闭'});
+ for(const button of [settings,close]){
+  await expect(button).toBeVisible();
+  const style=await button.evaluate(element=>{const s=getComputedStyle(element),r=element.getBoundingClientRect();return {color:s.color,background:s.backgroundColor,x:r.x,y:r.y,right:r.right,bottom:r.bottom};});
+  expect(style.color).toBe('rgb(0, 0, 0)');expect(style.background).toBe('rgb(246, 246, 246)');
+  expect(style.x).toBeGreaterThanOrEqual(12);expect(style.right).toBeLessThanOrEqual(372);expect(style.y).toBeGreaterThanOrEqual(12);expect(style.bottom).toBeLessThanOrEqual(102);
+ }
+ await page.keyboard.press('Tab');await expect(settings).toBeFocused();
+ expect(await settings.evaluate(e=>getComputedStyle(e).outlineStyle)).toBe('solid');
+ await page.keyboard.press('Enter');await expect(page.locator('html')).toHaveAttribute('data-configured','true');
+ await page.screenshot({path:`tests/visual/error-overlay-readable-${scale}.png`});
+ await page.keyboard.press('Tab');await expect(close).toBeFocused();await page.keyboard.press('Enter');await expect(page.getByRole('status')).toHaveText('已关闭');
+ await context.close();
+});

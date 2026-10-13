@@ -5,5 +5,5 @@
 .resultText { margin-top: 8px; max-height: 96px; overflow-y: auto; overflow-wrap: anywhere; user-select: text; font-size: var(--text-body); line-height: var(--line-body); }
 .actions { margin-top: 12px; display: flex; gap: 8px; }
 
-.notice { display:flex; align-items:center; gap:8px; width:auto; max-width:360px; border-radius:999px; background:var(--text-primary); color:var(--surface-content); font-size:var(--text-small); line-height:var(--line-small); padding:8px 12px; }
-.notice span { min-width:0; overflow-wrap:anywhere; }.notice button { flex:none; color:inherit; }
+.notice { display:flex; align-items:center; gap:8px; width:360px; max-width:100%; max-height:calc(100vh - 22px); border-radius:var(--radius-card); background:var(--text-primary); color:var(--surface-content); font-size:var(--text-small); line-height:var(--line-small); padding:8px 12px; }
+.noticeText { flex:1; min-width:0; max-height:calc(100vh - 38px); overflow-y:auto; overflow-wrap:anywhere; }.noticeActions { display:flex; flex:none; gap:8px; align-items:center; }.notice button { flex:none; }.notice button:focus-visible { outline-color:var(--signal); outline-offset:2px; }
