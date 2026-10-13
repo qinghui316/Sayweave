@@ -18,11 +18,6 @@ pub fn stale_tracking_range() -> bool {
         .compare_exchange(6, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
 }
-pub fn pending_tracking() -> bool {
-    FAULT
-        .compare_exchange(7, 0, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-}
 pub fn request(
     context: &ITfContext,
     client: u32,

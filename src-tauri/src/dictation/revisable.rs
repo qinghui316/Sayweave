@@ -14,7 +14,6 @@ pub(super) struct State {
     snapshot: Option<BlockSnapshot>,
     bound: bool,
     read_needed: bool,
-    read_deadline: Option<Instant>,
     capacity: bool,
     permit: Arc<AtomicBool>,
     sequence: u64,
@@ -39,7 +38,6 @@ impl State {
             snapshot: None,
             bound: false,
             read_needed: false,
-            read_deadline: None,
             capacity: false,
             permit: Arc::new(AtomicBool::new(true)),
             sequence: 0,
@@ -71,7 +69,6 @@ impl State {
         self.snapshot = None;
         self.bound = false;
         self.read_needed = false;
-        self.read_deadline = None;
         self.capacity = false;
         self.final_recorded = false;
         self.rollover = false;
@@ -550,23 +547,11 @@ pub(super) fn schedule(
     }
     if r.read_needed
         && let Some(snapshot) = &r.snapshot
-        && ((s.ending.is_some() && r.read_deadline.is_none())
+        && (s.ending.is_some()
             || s.paused_at
                 .is_none_or(|a| a.elapsed() >= Duration::from_millis(300)))
         && (s.ending.is_some() || !input_state::editing_key_held())
     {
-        let deadline = *r
-            .read_deadline
-            .get_or_insert_with(|| Instant::now() + Duration::from_secs(15));
-        let deadline = s
-            .ending
-            .as_ref()
-            .map_or(deadline, |end| end.deadline.min(deadline));
-        if Instant::now() >= deadline {
-            log::info!(target:"sayweave", "operation=block_prepare_timeout task_id={} block={}", actor.task, r.block.id());
-            release(actor, s, r, true);
-            return Ok(());
-        }
         let connection = actor.connection.clone();
         let turn = s.turn;
         let anchor = match windows_input::reanchor_turn(&actor.task, &actor.anchor) {
@@ -970,7 +955,6 @@ pub(super) fn native_done(
                             {
                                 r.snapshot = Some(snapshot);
                                 r.read_needed = false;
-                                r.read_deadline = None;
                                 r.permit = Arc::new(AtomicBool::new(!stopped));
                                 checkpoint(actor, r, "preview");
                                 if stopped {
@@ -1003,14 +987,6 @@ pub(super) fn native_done(
                 Ok(reply) if reply.applied => {
                     r.snapshot = reply.block.or_else(|| r.snapshot.take());
                     s.activity = input_state::activity();
-                    s.paused_at = Some(Instant::now());
-                }
-                Ok(reply)
-                    if reply.mutation == Mutation::NotAttempted
-                        && reply.code.starts_with("blockRepresentationPending:") =>
-                {
-                    // Keep the original block readonly; this is neither a
-                    // successful read nor a permanent scope-retirement fact.
                     s.paused_at = Some(Instant::now());
                 }
                 Ok(reply) if reply.mutation == Mutation::NotAttempted => release(actor, s, r, true),
@@ -1556,64 +1532,5 @@ mod tests {
             s.report.text.is_empty(),
             "cannot claim a stale read as current editor body"
         );
-    }
-    #[tokio::test]
-    async fn pending_representation_keeps_block_readonly_and_budget_then_rebases() {
-        let (actor, mut s, _) = actor(None);
-        s.draft = None;
-        let mut r = State::new();
-        let mut current = baseline(&mut r, "周三开会");
-        let id = r.block.id().to_owned();
-        r.handoff();
-        let deadline = Instant::now() + Duration::from_secs(15);
-        r.read_deadline = Some(deadline);
-        for _ in 0..2 {
-            let mut pending = block_reply(&actor.task, None, false);
-            pending.code = "blockRepresentationPending:8000000a".into();
-            native_done(
-                &actor,
-                &mut s,
-                &mut r,
-                &NativeKind::Revisable(Effect::Read {
-                    activity: input_state::activity(),
-                }),
-                NativeValue::block(Ok(pending)),
-            );
-            assert_eq!(r.block.id(), id);
-            assert!(r.read_needed && !r.permit.load(Ordering::Acquire));
-            assert_eq!(r.read_deadline, Some(deadline));
-            assert!(s.native.is_none());
-        }
-        current.text = "周五开会".into();
-        current.version += 1;
-        current.lease += 1;
-        native_done(
-            &actor,
-            &mut s,
-            &mut r,
-            &NativeKind::Revisable(Effect::Read {
-                activity: input_state::activity(),
-            }),
-            NativeValue::block(Ok(block_reply(&actor.task, Some(current), true))),
-        );
-        assert_eq!(r.block.id(), id);
-        assert_eq!(r.block.confirmed().1, "周五开会");
-        assert!(!r.read_needed && r.read_deadline.is_none());
-    }
-    #[tokio::test]
-    async fn unresolved_representation_budget_releases_without_writing() {
-        let (actor, mut s, native) = actor(None);
-        s.draft = None;
-        let mut r = State::new();
-        baseline(&mut r, "已显示的正文");
-        r.handoff();
-        r.read_deadline = Some(Instant::now() - Duration::from_millis(1));
-        schedule(&actor, &mut s, &mut r).unwrap();
-        let Command::Block(_, _, request, text, _, _) = command(&native).await else {
-            panic!("release");
-        };
-        assert_eq!(request.action, BlockAction::Release);
-        assert!(text.is_empty());
-        assert!(!r.permit.load(Ordering::Acquire));
     }
 }

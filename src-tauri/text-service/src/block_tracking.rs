@@ -4,8 +4,7 @@ use super::*;
 use unicode_segmentation::UnicodeSegmentation;
 #[path = "block_boundary.rs"]
 mod boundary;
-use boundary::{BoundaryProof, BoundaryState};
-const E_PENDING: HRESULT = HRESULT(0x8000000au32 as i32);
+use boundary::BoundaryProof;
 #[path = "block_evidence.rs"]
 mod evidence;
 
@@ -33,7 +32,6 @@ struct Data {
     writable: bool,
     lease: u64,
     writing: bool,
-    pending: bool,
     evidence: evidence::Record,
 }
 impl Drop for Track {
@@ -50,7 +48,6 @@ impl Drop for Track {
 pub(super) struct OwnedUpdate {
     track: Rc<Track>,
     version: u64,
-    lease: u64,
     armed: std::cell::Cell<bool>,
 }
 impl Drop for OwnedUpdate {
@@ -77,7 +74,7 @@ pub(super) unsafe fn owned_update(
         }
         track
     };
-    if !track.data.borrow().valid || track.data.borrow().writing || track.data.borrow().pending {
+    if !track.data.borrow().valid || track.data.borrow().writing {
         return None;
     }
     let matched = (|| unsafe {
@@ -92,17 +89,6 @@ pub(super) unsafe fn owned_update(
         Ok::<_, windows::core::Error>(())
     })();
     let mut data = track.data.borrow_mut();
-    if matched
-        .as_ref()
-        .err()
-        .is_some_and(|e| e.code() == E_PENDING)
-        && data.valid
-    {
-        data.pending = true;
-        data.writable = false;
-        data.lease += 1;
-        return None;
-    }
     if matched.is_err() || !data.valid {
         if data.valid {
             data.invalid_reason = "blockOwnedBaseline".into();
@@ -112,24 +98,17 @@ pub(super) unsafe fn owned_update(
         return None;
     }
     let version = data.version;
-    let lease = data.lease;
     drop(data);
     Some(OwnedUpdate {
         track,
         version,
-        lease,
         armed: std::cell::Cell::new(false),
     })
 }
 impl OwnedUpdate {
     pub(super) fn arm(&self) -> bool {
         let mut data = self.track.data.borrow_mut();
-        if !data.valid
-            || data.version != self.version
-            || data.lease != self.lease
-            || data.writing
-            || data.pending
-        {
+        if !data.valid || data.version != self.version || data.writing {
             return false;
         }
         data.writing = true;
@@ -282,7 +261,6 @@ impl Track {
                 writable: false,
                 lease: 0,
                 writing: false,
-                pending: false,
                 evidence: evidence::Record::default(),
             }));
             let sink: ITfTextEditSink = Sink {
@@ -346,10 +324,7 @@ impl Track {
 
     unsafe fn snapshot(&self, ec: u32, phase: &mut String) -> windows::core::Result<BlockSnapshot> {
         unsafe {
-            let (version, lease, pending) = {
-                let data = self.data.borrow();
-                (data.version, data.lease, data.pending)
-            };
+            let version = self.data.borrow().version;
             if !self.data.borrow().valid {
                 *phase = self.data.borrow().invalid_reason.clone();
                 return Err(failure(TF_E_DISCONNECTED));
@@ -379,74 +354,34 @@ impl Track {
             }
             *phase = "blockSnapshotText".into();
             let text = range_text(&self.range, ec)?;
-            if text.is_empty() {
-                *phase = "blockSnapshotEmpty".into();
-                return Err(failure(TF_E_DISCONNECTED));
-            }
             *phase = "blockSnapshotSelection".into();
             let (selection_start, selection_end) =
                 relative_selection(&self.context, &self.range, ec)?;
             *phase = "blockSnapshotBoundary".into();
-            if let Some(boundary) = &self.boundary {
-                match boundary.matches(&self.context, &self.range, ec, phase)? {
-                    BoundaryState::Matched => (),
-                    BoundaryState::Pending => return Err(failure(E_PENDING)),
-                    BoundaryState::Outside => return Err(failure(TF_E_DISCONNECTED)),
-                }
-            }
-            if self.data.borrow().pending {
-                let owner: ITfContextComposition = self.context.cast()?;
-                let mut compositions = [None];
-                let mut fetched = 0;
-                owner
-                    .EnumCompositions()?
-                    .Next(&mut compositions, &mut fetched)?;
-                if fetched != 0 {
-                    *phase = "blockRepresentationPending".into();
-                    return Err(failure(E_PENDING));
-                }
+            if let Some(boundary) = &self.boundary
+                && !boundary.matches(&self.context, &self.range, ec, phase)?
+            {
+                return Err(failure(TF_E_DISCONNECTED));
             }
             *phase = "blockSnapshotField".into();
             if !self.field.matches()? {
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            if text != range_text(&self.range, ec)?
-                || (selection_start, selection_end)
-                    != relative_selection(&self.context, &self.range, ec)?
-            {
-                *phase = "blockRepresentationPending".into();
-                return Err(failure(E_PENDING));
-            }
             *phase = "blockSnapshotVersion".into();
-            let mut data = self.data.borrow_mut();
+            let data = self.data.borrow();
             if !data.valid {
                 *phase = data.invalid_reason.clone();
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            if data.version != version || data.lease != lease || data.pending != pending {
-                *phase = "blockRepresentationPending".into();
-                return Err(failure(E_PENDING));
-            }
-            if text.is_empty() || (!pending && data.text != text) {
+            if data.version != version || text.is_empty() || data.text != text {
                 return Err(failure(TF_E_DISCONNECTED));
-            }
-            if data.pending {
-                // Only a fully verified readonly snapshot can resolve the
-                // suspended observation. This grants no writing capability.
-                if data.text != text {
-                    data.text = text.clone();
-                    data.version += 1;
-                }
-                data.pending = false;
-                data.writable = false;
-                data.lease += 1;
             }
             *phase = "block".into();
             Ok(BlockSnapshot {
                 lease: data.lease,
                 id: data.id.clone(),
                 epoch: data.epoch,
-                version: data.version,
+                version,
                 text,
                 selection_start,
                 selection_end,
@@ -496,14 +431,6 @@ impl ITfTextEditSink_Impl for Sink_Impl {
             if !self.field.matches()? {
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            phase = "blockEditSelection".into();
-            relative_selection(context, &self.range, ec)?;
-            phase = "blockEditTextRead".into();
-            let text = range_text(&self.range, ec)?;
-            if text.is_empty() {
-                phase = "blockEditEmpty".into();
-                return Err(failure(TF_E_DISCONNECTED));
-            }
             let record = record.as_ref().ok_or_else(|| failure(E_POINTER))?;
             phase = "blockEditUpdates".into();
             let within = updates_within(record, &self.range, ec)?;
@@ -514,18 +441,23 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                 let coarse = block_faults::coarse_notification(changed);
                 within && !coarse
             };
-            if !within || self.data.borrow().pending {
+            if !within {
                 phase = self.boundary_reason.clone();
-                let state = if let Some(boundary) = &self.boundary {
-                    boundary.matches(context, &self.range, ec, &mut phase)?
-                } else {
-                    BoundaryState::Outside
-                };
-                match state {
-                    BoundaryState::Matched => (),
-                    BoundaryState::Pending => return Err(failure(E_PENDING)),
-                    BoundaryState::Outside => return Err(failure(TF_E_DISCONNECTED)),
+                if !self.boundary.as_ref().is_some_and(|boundary| {
+                    boundary
+                        .matches(context, &self.range, ec, &mut phase)
+                        .unwrap_or(false)
+                }) {
+                    return Err(failure(TF_E_DISCONNECTED));
                 }
+            }
+            phase = "blockEditSelection".into();
+            relative_selection(context, &self.range, ec)?;
+            phase = "blockEditTextRead".into();
+            let text = range_text(&self.range, ec)?;
+            if text.is_empty() {
+                phase = "blockEditEmpty".into();
+                return Err(failure(TF_E_DISCONNECTED));
             }
             phase = "blockEditSelectionStatus".into();
             let changed = record.GetSelectionStatus()?.as_bool();
@@ -544,13 +476,6 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                     data.writable = false;
                     data.lease += 1;
                 }
-            }
-            Err(error)
-                if error.code() == E_PENDING && phase.starts_with("blockRepresentationPending") =>
-            {
-                data.pending = true;
-                data.writable = false;
-                data.lease += 1;
             }
             Err(_) => {
                 if data.valid {
@@ -588,13 +513,6 @@ pub(super) fn writing(shared: &Shared) -> bool {
         .block
         .as_ref()
         .is_some_and(|t| t.data.borrow().writing)
-}
-pub(super) fn ensure_write_ready(shared: &Shared) -> windows::core::Result<()> {
-    let track = shared.borrow().block.clone();
-    if track.is_some_and(|t| t.data.borrow().pending) {
-        return Err(failure(TF_E_LOCKED));
-    }
-    Ok(())
 }
 pub(super) fn revoke(shared: &Shared) {
     if let Some(track) = shared.borrow().block.as_ref() {
@@ -889,15 +807,6 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                 .block
                 .clone()
                 .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
-            #[cfg(feature = "acceptance")]
-            if command.action == BlockAction::Read && block_faults::pending_tracking() {
-                let mut data = track.data.borrow_mut();
-                data.pending = true;
-                data.writable = false;
-                data.lease += 1;
-                phase = "blockRepresentationPending".into();
-                return Err(failure(E_PENDING));
-            }
             let snapshot = track.snapshot(ec, &mut phase)?;
             if track.task != r.task
                 || snapshot.id != command.id
