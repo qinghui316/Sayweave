@@ -170,6 +170,12 @@ pub(super) fn observe(
     let transport_boundary =
         native_capacity_boundary(&candidate, r.block.native_speech_capacity(14 * 1024));
     let end = transport_boundary.unwrap_or(end);
+    if end == 0 && !candidate.is_empty() && r.block.confirmed().1.is_empty() {
+        // A single grapheme larger than the native hard bound cannot acquire
+        // a range; do not loop through empty delivery blocks or split it.
+        s.record_failure(&actor.task, "compositionTextLimit".into());
+        return;
+    }
     r.capacity = boundary.is_some() || transport_boundary.is_some();
     let text = units::slice(&tail, 0..end);
     if text.encode_utf16().count() > 14 * 1024 {
@@ -1168,6 +1174,55 @@ mod tests {
         r.handoff();
         r.block.rebase_retained(text, 1800..1900).unwrap();
         assert_eq!(r.block.native_speech_capacity(14 * 1024), 14 * 1024 - 3600);
+    }
+    #[tokio::test]
+    async fn exhausted_native_budget_keeps_baseline_and_replays_tail_during_finish() {
+        for (base, tail) in [("甲".repeat(16384), "后"), ("甲".repeat(14335), "🙂")] {
+            let (actor, mut s, native) = actor(None);
+            s.draft = None;
+            let mut r = State::new();
+            baseline(&mut r, &base);
+            ending(&mut s, false);
+            observe(
+                &actor,
+                &mut s,
+                &mut r,
+                NativeTranscript {
+                    task_id: actor.task.clone(),
+                    turn: 1,
+                    sequence: 1,
+                    text: tail.into(),
+                    segments: vec![crate::contracts::processing::SourceSegment {
+                        id: 1,
+                        revision: 1,
+                        text: tail.into(),
+                        confirmed: true,
+                    }],
+                },
+            );
+            assert!(s.stop_error.is_none());
+            assert!(r.capacity);
+            assert_eq!(r.block.visible(), base);
+            assert_eq!(r.block.state_snapshot().speech_end, 0);
+            schedule(&actor, &mut s, &mut r).unwrap();
+            let Command::Block(_, _, request, text, _, reply) = command(&native).await else {
+                panic!("release baseline")
+            };
+            assert_eq!(request.action, BlockAction::Release);
+            assert!(text.is_empty());
+            reply
+                .send(Ok(block_reply(&actor.task, None, true)))
+                .unwrap();
+            let value = SessionDraft::native_value(&mut s.native).await.unwrap();
+            let completed = s.native.take().unwrap();
+            native_done(&actor, &mut s, &mut r, &completed.kind, value);
+            assert_eq!(s.report.text, base);
+            assert_eq!(r.offset, 0);
+            assert_eq!(r.block.visible(), tail);
+            assert!(s.stop_error.is_none());
+        }
+        assert_eq!(native_capacity_boundary("🙂", 1), Some(0));
+        assert_eq!(native_capacity_boundary("后", 0), Some(0));
     }
     #[tokio::test]
     async fn tracked_capacity_rollover_replays_tail_even_when_finish_has_arrived() {

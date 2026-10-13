@@ -370,7 +370,7 @@ pub fn native_capacity_boundary(text: &str, limit: usize) -> Option<usize> {
     for part in text.graphemes(true) {
         let next = part.encode_utf16().count();
         if units + next > limit {
-            return (scalars > 0).then_some(scalars);
+            return Some(scalars);
         }
         units += next;
         scalars += part.chars().count();
