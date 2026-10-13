@@ -100,13 +100,38 @@ fn richtext_core_window() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the owned rich-text fixture and matching installed core"]
 async fn richtext_actor() {
+    // Hold the first successful native Update receipt before the actor can
+    // schedule Bind. This changes scheduling only, not the native result.
+    static HOLD_FIRST_UPDATE: AtomicBool = AtomicBool::new(false);
+    static BARRIER_TIMEOUT: AtomicBool = AtomicBool::new(false);
+    static RELEASE_UPDATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+        (std::sync::Mutex::new(false), std::sync::Condvar::new());
     struct FixtureLog;
     impl log::Log for FixtureLog {
         fn enabled(&self, _: &log::Metadata<'_>) -> bool {
             true
         }
         fn log(&self, record: &log::Record<'_>) {
-            eprintln!("{}", record.args());
+            let line = record.args().to_string();
+            eprintln!("{line}");
+            if line.contains("operation=composition_edit")
+                && line.contains("action=Update applied=true")
+                && HOLD_FIRST_UPDATE.swap(false, Ordering::AcqRel)
+            {
+                eprintln!("owned_bind_barrier=waiting");
+                let (lock, ready) = &RELEASE_UPDATE;
+                let released = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let (released, timeout) = ready
+                    .wait_timeout_while(released, Duration::from_secs(10), |done| !*done)
+                    .unwrap_or_else(|e| e.into_inner());
+                let failed = !*released || timeout.timed_out();
+                drop(released);
+                BARRIER_TIMEOUT.store(failed, Ordering::Release);
+                if failed {
+                    eprintln!("owned_bind_barrier=timeout");
+                }
+                eprintln!("owned_bind_barrier=released");
+            }
         }
         fn flush(&self) {}
     }
@@ -158,6 +183,10 @@ async fn richtext_actor() {
         Some(context),
         None,
     );
+    HOLD_FIRST_UPDATE.store(
+        std::env::var("SAYWEAVE_BLOCK_EARLY_EDIT").as_deref() == Ok("1"),
+        Ordering::Release,
+    );
     manager.activate();
     let actor = tokio::spawn(manager.clone().maintain(|_| {}));
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
@@ -182,6 +211,9 @@ async fn richtext_actor() {
             if Instant::now() >= deadline { return Err("owned actor deadline".into()); }
             let line = receiver.recv_timeout(Duration::from_secs(15)).map_err(|e|e.to_string())?;
             let command: serde_json::Value = serde_json::from_str(&line).map_err(|e|e.to_string())?;
+            if BARRIER_TIMEOUT.load(Ordering::Acquire) {
+                return Err("owned Bind barrier timeout".into());
+            }
             match command["action"].as_str() {
                 Some("asr") => {
                     let segments = command["segments"].as_array().ok_or("source array required")?;
@@ -200,6 +232,11 @@ async fn richtext_actor() {
                     manager.update(&latest);
                 }
                 Some("edited") => { input_state::edited(); }
+                Some("release-bind") => {
+                    let (lock, ready) = &RELEASE_UPDATE;
+                    *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+                    ready.notify_one();
+                }
                 Some("status") => {},
                 Some("finish") => {
                     control.request_finish();
@@ -222,6 +259,9 @@ async fn richtext_actor() {
         }
         Err("owned actor command limit".into())
     }.await;
+    // Also unblock native retirement if the driver exits during the edit.
+    *RELEASE_UPDATE.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    RELEASE_UPDATE.1.notify_one();
     if !finished {
         control.request_finish();
         cancel.send_replace(2);

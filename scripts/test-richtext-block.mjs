@@ -150,15 +150,26 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
  };
  try{
   report.actorIdentity=await receive();
+  const earlyEdit=process.env.SAYWEAVE_BLOCK_EARLY_EDIT==='1';
+  report.actorScenario=earlyEdit?'edit-before-bind':'edit-after-bind';
   segments.push({id:1,revision:1,text:'周三开会',confirmed:false});
   await command({action:'asr',segments});await expectBody('actor first input','周三开会');
+  if(earlyEdit){
+   const deadline=Date.now()+5000;
+   while(!diagnostics.includes('owned_bind_barrier=waiting')){
+    if(Date.now()>=deadline)throw Error('Early-edit receipt barrier not reached');
+    await command({action:'status'});await settled();
+   }
+  }
   // This scenario edits a tracked first block. Wait for that production
   // acknowledgment, rather than race the asynchronous initial Bind request.
   const bindDeadline=Date.now()+5000;
-  while(!diagnostics.includes('code=blockReady')){
+  while(!earlyEdit&&!diagnostics.includes('code=blockReady')){
    if(Date.now()>=bindDeadline)throw Error('Production initial block did not bind');
    await command({action:'status'});await settled();
   }
+  report.actorBindReadyBeforeEdit=diagnostics.includes('code=blockReady');
+  if(earlyEdit&&report.actorBindReadyBeforeEdit)throw Error('Early-edit timing not exercised: Bind already completed');
   for(const [index,replacement,tail,final]of [[0,'周五开会','，不对，改成下周一上午开会','下周一上午开会'],[1,'下周一开会','，改成下午三点开会','下周一下午三点开会'],[2,'下周一下午两点开会','，不对，改成线上四点开会','下周一下午四点线上开会']]){
    const before=await read();if(before.text!==lastBody)throw Error('Late actor body change before edit');
    let left=0,right=0;while(left<Math.min(before.text.length,replacement.length)&&before.text[left]===replacement[left])left++;while(right<Math.min(before.text.length,replacement.length)-left&&before.text.at(-1-right)===replacement.at(-1-right))right++;
@@ -173,6 +184,11 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
    if(handedOff.text!==before.text)throw Error('Native editing handoff changed body');
    await page.evaluate(({left,end,text,caret})=>{window.fixtureEditor.edit(left,end,text);window.fixtureEditor.select(caret);},{left,end:before.text.length-right,text:replacement.slice(left,replacement.length-right),caret:replacement.length});
    const edited=await settled();trace.push({label:'actor manual edit '+index,settled:edited});if(edited.text!==replacement)throw Error('Actor manual edit differs');
+   if(index===0){
+    report.actorBindReadyAfterEdit=diagnostics.includes('code=blockReady');
+    if(earlyEdit&&report.actorBindReadyAfterEdit)throw Error('Early-edit timing ambiguous: Bind completed during edit');
+    if(earlyEdit)await command({action:'release-bind'});
+   }
    segments.forEach(s=>s.confirmed=true);
    segments.push({id:index+2,revision:1,text:tail.slice(0,3),confirmed:false});
    await command({action:'asr',segments});await expectBody('actor partial '+index,replacement+tail.slice(0,3));
@@ -186,7 +202,14 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
   if(!exited)await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Actor cleanup timeout')),5000);actor.once('exit',code=>{clearTimeout(timer);code===0?resolve():reject(Error('Actor failed '+code+': '+diagnostics));});});
   report.actorPassed=true;
  }finally{
-  if(!exited){actor.stdin.end();await new Promise(resolve=>{const timer=setTimeout(resolve,5500);actor.once('exit',()=>{clearTimeout(timer);resolve();});});}
-  report.actorDiagnostics=diagnostics;
+  const samplingErrors=[];
+  try{report.actorBodyBeforeCleanup=await settled();}catch(error){samplingErrors.push(String(error));}
+  try{
+   if(!exited){actor.stdin.end();await new Promise(resolve=>{const timer=setTimeout(resolve,5500);actor.once('exit',()=>{clearTimeout(timer);resolve();});});}
+  }finally{
+   report.actorDiagnostics=diagnostics;
+  }
+  try{report.actorBodyAfterCleanup=await settled();}catch(error){samplingErrors.push(String(error));}
+  if(samplingErrors.length){report.actorCleanupSamplingErrors=samplingErrors;throw Error('Actor cleanup body evidence unavailable');}
  }
 }
