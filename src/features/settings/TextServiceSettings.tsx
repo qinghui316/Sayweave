@@ -4,14 +4,15 @@ import {componentMessage,type TextServicePort,type TextServiceAction,type TextSe
 
 export function TextServiceSettings({port}:{port:TextServicePort}){
  const [status,setStatus]=useState<TextServiceStatus|null>(null),[busy,setBusy]=useState(false),[error,setError]=useState(''),[restart,setRestart]=useState(false);
+ const [source,setSource]=useState<TextServicePort|null>(null);
  const generation=useRef({value:0}),pending=useRef(false);
  useEffect(()=>{
   const epoch=generation.current;const id=++epoch.value;pending.current=false;
-  void port.status().then(value=>{if(id===generation.current.value){setStatus(value);setError('');setBusy(false);setRestart(false);}}).catch(()=>{if(id===generation.current.value){setStatus(null);setBusy(false);setError(componentMessage('componentUnavailable'));}});
+  void port.status().then(value=>{if(id===generation.current.value){setSource(port);setStatus(value);setError('');setBusy(false);setRestart(false);}}).catch(()=>{if(id===generation.current.value){setSource(port);setStatus(null);setBusy(false);setRestart(false);setError(componentMessage('componentUnavailable'));}});
   return()=>{epoch.value++;};
  },[port]);
  async function act(action?:TextServiceAction){
-  if(pending.current)return;
+  if(source!==port||pending.current)return;
   pending.current=true;const id=++generation.current.value;setBusy(true);setError('');
   try{
    const value=action?await port.act(action):await port.status();
@@ -19,6 +20,7 @@ export function TextServiceSettings({port}:{port:TextServicePort}){
   }catch(e){if(id===generation.current.value)setError(componentMessage(typeof e==='object'&&e&&'code'in e?String(e.code):'componentUnavailable'));}
   finally{if(id===generation.current.value){pending.current=false;setBusy(false);}}
  }
+ if(source!==port)return null;
  const blocked=status?.deploymentState==='pending'||status?.deploymentState==='failed';
  const unavailable=status&&(status.error||!status.installed||!status.enabled||status.updateAvailable||blocked);
  if(!unavailable&&!error&&!restart)return null;

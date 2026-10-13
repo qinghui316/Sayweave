@@ -57,6 +57,17 @@ describe('input recovery',()=>{
   await userEvent.click(await screen.findByRole('button',{name:'重新检查'}));
   await waitFor(()=>expect(view.container).toBeEmptyDOMElement());expect(port.act).not.toHaveBeenCalled();
  });
+ it('never applies an old port recovery permission to a newly selected port',async()=>{
+  const previous=service({...ready,updateAvailable:true}),next=service(ready);
+  let finish!:(v:TextServiceStatus)=>void;
+  vi.mocked(next.status).mockImplementation(()=>new Promise(r=>{finish=r;}));
+  const view=render(<TextServiceSettings port={previous}/>);
+  await screen.findByRole('button',{name:'恢复输入'});
+  view.rerender(<TextServiceSettings port={next}/>);
+  expect(view.container).toBeEmptyDOMElement();expect(next.act).not.toHaveBeenCalled();
+  await act(async()=>{finish(ready);});
+  expect(view.container).toBeEmptyDOMElement();expect(next.act).not.toHaveBeenCalled();
+ });
  it('rejects impossible or malformed native status',()=>{
   for(const invalid of [{...ready,installed:false},{...ready,updateAvailable:true,payloadAvailable:false},{...ready,restartRequired:'true'},{...ready,maintenanceAvailable:1}])expect(()=>parseTextService(invalid)).toThrow();
  });
