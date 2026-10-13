@@ -1,15 +1,14 @@
 import {test,expect,type Page} from '@playwright/test';
 async function menu(page:Page,word:string,action:string){await page.getByRole('button',{name:'更多操作 '+word,exact:true}).click();await page.getByRole('menuitem',{name:action,exact:true}).click();}
-test('simple words and advanced corrections preserve CRUD and keyboard focus',async({page})=>{
+test('dictionary terms preserve CRUD and keyboard focus',async({page})=>{
  await page.goto('/#/dictionary');await expect(page.getByText('还没有词条')).toBeVisible();await expect(page.getByRole('table')).toHaveCount(0);await expect(page.getByRole('tablist')).toHaveCount(0);
  await page.getByRole('button',{name:'添加词语'}).click();const dialog=page.getByRole('dialog');await expect(dialog.getByRole('textbox')).toHaveCount(1);await dialog.getByLabel('词语',{exact:true}).fill('Figma');await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(page.getByText('Figma',{exact:true})).toBeVisible();
  await menu(page,'Figma','编辑');await dialog.getByRole('button',{name:'补充设置'}).click();await dialog.getByLabel('分类（可选）').fill('设计工具');await dialog.getByRole('button',{name:'保存',exact:true}).click();
  await page.getByRole('button',{name:'添加词语'}).click();await dialog.getByLabel('词语',{exact:true}).fill('figma');await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(dialog.getByRole('alert')).toBeVisible();await dialog.getByRole('button',{name:'查看已有词条'}).click();await expect(dialog.getByLabel('词语',{exact:true})).toHaveValue('Figma');await dialog.getByLabel('词语',{exact:true}).fill('Figma Design');await dialog.getByRole('button',{name:'保存',exact:true}).click();
  await page.getByRole('button',{name:'搜索词语'}).click();await page.getByRole('textbox',{name:'搜索词条'}).fill('设计');await expect(page.getByText('Figma Design',{exact:true})).toBeVisible();await page.getByRole('textbox',{name:'搜索词条'}).fill('不存在');await expect(page.getByText('没有匹配的词条')).toBeVisible();await page.getByRole('textbox',{name:'搜索词条'}).fill('');
  await menu(page,'Figma Design','编辑');await dialog.getByRole('button',{name:'取消',exact:true}).click();await expect(page.getByRole('button',{name:'更多操作 Figma Design'})).toBeFocused();
- await page.getByRole('button',{name:'词典更多操作'}).click();await page.getByRole('menuitem',{name:'纠错映射'}).click();await page.getByRole('button',{name:'添加纠错'}).click();await dialog.getByLabel('听成').fill('飞格玛');await dialog.getByLabel('改为').fill('Figma');await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(page.getByRole('button',{name:'编辑词语 飞格玛',exact:true})).toBeVisible();
- await menu(page,'飞格玛','删除');await dialog.getByRole('button',{name:'取消',exact:true}).click();await expect(page.getByRole('button',{name:'编辑词语 飞格玛',exact:true})).toBeVisible();await menu(page,'飞格玛','删除');await dialog.getByRole('button',{name:'删除',exact:true}).click();await expect(page.getByText('还没有词条')).toBeVisible();
- await page.getByRole('button',{name:'词典更多操作'}).click();await page.getByRole('menuitem',{name:'返回词典'}).click();await expect(page.getByText('Figma Design',{exact:true})).toBeVisible();await page.reload();await expect(page.getByText('还没有词条')).toBeVisible();
+ await expect(page.getByRole('button',{name:'词典更多操作'})).toHaveCount(0);await expect(page.getByText('纠错映射',{exact:true})).toHaveCount(0);
+ await menu(page,'Figma Design','删除');await dialog.getByRole('button',{name:'取消',exact:true}).click();await expect(page.getByText('Figma Design',{exact:true})).toBeVisible();await menu(page,'Figma Design','删除');await dialog.getByRole('button',{name:'删除',exact:true}).click();await expect(page.getByText('还没有词条')).toBeVisible();
 });
 test('compact dictionary and real-zero dashboard fit desktop sizes',async({page})=>{
  for(const [width,height] of [[1120,760],[960,640]] as const){

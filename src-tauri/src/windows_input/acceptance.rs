@@ -173,6 +173,102 @@ impl Fixture {
     }
 }
 /// Production host against an owned TSF editor. No clipboard reads/writes or supplier requests.
+fn observer_restart_samples(
+    fixture: &mut Fixture,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<(), String> {
+    use super::composition::{Draft, Finish, ObservationSink, stop_observer};
+    use crate::contracts::language::{LanguageSettings, Settings, Snapshot};
+    for (text, delay) in [("", 0), ("", 950), ("", 1050), ("第一轮", 0)] {
+        fixture.command(serde_json::json!({"action":"focus","text":"前后","start":1,"end":1}))?;
+        thread::sleep(Duration::from_millis(60));
+        let id = uuid::Uuid::new_v4().to_string();
+        let anchor = WindowsInputService::anchor().ok_or("observer fixture not foreground")?;
+        let application = super::application::resolve(&anchor);
+        bind_watch(&id, &anchor, None).map_err(|e| e.code)?;
+        let old = runtime
+            .block_on(Draft::begin(
+                id.clone(),
+                1,
+                anchor,
+                Arc::new(DeliveryGate::default()),
+            ))
+            .map_err(|e| e.code)?;
+        let settings = LanguageSettings {
+            automatic_terms: Settings {
+                enabled: true,
+                revision: 1,
+            },
+            personalization: Settings {
+                enabled: true,
+                revision: 1,
+            },
+        };
+        let observing = runtime.block_on(old.observe(Arc::new(ObservationSink {
+            snapshot: Snapshot {
+                application,
+                settings: settings.clone(),
+                profile_version: 0,
+                shared_version: 0,
+                preferences: vec![],
+            },
+            control: Arc::new(crate::language_policy::LearningControl::new(settings)),
+            emit: Arc::new(|_| {}),
+        })));
+        if !observing {
+            return Err("owned observer unavailable".into());
+        }
+        if !text.is_empty() {
+            runtime
+                .block_on(old.replace(1, text.into()))
+                .map_err(|e| e.code)?;
+        }
+        let outcome = runtime.block_on(old.finish_receipt(text.into(), Finish::Commit));
+        if outcome.delivery.restore_error
+            || outcome.delivery.error.as_deref() == Some("compositionCleanup")
+        {
+            return Err("observer finish failed".into());
+        }
+        release_watch(&id);
+        thread::sleep(Duration::from_millis(delay));
+        let expected = format!("前{text}后");
+        let read = fixture.command(serde_json::json!({"action":"read"}))?;
+        if read["text"].as_str() != Some(expected.as_str()) {
+            return Err("observer changed first body".into());
+        }
+        let next = uuid::Uuid::new_v4().to_string();
+        let anchor = WindowsInputService::anchor().ok_or("observer restart lost foreground")?;
+        bind_watch(&next, &anchor, None).map_err(|e| e.code)?;
+        let current = runtime
+            .block_on(Draft::begin(
+                next.clone(),
+                1,
+                anchor,
+                Arc::new(DeliveryGate::default()),
+            ))
+            .map_err(|e| e.code)?;
+        runtime
+            .block_on(current.replace(1, "第二轮".into()))
+            .map_err(|e| e.code)?;
+        let delivered = runtime.block_on(current.finish_receipt("第二轮".into(), Finish::Commit));
+        if !delivered.committed {
+            return Err("observer restart did not commit".into());
+        }
+        let actual = fixture.command(serde_json::json!({"action":"read"}))?;
+        if actual["text"].as_str() != Some(format!("前{text}第二轮后").as_str()) {
+            return Err("observer restart duplicated or lost text".into());
+        }
+        release_watch(&next);
+        runtime.block_on(stop_observer()).map_err(|e| e.code)?;
+        println!(
+            "SAYWEAVE_OBSERVER_RESTART_PASS delay_ms={delay} prior_text={} same_pid={} exact_body=true",
+            !text.is_empty(),
+            fixture.child.id()
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
     use super::composition::{Draft, Finish};
     let input = WindowsInputService::new();
@@ -220,6 +316,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         return Err("owned initialization changed body, selection or foreground".into());
     }
     println!("SAYWEAVE_EDITOR_INITIALIZATION body_selection_unchanged=true");
+    observer_restart_samples(&mut fixture, &runtime)?;
     for (start, end) in [(1, 1), (1, 3)] {
         for mode in [
             Finish::Commit,

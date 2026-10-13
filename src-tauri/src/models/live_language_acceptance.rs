@@ -88,7 +88,7 @@ async fn selected_language_evaluation() {
     ] {
         let new = prompt::build_with_context(body, "", &terms, Some(&app), &[]).unwrap();
         let old = vec![Message { role:"system",content:baseline.into() },Message { role:"user",content:json!({"input_text":body,"previous_context":"","terms":["Sayweave"],"corrections":[]}).to_string() }];
-        for (version, messages) in [("faithful-v1", old), ("faithful-v2", new.messages)] {
+        for (version, messages) in [("faithful-v1", old), (prompt::VERSION, new.messages)] {
             if refinement && version == "faithful-v1" {
                 continue;
             }

@@ -43,8 +43,8 @@ test('personalization and automatic terms are findable at both desktop sizes',as
   expect(await footer.getByRole('button',{name:'设置',exact:true}).evaluate(node=>{const r=node.getBoundingClientRect();return r.height<=40&&node.scrollWidth<=node.clientWidth;})).toBe(true);
   await page.screenshot({path:'.local/settings-personalization-'+width+'.png'});
   await page.getByRole('link',{name:'词典',exact:true}).click();await expect(page.getByRole('switch',{name:'自动入词'})).toBeEnabled();
-  await page.getByRole('button',{name:'词典更多操作'}).click();await page.getByRole('menuitem',{name:'纠错映射'}).click();await expect(page.getByRole('switch',{name:'自动入词'})).toBeVisible();
-  await expect(page.getByRole('heading',{name:'纠错映射'})).toBeVisible();
+  await expect(page.getByRole('button',{name:'词典更多操作'})).toHaveCount(0);await expect(page.getByRole('switch',{name:'自动入词'})).toBeVisible();
+  await expect(page.getByRole('heading',{name:'词典',exact:true})).toBeVisible();
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);await page.screenshot({path:'.local/settings-dictionary-'+width+'.png'});
  }
 });

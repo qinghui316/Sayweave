@@ -6,6 +6,19 @@ import {Dictionary} from '../src/features/dictionary';
 import {BrowserDictionary} from '../src/adapters/dictionary-browser';
 import {DictionaryError,type DictionaryPage} from '../src/contracts/dictionary';
 describe('manual dictionary',()=>{
+  it('keeps legacy mappings stored while exposing only terms',async()=>{
+    const port=new BrowserDictionary();
+    const legacy=await port.create({kind:'correction',original:'飞格玛',replacement:'Figma',category:null});
+    await port.create({kind:'term',original:'Sayweave',replacement:null,category:null});
+    const list=vi.spyOn(port,'list');
+    render(<Dictionary automaticTerms={automaticSettings()} port={port}/>);
+    await screen.findByText('Sayweave');
+    expect(screen.queryByText('飞格玛')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button',{name:'词典更多操作'})).not.toBeInTheDocument();
+    expect(screen.getByRole('switch',{name:'自动入词'})).toBeVisible();
+    expect(list.mock.calls.every(([query])=>query.kind==='term')).toBe(true);
+    expect(await port.get('correction',legacy.id)).toEqual(legacy);
+  });
   it('update Save/Cancel preserves the word and continues only after a confirmed save',async()=>{
     const port=new BrowserDictionary(),install=vi.fn();let guard:((action:()=>void)=>void)|null=null;
     const create=vi.spyOn(port,'create').mockRejectedValueOnce(new DictionaryError('busy'));

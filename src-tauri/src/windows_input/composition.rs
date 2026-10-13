@@ -23,6 +23,8 @@ use windows::Win32::{
     System::{Com::*, SystemInformation::GetTickCount64},
     UI::WindowsAndMessaging::*,
 };
+mod retirement;
+use retirement::{Retirement, WorkerCompletion};
 
 pub(crate) enum Command {
     Observe(Arc<ObservationSink>, oneshot::Sender<bool>),
@@ -35,7 +37,6 @@ pub(crate) enum Command {
         bool,
         oneshot::Sender<FinishOutcome>,
     ),
-    Close(oneshot::Sender<Result<(), Error>>),
     Replace(
         u64,
         String,
@@ -72,17 +73,50 @@ struct SourceReceipt {
 }
 static RETAINED: Mutex<Option<Arc<Connection>>> = Mutex::new(None);
 pub(crate) async fn stop_observer() -> Result<(), Error> {
+    stop_observer_for(None).await
+}
+async fn stop_observer_for(gate: Option<&DeliveryGate>) -> Result<(), Error> {
     let old = RETAINED
         .lock()
         .map_err(|_| Error::new("compositionWorker"))?
-        .take();
-    if let Some(old) = old
-        && let Err(error) = old.close().await
-    {
-        log::info!(target:"sayweave","operation=observation_retire result=failed error={}",error.code);
-        return Err(error);
+        .clone();
+    if let Some(old) = old {
+        let began = Instant::now();
+        let result = wait_retirement(&old, gate).await;
+        log::info!(target:"sayweave","operation=observation_retire task_id={} turn={} result={} error={} elapsed_ms={}",old.retirement.task,old.retirement.turn,if result.is_ok(){"complete"}else{"failed"},result.as_ref().err().map_or("none",|e|e.code.as_str()),began.elapsed().as_millis());
+        result?;
+        clear_retained(&RETAINED, &old.retirement);
     }
     Ok(())
+}
+async fn wait_retirement(old: &Connection, gate: Option<&DeliveryGate>) -> Result<(), Error> {
+    let remaining = gate.map_or(15_000, |gate| {
+        gate.preparation_deadline()
+            .saturating_sub(unsafe { GetTickCount64() })
+    });
+    let cancelled = async {
+        loop {
+            if gate.is_some_and(DeliveryGate::cancelled) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::select! {
+        biased;
+        _ = cancelled => Err(Error::new("cancelled")),
+        result = tokio::time::timeout(Duration::from_millis(remaining), old.close()) =>
+            result.unwrap_or_else(|_| Err(Error::new("compositionTimeout"))),
+    }
+}
+fn clear_retained(slot: &Mutex<Option<Arc<Connection>>>, retirement: &Arc<Retirement>) {
+    if let Ok(mut retained) = slot.lock()
+        && retained
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(&c.retirement, retirement))
+    {
+        retained.take();
+    }
 }
 pub(crate) struct PrefixOutcome {
     pub prefix: Mutation,
@@ -130,6 +164,7 @@ pub struct Draft {
 /// Editing retires only the range; it does not toggle the process-wide TSF service.
 pub(crate) struct Connection {
     sender: mpsc::SyncSender<Command>,
+    retirement: Arc<Retirement>,
 }
 impl Connection {
     pub async fn begin_turn(
@@ -152,11 +187,7 @@ impl Connection {
         }))
     }
     pub async fn close(&self) -> Result<(), Error> {
-        let (reply, result) = oneshot::channel();
-        self.sender
-            .try_send(Command::Close(reply))
-            .map_err(|_| Error::new("compositionWorker"))?;
-        result.await.map_err(|_| Error::new("compositionWorker"))?
+        self.retirement.close().await
     }
 }
 impl Draft {
@@ -165,7 +196,10 @@ impl Draft {
         let (sender, receiver) = mpsc::sync_channel(4);
         (
             Arc::new(Self {
-                connection: Arc::new(Connection { sender }),
+                connection: Arc::new(Connection {
+                    sender,
+                    retirement: Retirement::new("fixture".into(), 1),
+                }),
                 turn: 1,
                 closed: AtomicBool::new(false),
                 source_sequence: AtomicU64::new(0),
@@ -181,14 +215,27 @@ impl Draft {
     ) -> Result<Arc<Self>, Error> {
         // Retire the previous read-only lease before acquiring the exclusive
         // activation. An old observer can never deactivate the next session.
-        stop_observer().await?;
+        stop_observer_for(Some(&gate)).await?;
+        if gate.cancelled() {
+            return Err(Error::new("cancelled"));
+        }
+        if unsafe { GetTickCount64() } >= gate.preparation_deadline() {
+            return Err(Error::new("compositionTimeout"));
+        }
         let (sender, commands) = mpsc::sync_channel(4);
-        let connection = Arc::new(Connection { sender });
+        let retirement = Retirement::new(task.clone(), turn);
+        let connection = Arc::new(Connection {
+            sender,
+            retirement: retirement.clone(),
+        });
         let weak_connection = Arc::downgrade(&connection);
         let (ready, result) = oneshot::channel();
         std::thread::Builder::new()
             .name("sayweave-composition-sta".into())
             .spawn(move || {
+                // Declared before Host: unwinding drops all apartment-owned
+                // resources before the terminal failure becomes observable.
+                let mut completion = WorkerCompletion::new(retirement);
                 let began = Instant::now();
                 let diagnostic_task = task.clone();
                 let mut host = match Host::open(task, turn, anchor, gate) {
@@ -196,14 +243,20 @@ impl Draft {
                     Err(error) => {
                         log::info!(target:"sayweave", "operation=draft_admission task_id={} turn={} result=rejected error={} elapsed_ms={}", diagnostic_task,turn,error.code,began.elapsed().as_millis());
                         let _ = ready.send(Err(error));
+                        completion.finish(Err(Error::new("compositionWorker")), "openFailed");
                         return;
                     }
                 };
                 log::info!(target:"sayweave", "operation=draft_admission task_id={} turn={} result=ready elapsed_ms={}", diagnostic_task,turn,began.elapsed().as_millis());
                 if ready.send(Ok(())).is_err() {
+                    let _ = host.retire(&mut completion, "admissionAbandoned");
                     return;
                 }
                 loop {
+                    if completion.requested() {
+                        let _ = host.retire(&mut completion, "closeRequested");
+                        return;
+                    }
                     pump();
                     match commands.recv_timeout(Duration::from_millis(5)) {
                         Ok(Command::Observe(sink,reply))=>{let ready=host.observe(sink);let _=reply.send(ready);},
@@ -220,7 +273,6 @@ impl Draft {
                             let _=reply.send(outcome);
                         },
                         Ok(Command::Begin(turn,anchor,reply))=>{let _=reply.send(host.begin_turn(turn,anchor));},
-                        Ok(Command::Close(reply))=>{let result=host.close();drop(host);let _=reply.send(result);return;},
                         Ok(Command::Finish(turn,text,mode,raw,keep,reply))=>{
                             if turn!=host.turn {let _=reply.send(FinishOutcome::rejected("staleSession"));continue;}
                             let mut delivery=host.finish(&text,mode);
@@ -231,14 +283,14 @@ impl Draft {
                                 if let Ok(mut retained)=RETAINED.lock(){*retained=Some(connection);}
                                 let _=reply.send(delivery);continue;
                             }
-                            delivery.record_cleanup(host.close().is_err());
-                            drop(host);let _=reply.send(delivery);return;
+                            delivery.record_cleanup(host.retire(&mut completion,"finished").is_err());
+                            let _=reply.send(delivery);return;
                         },
-                        Err(mpsc::RecvTimeoutError::Disconnected)=>return,
+                        Err(mpsc::RecvTimeoutError::Disconnected)=>{let _=host.retire(&mut completion,"disconnected");return;},
                         Err(mpsc::RecvTimeoutError::Timeout)=>{
                             if let Some(at)=host.retained_at {
                                 let alive=host.poll_observer();
-                                if !alive || at.elapsed()>=Duration::from_secs(60){let _=host.close();if let Ok(mut retained)=RETAINED.lock()&&retained.as_ref().is_some_and(|c|std::sync::Weak::ptr_eq(&weak_connection,&Arc::downgrade(c))){retained.take();}return;}
+                                if !alive || at.elapsed()>=Duration::from_secs(60){let _=host.retire(&mut completion,if alive{"observationExpired"}else{"observationEnded"});return;}
                             }
                         },
                     }
@@ -449,6 +501,16 @@ struct Host {
     _apartment: Apartment,
 }
 impl Host {
+    fn retire(
+        mut self,
+        completion: &mut WorkerCompletion,
+        reason: &'static str,
+    ) -> Result<(), Error> {
+        let result = self.close();
+        drop(self);
+        completion.finish(result.clone(), reason);
+        result
+    }
     fn remember_tail(&mut self, raw: Option<String>) {
         self.raw_tail = raw.map(|raw| SourceReceipt {
             operation: self.operation,

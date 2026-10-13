@@ -135,3 +135,5 @@ Foreground accessibility notifications are distinct from actual activation. A li
 Begin 对空光标和非空选区统一只准备范围；首次非空更新才创建原生组合。未写入的结束、取消与交接只释放本任务范围和监听，不需要新焦点可写，也不提交或恢复正文。已写入组合跨焦点交接仅在其捕获上下文的合法写会话结束组合，不向新目标写入旧识别文字。身份、代际、操作修订和组合对象仍约束所有回调；拒绝结束时保留实际范围和恢复事实。
 
 普通投递 pending/delivering 记录在后台归档，不作为输入激活门禁；取消与正文恢复的安全意图仍由原生所有者处理。空结果、取消、只读以及结算安全事实不弹遮挡目标输入框的长条提示；安静投影不改变输入效果、首个错误和历史诊断。真正不确定的效果阻止后续不安全写入，终态不能由迟到准备或识别事件重新打开。
+
+Observation retirement shares one connection-owned completion between automatic expiry and explicit close. Completion is published after Host resources and the activation lease have been released; command-channel closure is not proof of either success or failure. A retained connection remains tracked through cleanup, and only its confirmed successful completion clears that exact slot. Failure stays attributable and blocks the next admission. Waiting consumes the existing preparation deadline and supports cancellation without abandoning the old cleanup.

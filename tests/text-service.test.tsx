@@ -2,10 +2,13 @@ import {act,render,screen,waitFor} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import {describe,expect,it,vi} from 'vitest';
 import {TextServiceSettings} from '../src/features/settings/TextServiceSettings';
-import {parseTextService,type TextServicePort,type TextServiceStatus} from '../src/contracts/text-service';
+import {componentMessage,parseTextService,type TextServicePort,type TextServiceStatus} from '../src/contracts/text-service';
 const ready:TextServiceStatus={installed:true,enabled:true,updateAvailable:false,payloadAvailable:true,cleanupPending:false,deploymentState:'ready',error:null};
 function service(value:TextServiceStatus):TextServicePort{return {mode:'native',status:vi.fn().mockResolvedValue(value),act:vi.fn().mockResolvedValue(ready)};}
 describe('input recovery',()=>{
+ it('identifies worker failure without claiming the loaded component cannot be read',()=>{
+  expect(componentMessage('compositionWorker')).toBe('输入服务意外中断，请退出并重新打开 Sayweave。');
+ });
  it('keeps healthy input invisible without maintenance or enable controls',async()=>{
   const port=service(ready),view=render(<TextServiceSettings port={port}/>);
   await act(async()=>{});

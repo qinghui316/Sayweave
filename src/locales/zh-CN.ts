@@ -1,13 +1,13 @@
 export const zh = {
   dictionary: {
-    title:'词典', description:'管理专有名词和常见纠错，内容保存在本机。', memory:'浏览器预览：仅保存在内存，刷新后重置。',
-    terms:'专有名词', corrections:'常见纠错', tabs:'词典类型', search:'搜索词条', addTerm:'新增词条', addCorrection:'新增纠错', edit:'编辑', remove:'删除',
-    original:'词语', heard:'听成', replacement:'改为', category:'分类（可选）', categoryColumn:'分类', actions:'操作',
+    title:'词典', description:'管理常用词语，内容保存在本机。', memory:'浏览器预览：仅保存在内存，刷新后重置。',
+    terms:'专有名词', tabs:'词典类型', search:'搜索词条', addTerm:'新增词条', edit:'编辑', remove:'删除',
+    original:'词语', category:'分类（可选）', categoryColumn:'分类', actions:'操作',
     save:'保存', cancel:'取消', retry:'重新加载', empty:'还没有词条', emptyDescription:'添加常用名称、专业术语或正确写法。', noMatches:'没有匹配的词条',
     editTitle:'编辑词条', newTitle:'新增词条', formDescription:'填写后保存到词典。', removeTitle:'删除词条', removeDescription:'删除当前词典中的记录。',
     saved:'已保存', deleted:'已删除', loading:'正在加载词典', viewExisting:'查看已有词条', reloadConflict:'重新读取当前记录',
     previous:'上一页', next:'下一页', total:(n:number)=>`${n} 条`, page:(n:number,total:number)=>`第 ${n} / ${Math.max(1,Math.ceil(total/50))} 页`,
-    errors:{invalid:'请填写单行文字，词条和纠错内容最多 128 个字符，分类最多 64 个字符。',duplicate:'这个词条已存在；同一个“听成”只能有一个纠正目标。请查看已有记录后再编辑。',notFound:'记录已不存在，请重新加载。',conflict:'记录已被修改，当前填写内容已保留。请读取最新记录后重新确认。',busy:'本地数据正在忙，请稍后重试。',unavailable:'本地数据暂不可用。原文件已保留，请检查日志或重新加载。',forbidden:'当前窗口不能访问词典。'},
+    errors:{invalid:'请填写单行文字，词语最多 128 个字符，分类最多 64 个字符。',duplicate:'这个词条已存在，请查看已有记录后再编辑。',notFound:'记录已不存在，请重新加载。',conflict:'记录已被修改，当前填写内容已保留。请读取最新记录后重新确认。',busy:'本地数据正在忙，请稍后重试。',unavailable:'本地数据暂不可用。原文件已保留，请检查日志或重新加载。',forbidden:'当前窗口不能访问词典。'},
   },
   motion: {
     copy: { idle: '复制', pending: '复制中', success: '已复制', error: '复制失败，重试' },
