@@ -2,6 +2,9 @@
 //! All ranges and subscriptions stay on the owning apartment.
 use super::*;
 use unicode_segmentation::UnicodeSegmentation;
+#[path = "block_boundary.rs"]
+mod boundary;
+use boundary::BoundaryProof;
 
 pub(super) struct Track {
     pub context: ITfContext,
@@ -13,6 +16,7 @@ pub(super) struct Track {
     manager_source: ITfSource,
     manager_cookie: u32,
     notifications: Rc<TextNotifications>,
+    boundary: Option<Rc<BoundaryProof>>,
     _lease: Lease,
 }
 struct Data {
@@ -95,6 +99,11 @@ impl Track {
             }
             let field = initial_selection::FocusIdentity::capture()?;
             range.SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_FORWARD)?;
+            // Unavailable/oversized outside evidence keeps the original strict
+            // notification rule. It does not block ordinary composition input.
+            let boundary = BoundaryProof::capture(context, &range, ec)
+                .ok()
+                .map(Rc::new);
             let data = Rc::new(RefCell::new(Data {
                 id: command.id.clone(),
                 epoch: COMPOSITION_EPOCH.fetch_add(1, Ordering::AcqRel) + 1,
@@ -113,6 +122,7 @@ impl Track {
                 client,
                 data: data.clone(),
                 notifications: notifications.clone(),
+                boundary: boundary.clone(),
                 _lease: Lease::new(),
             }
             .into();
@@ -149,6 +159,7 @@ impl Track {
                 manager_source,
                 manager_cookie,
                 notifications,
+                boundary,
                 _lease: Lease::new(),
             })
         }
@@ -193,6 +204,12 @@ impl Track {
             *phase = "blockSnapshotSelection";
             let (selection_start, selection_end) =
                 relative_selection(&self.context, &self.range, ec)?;
+            *phase = "blockSnapshotBoundary";
+            if let Some(boundary) = &self.boundary
+                && !boundary.matches(&self.context, &self.range, ec)?
+            {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
             *phase = "blockSnapshotField";
             if !self.field.matches()? {
                 return Err(failure(TF_E_DISCONNECTED));
@@ -228,6 +245,7 @@ struct Sink {
     client: u32,
     data: Rc<RefCell<Data>>,
     notifications: Rc<TextNotifications>,
+    boundary: Option<Rc<BoundaryProof>>,
     _lease: Lease,
 }
 impl ITfTextEditSink_Impl for Sink_Impl {
@@ -253,8 +271,19 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             let record = record.as_ref().ok_or_else(|| failure(E_POINTER))?;
+            phase = "blockEditUpdates";
+            let within = updates_within(record, &self.range, ec)?;
+            #[cfg(feature = "acceptance")]
+            let within = {
+                let coarse = block_faults::coarse_notification();
+                within && !coarse
+            };
             phase = "blockEditOutside";
-            if !updates_within(record, &self.range, ec)? {
+            if !within
+                && !self.boundary.as_ref().is_some_and(|boundary| {
+                    boundary.matches(context, &self.range, ec).unwrap_or(false)
+                })
+            {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             phase = "blockEditSelection";

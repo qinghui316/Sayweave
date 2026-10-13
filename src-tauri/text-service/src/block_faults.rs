@@ -7,6 +7,11 @@ thread_local! {static DEFERRED:RefCell<Vec<(ITfContext,u32,ITfEditSession,TF_CON
 pub extern "system" fn SayweaveBlockFixtureFault(value: u32) {
     FAULT.store(value, Ordering::Release);
 }
+pub fn coarse_notification() -> bool {
+    FAULT
+        .compare_exchange(5, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
 pub fn request(
     context: &ITfContext,
     client: u32,

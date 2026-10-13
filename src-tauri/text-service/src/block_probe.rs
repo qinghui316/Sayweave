@@ -303,6 +303,162 @@ pub(super) fn run(
     println!(
         "block manual-edit/read/stale-refusal/lease-rotation/reacquire/actual-write/focus-retirement/release=true"
     );
+    boundary_cases(editor, pipe, capability, module)?;
+    Ok(())
+}
+fn boundary_cases(
+    editor: HWND,
+    pipe: &Pipe,
+    capability: &str,
+    module: windows::Win32::Foundation::HMODULE,
+) -> Result<(), Box<dyn std::error::Error>> {
+    unsafe {
+        SendMessageW(
+            editor,
+            0xC,
+            Some(WPARAM(0)),
+            Some(LPARAM(windows::core::w!("左右").as_ptr() as isize)),
+        );
+        SendMessageW(editor, 0xB1, Some(WPARAM(1)), Some(LPARAM(1)));
+    }
+    pump(Duration::from_millis(40));
+    let task = uuid::Uuid::new_v4().to_string();
+    for (op, rev, action, text) in [
+        (1, 0, Action::Begin, ""),
+        (2, 1, Action::Update, "周三开会"),
+    ] {
+        let reply = exchange(pipe, capability, &task, 1, op, rev, action, text, false)?;
+        if !reply.applied {
+            return Err(format!("boundary setup: {}", reply.code).into());
+        }
+    }
+    let initial = snapshot(request(
+        pipe,
+        capability,
+        &task,
+        3,
+        BlockCommand {
+            id: uuid::Uuid::new_v4().to_string(),
+            action: BlockAction::Bind,
+            epoch: 0,
+            version: 0,
+            lease: 0,
+            expected: String::new(),
+            selection_start: 0,
+            selection_end: 0,
+        },
+        "",
+    )?)?;
+    let handoff = exchange(pipe, capability, &task, 1, 4, 1, Action::Handoff, "", false)?;
+    if !handoff.applied {
+        return Err("boundary handoff failed".into());
+    }
+    let handed = snapshot(request(
+        pipe,
+        capability,
+        &task,
+        5,
+        command(&initial, BlockAction::Read),
+        "",
+    )?)?;
+    let fault: unsafe extern "system" fn(u32) = unsafe {
+        std::mem::transmute(
+            windows::Win32::System::LibraryLoader::GetProcAddress(
+                module,
+                windows::core::s!("SayweaveBlockFixtureFault"),
+            )
+            .ok_or("missing coarse fixture hook")?,
+        )
+    };
+    unsafe {
+        fault(5);
+        SendMessageW(editor, 0xB1, Some(WPARAM(2)), Some(LPARAM(3)));
+        SendMessageW(
+            editor,
+            0xC2,
+            Some(WPARAM(1)),
+            Some(LPARAM(windows::core::w!("五").as_ptr() as isize)),
+        );
+        SendMessageW(editor, 0xB1, Some(WPARAM(5)), Some(LPARAM(5)));
+    }
+    pump(Duration::from_millis(50));
+    let edited = snapshot(request(
+        pipe,
+        capability,
+        &task,
+        6,
+        command(&handed, BlockAction::Read),
+        "",
+    )?)?;
+    if edited.text != "周五开会" || editor_text(editor)? != "左周五开会右" {
+        return Err("coarse notification lost scoped user edit".into());
+    }
+    let acquired = snapshot(request(
+        pipe,
+        capability,
+        &task,
+        7,
+        command(&edited, BlockAction::Acquire),
+        "",
+    )?)?;
+    let applied = snapshot(request(
+        pipe,
+        capability,
+        &task,
+        8,
+        command(&acquired, BlockAction::Apply),
+        "下周一上午开会",
+    )?)?;
+    if editor_text(editor)? != "左下周一上午开会右" || applied.text != "下周一上午开会"
+    {
+        return Err("coarse notification replacement changed outside text".into());
+    }
+    unsafe {
+        SendMessageW(editor, 0xB1, Some(WPARAM(0)), Some(LPARAM(1)));
+        SendMessageW(
+            editor,
+            0xC2,
+            Some(WPARAM(1)),
+            Some(LPARAM(windows::core::w!("改").as_ptr() as isize)),
+        );
+    }
+    pump(Duration::from_millis(50));
+    let denied = request(
+        pipe,
+        capability,
+        &task,
+        9,
+        command(&applied, BlockAction::Read),
+        "",
+    )?;
+    let write = request(
+        pipe,
+        capability,
+        &task,
+        10,
+        command(&applied, BlockAction::Apply),
+        "不能写入",
+    )?;
+    if denied.applied
+        || write.applied
+        || write.mutation != Mutation::NotAttempted
+        || editor_text(editor)? != "改下周一上午开会右"
+    {
+        return Err("outside edit retained block write authority".into());
+    }
+    if !request(
+        pipe,
+        capability,
+        &task,
+        11,
+        command(&applied, BlockAction::Release),
+        "",
+    )?
+    .applied
+    {
+        return Err("boundary track release failed".into());
+    }
+    println!("block coarse-notice/edit/read/reacquire/body/outside-refusal=true");
     Ok(())
 }
 fn frame(
