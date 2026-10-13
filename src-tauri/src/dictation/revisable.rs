@@ -1030,6 +1030,7 @@ pub(super) fn native_done(
             });
             if !s.report.text.is_empty() {
                 delivery.submission = Submission::Submitted;
+                delivery.verification = crate::windows_input::Verification::Unavailable;
                 delivery.stage = "composition".into();
                 delivery.state = "unconfirmed".into();
             }
@@ -1039,6 +1040,8 @@ pub(super) fn native_done(
             }
             if r.uncertain {
                 delivery.submission = Submission::Uncertain;
+                delivery.verification = crate::windows_input::Verification::Unavailable;
+                delivery.stage = "composition".into();
                 delivery.state = "unconfirmed".into();
             }
             return Some(delivery);
@@ -1053,6 +1056,38 @@ mod tests {
     use super::super::tests::{actor, block_reply, command};
     use super::*;
     use crate::windows_input::composition::Command;
+    #[test]
+    fn native_receipt_classifies_known_and_uncertain_effects_as_unverified_display() {
+        for uncertain in [false, true] {
+            let (actor, mut s, _) = actor(None);
+            let mut r = State::new();
+            r.uncertain = uncertain;
+            if !uncertain {
+                s.report.text = "实际写入结果".into();
+            }
+            let delivery = native_done(
+                &actor,
+                &mut s,
+                &mut r,
+                &NativeKind::Revisable(Effect::Close),
+                NativeValue::Closed(Ok(())),
+            )
+            .unwrap();
+            assert_eq!(
+                delivery.submission,
+                if uncertain {
+                    Submission::Uncertain
+                } else {
+                    Submission::Submitted
+                }
+            );
+            assert_eq!(
+                delivery.verification,
+                crate::windows_input::Verification::Unavailable
+            );
+            assert_eq!(delivery.stage, "composition");
+        }
+    }
 
     fn ending(s: &mut super::super::State, expired: bool) {
         let (reply, _) = oneshot::channel();
