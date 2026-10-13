@@ -1600,6 +1600,9 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
             );
             Ok(())
         })();
+        if let Err(error) = &result {
+            eprintln!("owned fixture assertion: {error}");
+        }
         drop(host);
         let stopped = if installed {
             registration::deactivate(language, false)

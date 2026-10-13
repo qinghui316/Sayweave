@@ -19,7 +19,7 @@ fn request(
         task: task.into(),
         turn: 1,
         operation,
-        revision: 1,
+        revision: operation,
         deadline_tick: unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
             + 2000,
         action: Action::Inspect,
@@ -68,7 +68,7 @@ pub(super) fn run(
     module: windows::Win32::Foundation::HMODULE,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if std::env::var("SAYWEAVE_BLOCK_FIXTURE").as_deref() == Ok("unified") {
-        return unified(editor, pipe, capability);
+        return unified(editor, pipe, capability, module);
     }
     let task = uuid::Uuid::new_v4().to_string();
     let id = uuid::Uuid::new_v4().to_string();
@@ -221,25 +221,20 @@ pub(super) fn run(
         command(&current, BlockAction::Acquire),
         "",
     )?)?;
-    let renewed = snapshot(request(
+    let repeated = request(
         pipe,
         capability,
         &task,
         11,
         command(&current, BlockAction::Acquire),
         "",
-    )?)?;
-    if lease.lease == renewed.lease {
-        return Err("acquire reused write lease".into());
-    }
-    let obsolete = request(
-        pipe,
-        capability,
-        &task,
-        12,
-        command(&lease, BlockAction::Apply),
-        "过期正文",
     )?;
+    if repeated.applied || repeated.mutation != Mutation::NotAttempted {
+        return Err("already owned composition acquired a second owner".into());
+    }
+    let mut obsolete_lease = command(&lease, BlockAction::Apply);
+    obsolete_lease.lease = lease.lease.saturating_sub(1);
+    let obsolete = request(pipe, capability, &task, 12, obsolete_lease, "过期正文")?;
     if obsolete.applied
         || obsolete.mutation != Mutation::NotAttempted
         || editor_text(editor)? != "周四开会"
@@ -251,7 +246,7 @@ pub(super) fn run(
         capability,
         &task,
         13,
-        command(&renewed, BlockAction::Apply),
+        command(&lease, BlockAction::Apply),
         "周四下午开会",
     )?)?;
     if editor_text(editor)? != "周四下午开会" || applied.text != "周四下午开会" {
@@ -262,18 +257,48 @@ pub(super) fn run(
         pipe,
         capability,
         &task,
-        24,
-        command(&applied, BlockAction::Acquire),
+        27,
+        command(&applied, BlockAction::Read),
         "",
     )?)?;
     let multiline = "周四下午两点开会\n下一行 👩‍💻 e\u{301}";
+    let updated = exchange(
+        pipe,
+        capability,
+        &task,
+        1,
+        28,
+        28,
+        Action::Update,
+        multiline,
+        false,
+    )?;
+    if !updated.applied {
+        return Err(format!("multiline shared update: {}", updated.code).into());
+    }
+    if !exchange(
+        pipe,
+        capability,
+        &task,
+        1,
+        29,
+        29,
+        Action::Handoff,
+        "",
+        false,
+    )?
+    .applied
+    {
+        return Err("multiline shared composition did not retire".into());
+    }
+    pump(Duration::from_millis(50));
     let applied = snapshot(request(
         pipe,
         capability,
         &task,
-        25,
-        command(&acquired, BlockAction::Apply),
-        multiline,
+        30,
+        command(&acquired, BlockAction::Read),
+        "",
     )?)?;
     let normalize = |text: &str| text.replace("\r\n", "\n").replace('\r', "\n");
     if normalize(&editor_text(editor)?) != multiline
@@ -294,7 +319,7 @@ pub(super) fn run(
         pipe,
         capability,
         &task,
-        26,
+        31,
         command(&applied, BlockAction::Acquire),
         "",
     )?;
@@ -308,7 +333,7 @@ pub(super) fn run(
         pipe,
         capability,
         &task,
-        27,
+        32,
         command(&applied, BlockAction::Release),
         "",
     )?;
@@ -434,6 +459,10 @@ fn boundary_cases(
     {
         return Err("coarse notification replacement changed outside text".into());
     }
+    if !exchange(pipe, capability, &task, 1, 9, 9, Action::Handoff, "", false)?.applied {
+        return Err("boundary composition handoff failed".into());
+    }
+    pump(Duration::from_millis(30));
     unsafe {
         SendMessageW(editor, 0xB1, Some(WPARAM(0)), Some(LPARAM(1)));
         SendMessageW(
@@ -448,7 +477,7 @@ fn boundary_cases(
         pipe,
         capability,
         &task,
-        9,
+        10,
         command(&applied, BlockAction::Read),
         "",
     )?;
@@ -456,7 +485,7 @@ fn boundary_cases(
         pipe,
         capability,
         &task,
-        10,
+        11,
         command(&applied, BlockAction::Apply),
         "不能写入",
     )?;
@@ -465,13 +494,20 @@ fn boundary_cases(
         || write.mutation != Mutation::NotAttempted
         || editor_text(editor)? != "改下周一上午开会右"
     {
-        return Err("outside edit retained block write authority".into());
+        return Err(format!(
+            "outside edit refusal differs: read={} write={} mutation={:?} body={:?}",
+            denied.applied,
+            write.applied,
+            write.mutation,
+            editor_text(editor)?
+        )
+        .into());
     }
     if !request(
         pipe,
         capability,
         &task,
-        11,
+        12,
         command(&applied, BlockAction::Release),
         "",
     )?
@@ -491,6 +527,7 @@ fn frame(
     text: &str,
     revoke: Option<Revoke>,
 ) -> Request {
+    let revision = revoke.as_ref().map_or(operation, |target| target.revision);
     Request {
         protocol: PROTOCOL,
         engine: fixture_binding(),
@@ -498,7 +535,7 @@ fn frame(
         task: task.into(),
         turn: 1,
         operation,
-        revision: 1,
+        revision,
         deadline_tick: unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
             + 2000,
         block,
@@ -551,7 +588,7 @@ fn timing_cases(
                 .ok_or("missing timing flush")?,
         )
     };
-    for (kind, op) in [(3, 13), (4, 15)] {
+    for (kind, op) in [(3, 14), (4, 16)] {
         unsafe {
             fault(kind);
         }
@@ -581,7 +618,7 @@ fn timing_cases(
     pipe.send(&serde_json::to_vec(&frame(
         capability,
         task,
-        17,
+        18,
         Some(command(&current, BlockAction::Apply)),
         Action::Inspect,
         "不应显示的尾部",
@@ -594,16 +631,16 @@ fn timing_cases(
     pipe.send(&serde_json::to_vec(&frame(
         capability,
         task,
-        18,
+        19,
         None,
         Action::Revoke,
         "",
         Some(Revoke {
-            operation: 17,
-            revision: 1,
+            operation: 18,
+            revision: 18,
         }),
     ))?)?;
-    let (original, revoke) = pair(pipe, 17, 18)?;
+    let (original, revoke) = pair(pipe, 18, 19)?;
     if original.applied || original.mutation != Mutation::NotAttempted || !revoke.applied {
         return Err("queued write not precisely revoked".into());
     }
@@ -618,7 +655,30 @@ fn timing_cases(
         pipe,
         capability,
         task,
-        19,
+        20,
+        command(&current, BlockAction::Read),
+        "",
+    )?)?;
+    if !exchange(
+        pipe,
+        capability,
+        task,
+        1,
+        21,
+        21,
+        Action::Handoff,
+        "",
+        false,
+    )?
+    .applied
+    {
+        return Err("timing composition handoff failed".into());
+    }
+    current = snapshot(request(
+        pipe,
+        capability,
+        task,
+        22,
         command(&current, BlockAction::Read),
         "",
     )?)?;
@@ -626,7 +686,7 @@ fn timing_cases(
         pipe,
         capability,
         task,
-        20,
+        23,
         command(&current, BlockAction::Acquire),
         "",
     )?)?;
@@ -636,13 +696,13 @@ fn timing_cases(
     pipe.send(&serde_json::to_vec(&frame(
         capability,
         task,
-        21,
+        24,
         Some(command(&current, BlockAction::Apply)),
         Action::Inspect,
         "周四下午两点开会",
         None,
     ))?)?;
-    let (original, revoke) = pair(pipe, 21, 22)?;
+    let (original, revoke) = pair(pipe, 24, 25)?;
     if !original.applied
         || original.mutation != Mutation::Changed
         || !revoke.applied
@@ -654,7 +714,7 @@ fn timing_cases(
         pipe,
         capability,
         task,
-        23,
+        26,
         command(&current, BlockAction::Read),
         "",
     )?)?;
@@ -669,7 +729,21 @@ fn timing_cases(
 
 /// Actual native input on the existing owned control, using ordinary Update
 /// after Acquire. Checks are repeated after pumping host notifications.
-fn unified(editor: HWND, pipe: &Pipe, capability: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn unified(
+    editor: HWND,
+    pipe: &Pipe,
+    capability: &str,
+    module: windows::Win32::Foundation::HMODULE,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fault: unsafe extern "system" fn(u32) = unsafe {
+        std::mem::transmute(
+            windows::Win32::System::LibraryLoader::GetProcAddress(
+                module,
+                windows::core::s!("SayweaveBlockFixtureFault"),
+            )
+            .ok_or("missing acquisition fixture hook")?,
+        )
+    };
     // These sentinels are outside the owned composition in every round.
     unsafe {
         SendMessageW(
@@ -811,6 +885,39 @@ fn unified(editor: HWND, pipe: &Pipe, capability: &str) -> Result<(), Box<dyn st
         if current.text != expected {
             return Err(format!("unified baseline {round} differs").into());
         }
+        if round == 0 {
+            // Rejected HRESULT, null-object wrapper error, then synchronous
+            // revocation with the same prepared listener. Each retry must find
+            // no leaked composition listener, and no attempt may change text.
+            for mode in [7, 8, 9] {
+                unsafe { fault(mode) };
+                op += 1;
+                let rejected = request(
+                    pipe,
+                    capability,
+                    &task,
+                    op,
+                    command(&current, BlockAction::Acquire),
+                    "",
+                )?;
+                if rejected.applied || !rejected.code.starts_with("blockStartComposition:") {
+                    return Err(format!("acquisition failure {mode}: {}", rejected.code).into());
+                }
+                pump(Duration::from_millis(40));
+                if editor_text(editor)? != format!("左{expected}右") {
+                    return Err("failed acquisition changed the body".into());
+                }
+                op += 1;
+                current = snapshot(request(
+                    pipe,
+                    capability,
+                    &task,
+                    op,
+                    command(&current, BlockAction::Read),
+                    "",
+                )?)?;
+            }
+        }
         op += 1;
         current = snapshot(request(
             pipe,
@@ -820,6 +927,7 @@ fn unified(editor: HWND, pipe: &Pipe, capability: &str) -> Result<(), Box<dyn st
             command(&current, BlockAction::Acquire),
             "",
         )?)?;
+        rev = op;
         for text in updates {
             op += 1;
             rev += 1;

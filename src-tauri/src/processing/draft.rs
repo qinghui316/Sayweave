@@ -25,6 +25,7 @@ pub struct Block {
     speech: String,
     stable: usize,
     preview: Option<Preview>,
+    confirmed_preview: Option<Preview>,
     attempted: Option<Snapshot>,
     confirmed_visible: String,
     confirmed_revision: u64,
@@ -96,6 +97,7 @@ impl Block {
             speech: String::new(),
             stable: 0,
             preview: None,
+            confirmed_preview: None,
             attempted: None,
             confirmed_visible: String::new(),
             confirmed_revision: 0,
@@ -305,6 +307,11 @@ impl Block {
             return Err(ProcessingError::new("staleDraft"));
         }
         self.confirmed_revision = revision;
+        self.confirmed_preview = if self.visible() == text {
+            self.preview.clone()
+        } else {
+            None
+        };
         self.confirmed_visible = text;
         Ok(())
     }
@@ -313,14 +320,27 @@ impl Block {
         if self.suspended {
             return;
         }
+        // Keep only an already displayed preview as a projection of its ASR
+        // source. It does not become an editor baseline or authorize an old
+        // model callback. An unacknowledged candidate is discarded.
+        let retained_preview = self
+            .confirmed_preview
+            .clone()
+            .filter(|p| self.matches(&p.source));
         self.suspended = true;
         self.source_epoch += 1;
-        self.preview = None;
         self.attempted = None;
+        self.preview = retained_preview;
+        if let Some(preview) = &mut self.preview {
+            preview.source.source_epoch = self.source_epoch;
+            self.attempted = Some(preview.source.clone());
+        }
+        self.confirmed_preview = self.preview.clone();
     }
 
     /// A refreshed lease/selection is not evidence of user-authored text.
-    /// Fold the already confirmed preview without changing its source kind.
+    /// Preserve the source and its confirmed projection. A relocated selection
+    /// without a proven source insertion mapping cannot authorize a rewrite.
     pub fn resume_unchanged(&mut self, selection: Range<usize>) -> Result<(), ProcessingError> {
         if !self.suspended
             || selection.start > selection.end
@@ -329,10 +349,19 @@ impl Block {
         {
             return Err(ProcessingError::new("sourceBoundary"));
         }
-        self.baseline = self.confirmed_visible.clone();
-        self.insertion = selection;
-        self.speech.clear();
-        self.stable = 0;
+        if self.speech.is_empty() {
+            if self.baseline != self.confirmed_visible {
+                return Err(ProcessingError::new("sourceSelection"));
+            }
+            self.insertion = selection;
+        } else {
+            let source = self.state_snapshot();
+            let insertion =
+                map_position(&source.text, &self.confirmed_visible, source.insertion_end);
+            if selection.start != selection.end || insertion != Some(selection.start) {
+                return Err(ProcessingError::new("sourceSelection"));
+            }
+        }
         self.suspended = false;
         Ok(())
     }
@@ -354,6 +383,9 @@ impl Block {
         self.confirmed_revision = self.next_revision;
         self.insertion = selection;
         self.kind = BaselineKind::EditorSnapshot;
+        self.preview = None;
+        self.confirmed_preview = None;
+        self.attempted = None;
         self.speech.clear();
         self.stable = 0;
         self.version += 1;
@@ -560,10 +592,55 @@ mod tests {
         assert_eq!(b.source_epoch, epoch);
         b.resume_unchanged(5..5).unwrap();
         assert_eq!(b.confirmed().1, "周三开会。");
-        assert!(b.snapshot(true).is_none());
-        b.observe("改成周四".into(), 4).unwrap();
+        assert_eq!(b.visible(), "周三开会。");
+        assert_eq!(b.snapshot(true).unwrap().text, "周三开会");
+        assert!(b.write().is_none());
+        b.observe("周三开会改成周四".into(), 8).unwrap();
         let next = b.snapshot(true).unwrap();
-        assert_eq!(next.text, "周三开会。改成周四");
+        assert_eq!(next.text, "周三开会改成周四");
         assert_ne!(next.baseline_kind, BaselineKind::EditorSnapshot);
+    }
+    #[test]
+    fn lease_refresh_keeps_same_source_revisions_and_rejects_old_model_results() {
+        let mut b = Block::new("b".into());
+        b.observe("周三开会".into(), 4).unwrap();
+        let old = b.snapshot(true).unwrap();
+        b.accept(old.clone(), "周三开会。".into()).unwrap();
+        let (revision, text) = b.write().unwrap();
+        b.acknowledge(revision, text).unwrap();
+        b.handoff();
+        b.resume_unchanged(5..5).unwrap();
+        assert!(b.accept(old, "旧结果".into()).is_err());
+        b.observe("周四下午开会".into(), 6).unwrap();
+        assert_eq!(b.snapshot(true).unwrap().text, "周四下午开会");
+        assert_eq!(b.visible(), "周四下午开会");
+        assert!(b.baseline.is_empty());
+    }
+    #[test]
+    fn unmapped_caret_move_does_not_promote_preview_to_a_source_baseline() {
+        let mut b = Block::new("b".into());
+        b.observe("周三开会".into(), 4).unwrap();
+        let (revision, text) = b.write().unwrap();
+        b.acknowledge(revision, text).unwrap();
+        b.handoff();
+        assert!(b.resume_unchanged(2..2).is_err());
+        assert!(b.write().is_none());
+        assert_eq!(b.speech, "周三开会");
+        assert!(b.baseline.is_empty());
+    }
+    #[test]
+    fn lease_refresh_retains_confirmed_projection_when_new_preview_was_not_written() {
+        let mut b = Block::new("b".into());
+        b.observe("周三开会".into(), 4).unwrap();
+        let source = b.snapshot(true).unwrap();
+        b.accept(source.clone(), "周三开会。".into()).unwrap();
+        let (rev, text) = b.write().unwrap();
+        b.acknowledge(rev, text).unwrap();
+        b.accept(source, "周三开会！".into()).unwrap();
+        b.handoff();
+        b.resume_unchanged(5..5).unwrap();
+        assert_eq!(b.visible(), "周三开会。");
+        assert!(b.write().is_none());
+        assert_eq!(b.snapshot(true).unwrap().text, "周三开会");
     }
 }

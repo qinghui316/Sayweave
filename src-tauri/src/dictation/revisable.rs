@@ -989,9 +989,11 @@ pub(super) fn native_done(
                                 r.block.resume_unchanged(start..end)
                             };
                             if rebased.is_ok() {
-                                r.offset = s.written_raw.chars().count();
-                                r.absorbed_coverage = r.visible_coverage.clone();
-                                r.sealed_source = s.written_raw.clone();
+                                if fresh {
+                                    r.offset = s.written_raw.chars().count();
+                                    r.absorbed_coverage = r.visible_coverage.clone();
+                                    r.sealed_source = s.written_raw.clone();
+                                }
                                 r.edit_identity = Some(identity);
                                 r.snapshot = Some(snapshot);
                                 r.read_needed = false;
@@ -1015,6 +1017,11 @@ pub(super) fn native_done(
                                     s.latest.sequence = 0;
                                     observe(actor, s, r, pending);
                                 }
+                            } else if rebased.is_err_and(|e| e.code == "sourceSelection") {
+                                // A caret-only move is not an editor baseline.
+                                // Retire this block if its source insertion cannot
+                                // be mapped, preserving the actual editor text.
+                                release(actor, s, r, true);
                             } else {
                                 r.cleanup_failed = true;
                                 s.record_failure(&actor.task, "compositionProtocol".into());

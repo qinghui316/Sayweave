@@ -915,6 +915,34 @@ impl ITfCompositionSink_Impl for AcquisitionSink_Impl {
     }
 }
 
+struct AcquisitionOwner {
+    epoch: u64,
+    context: ITfContext,
+    cookie: u32,
+}
+impl AcquisitionOwner {
+    fn retire_failed(&self, shared: &Shared) {
+        let has_composition = {
+            let state = shared.borrow();
+            // Reentrant Deactivate may revoke the generation without removing
+            // this candidate's resources. Conversely, a newer epoch must never
+            // be touched by the old request's cleanup.
+            if state.epoch != self.epoch
+                || state.context.as_ref() != Some(&self.context)
+                || state.text_cookie != Some(self.cookie)
+            {
+                return;
+            }
+            state.composition.is_some()
+        };
+        if has_composition {
+            end_owned(shared);
+        } else {
+            release_composition(shared, self.epoch, None);
+        }
+    }
+}
+
 unsafe fn acquire_composition(
     edit: &EditBlock_Impl,
     track: &Track,
@@ -922,7 +950,7 @@ unsafe fn acquire_composition(
     ec: u32,
     mutation: &mut Mutation,
     phase: &mut String,
-    acquired_epoch: &mut Option<u64>,
+    acquired_owner: &mut Option<AcquisitionOwner>,
 ) -> windows::core::Result<()> {
     unsafe {
         let shared = &edit.shared;
@@ -986,7 +1014,11 @@ unsafe fn acquire_composition(
                 return Err(failure(TF_E_DISCONNECTED));
             }
             state.epoch = epoch;
-            *acquired_epoch = Some(epoch);
+            *acquired_owner = Some(AcquisitionOwner {
+                epoch,
+                context: context.clone(),
+                cookie,
+            });
             state.context = Some(context.clone());
             state.text_cookie = Some(cookie);
             state.expected = native.clone();
@@ -1028,6 +1060,8 @@ unsafe fn acquire_composition(
         }
         .into();
         let owner: ITfContextComposition = context.cast()?;
+        #[cfg(feature = "acceptance")]
+        block_faults::acquisition_without_object(shared)?;
         // The Windows wrapper rejects a successful HRESULT with a null object.
         let composition = owner.StartComposition(ec, &track.range, &sink)?;
         // StartComposition may synchronously terminate the candidate or reenter
@@ -1138,7 +1172,7 @@ impl ITfEditSession_Impl for EditBlock_Impl {
         let _callback = Callback::enter();
         let mut mutation = Mutation::NotAttempted;
         let mut phase = "block".into();
-        let mut acquired_epoch = None;
+        let mut acquired_owner = None;
         let result = (|| unsafe {
             let shared = &self.shared;
             let r = &self.request;
@@ -1224,7 +1258,7 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                         ec,
                         &mut mutation,
                         &mut phase,
-                        &mut acquired_epoch,
+                        &mut acquired_owner,
                     )?;
                     // Do not re-read UIA inside compositionstart. The exact native
                     // readback above confirms this acquisition; later writes
@@ -1323,16 +1357,8 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                     mutation,
                     None,
                 );
-                let cleanup_ours = {
-                    let state = self.shared.borrow();
-                    acquired_epoch == Some(state.epoch)
-                        && state.generation == self.generation
-                        && state.version.task == self.request.task
-                        && state.version.turn == self.request.turn
-                        && state.version.operation == self.request.operation
-                };
-                if cleanup_ours {
-                    end_owned(&self.shared);
+                if let Some(owner) = acquired_owner {
+                    owner.retire_failed(&self.shared);
                 }
             }
         }

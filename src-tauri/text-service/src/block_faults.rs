@@ -18,6 +18,21 @@ pub fn stale_tracking_range() -> bool {
         .compare_exchange(6, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
 }
+pub fn acquisition_without_object(shared: &Shared) -> windows::core::Result<()> {
+    let fault = FAULT.load(Ordering::Acquire);
+    if matches!(fault, 7..=9)
+        && FAULT
+            .compare_exchange(fault, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        if fault == 9 {
+            // The same candidate resources survive a synchronous revocation.
+            shared.borrow_mut().generation = next_generation();
+        }
+        return Err(failure(if fault == 8 { E_POINTER } else { E_FAIL }));
+    }
+    Ok(())
+}
 pub fn request(
     context: &ITfContext,
     client: u32,

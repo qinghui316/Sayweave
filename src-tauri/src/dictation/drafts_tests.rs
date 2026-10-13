@@ -1,6 +1,9 @@
 //! Drive the production actor transitions with controlled native replies and a
 //! real local HTTPS model. Native rendering is covered by the input fixture.
 use super::*;
+#[cfg(windows)]
+#[path = "drafts_owned_test.rs"]
+mod owned;
 use crate::{
     contracts::processing::SourceSegment,
     models::provider::tests::{Fixture, Reply},
