@@ -88,7 +88,7 @@ export async function runBlockRegression({page,pid,focus,start,root,folder,repor
     }
    }
    child.stdin.end('exit\n');
-   if(!ended)await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Native identity probe did not retire')),5000);child.once('exit',code=>{clearTimeout(timer);code===0?resolve():reject(Error('Native identity cleanup '+code));});});
+   if(!ended)await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Native identity probe did not retire')),5000);child.once('exit',code=>{clearTimeout(timer);if(code===0)resolve();else reject(Error('Native identity cleanup '+code));});});
    if(process.env.SAYWEAVE_BLOCK_BOUNDARY_CASE)return;
    await runActor({page,pid,focus,start,read,settled,trace,report});
    return;
@@ -121,7 +121,7 @@ export async function runBlockRegression({page,pid,focus,start,root,folder,repor
   report.finalBody=await settled();
   if(report.finalBody.text!==lastBody)throw Error('Late host body change after release');
   child.stdin.end('exit\n');
-  if(!ended)await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Native probe did not retire')),5000);child.once('exit',code=>{clearTimeout(timer);code===0?resolve():reject(Error('Native probe cleanup '+code));});});
+  if(!ended)await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Native probe did not retire')),5000);child.once('exit',code=>{clearTimeout(timer);if(code===0)resolve();else reject(Error('Native probe cleanup '+code));});});
   await runActor({page,pid,focus,start,read,settled,trace,report});
  }finally{
   report.blockEvents=await page.evaluate(()=>window.ownedBlockEvents);
@@ -142,7 +142,7 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
  actor.once('exit',code=>{exited=true;for(const item of pending.splice(0))item.reject(Error('Actor exited '+code+': '+diagnostics));});
  const receive=()=>values.length?Promise.resolve(values.shift()):new Promise((resolve,reject)=>{if(exited){reject(Error(diagnostics));return;}const item={resolve:value=>{clearTimeout(timer);resolve(value);},reject:error=>{clearTimeout(timer);reject(error);}};const timer=setTimeout(()=>{const index=pending.indexOf(item);if(index>=0)pending.splice(index,1);reject(Error('Actor response timeout: '+diagnostics));},18000);pending.push(item);});
  const command=async value=>{actor.stdin.write(JSON.stringify(value)+'\n');const reply=await receive();trace.push({label:'actor '+value.action,reply});return reply;};
- let lastBody='';const segments=[];
+ let lastBody='',cleanupFailure;const segments=[];
  const expectBody=async(label,expected)=>{
   const deadline=Date.now()+5000;let sample;
   do{sample=await settled();trace.push({label,settled:sample});if(sample.text===expected){lastBody=expected;return;}await command({action:'status'});}while(Date.now()<deadline);
@@ -231,7 +231,7 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
   if(!report.actorDelivery.finished||report.actorDelivery.error||report.actorDelivery.requests!==3)throw Error('Actor final settlement or request count differs');
   await expectBody('actor final settled',lastBody);
   actor.stdin.end();
-  if(!exited)await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Actor cleanup timeout')),5000);actor.once('exit',code=>{clearTimeout(timer);code===0?resolve():reject(Error('Actor failed '+code+': '+diagnostics));});});
+  if(!exited)await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Actor cleanup timeout')),5000);actor.once('exit',code=>{clearTimeout(timer);if(code===0)resolve();else reject(Error('Actor failed '+code+': '+diagnostics));});});
   report.actorPassed=true;
  }finally{
   const samplingErrors=[];
@@ -242,6 +242,7 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
    report.actorDiagnostics=diagnostics;
   }
   try{report.actorBodyAfterCleanup=await settled();}catch(error){samplingErrors.push(String(error));}
-  if(samplingErrors.length){report.actorCleanupSamplingErrors=samplingErrors;throw Error('Actor cleanup body evidence unavailable');}
+  if(samplingErrors.length){report.actorCleanupSamplingErrors=samplingErrors;cleanupFailure=Error('Actor cleanup body evidence unavailable');}
  }
+ if(cleanupFailure)throw cleanupFailure;
 }

@@ -100,7 +100,7 @@ describe('frozen product release controller boundaries',()=>{
   expect(()=>validateFrozenController('v0.1.9',product,product,ref,['tests/e2e/models.spec.ts'])).toThrow();
   expect(()=>validateFrozenController('v0.1.9',product,'unknown',ref,['tests/e2e/models.spec.ts'])).toThrow();
  });
- it.each([0,1,2])('preserves the frozen checkout and failure facts for outcome %s',async status=>{
+ it.each([['e2e',0],['e2e',1],['e2e',2],['check',0],['check',1],['check',2]] as const)('preserves the frozen checkout and failure facts for %s outcome %s',async(kind,status)=>{
   const root=mkdtempSync(join(tmpdir(),'beaver-frozen-release-'));
   const owned=resolve(root);if(!owned.startsWith(resolve(tmpdir())+sep)||!owned.split(sep).at(-1)?.startsWith('beaver-frozen-release-'))throw Error('Unexpected temporary fixture path');
   const git=(args:string[])=>execFileSync('git',args,{cwd:root,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
@@ -108,14 +108,18 @@ describe('frozen product release controller boundaries',()=>{
    mkdirSync(join(root,'scripts'),{recursive:true});mkdirSync(join(root,'tests/e2e'),{recursive:true});
    writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9'}));
    writeFileSync(join(root,'scripts/release-validation.mjs'),readFileSync('scripts/release-validation.mjs'));
+   writeFileSync(join(root,'scripts/test-richtext-block.mjs'),'original check');
    for(const path of ['models','ui-interaction'])writeFileSync(join(root,`tests/e2e/${path}.spec.ts`),'original');
    git(['init']);git(['config','user.name','fixture']);git(['config','user.email','fixture@example.invalid']);git(['config','commit.gpgsign','false']);git(['config','core.autocrlf','false']);git(['config','core.hooksPath',join(root,'no-hooks')]);
    git(['add','.']);git(['commit','-m','product']);const product=git(['rev-parse','HEAD']);git(['tag','v0.1.9']);
    for(const path of ['models','ui-interaction'])writeFileSync(join(root,`tests/e2e/${path}.spec.ts`),'reviewed');
+   writeFileSync(join(root,'scripts/test-richtext-block.mjs'),'reviewed check');
    git(['add','.']);git(['commit','-m','controller']);const controller=git(['rev-parse','HEAD']);git(['tag','v0.1.9-release-check-e2e-1']);git(['update-ref','refs/remotes/origin/main',controller]);git(['checkout','--detach',product]);
-   const work=runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{expect(readFileSync(join(root,'tests/e2e/models.spec.ts'),'utf8')).toBe('reviewed');if(status===2)writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9',unexpected:true}));return {status:status===0?0:1};});
-   if(status===0)await work;else if(status===1)await expect(work).rejects.toThrow('E2E failed');else{await expect(work).rejects.toMatchObject({name:'AggregateError',errors:[expect.objectContaining({message:'Reviewed frozen-product E2E failed'}),expect.objectContaining({message:'Frozen product checkout was not restored cleanly'})]});expect(git(['status','--porcelain'])).toContain('package.json');git(['restore','--worktree','--','package.json']);}
+   const failure=`Reviewed frozen-product ${kind==='check'?'check':'E2E'} failed`;
+   const work=runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{expect(readFileSync(join(root,'tests/e2e/models.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe(kind==='check'?'reviewed check':'original check');if(status===2)writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9',unexpected:true}));return {status:status===0?0:1};},kind);
+   if(status===0)await work;else if(status===1)await expect(work).rejects.toThrow(failure);else{await expect(work).rejects.toMatchObject({name:'AggregateError',errors:[expect.objectContaining({message:failure}),expect.objectContaining({message:'Frozen product checkout was not restored cleanly'})]});expect(git(['status','--porcelain'])).toContain('package.json');git(['restore','--worktree','--','package.json']);}
    for(const path of ['models','ui-interaction'])expect(readFileSync(join(root,`tests/e2e/${path}.spec.ts`),'utf8')).toBe('original');
+   expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe('original check');
    expect(git(['status','--porcelain'])).toBe('');expect(git(['rev-parse','HEAD'])).toBe(product);
    if(status===0){git(['update-ref','refs/remotes/origin/main',product]);let invoked=false;await expect(runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{invoked=true;return {status:0};})).rejects.toThrow();expect(invoked).toBe(false);expect(git(['status','--porcelain'])).toBe('');}
   }finally{

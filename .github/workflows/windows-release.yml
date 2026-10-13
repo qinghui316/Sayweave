@@ -177,8 +177,16 @@ jobs:
         run: Write-Output 'Cargo registry exact=${{ steps.cargo-registry.outputs.cache-hit }} compiler exact=${{ steps.cargo-compiled.outputs.cache-hit }}; restored key=${{ steps.cargo-compiled.outputs.cache-matched-key }}'
       - if: inputs.verification_run_id == '' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
         run: npx playwright install chromium
-      - if: inputs.verification_run_id == '' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
-        run: npm run check
+      - name: Run npm run check
+        if: inputs.verification_run_id == '' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+        shell: pwsh
+        run: |
+          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen') {
+            node $env:SAYWEAVE_RELEASE_HELPER check-frozen
+          } else {
+            npm run check
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Full product check failed.' }
       - if: inputs.verification_run_id == '' && inputs.phase != 'build-frozen' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
         run: npm run test:e2e
       - name: Run reviewed E2E against the frozen product and restore its checkout
