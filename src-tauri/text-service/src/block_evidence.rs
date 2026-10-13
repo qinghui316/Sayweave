@@ -34,6 +34,49 @@ struct Frame {
     native_read_error: Option<u32>,
     projection: Option<initial_selection::BlockProjection>,
     projection_error: Option<String>,
+    provider_summary: Option<ProviderSummary>,
+}
+#[derive(Default, Serialize)]
+struct ProviderSummary {
+    raw_units: Option<usize>,
+    tsf_units: Option<usize>,
+    selected: [Option<usize>; 2],
+    equal: Option<bool>,
+    mapped: Option<bool>,
+    stable: Option<bool>,
+    proxy: Option<bool>,
+    stage: Option<String>,
+    error: Option<u32>,
+}
+impl ProviderSummary {
+    // inspect() also returns metadata when its full representation proof is
+    // unavailable. Keep only these generated numeric/boolean/fixed-stage keys.
+    fn read(input: &str) -> Self {
+        let mut out = Self::default();
+        for part in input.split_ascii_whitespace() {
+            let Some((key, value)) = part.split_once('=') else {
+                continue;
+            };
+            match key {
+                "raw_len" => out.raw_units = value.parse().ok(),
+                "tsf_len" => out.tsf_units = value.parse().ok(),
+                "raw_start" => out.selected[0] = value.parse().ok(),
+                "raw_end" => out.selected[1] = value.parse().ok(),
+                "raw_tsf_equal" => out.equal = value.parse().ok(),
+                "raw_tsf_mapped" => out.mapped = value.parse().ok(),
+                "raw_stable" => out.stable = value.parse().ok(),
+                "raw_proxy_interface" => out.proxy = value.parse().ok(),
+                "raw_stage"
+                    if value.len() <= 32 && value.bytes().all(|b| b.is_ascii_alphanumeric()) =>
+                {
+                    out.stage = Some(value.into())
+                }
+                "raw_error" if value.len() == 8 => out.error = u32::from_str_radix(value, 16).ok(),
+                _ => (),
+            }
+        }
+        out
+    }
 }
 pub(super) unsafe fn capture(
     context: &ITfContext,
@@ -73,6 +116,7 @@ pub(super) unsafe fn capture(
             native_read_error: None,
             projection: None,
             projection_error: None,
+            provider_summary: None,
         };
         if error.is_some() {
             // Reserve the first header before any COM call. A reentrant refusal
@@ -101,6 +145,7 @@ pub(super) unsafe fn capture(
                 native_read_error: None,
                 projection: None,
                 projection_error: Some("capturePending".into()),
+                provider_summary: None,
             };
             d.evidence.first = Some(Rc::new(header));
         }
@@ -135,7 +180,8 @@ pub(super) unsafe fn capture(
             return Err(failure(E_ACCESSDENIED));
         }
         let native = range_text(&whole, ec)?;
-        let (_, evidence) = initial_selection::inspect(&native);
+        let (summary, evidence) = initial_selection::inspect(&native);
+        frame.provider_summary = Some(ProviderSummary::read(&summary));
         let Some(evidence) = evidence else {
             frame.projection_error = Some("providerUnavailable".into());
             return Ok(());
@@ -166,19 +212,25 @@ pub(super) unsafe fn capture(
     if let Err(e) = result {
         frame.projection_error = Some(format!("probe:{:08x}", e.code().0 as u32));
     }
-    {
+    let (end_version, end_lease, end_valid, raced) = {
         let d = data.borrow();
-        frame.end_version = d.version;
-        frame.end_lease = d.lease;
-        frame.end_valid = d.valid;
-        if d.epoch != frame.epoch
-            || d.version != frame.version
-            || d.lease != frame.lease
-            || d.valid != frame.valid
-        {
-            frame.projection = None;
-            frame.projection_error = Some("captureRaced".into());
-        }
+        (
+            d.version,
+            d.lease,
+            d.valid,
+            d.epoch != frame.epoch
+                || d.version != frame.version
+                || d.lease != frame.lease
+                || d.valid != frame.valid,
+        )
+    };
+    frame.end_version = end_version;
+    frame.end_lease = end_lease;
+    frame.end_valid = end_valid;
+    if raced {
+        // Releasing the provider can reenter Data; no RefCell borrow is alive.
+        frame.projection = None;
+        frame.projection_error = Some("captureRaced".into());
     }
     let frame = Rc::new(frame);
     let (retired, retired_ui) = {
@@ -227,4 +279,28 @@ pub(super) fn suffix(data: &Rc<RefCell<Data>>) -> String {
         return ":structure=oversize".into();
     }
     format!(":structure={encoded}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unavailable_projection_keeps_structural_numbers_but_no_external_strings() {
+        let summary = ProviderSummary::read(
+            "raw_len=5 tsf_len=0 raw_start=0 raw_end=0 raw_tsf_equal=false raw_tsf_mapped=false raw_stable=true raw_proxy_interface=false raw_module=private.dll body=secret path=C:/private hash=abcdef raw_stage=secret/path raw_us=99",
+        );
+        let value = serde_json::to_value(summary).unwrap();
+        assert_eq!(value["raw_units"], 5);
+        assert_eq!(value["tsf_units"], 0);
+        assert_eq!(value["mapped"], false);
+        assert_eq!(value["stable"], true);
+        let encoded = value.to_string();
+        for forbidden in ["private", "secret", "path", "module", "hash", "abcdef"] {
+            assert!(!encoded.contains(forbidden));
+        }
+        assert_eq!(
+            ProviderSummary::read("raw_stage=textPattern raw_error=80004002").error,
+            Some(0x80004002)
+        );
+    }
 }
