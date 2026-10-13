@@ -232,7 +232,8 @@ impl Track {
             range.SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_FORWARD)?;
             // Unavailable/oversized outside evidence keeps the original strict
             // notification rule. It does not block ordinary composition input.
-            let boundary = BoundaryProof::capture(context, &range, ec)
+            let mut boundary_reason = "blockBoundaryUnavailable";
+            let boundary = BoundaryProof::capture(context, &range, ec, &mut boundary_reason)
                 .ok()
                 .map(Rc::new);
             let data = Rc::new(RefCell::new(Data {
@@ -254,6 +255,7 @@ impl Track {
                 data: data.clone(),
                 notifications: notifications.clone(),
                 boundary: boundary.clone(),
+                boundary_reason,
                 _lease: Lease::new(),
             }
             .into();
@@ -337,7 +339,7 @@ impl Track {
                 relative_selection(&self.context, &self.range, ec)?;
             *phase = "blockSnapshotBoundary";
             if let Some(boundary) = &self.boundary
-                && !boundary.matches(&self.context, &self.range, ec)?
+                && !boundary.matches(&self.context, &self.range, ec, phase)?
             {
                 return Err(failure(TF_E_DISCONNECTED));
             }
@@ -377,6 +379,7 @@ struct Sink {
     data: Rc<RefCell<Data>>,
     notifications: Rc<TextNotifications>,
     boundary: Option<Rc<BoundaryProof>>,
+    boundary_reason: &'static str,
     _lease: Lease,
 }
 impl ITfTextEditSink_Impl for Sink_Impl {
@@ -418,13 +421,15 @@ impl ITfTextEditSink_Impl for Sink_Impl {
                 let coarse = block_faults::coarse_notification(changed);
                 within && !coarse
             };
-            phase = "blockEditOutside";
-            if !within
-                && !self.boundary.as_ref().is_some_and(|boundary| {
-                    boundary.matches(context, &self.range, ec).unwrap_or(false)
-                })
-            {
-                return Err(failure(TF_E_DISCONNECTED));
+            if !within {
+                phase = self.boundary_reason;
+                if !self.boundary.as_ref().is_some_and(|boundary| {
+                    boundary
+                        .matches(context, &self.range, ec, &mut phase)
+                        .unwrap_or(false)
+                }) {
+                    return Err(failure(TF_E_DISCONNECTED));
+                }
             }
             phase = "blockEditSelection";
             relative_selection(context, &self.range, ec)?;

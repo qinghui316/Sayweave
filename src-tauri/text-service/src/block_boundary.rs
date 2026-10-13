@@ -19,9 +19,11 @@ unsafe fn fingerprint(
     range: &ITfRange,
     ec: u32,
     limit: usize,
+    phase: &mut &'static str,
 ) -> windows::core::Result<Fingerprint> {
     unsafe {
         if password(context, range, ec)? {
+            *phase = "blockGuardProtected";
             return Err(failure(E_ACCESSDENIED));
         }
         let cursor = range.Clone()?;
@@ -37,12 +39,14 @@ unsafe fn fingerprint(
             }
             let room = buffer.len().min(limit.saturating_sub(units));
             if room == 0 {
+                *phase = "blockGuardBudget";
                 return Err(failure(E_FAIL));
             }
             let mut copied = 0;
             cursor.GetText(ec, TF_TF_MOVESTART, &mut buffer[..room], &mut copied)?;
             let copied = copied as usize;
             if copied == 0 || copied > room {
+                *phase = "blockGuardReadProgress";
                 return Err(failure(E_FAIL));
             }
             for value in &buffer[..copied] {
@@ -61,7 +65,8 @@ impl BoundaryProof {
         ec: u32,
     ) -> windows::core::Result<()> {
         unsafe {
-            let current = Self::capture(context, block, ec)?;
+            let mut phase = "blockGuardCapture";
+            let current = Self::capture(context, block, ec, &mut phase)?;
             if current.before != self.before || current.after != self.after {
                 return Err(failure(TF_E_DISCONNECTED));
             }
@@ -80,16 +85,25 @@ impl BoundaryProof {
         context: &ITfContext,
         block: &ITfRange,
         ec: u32,
+        phase: &mut &'static str,
     ) -> windows::core::Result<Self> {
         unsafe {
+            *phase = "blockGuardPrefixRoot";
             let prefix = context.GetStart(ec)?;
+            *phase = "blockGuardPrefixAnchor";
             prefix.ShiftEndToRange(ec, block, TF_ANCHOR_START)?;
+            *phase = "blockGuardPrefixGravity";
             prefix.SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_BACKWARD)?;
+            *phase = "blockGuardSuffixRoot";
             let suffix = context.GetEnd(ec)?;
+            *phase = "blockGuardSuffixAnchor";
             suffix.ShiftStartToRange(ec, block, TF_ANCHOR_END)?;
+            *phase = "blockGuardSuffixGravity";
             suffix.SetGravity(ec, TF_GRAVITY_FORWARD, TF_GRAVITY_FORWARD)?;
-            let before = fingerprint(context, &prefix, ec, MAX_UNITS)?;
-            let after = fingerprint(context, &suffix, ec, MAX_UNITS - before.units)?;
+            *phase = "blockGuardPrefixRead";
+            let before = fingerprint(context, &prefix, ec, MAX_UNITS, phase)?;
+            *phase = "blockGuardSuffixRead";
+            let after = fingerprint(context, &suffix, ec, MAX_UNITS - before.units, phase)?;
             Ok(Self {
                 prefix,
                 suffix,
@@ -103,28 +117,52 @@ impl BoundaryProof {
         context: &ITfContext,
         block: &ITfRange,
         ec: u32,
+        phase: &mut &'static str,
     ) -> windows::core::Result<bool> {
         unsafe {
             // Check original anchors, not offsets or a text search. Collapsed,
             // rebased or non-contiguous guards cannot revive the block.
+            *phase = "blockPrefixDocument";
             if self
                 .prefix
                 .CompareStart(ec, &context.GetStart(ec)?, TF_ANCHOR_START)?
                 != 0
-                || self.prefix.CompareEnd(ec, block, TF_ANCHOR_START)? != 0
-                || self.suffix.CompareStart(ec, block, TF_ANCHOR_END)? != 0
-                || self
-                    .suffix
-                    .CompareEnd(ec, &context.GetEnd(ec)?, TF_ANCHOR_END)?
-                    != 0
             {
                 return Ok(false);
             }
-            Ok(
-                fingerprint(context, &self.prefix, ec, MAX_UNITS)? == self.before
-                    && fingerprint(context, &self.suffix, ec, MAX_UNITS - self.before.units)?
-                        == self.after,
-            )
+            *phase = "blockPrefixAnchor";
+            if self.prefix.CompareEnd(ec, block, TF_ANCHOR_START)? != 0 {
+                return Ok(false);
+            }
+            *phase = "blockSuffixAnchor";
+            if self.suffix.CompareStart(ec, block, TF_ANCHOR_END)? != 0 {
+                return Ok(false);
+            }
+            *phase = "blockSuffixDocument";
+            if self
+                .suffix
+                .CompareEnd(ec, &context.GetEnd(ec)?, TF_ANCHOR_END)?
+                != 0
+            {
+                return Ok(false);
+            }
+            *phase = "blockPrefixText";
+            if fingerprint(context, &self.prefix, ec, MAX_UNITS, phase)? != self.before {
+                return Ok(false);
+            }
+            *phase = "blockSuffixText";
+            if fingerprint(
+                context,
+                &self.suffix,
+                ec,
+                MAX_UNITS - self.before.units,
+                phase,
+            )? != self.after
+            {
+                return Ok(false);
+            }
+            *phase = "block";
+            Ok(true)
         }
     }
 }
