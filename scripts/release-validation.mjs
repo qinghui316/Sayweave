@@ -42,7 +42,7 @@ export function releaseNotes(value){
  return `Sayweave ${value.version}\n\n${value.changes.map(change=>`- ${change}`).join('\n')}\n${value.installation?`\n${value.installation}\n`:''}`;
 }
 
-export const frozenTestPaths=['tests/e2e/models.spec.ts','tests/e2e/ui-interaction.spec.ts','tests/e2e/dictation.spec.ts'];
+export const frozenTestPaths=['tests/e2e/models.spec.ts','tests/e2e/ui-interaction.spec.ts','tests/e2e/dictation.spec.ts','tests/fixtures/voice-recovery.tsx'];
 const receiptTestPath='src-tauri/src/installer/record.rs';
 export const frozenCheckPaths=['scripts/test-richtext-block.mjs',receiptTestPath];
 export const frozenFormalPaths=['src-tauri/text-service/src/formal_switch_probe.rs'];

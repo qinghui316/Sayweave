@@ -142,6 +142,10 @@ describe('frozen product release controller boundaries',()=>{
   expect(()=>validateFrozenController('v0.1.9',product,controller,ref,['tests/e2e/dictation.spec.ts'])).not.toThrow();
   expect(()=>validateFrozenController('v0.1.9',product,controller,ref,['tests/e2e/speech.spec.ts'])).toThrow();
  });
+ it('permits only the named standalone theme fixture and rejects neighboring bootstrap code',()=>{
+  expect(()=>validateFrozenController('v0.1.9',product,controller,ref,['tests/fixtures/voice-recovery.tsx'])).not.toThrow();
+  for(const path of ['src/main.tsx','src/design/themes.ts','tests/fixtures/other.tsx'])expect(()=>validateFrozenController('v0.1.9',product,controller,ref,[path])).toThrow();
+ });
  it.each(['src/app/App.tsx','src-tauri/src/lib.rs','package.json','.github/workflows/windows-ci.yml','../tests/e2e/models.spec.ts'])('rejects undeclared/product change %s',path=>{
   expect(()=>validateFrozenController('v0.1.9',product,controller,ref,['tests/e2e/models.spec.ts',path])).toThrow();
  });
@@ -155,7 +159,7 @@ describe('frozen product release controller boundaries',()=>{
   const owned=resolve(root);if(!owned.startsWith(resolve(tmpdir())+sep)||!owned.split(sep).at(-1)?.startsWith('beaver-frozen-release-'))throw Error('Unexpected temporary fixture path');
   const git=(args:string[])=>execFileSync('git',args,{cwd:root,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
   try{
-   mkdirSync(join(root,'scripts'),{recursive:true});mkdirSync(join(root,'tests/e2e'),{recursive:true});mkdirSync(join(root,'src-tauri/src/installer'),{recursive:true});
+   mkdirSync(join(root,'scripts'),{recursive:true});mkdirSync(join(root,'tests/e2e'),{recursive:true});mkdirSync(join(root,'tests/fixtures'),{recursive:true});mkdirSync(join(root,'src-tauri/src/installer'),{recursive:true});
    writeFileSync(join(root,'src-tauri/src/installer/record.rs'),nativeOriginal);
    mkdirSync(join(root,'src-tauri/text-service/src'),{recursive:true});
    writeFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'original probe');
@@ -163,17 +167,20 @@ describe('frozen product release controller boundaries',()=>{
    writeFileSync(join(root,'scripts/release-validation.mjs'),readFileSync('scripts/release-validation.mjs'));
    writeFileSync(join(root,'scripts/test-richtext-block.mjs'),'original check');
    for(const path of ['models','ui-interaction','dictation'])writeFileSync(join(root,`tests/e2e/${path}.spec.ts`),'original');
+   writeFileSync(join(root,'tests/fixtures/voice-recovery.tsx'),'original theme fixture');
    git(['init']);git(['config','user.name','fixture']);git(['config','user.email','fixture@example.invalid']);git(['config','commit.gpgsign','false']);git(['config','core.autocrlf','false']);git(['config','core.hooksPath',join(root,'no-hooks')]);
    git(['add','.']);git(['commit','-m','product']);const product=git(['rev-parse','HEAD']);git(['tag','v0.1.9']);
    for(const path of ['models','ui-interaction','dictation'])writeFileSync(join(root,`tests/e2e/${path}.spec.ts`),'reviewed');
+   writeFileSync(join(root,'tests/fixtures/voice-recovery.tsx'),'reviewed theme fixture');
    writeFileSync(join(root,'scripts/test-richtext-block.mjs'),'reviewed check');
    writeFileSync(join(root,'src-tauri/src/installer/record.rs'),nativeReviewed);
    writeFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'reviewed probe');
    git(['add','.']);git(['commit','-m','controller']);const controller=git(['rev-parse','HEAD']);git(['tag','v0.1.9-release-check-e2e-1']);git(['update-ref','refs/remotes/origin/main',controller]);git(['checkout','--detach',product]);
    const failure=`Reviewed frozen-product ${kind==='e2e'?'E2E':kind} failed`;
-   const work=runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{expect(readFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'utf8')).toBe(kind==='formal'?'reviewed probe':'original probe');expect(readFileSync(join(root,'tests/e2e/dictation.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(kind==='check'?nativeReviewed:nativeOriginal);expect(readFileSync(join(root,'tests/e2e/models.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe(kind==='check'?'reviewed check':'original check');if(status===2)writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9',unexpected:true}));return {status:status===0?0:1};},kind);
+   const work=runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{expect(readFileSync(join(root,'tests/fixtures/voice-recovery.tsx'),'utf8')).toBe(kind==='e2e'?'reviewed theme fixture':'original theme fixture');expect(readFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'utf8')).toBe(kind==='formal'?'reviewed probe':'original probe');expect(readFileSync(join(root,'tests/e2e/dictation.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(kind==='check'?nativeReviewed:nativeOriginal);expect(readFileSync(join(root,'tests/e2e/models.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe(kind==='check'?'reviewed check':'original check');if(status===2)writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9',unexpected:true}));return {status:status===0?0:1};},kind);
    if(status===0)await work;else if(status===1)await expect(work).rejects.toThrow(failure);else{await expect(work).rejects.toMatchObject({name:'AggregateError',errors:[expect.objectContaining({message:failure}),expect.objectContaining({message:'Frozen product checkout was not restored cleanly'})]});expect(git(['status','--porcelain'])).toContain('package.json');git(['restore','--worktree','--','package.json']);}
    for(const path of ['models','ui-interaction','dictation'])expect(readFileSync(join(root,`tests/e2e/${path}.spec.ts`),'utf8')).toBe('original');
+   expect(readFileSync(join(root,'tests/fixtures/voice-recovery.tsx'),'utf8')).toBe('original theme fixture');
    expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe('original check');
    expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(nativeOriginal);
    expect(readFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'utf8')).toBe('original probe');

@@ -1,3 +1,4 @@
+import {applyTheme} from '../../src/design/themes';
 import {Button,Dialog,Icon,Select,ActionMenu} from '../../src/ui';
 import {ModelPicker} from '../../src/features/models/ModelPicker';
 import {useState,useEffect} from 'react';
@@ -6,6 +7,8 @@ import '../../src/design/tokens.css';
 import '../../src/design/base.css';
 import {VoiceSurface} from '../../src/features/voice';
 import type {DictationPresentation} from '../../src/contracts/dictation';
+// This isolated entry bypasses main.tsx; use the same catalogue before rendering.
+applyTheme('light');
 function Fixture(){
  const [kind,setKind]=useState((new URLSearchParams(location.search).get('presentation')??'notice') as DictationPresentation);
  useEffect(()=>{const change=(event:Event)=>setKind((event as CustomEvent<DictationPresentation>).detail);window.addEventListener('fixture:presentation',change);return()=>window.removeEventListener('fixture:presentation',change);},[]);
