@@ -53,3 +53,24 @@ for(const size of [{width:1120,height:760,scale:1},{width:960,height:640,scale:1
  const face=page.locator('section[aria-labelledby="usage-title"] > div').nth(1);await face.hover();await expect(face).toHaveCSS('transform','none');
  expect(errors).toEqual([]);await context.close();
 });
+
+test('success and unchecked control contrast roles',async({page})=>{
+ await page.goto('/');
+ for(const [id,name] of [['light','浅色'],['graphite','石墨银灰']]){
+  await page.getByRole('button',{name:'设置',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'设置',exact:true});
+  await dialog.getByRole('button',{name:'外观',exact:true}).click();
+  await dialog.getByRole('button',{name:name!,exact:true}).click();
+  await dialog.getByRole('button',{name:'关闭',exact:true}).click();
+  await page.goto('/#/dev/components');
+  await page.getByRole('button',{name:'测试演示连接',exact:true}).click();
+  const status=page.getByRole('status').filter({hasText:'演示连接成功'});
+  await expect(status).toBeVisible();
+  await expect(status.locator('svg')).toHaveAttribute('stroke','var(--on-signal)');
+  await status.screenshot({path:`.local/appearance-input/ui/${id}-success.png`});
+  const toggle=page.getByRole('switch',{name:'开关',exact:true});
+  await expect(toggle).toHaveAttribute('data-state','unchecked');
+  await toggle.screenshot({path:`.local/appearance-input/ui/${id}-switch-off.png`});
+  await page.goto('/');
+ }
+});

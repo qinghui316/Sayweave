@@ -16,6 +16,7 @@ it('presets share complete color roles, resolve startup colors and preserve read
   expect(resolve(theme.vars,'--surface-canvas')).toMatch(/^#[0-9a-f]{6}$/i);
   expect(contrast(resolve(theme.vars,'--action-bg'),resolve(theme.vars,'--action-fg'))).toBeGreaterThanOrEqual(4.5);
   expect(contrast(resolve(theme.vars,'--voice-bg'),resolve(theme.vars,'--voice-fg'))).toBeGreaterThanOrEqual(4.5);
+  expect(contrast(resolve(theme.vars,'--signal'),resolve(theme.vars,'--on-signal'))).toBeGreaterThanOrEqual(4.5);
  }
  const dark=themeById('graphite').vars;
  for(const surface of ['--surface-content','--surface-canvas','--surface-key','--surface-work','--surface-hover']){
@@ -24,6 +25,8 @@ it('presets share complete color roles, resolve startup colors and preserve read
  expect(contrast(dark['--voice-bg'],dark['--voice-button'])).toBeGreaterThanOrEqual(3);
  expect(contrast(dark['--action-bg'],dark['--selected-icon'])).toBeGreaterThanOrEqual(3);
  expect(contrast(dark['--switch-track'],dark['--switch-thumb'])).toBeGreaterThanOrEqual(3);
+ expect(contrast(dark['--surface-key'],dark['--switch-off-thumb'])).toBeGreaterThanOrEqual(3);
+ expect(contrast('#e1e1e1',themeById('light').vars['--switch-off-outline'])).toBeGreaterThanOrEqual(3);
 });
 it('unknown theme restores light variables without changing geometry',()=>{
  document.documentElement.style.setProperty('--radius-control','17px');
