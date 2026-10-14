@@ -382,17 +382,20 @@ jobs:
         run: |
           node $env:SAYWEAVE_VERIFIER_HELPER check-tool
           if ($LASTEXITCODE -ne 0) { throw 'Preserved verifier differs; no signed package will be built.' }
-      - name: Verify ordinary fixed proxy switches cores in one owned host
+      - name: Record separate installed-input acceptance boundary
         if: inputs.phase != 'resume-package'
         shell: pwsh
         run: |
-          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen') {
-            node $env:SAYWEAVE_RELEASE_HELPER formal-frozen
-          } else {
-            node scripts/test-formal-core-switch.mjs
-          }
-          if ($LASTEXITCODE -ne 0) { throw 'Ordinary proxy same-process input failed; no signed package built.' }
-      - name: Preserve ordinary proxy provenance and same-process evidence
+          New-Item -ItemType Directory -Force -Path .local | Out-Null
+          [ordered]@{
+            productTag = $env:SAYWEAVE_RELEASE_TAG
+            productCommit = $env:SAYWEAVE_RELEASE_COMMIT
+            controllerCommit = $env:SAYWEAVE_CONTROLLER_COMMIT
+            nativeInputTest = 'not-run-by-release-workflow'
+            installedHotUpdate = 'separate-owner-acceptance'
+            packageChecks = 'identity-payload-signature-download-required'
+          } | ConvertTo-Json | Set-Content -LiteralPath .local/release-input-boundary.json -Encoding UTF8
+      - name: Preserve ordinary proxy provenance and input acceptance scope
         if: always() && inputs.phase != 'resume-package'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -400,8 +403,7 @@ jobs:
           retention-days: 14
           path: |
             src-tauri/resources/fixed-proxy/manifest.json
-            .local/formal-core-switch/*.log
-            .local/formal-core-switch/receipt.json
+            .local/release-input-boundary.json
           if-no-files-found: error
       - name: Build signed NSIS package
         id: signed
