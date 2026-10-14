@@ -1620,10 +1620,8 @@ impl Host {
                         return Err(Error::new("compositionPartial"));
                     }
                     Ok(r.block)
-                } else if r.mutation != Mutation::NotAttempted {
-                    Err(Error::new("compositionPartial"))
                 } else {
-                    Err(Error::new(reply_error(&r.code)))
+                    Err(Error::new(update_refusal(&r)))
                 }
             });
         if result.is_ok() {
@@ -1634,7 +1632,11 @@ impl Host {
         } else if result.as_ref().err().is_some_and(|e| {
             !matches!(
                 e.code.as_str(),
-                "staleSnapshot" | "editing" | "inputComposition" | "selectionMapping"
+                "staleSnapshot"
+                    | "editing"
+                    | "inputComposition"
+                    | "selectionMapping"
+                    | "compositionOwnershipLost"
             )
         }) {
             self.failure = result.as_ref().err().map(|e| e.code.clone());
@@ -1826,6 +1828,20 @@ fn discard_optional_reply(abandoned: &mut Vec<(u64, u64)>, operation: u64, revis
 fn completed_prefix(receipt: Option<u64>, revision: u64, stored: &str, requested: &str) -> bool {
     receipt == Some(revision) && stored.is_empty() && requested.is_empty()
 }
+fn update_refusal(reply: &Reply) -> &'static str {
+    // Only an explicit no-write receipt may enter proof-gated recovery. The
+    // same callback/error with changed or unknown effects must never be replayed.
+    if reply.mutation != Mutation::NotAttempted {
+        return "compositionPartial";
+    }
+    if reply.code.starts_with("draftOwnershipTerminated:") {
+        return "compositionOwnershipLost";
+    }
+    match reply_error(&reply.code) {
+        "compositionRejected" => "compositionNotAttempted",
+        known => known,
+    }
+}
 fn reply_error(code: &str) -> &'static str {
     if code.starts_with("edit:selectionMapping:") {
         return "selectionMapping";
@@ -1910,6 +1926,25 @@ fn pump() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ownership_loss_only_recovers_an_explicit_no_write_receipt() {
+        let mut reply: Reply = serde_json::from_value(serde_json::json!({
+            "engine":{"proxy_instance":uuid::Uuid::new_v4().to_string(),"engine_generation":1},
+            "task":uuid::Uuid::new_v4().to_string(),"turn":1,"operation":1,"revision":2,
+            "applied":false,"code":"draftOwnershipTerminated:80070057","mutation":"notAttempted"
+        }))
+        .unwrap();
+        assert_eq!(update_refusal(&reply), "compositionOwnershipLost");
+        for effect in [Mutation::Changed, Mutation::Uncertain] {
+            reply.mutation = effect;
+            assert_eq!(update_refusal(&reply), "compositionPartial");
+        }
+        reply.mutation = Mutation::NotAttempted;
+        reply.code = "edit:updateText:80070057".into();
+        assert_eq!(update_refusal(&reply), "compositionNotAttempted");
+        reply.code = "edit:lease:80070057".into();
+        assert_eq!(update_refusal(&reply), "editing");
+    }
     #[test]
     fn block_refusals_keep_wait_boundary_and_uncertain_effect_separate() {
         let mut reply: Reply = serde_json::from_value(serde_json::json!({

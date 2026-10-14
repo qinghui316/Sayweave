@@ -1,10 +1,4 @@
 :root {
-  --base-white: #ffffff; --base-canvas: #f6f6f6; --base-gray: #cbcbcb; --base-ink: #000000; --base-signal: #75fb91;
-  --surface-content: var(--base-white); --surface-canvas: var(--base-canvas);
-  --surface-sidebar: rgb(203 203 203 / 24%); --surface-key: rgb(203 203 203 / 48%);
-  --surface-work: rgb(203 203 203 / 38%); --surface-hover: rgb(203 203 203 / 18%);
-  --text-primary: var(--base-ink); --text-secondary: rgb(0 0 0 / 64%); --text-inverse: var(--base-canvas);
-  --signal: var(--base-signal); --backdrop: rgb(0 0 0 / 28%);
   --font-body: 'Noto Sans SC', sans-serif; --font-brand: 'Inter', sans-serif;
   --text-home: 32px; --line-home: 44px; --text-page: 24px; --line-page: 32px;
   --text-mode: 16px; --line-mode: 24px; --text-body: 14px; --line-body: 22px;
@@ -19,8 +13,5 @@
   --mode-height: 64px; --mode-icon: 20px; --key-width: 148px; --control-height: 36px;
   --usage-width: 252px; --usage-height: 238px; --usage-back-height: 238px;
   --duration-shape: 280ms; --duration-local: 50ms; --duration-reduced: 120ms; --ease-shape: cubic-bezier(.22,.8,.24,1);
-  --shadow-usage: 0 5px 16px rgb(0 0 0 / 7%); --shadow-panel: 0 16px 48px rgb(0 0 0 / 20%);
-  --shadow-voice: 0 4px 6px rgb(0 0 0 / 18%);
-  --usage-material: linear-gradient(180deg,rgb(255 255 255 / 24%),rgb(255 255 255 / 6%) 55%,rgb(255 255 255 / 0%)), linear-gradient(180deg,rgb(117 251 145 / 26%),rgb(117 251 145 / 40%)), linear-gradient(90deg,rgb(246 246 246 / 82%),rgb(246 246 246 / 82%));
 }
 :root { --duration-select-enter:180ms; --duration-select-exit:120ms; --duration-select-glide:220ms; }

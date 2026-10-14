@@ -908,19 +908,31 @@ pub(super) fn native_done(
                 Err(error)
                     if matches!(
                         error.code.as_str(),
-                        "staleSnapshot" | "editing" | "cancelled"
+                        "staleSnapshot" | "editing" | "cancelled" | "compositionOwnershipLost"
                     ) && r.stopped => {}
                 Err(error)
                     if matches!(
                         error.code.as_str(),
-                        "staleSnapshot" | "editing" | "inputComposition"
+                        "staleSnapshot"
+                            | "editing"
+                            | "inputComposition"
+                            | "compositionOwnershipLost"
                     ) =>
                 {
+                    if error.code == "compositionOwnershipLost" && !r.bound {
+                        // No continuous tracked block was acknowledged. Preserve
+                        // the no-write fact, but do not guess a range to recover.
+                        s.record_failure(&actor.task, error.code);
+                        return None;
+                    }
                     actor.control.hold_input();
                     cancel(actor, s, r);
                     r.handoff();
                     s.handoff = true;
                     s.paused_at = Some(Instant::now());
+                }
+                Err(error) if error.code == "compositionNotAttempted" => {
+                    s.record_failure(&actor.task, error.code);
                 }
                 Err(error) => {
                     r.uncertain = true;
@@ -1165,6 +1177,79 @@ mod tests {
     use super::super::tests::{actor, block_reply, command};
     use super::*;
     use crate::windows_input::composition::Command;
+    #[test]
+    fn ownership_loss_revokes_only_the_lease_and_retains_source_and_deadline() {
+        for bound in [false, true] {
+            let (actor, mut s, _) = actor(None);
+            let mut r = State::new();
+            r.bound = bound;
+            r.block.observe("周三开会".into(), 4).unwrap();
+            s.written_raw = "周三开会".into();
+            r.offset = 2;
+            r.sealed_source = "周三".into();
+            let turn = s.turn;
+            let write = NativeKind::Revisable(Effect::Write {
+                preview: None,
+                revision: 2,
+                text: "周三开会。".into(),
+                raw: "周三开会。".into(),
+            });
+            native_done(
+                &actor,
+                &mut s,
+                &mut r,
+                &write,
+                NativeValue::Replaced(Err(Error::new("compositionOwnershipLost"))),
+            );
+            assert!(!r.uncertain);
+            assert_eq!(s.turn, turn);
+            assert_eq!(r.offset, 2);
+            assert_eq!(r.sealed_source, "周三");
+            assert_eq!(s.written_raw, "周三开会");
+            if bound {
+                assert!(s.stop_error.is_none());
+                assert!(r.read_needed && s.handoff);
+                assert!(!r.permit.load(Ordering::Acquire));
+                let deadline = r.proof_deadline;
+                native_done(
+                    &actor,
+                    &mut s,
+                    &mut r,
+                    &write,
+                    NativeValue::Replaced(Err(Error::new("compositionOwnershipLost"))),
+                );
+                assert_eq!(r.proof_deadline, deadline);
+            } else {
+                assert_eq!(s.stop_error.as_deref(), Some("compositionOwnershipLost"));
+                assert!(!s.handoff);
+            }
+        }
+    }
+    #[test]
+    fn no_write_rejection_and_uncertain_write_have_distinct_terminal_effects() {
+        for (code, uncertain) in [
+            ("compositionNotAttempted", false),
+            ("compositionPartial", true),
+        ] {
+            let (actor, mut s, _) = actor(None);
+            let mut r = State::new();
+            native_done(
+                &actor,
+                &mut s,
+                &mut r,
+                &NativeKind::Revisable(Effect::Write {
+                    preview: None,
+                    revision: 2,
+                    text: "新正文".into(),
+                    raw: "新正文".into(),
+                }),
+                NativeValue::Replaced(Err(Error::new(code))),
+            );
+            assert_eq!(r.uncertain, uncertain);
+            assert_eq!(s.stop_error.as_deref(), Some(code));
+            assert!(!s.handoff);
+        }
+    }
     #[test]
     fn resumed_ime_composition_waits_without_failing_and_can_recover_same_turn() {
         let (actor, mut s, _) = actor(None);

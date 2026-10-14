@@ -27,6 +27,14 @@ it('missing presentation detail cannot invent a recognition failure',()=>{
  render(<VoiceSurface presentation="error" phase="failed" start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
  expect(screen.queryByRole('alert')).not.toBeInTheDocument();
 });
+it('first input failure remains readable when teardown cannot confirm the outcome',()=>{
+ const value={...initialDictation(),source:'external' as const,presentation:'error' as const,error:'compositionNotAttempted',delivery:{state:'unconfirmed' as const,submission:'uncertain' as const,verification:'unavailable' as const,stage:'composition',submittedEvents:0,error:'emptyText',restoreError:true,elapsedMs:1}};
+ const message=dictationFeedback(value,initialSpeech());
+ expect(message).toContain('拒绝了本次更新');
+ render(<VoiceSurface presentation="error" phase="failed" error={message} start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
+ expect(screen.getByRole('alert')).toHaveTextContent('拒绝了本次更新');
+ expect(screen.queryByRole('button',{name:'重新开始录音'})).not.toBeInTheDocument();
+});
 it.each(['compositionDisconnected','compositionRejected'])('an empty recognition result does not mask the real input error %s',code=>{
  const value={...initialDictation(),source:'external' as const,taskId:'current',presentationId:'view',presentation:'error' as const,error:'emptyText',delivery:{state:'unconfirmed' as const,submission:'notSubmitted' as const,verification:'unavailable' as const,stage:'composition',submittedEvents:0,error:code,restoreError:false,elapsedMs:1}};
  expect(dictationFeedback(value,initialSpeech())).not.toBe('未识别到文字。');

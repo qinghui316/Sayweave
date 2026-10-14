@@ -3,9 +3,11 @@ import type {LanguageSettingsPort} from '../contracts/language';
 import {speechError,type SpeechPort} from '../contracts/speech';
 import {inputMessage,type ShortcutConfigPort} from '../contracts/dictation';
 import {speechMessages} from '../locales/speech';
+import type {AppearancePort} from '../contracts/appearance';
 import {SettingStore} from './store';
-export function createSettingsStores(processing:ProcessingPort,language:LanguageSettingsPort,speech:SpeechPort,shortcuts:ShortcutConfigPort){
+export function createSettingsStores(processing:ProcessingPort,language:LanguageSettingsPort,speech:SpeechPort,shortcuts:ShortcutConfigPort,appearance:AppearancePort){
  return {
+  appearance:new SettingStore(()=>appearance.read(),value=>appearance.save(value)),
   polish:new SettingStore(()=>processing.settings(),value=>processing.save(value)),
   automaticTerms:new SettingStore(async()=>(await language.settings()).automaticTerms,async automaticTerms=>(await language.save({automaticTerms})).automaticTerms),
   personalization:new SettingStore(async()=>(await language.settings()).personalization,async personalization=>(await language.save({personalization})).personalization),

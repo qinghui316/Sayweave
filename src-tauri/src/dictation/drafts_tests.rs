@@ -1063,7 +1063,7 @@ fn first_live_failure_survives_secondary_teardown_but_keeps_uncertain_effects() 
     delivery.restore_error = true;
     delivery.error = Some("compositionCleanup".into());
     state.terminal_failure("actor-test", &mut delivery);
-    assert_eq!(delivery.error.as_deref(), Some("compositionCleanup"));
+    assert_eq!(delivery.error.as_deref(), Some("compositionRejected"));
     assert!(delivery.restore_error);
     assert_eq!(delivery.submission, Submission::Uncertain);
     assert_eq!(state.report.error.as_deref(), Some("compositionRejected"));

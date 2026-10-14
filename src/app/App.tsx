@@ -1,3 +1,6 @@
+import {createAppearance} from '../adapters/appearance-tauri';
+import {applyTheme} from '../design/themes';
+import {useSetting} from '../settings/use-setting';
 import {dictationFeedback} from './dictation-feedback';
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore, lazy, Suspense } from 'react';
 import { HashRouter, Link, Route, Routes,useNavigate,useLocation } from 'react-router-dom';
@@ -63,7 +66,11 @@ function RuntimeApp() {
   const [updates] = useState(createUpdatePort);
   const [processing]=useState(()=>createProcessing(models));
   const [language]=useState(createLanguageSettings);
-  const [settings]=useState(()=>createSettingsStores(processing,language,ports.speech,dictationPorts.shortcuts));
+  const [appearance]=useState(createAppearance);
+  const [settings]=useState(()=>createSettingsStores(processing,language,ports.speech,dictationPorts.shortcuts,appearance));
+  const appearanceState=useSetting(settings.appearance);
+  useEffect(()=>{const value=appearanceState.error?settings.appearance.getConfirmed():appearanceState.value;if(value)applyTheme(value.themeId);},[appearanceState,settings]);
+  useEffect(()=>{let disposed=false;let release:(()=>void)|undefined;void appearance.subscribe(value=>{if(!disposed)settings.appearance.accept(value);}).then(unlisten=>{if(disposed)unlisten();else{release=unlisten;void settings.appearance.load();}}).catch(()=>{if(!disposed)void settings.appearance.load();});const refresh=()=>{void settings.appearance.load();};window.addEventListener('focus',refresh);return()=>{disposed=true;release?.();window.removeEventListener('focus',refresh);};},[appearance,settings]);
   const [dataRevision,setDataRevision]=useState(0);
   const dataChanged=useCallback(()=>setDataRevision(value=>value+1),[]);
   useEffect(()=>{if(!processing.onArchived)return;let stopped=false;let release:(()=>void)|undefined;void processing.onArchived(dataChanged).then(value=>{if(stopped)value();else release=value;});return()=>{stopped=true;release?.();};},[processing,dataChanged]);

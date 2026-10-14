@@ -2,6 +2,58 @@
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {writeFileSync} from 'node:fs';
+
+// Existing Win32 fixture exposes its host-owned TSF termination operation.
+// The same production SessionDraft/adapter/local model actor consumes updates.
+export async function runOwnedTermination({focus,start,report,pid}){
+ const executable=process.env.SAYWEAVE_ACTOR_TEST_EXE;
+ if(!executable||!path.isAbsolute(executable))throw Error('Built actor required');
+ const initial=await focus({action:'focus',text:'',start:0,end:0});
+ if(!initial.foreground||initial.foregroundProcess!==pid)throw Error('Owned editor focus required');
+ const actor=start(executable,['--exact','dictation::drafts::tests::owned::richtext_actor','--ignored','--nocapture','--test-threads=1'],{SAYWEAVE_INPUT_ACCEPTANCE:'1',SAYWEAVE_TSF_OWNED_PID:String(pid),SAYWEAVE_DRAFT_STRATEGY:'revisable'});
+ let buffer='',diagnostics='',ended=false;const queue=[],waiting=[];
+ actor.stderr.on('data',data=>diagnostics+=data.toString('utf8'));
+ actor.stdout.on('data',data=>{buffer+=data.toString('utf8');let at;while((at=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,at);buffer=buffer.slice(at+1);const index=line.indexOf('ACTOR_JSON:');if(index<0){diagnostics+=line+'\n';continue;}const value=JSON.parse(line.slice(index+11));if(waiting.length)waiting.shift().resolve(value);else queue.push(value);}});
+ actor.once('exit',code=>{ended=true;for(const item of waiting.splice(0))item.reject(Error('Actor exit '+code+': '+diagnostics));});
+ const receive=()=>queue.length?Promise.resolve(queue.shift()):new Promise((resolve,reject)=>{if(ended){reject(Error(diagnostics));return;}const item={resolve:value=>{clearTimeout(timer);resolve(value);},reject:error=>{clearTimeout(timer);reject(error);}};const timer=setTimeout(()=>{waiting.splice(waiting.indexOf(item),1);reject(Error('Actor timeout: '+diagnostics));},18000);waiting.push(item);});
+ const command=async value=>{actor.stdin.write(JSON.stringify(value)+'\n');return receive();};
+ const trace=[];report.terminationTrace=trace;
+ const expectBody=async(label,text)=>{
+  const deadline=Date.now()+5000;let consecutive=0;
+  while(Date.now()<deadline){
+   const read=await focus({action:'read'});trace.push({label,...read});
+   if(!read.foreground)throw Error('Owned editor focus lost');
+   consecutive=read.text===text?consecutive+1:0;
+   if(consecutive===3)return read;
+   await new Promise(resolve=>setTimeout(resolve,30));
+  }
+  throw Error(label+': actual host body differs, expected '+text);
+ };
+ try{
+  report.actorIdentity=await receive();
+  const source={id:1,revision:1,text:'周三开会',confirmed:false};
+  await command({action:'asr',segments:[source]});await expectBody('first write','周三开会');
+  const deadline=Date.now()+5000;
+  while(!diagnostics.includes('operation=draft_block_bound')){if(Date.now()>deadline)throw Error('Tracking not bound');await new Promise(resolve=>setTimeout(resolve,30));}
+  const terminated=await focus({action:'terminate-composition'});trace.push({label:'host terminate',...terminated});
+  if(!terminated.terminated)throw Error('Host termination failed '+JSON.stringify(terminated));
+  await expectBody('after host events','周三开会');
+  source.revision++;source.text='周三开会，不对，改成下周一上午开会';source.confirmed=true;
+  await command({action:'asr',segments:[source]});
+  await expectBody('reacquired model result','下周一上午开会');
+  if(!/code=draftOwnershipTerminated:[^\n]+mutation=NotAttempted/.test(diagnostics))throw Error('Exact no-write termination receipt not observed');
+  const state=await command({action:'status'});
+  if(state.audioRoute!==1||state.published!=='recording')throw Error('Recording projection did not resume');
+  report.actorDelivery=await command({action:'finish'});
+  if(!report.actorDelivery.finished||report.actorDelivery.error||report.actorDelivery.requests!==1)throw Error('Final settlement differs');
+  await expectBody('after final host events','下周一上午开会');
+  report.terminationRecovered=true;
+ }finally{
+  if(!ended){actor.stdin.end();await new Promise(resolve=>{const timer=setTimeout(resolve,5500);actor.once('exit',()=>{clearTimeout(timer);resolve();});});}
+  report.actorDiagnostics=diagnostics;
+ }
+}
+
 export async function runBlockRegression({page,pid,focus,start,root,folder,report}){
  const baselineMode=process.env.SAYWEAVE_BLOCK_BASELINE??'semantic-control';
  if(!['semantic-control','native-readback'].includes(baselineMode))throw Error('Unknown owned baseline mode');

@@ -51,6 +51,10 @@ try{
  await command('cargo',['build','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance','--bin','input-fixture']);
  helper=start(path.join(root,'src-tauri/target/debug/input-fixture.exe'),['composition'],{SAYWEAVE_INPUT_ACCEPTANCE:'1'});
  const focus=requestFixture(helper);await wait(400);
+ if(process.env.SAYWEAVE_BLOCK_HOST_TERMINATION==='1'){
+  const {runOwnedTermination}=await import('./test-richtext-block.mjs');
+  await runOwnedTermination({focus,start,root,report,pid:helper.pid});
+ }else{
  browser=await chromium.launch({headless:false,...(engine==='edge'?{executablePath:'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'}:{}),args:['--force-renderer-accessibility']});
  report.browserVersion=browser.version();
  if(process.env.SAYWEAVE_PREFIX_TRACE_IME==='1'){
@@ -214,6 +218,7 @@ try{
    report.cases.at(-1).editProtected=interfered&&refused&&actual===protectedText;
    if(!report.cases.at(-1).editProtected)throw Error('Owned external edit was not protected');
   }else if(code!==0||!liveAsr||!firstPrefix||!growingTail||(!abortTail&&!secondPrefix)||actual!==expected||(suffixCase&&!interfered))throw Error('Owned '+control+' actual prefix/tail text assertions failed');
+ }
  }
  }
  report.passed=true;

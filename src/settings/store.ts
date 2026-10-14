@@ -16,6 +16,7 @@ export class SettingStore<T extends {revision:number}> {
  constructor(private read:()=>Promise<T>,private save:(value:T)=>Promise<T>,private saveError:(error:unknown)=>string=()=> '保存失败，请重试。'){}
  subscribe=(listener:()=>void)=>{this.listeners.add(listener);return()=>{this.listeners.delete(listener);};};
  getSnapshot=()=>this.state;
+ getConfirmed=()=>this.confirmed;
  private emit(){
   this.state={value:this.uncertain?{...this.uncertain,...this.pending}:(this.confirmed?{...this.confirmed,...this.flight,...this.pending}:null),ready:!!this.confirmed&&!this.uncertain&&!this.paused,busy:this.running,error:this.error};
   for(const listener of this.listeners)listener();

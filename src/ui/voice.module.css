@@ -1,20 +1,20 @@
-.control { position: relative; display: flex; align-items: center; justify-content: center; gap: var(--space-8); padding: 6px; border-radius: var(--radius-pill); background: var(--text-primary); box-shadow: var(--shadow-voice); flex: none; width: 44px; height: 44px; transition: width var(--duration-shape) var(--ease-shape), height var(--duration-shape) var(--ease-shape); }
+.control { position: relative; display: flex; align-items: center; justify-content: center; gap: var(--space-8); padding: 6px; border-radius: var(--radius-pill); background: var(--voice-bg); box-shadow: var(--shadow-voice); flex: none; width: 44px; height: 44px; transition: width var(--duration-shape) var(--ease-shape), height var(--duration-shape) var(--ease-shape); }
 .control button { display: grid; place-items: center; flex: none; padding: 0; border-radius: 50%; }
-.control button:focus-visible { outline-color: var(--surface-content); }
+.control button:focus-visible { outline-color: var(--voice-fg); }
 .round { width: 32px; height: 32px; background: transparent; }
 .connecting,.processing { width: 84px; height: 40px; }.recording { width: 216px; height: 52px; }.failed { width: 176px; height: 44px; }
-.cancel { width: 36px; height: 36px; background: rgb(246 246 246 / 20%); }.cancelSmall { position: absolute; left: 10px; width: 22px; height: 22px; background: transparent; }
+.cancel { width: 36px; height: 36px; background: var(--voice-muted); }.cancelSmall { position: absolute; left: 10px; width: 22px; height: 22px; background: transparent; }
 .finish { width: 36px; height: 36px; background: var(--signal); }
-.wave { display: flex; align-items: center; justify-content: center; gap: 3px; height: 40px; width: 118px; contain: layout paint; }.wave i { width: 3px; border-radius: var(--radius-pill); background: var(--signal); transform-origin: center; animation: sound 720ms ease-in-out infinite alternate; box-shadow: 0 0 4px rgb(117 251 145 / 12%); }
+.wave { display: flex; align-items: center; justify-content: center; gap: 3px; height: 40px; width: 118px; contain: layout paint; }.wave i { width: 3px; border-radius: var(--radius-pill); background: var(--signal); transform-origin: center; animation: sound 720ms ease-in-out infinite alternate; box-shadow: var(--wave-shadow); }
 .control.recording[data-motion="active"] .wave i { will-change: transform, opacity; }
 .statusGlyph { position: absolute; display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; transition: background var(--duration-reduced), transform var(--duration-shape) var(--ease-shape); }
 .flow { transform: translateX(16px); background: transparent; }
 .done { transform: translateX(0); background: var(--signal); }
-.failure { transform: translateX(-62px); width: 26px; height: 26px; background: var(--surface-canvas); }
-.failureText { color: var(--text-inverse); font-size: var(--text-small); padding-left: 30px; }.retry { width: 26px; height: 26px; background: var(--surface-canvas); }
+.failure { transform: translateX(-62px); width: 26px; height: 26px; background: var(--voice-button); }
+.failureText { color: var(--voice-fg); font-size: var(--text-small); padding-left: 30px; }.retry { width: 26px; height: 26px; background: var(--voice-button); }
 .srOnly { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); }
 .control[data-motion="static"] .wave i { animation: none; }
-.wave[data-live="true"] i { animation:none; transition:none; background:linear-gradient(180deg,#a1ffb4,var(--signal) 55%,#58d875); box-shadow:none; }
+.wave[data-live="true"] i { animation:none; transition:none; background:var(--wave-material); box-shadow:none; }
 .control[data-motion="static"] .wave[data-live="true"] i { transition: none; }
 .control[data-motion="static"],.control[data-motion="static"] .statusGlyph { transition: opacity var(--duration-reduced); }
 @keyframes sound { to { transform: scaleY(.42); opacity: .65; } }
@@ -23,7 +23,7 @@
 .compact.recording { width: 136px; }
 .compact.failed { width: 136px; }
 .compact .round,.compact .cancel,.compact .finish,.compact .cancelSmall,.compact .statusGlyph { width: 26px; height: 26px; }
-.compact .cancelSmall { left: 4px; background: rgb(246 246 246 / 20%); }
+.compact .cancelSmall { left: 4px; background: var(--voice-muted); }
 .compact .flow { transform: translateX(15px); }
 .compact .wave { flex: 1; min-width: 0; max-width: 60px; height: 26px; gap: 2px; }
 .compact .wave i { width: 2px; }
@@ -31,3 +31,6 @@
 .compact .failureText { font-size: 12px; padding-left: 22px; }
 .compact .retry { width: 24px; height: 24px; }
 @media (prefers-reduced-motion: reduce) { .wave i { animation: none; }.control,.statusGlyph { transition: opacity var(--duration-reduced); } }
+
+.control { color:var(--voice-fg); }
+.finish,.done,.failure,.retry { color:var(--voice-button-fg); }

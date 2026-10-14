@@ -7,19 +7,19 @@ button { cursor: pointer; } button:disabled { cursor: not-allowed; }
 a { color: inherit; text-decoration: none; }
 h1,h2,h3,p { margin: 0; } button { border: 0; } img { display: block; }
 :focus-visible { outline: 2px solid var(--text-primary); outline-offset: 4px; }
-::selection { background: var(--signal); color: var(--text-primary); }
+::selection { background: var(--signal); color: var(--selection-fg); }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: 1ms !important; transition-duration: var(--duration-reduced) !important; } }
 
 [data-rubber]{position:relative;isolation:isolate}
-[data-rubber-indicator]{position:absolute;left:0;top:0;background:var(--text-primary);border-radius:var(--radius-control);pointer-events:none;z-index:0;opacity:0}
+[data-rubber-indicator]{position:absolute;left:0;top:0;background:var(--selected-bg);border-radius:var(--radius-control);pointer-events:none;z-index:0;opacity:0}
 [data-rubber]>:not([data-rubber-indicator]){position:relative;z-index:1}
-[data-rubber] [aria-current="page"]{background:transparent!important;color:var(--text-inverse)}
+[data-rubber] [aria-current="page"]{background:transparent!important;color:var(--selected-fg)}
 [data-rubber] [data-choice-face][data-current="true"]{background:transparent}
 [data-rubber] [data-choice-item][data-current="true"] [data-choice-face]{background:transparent}
-*{scrollbar-width:thin;scrollbar-color:rgb(0 0 0 / 9%) transparent}
-*:hover,*:focus-within{scrollbar-color:rgb(0 0 0 / 20%) transparent}
+*{scrollbar-width:thin;scrollbar-color:var(--scroll-thumb) transparent}
+*:hover,*:focus-within{scrollbar-color:var(--scroll-active) transparent}
 ::-webkit-scrollbar{width:6px;height:6px}
 ::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:rgb(0 0 0 / 9%);border-radius:6px}
-:hover::-webkit-scrollbar-thumb,:focus-within::-webkit-scrollbar-thumb{background:rgb(0 0 0 / 20%)}
+::-webkit-scrollbar-thumb{background:var(--scroll-thumb);border-radius:6px}
+:hover::-webkit-scrollbar-thumb,:focus-within::-webkit-scrollbar-thumb{background:var(--scroll-active)}
 @media(forced-colors:active){*{scrollbar-color:auto}[data-rubber-indicator]{background:Highlight}[data-rubber] [aria-current="page"]{color:HighlightText}}

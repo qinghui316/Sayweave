@@ -1,0 +1,14 @@
+.description{font-size:var(--text-meta);line-height:var(--line-meta);color:var(--text-secondary);margin-bottom:20px}
+.options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}
+.option{padding:0;background:transparent;text-align:left;border-radius:12px;color:var(--text-primary)}
+.preview{display:flex;height:148px;overflow:hidden;border-radius:12px;background:var(--surface-canvas);box-shadow:inset 0 0 0 1px var(--surface-key);pointer-events:none}
+.sidebar{width:46px;flex:none;background:var(--surface-sidebar);padding:24px 8px;display:flex;flex-direction:column;gap:9px}
+.sidebar i{height:5px;border-radius:2px;background:var(--text-secondary)}.sidebar i:first-child{background:var(--signal)}
+.page{flex:1;min-width:0;padding:16px 12px;position:relative}.title{display:block;width:34px;height:6px;background:var(--text-primary);border-radius:2px;margin-bottom:12px}
+.row{display:flex;gap:10px}.lines{flex:1;display:flex;flex-direction:column;gap:8px;padding-top:6px}.lines i{height:4px;background:var(--surface-key);border-radius:2px}
+.card{width:68px;height:46px;background:var(--usage-material);border-radius:7px;padding:8px;color:var(--text-primary);font-size:18px;line-height:22px}.card span{font-size:9px;margin-left:4px}
+.panel{display:flex;gap:8px;align-items:center;margin-top:12px;height:25px;background:var(--surface-work);border-radius:5px;padding:8px}.panel i{height:4px;width:25%;background:var(--text-secondary);border-radius:2px}
+.voice{position:absolute;bottom:8px;left:50%;display:flex;align-items:center;justify-content:center;gap:3px;width:48px;height:20px;border-radius:12px;background:var(--voice-bg)}.voice i{width:2px;height:7px;background:var(--signal);border-radius:2px}.voice i:nth-child(2n){height:11px}
+.label{display:flex;justify-content:space-between;align-items:center;padding:12px 0;font-size:var(--text-body)}.check{display:grid;place-items:center;width:20px;height:20px}
+.option[aria-pressed=true] .preview{outline:2px solid var(--text-primary);outline-offset:3px}.option:disabled{cursor:wait}
+@media(max-width:700px){.options{gap:16px}.preview{height:130px}.sidebar{width:32px}.card{width:54px}}

@@ -381,6 +381,30 @@ fn main() {
                     let _ = ok.send(());
                     continue;
                 }
+                if value["action"] == "terminate-composition" {
+                    use windows::{Win32::UI::TextServices::*, core::Interface};
+                    let result = (|| -> windows::core::Result<()> {
+                        if GetForegroundWindow() != top || GetFocus() != editor {
+                            return Err(E_ACCESSDENIED.into());
+                        }
+                        let context = tsf_manager
+                            .as_ref()
+                            .ok_or_else(|| windows::core::Error::from_hresult(E_NOINTERFACE))?
+                            .GetFocus()?
+                            .GetTop()?;
+                        let owner: ITfContextOwnerCompositionServices = context.cast()?;
+                        // The host's real TSF operation, on its own STA/context.
+                        // No application/proxy test hook and no fabricated reply.
+                        owner.TerminateComposition(None)
+                    })();
+                    println!(
+                        "{}",
+                        serde_json::json!({"terminated":result.is_ok(),"error":result.err().map(|e|format!("{:08x}",e.code().0 as u32))})
+                    );
+                    io::stdout().flush().unwrap();
+                    let _ = ok.send(());
+                    continue;
+                }
                 if value["action"] == "inspect-selection" {
                     let process = value["process"]
                         .as_u64()

@@ -1,3 +1,5 @@
 .brand { display:inline-flex; align-items:center; gap:8px; flex:none; max-width:100%; line-height:0; }
 .mark { width:24px; height:24px; flex:none; transform:translateY(-4px); }
 .lettering { display:block; width:112px; height:auto; flex:none; }
+
+.brand img { filter:var(--brand-filter); }

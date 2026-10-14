@@ -50,6 +50,27 @@ pub fn final_presentation(
     error: Option<&str>,
     explicit_end: bool,
 ) -> Presentation {
+    // A live input failure remains visible even if teardown cannot confirm the
+    // delivery. This is feedback only; it never grants another write attempt.
+    let input_failure = |code: &str| {
+        matches!(
+            code,
+            "compositionOwnershipLost"
+                | "compositionNotAttempted"
+                | "compositionRejected"
+                | "compositionPartial"
+                | "compositionProtocol"
+                | "compositionTimeout"
+                | "compositionDisconnected"
+                | "compositionWorker"
+        )
+    };
+    if error != Some("cancelled")
+        && (error.is_some_and(input_failure)
+            || delivery.is_some_and(|d| d.error.as_deref().is_some_and(input_failure)))
+    {
+        return Presentation::Error;
+    }
     // Terminal input/storage facts remain available in their owners. They do
     // not create a blocking external bubble or grant permission to retry input.
     let silent = |code: &str| {
@@ -202,6 +223,28 @@ pub fn final_presentation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn live_input_failure_is_visible_without_changing_uncertain_delivery() {
+        let mut delivery = Delivery::not_submitted("compositionRejected");
+        delivery.submission = Submission::Uncertain;
+        delivery.restore_error = true;
+        assert_eq!(
+            final_presentation(
+                false,
+                "",
+                Some(&delivery),
+                Some("compositionRejected"),
+                false
+            ),
+            Presentation::Error
+        );
+        assert_eq!(delivery.submission, Submission::Uncertain);
+        assert!(delivery.restore_error);
+        assert_eq!(
+            final_presentation(false, "", Some(&delivery), Some("cancelled"), true),
+            Presentation::Idle
+        );
+    }
     #[test]
     fn finish_projection_is_idempotent_and_cannot_reopen_a_released_task() {
         for live in [

@@ -1,3 +1,4 @@
+import {AppearanceSettings} from './AppearanceSettings';
 import { Dialog, Button, Icon, RubberIndicator, useRubberSelection } from '../../ui';
 import { zh } from '../../locales/zh-CN';
 import s from './settings.module.css';
@@ -22,7 +23,7 @@ export function SettingsShell({ open, tab, onTabChange, onOpenChange, modelConte
       <div className={s.content}><header><h2>{headings[tab]}</h2></header>{tab === 'models' && modelContent ? <div className={s.panelSlot}>{modelContent}</div> : <div className={s.scroll} key={tab} tabIndex={0}>
         {tab === 'device' ? <>{speechPort?<DeviceSettings port={speechPort} settings={settings.recording}/>:<section><h3>{t.microphone}</h3><p>{t.microphoneHelp}</p><Button disabled>{t.notConfigured}</Button></section>}{shortcutPort&&<ShortcutSettings port={shortcutPort} settings={settings.shortcuts}/>} {textServicePort&&<TextServiceSettings port={textServicePort}/>}</> :
         tab === 'about' ? <><UpdatePanel port={updatePort} onInstall={onInstallUpdate} preparing={updatePreparing} error={updateError}/><div className={s.aboutRow}><h3>{t.license}</h3><span>Apache-2.0</span></div></> :
-        tab === 'appearance' ? <section aria-label="外观"/> : tab === 'models' && modelContent ? modelContent :
+        tab === 'appearance' ? <AppearanceSettings store={settings.appearance}/> : tab === 'models' && modelContent ? modelContent :
         <section><p>{tab === 'models' ? t.modelsBody : t.appearanceBody}</p><p className={s.notice}>{t.notImplemented}</p></section>}
       </div>}</div>
     </div>

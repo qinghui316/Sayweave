@@ -1,5 +1,6 @@
 #[cfg(feature = "desktop-acceptance")]
 mod acceptance;
+mod appearance;
 mod application_exit;
 mod archive;
 mod build_info;
@@ -596,6 +597,8 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            appearance::appearance_read,
+            appearance::appearance_save,
             update::update_snapshot,
             update::update_check,
             update::update_cancel,
@@ -790,9 +793,15 @@ pub fn run() {
                     eprintln!("SAYWEAVE_LOG stderr_unavailable");
                 }
             }
+            let appearance_service=appearance::AppearanceService::new(&root);
+            let appearance_initial=appearance_service.startup();
+            let appearance_bootstrap=appearance::bootstrap(&appearance_initial);
+            app.manage(appearance_service);
             // Acquire the per-profile lease before creating WebView2 or a second visible window.
             tauri::WebviewWindowBuilder::from_config(app, &app.config().app.windows[0])?
                 .data_directory(root.join("webview2"))
+                .background_color(appearance::background(&appearance_initial.theme_id))
+                .initialization_script(&appearance_bootstrap)
                 .build()?;
             let build = build_info::current();
             log::info!(target: "sayweave", "operation=startup phase=main_window_created pid={} version={} commit={} channel={}", std::process::id(), build.version, build.commit, build.channel);
@@ -821,6 +830,7 @@ pub fn run() {
                 tauri::WebviewUrl::App("index.html?surface=overlay".into()),
             )
             .data_directory(root.join("webview2"))
+            .initialization_script(&appearance_bootstrap)
             .title("Sayweave · 语音控件")
             .inner_size(160.0, 88.0)
             .decorations(false)
