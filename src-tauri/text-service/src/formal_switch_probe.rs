@@ -101,7 +101,7 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
         registration::register_installer_machine(&module, language)
     )?;
     let mut current = None;
-    let result = (|| {
+    let result = (|| -> Outcome<()> {
         if !checked!(
             "enable_runner_profile",
             registration::initialize_installer_user(language, user_before)
