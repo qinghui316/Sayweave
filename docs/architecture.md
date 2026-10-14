@@ -1,8 +1,8 @@
 # 骨架架构与边界
 
-## 候选：整套外观预设与输入拒绝分类
+## 整套外观预设与输入拒绝分类
 
-`sayweave-appearance-input-recovery-v01` 的实现等待开发版验收及 I2，尚未合入。主题目录 `src/design/themes.json` 是显示名称、明暗类型和语义颜色/材质的唯一来源；前端应用器与原生窗口首屏初始化共同读取它。几何、字体、动效仍归 `tokens.css`。外观页只生成目录选项，不持有另一套设置状态。
+`sayweave-appearance-input-recovery-v01` 已合入 `906f60c3`，开发版在同一个 Codex 的正文、波形及外观试用通过。主题目录 `src/design/themes.json` 是显示名称、明暗类型和语义颜色/材质的唯一来源；前端应用器与原生窗口首屏初始化共同读取它。几何、字体、动效仍归 `tokens.css`。外观页只生成目录选项，不持有另一套设置状态。
 
 `AppearancePort` 接入现有 `SettingStore`。主窗口可保存主题 ID 与修订号，语音窗口只读；原生 `AppearanceService` 将选择原子写入当前用户配置目录的 `appearance.json`，再通知两窗口。数据库及输入协议保持不变。未知主题回退浅色，保存错误保留确认过的选择；不确定回执通过现有设置读回处理，不盲目重发。
 
