@@ -36,6 +36,30 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
                 .into(),
         );
     }
+    // Installation and a real application are different processes. Start the
+    // host after registration so its TSF profile cache sees the installed TIP.
+    if args.get(2).map(String::as_str) == Some("host") {
+        let proxy = args.get(3).ok_or("host proxy required")?;
+        let first: CurrentEngine = serde_json::from_str(args.get(4).ok_or("first descriptor")?)?;
+        let second: CurrentEngine = serde_json::from_str(args.get(5).ok_or("second descriptor")?)?;
+        let language = args.get(6).ok_or("host language")?.parse()?;
+        if deployment::current_engine()?.as_ref() != Some(&first)
+            || !first.valid()
+            || !second.valid()
+            || first.proxy_sha256 != second.proxy_sha256
+            || first.core_sha256 == second.core_sha256
+            || registration::owned_module()?.as_deref() != Some(proxy.as_str())
+        {
+            return Err("host descriptor differs".into());
+        }
+        return exercise(
+            Path::new(proxy),
+            &first,
+            &second,
+            &mut Some(first.clone()),
+            language,
+        );
+    }
     checked!("authorize_installer", deployment::authorize_installer())?;
     let lock = Pipe(unsafe { CreateMutexW(None, false, w!("Global\\Sayweave.TSF.Installer.v1"))? });
     if !matches!(
@@ -93,7 +117,32 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
         if same != module {
             return Err("proxy path changed".into());
         }
-        exercise(Path::new(&module), &first, &second, &mut current, language)
+        let output = checked!(
+            "spawn_registered_host",
+            std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "formal-core-switch",
+                    "host",
+                    &module,
+                    &serde_json::to_string(&first)?,
+                    &serde_json::to_string(&second)?,
+                    &language.to_string()
+                ])
+                .output()
+        )?;
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        // A child may fail after publication. Read back only our two exact
+        // descriptors; unknown state cannot be overwritten during cleanup.
+        let observed = deployment::current_engine()?;
+        if observed.as_ref() != Some(&first) && observed.as_ref() != Some(&second) {
+            return Err("registered host descriptor drift".into());
+        }
+        current = observed;
+        if !output.status.success() {
+            return Err(format!("registered host failed: {}", output.status).into());
+        }
+        Ok(())
     })();
     // Compare-and-restore only our descriptor/registration; never overwrite drift.
     let cleanup = registration::restore_installer_user(language, user_before)
