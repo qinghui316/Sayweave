@@ -1,4 +1,7 @@
 .slot { position:relative; display:flex; justify-content:flex-end; align-items:center; flex:none; width:216px; height:36px; }
+.slot[data-anchor=left] { justify-content:flex-start; }
+.slot[data-anchor=left] .box { left:0; right:auto; }
+.slot[data-anchor=left] .box::before { transform-origin:left center; }
 .trigger { border-radius:var(--radius-pill); background:var(--surface-key); }
 .box { position:absolute; right:0; top:0; width:216px; height:36px; border-radius:var(--radius-pill); }
 .box::before { content:''; position:absolute; inset:0; border:1px solid var(--text-primary); border-radius:inherit; background:var(--surface-content); transform-origin:right center; animation:search-expand 180ms ease-out; }

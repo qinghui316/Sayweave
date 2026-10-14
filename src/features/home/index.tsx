@@ -6,8 +6,10 @@ import {speechMessages} from '../../locales/speech';
 import type { Phase } from '../../contracts/runtime';
 import { zh } from '../../locales/zh-CN';
 import s from './home.module.css';
+import {useUsageTilt} from './use-usage-tilt';
 export function Home({ onShortcuts, onModels, phase, start, cancel, finish, motionEnabled = true,speech,level,meterSource,usage,copy,retryCurrent,readyModel,readyDevice,shortcut,startDisabled=false,failure,quietTerminal=false }: { onShortcuts: () => void; onModels: () => void; phase: Phase; start: () => void; cancel: () => void; finish: () => void; motionEnabled?: boolean;speech?:SpeechSnapshot;level?:number;meterSource?:SpeechMeterSource;usage?:Usage|null;copy?:(text:string)=>Promise<void>;simulation?:boolean;retryCurrent?:()=>void;readyModel?:string|null;readyDevice?:string|null;shortcut?:string;startDisabled?:boolean;failure?:string;quietTerminal?:boolean }) {
   const h = zh.home;
+  const {area:tiltAreaRef,card:tiltCardRef}=useUsageTilt(motionEnabled);
   const quiet=quietTerminal||!!speech&&isQuietLiveTerminal(speech);
   if(quiet)phase='idle';
   const active=['connecting','recording','processing'].includes(phase);
@@ -21,7 +23,7 @@ export function Home({ onShortcuts, onModels, phase, start, cancel, finish, moti
         <ModeRow icon="languages" title={h.translation} description={h.translationDescription} planned/>
         <ModeRow icon="square-pen" title={h.edit} description={h.editDescription} planned/>
       </section>
-      <section className={s.usageOffset} aria-labelledby="usage-title"><div className={s.backing}/><div className={s.usage}>
+      <section ref={tiltAreaRef} className={s.usageOffset} aria-labelledby="usage-title"><div className={s.backing}/><div ref={tiltCardRef} className={s.usage}>
         <div className={s.usageHeading}><h2 id="usage-title">{h.usage}</h2><span className={s.badge}><i/>{h.total}</span></div>
         <div className={s.total}><strong>{usage?.characters??'—'}</strong><span>{h.characters}</span></div>
         <div className={s.stats}><div><span>{h.duration}</span><strong>{usage?Math.round(usage.durationMs/6000)/10:'—'} {h.minutes}</strong></div><div><span>{h.inputs}</span><strong>{usage?.count??'—'} {h.times}</strong></div></div>

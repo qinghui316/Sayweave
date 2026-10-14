@@ -334,6 +334,9 @@ jobs:
         if: inputs.phase != 'resume-package'
         shell: pwsh
         run: |
+          $proxy = node --input-type=module -e "import {pinnedProxy} from './scripts/build-text-service.mjs'; console.log(pinnedProxy(process.cwd()).path)"
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned proxy identity failed before component build.' }
+          "SAYWEAVE_TSF_PROXY_PAYLOAD=$proxy" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           cargo metadata --locked --no-deps --manifest-path src-tauri/Cargo.toml > $null
           if ($LASTEXITCODE -ne 0) { throw 'Application lock differs.' }
           $componentFeatures = @()
@@ -372,6 +375,23 @@ jobs:
         run: |
           node $env:SAYWEAVE_VERIFIER_HELPER check-tool
           if ($LASTEXITCODE -ne 0) { throw 'Preserved verifier differs; no signed package will be built.' }
+      - name: Verify ordinary fixed proxy switches cores in one owned host
+        if: inputs.phase != 'resume-package'
+        shell: pwsh
+        run: |
+          node scripts/test-formal-core-switch.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Ordinary proxy same-process input failed; no signed package built.' }
+      - name: Preserve ordinary proxy provenance and same-process evidence
+        if: always() && inputs.phase != 'resume-package'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-components-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
+          retention-days: 14
+          path: |
+            src-tauri/resources/fixed-proxy/manifest.json
+            .local/formal-core-switch/*.log
+            .local/formal-core-switch/receipt.json
+          if-no-files-found: error
       - name: Build signed NSIS package
         id: signed
         if: inputs.phase != 'resume-package'
@@ -394,6 +414,14 @@ jobs:
           name: release-package-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
           retention-days: 14
           path: release/sayweave/*
+          if-no-files-found: error
+      - name: Preserve embedded component identities
+        if: always() && steps.signed.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-payloads-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
+          retention-days: 14
+          path: .local/component-build/payload-receipt.json
           if-no-files-found: error
       - name: Preserve failed bundle diagnostics
         if: always() && steps.signed.outcome == 'failure'

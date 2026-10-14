@@ -153,7 +153,7 @@ impl Control {
         self.receive(task, generation, op, revision)
     }
 }
-fn receive_pipe(
+pub(super) fn receive_pipe(
     pipe: &sayweave_text_service::transport::Pipe,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let at = Instant::now();
@@ -185,7 +185,7 @@ fn receipt_request(
         receipt: Some(key.clone()),
     }
 }
-fn acknowledge_pipe(
+pub(super) fn acknowledge_pipe(
     pipe: &sayweave_text_service::transport::Pipe,
     capability: &str,
     key: &sayweave_text_service::lifecycle::ReceiptKey,

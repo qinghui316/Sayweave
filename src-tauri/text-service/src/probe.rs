@@ -22,6 +22,9 @@ mod block_probe;
 #[path = "core_switch_probe.rs"]
 mod core_switch_probe;
 #[cfg(feature = "acceptance")]
+#[path = "formal_switch_probe.rs"]
+mod formal_switch_probe;
+#[cfg(feature = "acceptance")]
 #[path = "richtext_block_probe.rs"]
 mod richtext_block_probe;
 impl Drop for Apartment {
@@ -43,6 +46,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let _apartment = Apartment;
         let args: Vec<_> = std::env::args().collect();
         match args.get(1).map(String::as_str) {
+            #[cfg(feature = "acceptance")]
+            Some("formal-core-switch") => formal_switch_probe::run(&args)?,
             #[cfg(feature = "acceptance")]
             Some("richtext-block-script") => richtext_block_probe::run(&args)?,
             #[cfg(feature = "acceptance")]

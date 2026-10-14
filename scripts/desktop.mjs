@@ -1,6 +1,6 @@
 import {spawnSync} from 'node:child_process';
 import path from 'node:path';
-import { buildTextService } from './build-text-service.mjs';
+import { buildTextService,verifyComponentEmbeddings } from './build-text-service.mjs';
 import {fileURLToPath} from 'node:url';
 import {readFileSync,writeFileSync,mkdirSync,existsSync} from 'node:fs';
 import {createHash} from 'node:crypto';
@@ -14,6 +14,7 @@ if(process.platform!=='win32')throw new Error('Windows text-service builds requi
 const components=buildTextService(root);
 const env={...process.env,SAYWEAVE_TSF_PAYLOAD:components.core,SAYWEAVE_TSF_PROXY_PAYLOAD:components.proxy};
 let extra=process.argv.slice(3);
+let packagedHelper;
 if(mode==='package'){
  const pinned=JSON.parse(readFileSync(path.join(root,'src-tauri/windows/installer-source.json'),'utf8'));
  const cli=JSON.parse(readFileSync(path.join(root,'node_modules/@tauri-apps/cli/package.json'),'utf8'));
@@ -46,8 +47,10 @@ if(mode==='package'){
  run('cargo',['build','--manifest-path','src-tauri/Cargo.toml','--bin','sayweave-installer-helper',...(debug?[]:['--release']),...(features>=0?['--features',rest[features+1]]:[]),...(target>=0?['--target',rest[target+1]]:[])],helperEnv);
  const output=path.resolve(root,env.CARGO_TARGET_DIR??'src-tauri/target',...(target>=0?[rest[target+1]]:[]),debug?'debug':'release','sayweave-installer-helper.exe');
  const bytes=readFileSync(output),sha=createHash('sha256').update(bytes).digest('hex');
+ console.log(JSON.stringify({componentPayloads:verifyComponentEmbeddings([output],components)}));
  const directory=path.join(root,'.local','installer-helper',sha);mkdirSync(directory,{recursive:true});
  const helper=path.join(directory,'sayweave-installer-helper.exe');
+ packagedHelper=helper;
  if(existsSync(helper)){if(!readFileSync(helper).equals(bytes))throw Error('Installer helper cache identity differs.');}else writeFileSync(helper,bytes,{flag:'wx'});
  const combined={...config,build:{...config.build,beforeBuildCommand:''},bundle:{...config.bundle,resources:{[helper]:'sayweave-installer-helper.exe'}}};
  const configFile=path.join(directory,'package-config.json');writeFileSync(configFile,JSON.stringify(combined));
@@ -55,3 +58,11 @@ if(mode==='package'){
 }
 const tauriMode=mode==='package'?'build':mode;
 run(process.execPath,[path.join(root,'node_modules/@tauri-apps/cli/tauri.js'),tauriMode,...(mode==='build'?['--no-bundle']:mode==='package'?['--bundles','nsis']:[]),...extra],env);
+if(mode!=='dev'){
+ const target=extra.indexOf('--target');
+ const executable=path.resolve(root,env.CARGO_TARGET_DIR??'src-tauri/target',...(target>=0?[extra[target+1]]:[]),extra.includes('--debug')?'debug':'release','sayweave.exe');
+ const receipt=verifyComponentEmbeddings([executable,...(packagedHelper?[packagedHelper]:[])],components);
+ console.log(JSON.stringify({componentPayloads:receipt}));
+ mkdirSync(path.join(root,'.local/component-build'),{recursive:true});
+ writeFileSync(path.join(root,'.local/component-build/payload-receipt.json'),JSON.stringify(receipt,null,2)+'\n');
+}

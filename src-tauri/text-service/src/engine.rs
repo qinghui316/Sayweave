@@ -33,7 +33,13 @@ fn status_of(engine: &Engine) -> EngineStatusV1 {
         abi: ENGINE_ABI,
         input_protocol: PROTOCOL,
         generation: engine.generation,
-        build_id: env!("SAYWEAVE_ENGINE_BUILD_ID").parse().unwrap_or(0),
+        build_id: match env!("SAYWEAVE_ENGINE_BUILD_ID").parse().unwrap_or(0) {
+            0 => include_str!("../core-build-id.txt")
+                .trim()
+                .parse()
+                .expect("valid source-owned core build identity"),
+            explicit => explicit,
+        },
         module_base: engine.identity.0,
         module_sha256: engine.identity.1,
         active: u32::from(s.active),

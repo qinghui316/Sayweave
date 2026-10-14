@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "abi": 1,
+  "platform": "windows-x86_64-msvc",
+  "file": "abi1.dll",
+  "size": 498176,
+  "sha256": "f00e8d8a4ac7e3e03855670bf145eb73757636da365abf283e01b3dec72b234f",
+  "origin": {
+    "repository": "qinghui316/Sayweave",
+    "tag": "v0.1.12",
+    "commit": "e124efd1d4f2ad50a87b045a335a08015516a4a2",
+    "installer": "Sayweave_0.1.12_x64-setup.exe",
+    "installerSha256": "a5040e0e498dce3ab342ca55fb19f15d0d1f6d94d2f247565c6a45b4591c98f1",
+    "mainSha256": "ae44f59aa6ff7fa7c863a3b50c0264262969b98b4dd3bb9aed45846ac1b3886d",
+    "helperSha256": "2867a3f09cc7b2a754169e6628fe8c771fc8441d9d6b29755e4b4be0e87a9843",
+    "mainOffset": 20685176,
+    "helperOffset": 3837272,
+    "signature": "full native minisign and signed version",
+    "core": {
+      "sha256": "660f1c91e5fc074c207d7696965f78960edbd16bc865b15105ffdcb91219ad18",
+      "size": 989696,
+      "mainOffset": 21183365,
+      "helperOffset": 2847576
+    }
+  },
+  "source": {
+    "files": {
+      "Cargo.toml": "88ee6ab69adf43f1cf5847ebb6cabefcd4fa9e74456f46433531d9cb0b9cc91d",
+      "Cargo.lock": "6d6df1ac62a8848d4a650ea2bd6f692823493ad3fb5e846f3f6f3a971fc8aca5",
+      "build.rs": "b1dcbe83ce5346b7de1811f50b29a8111ae4d96ffff4024619de5a763778231c",
+      "service.def": "5d9e24ff60eded0d6abebdd19979194b956e69b92ebaba7b4855e0ea28b29eea",
+      "src/lib.rs": "13a4b12bfd1665ce0b6c14e6165dfe0e57b74e60a561805ad33be03867b40ce9",
+      "src/proxy.rs": "c579a8cf1a5390be60e76244de8161550631219e506920695b00945c98a74c51",
+      "src/proxy_transport.rs": "4dd9a6bde722b22546c85f0a7a4696a101add24a95be17a9a45e5cc4585f9d09",
+      "src/engine_abi.rs": "6ce3bb8d91bdcb267ca5c133d3bf6efdfd497cd7a75b05cfe36e19c617d6a864",
+      "src/lifecycle.rs": "ab47af57f5f0cd49522b7bab8d02a4923c71d02daedfdb8ae034b7f24a436a45",
+      "src/routing.rs": "76875782d2740149d9a239158142b4da57183bce2503be9a37808a89a15ee6c7",
+      "src/transport.rs": "532019904a0a8dc6016b2291d25103a04c614aa50ce82b4a7b7e4bf0f4d56f8c",
+      "src/registration.rs": "fdbcaa6bb23cbb831a69b9a863a082b255ad3d08f15b937230dd9b067b20a15d",
+      "src/host_identity.rs": "83c18deb3d137dc81ae7faa6883a23f90132deaab32941236d847c932593e8ad",
+      "src/deployment.rs": "c77d2f1ee00a78b7cef8e7fd1ebc3d01a2cd82681d36ad633315c73aafeab401",
+      "src/deployment/retired.rs": "a5a129798bc5bb2fb6bd98a884f014c6716b0f0e9584e025e39874e7f30b30b3",
+      "src/atomic_record.rs": "cdb64ff614010e1030ccdd6da3e0bd539cba686d9995a83f55c1dfff9e322ab4",
+      "src/client.rs": "4621f1711329f09ced356cdfa9696c0163d556e2979cbb4f32aace2f680bcbec",
+      "src/wire.rs": "3776f983fd3f3963abe614c12740fa5bf7fc1ca0e2e2309e7192dfcb3000f5f5",
+      "src/settlement_boundary.rs": "8ee6eb899c6f5719be569d7a761c7a6ee8be045f0f636726e0d7fd3e809fd1e8"
+    },
+    "toolchain": "4b0ac54a0484a3ad646a214e37b29e654f351353412dc2594ba5bd3c28d83c24"
+  }
+}

@@ -1,9 +1,48 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const sha = bytes => createHash('sha256').update(bytes).digest('hex');
+// Full ordinary proxy module closure, checked against rustc dep-info. Changes to
+// lib.rs or any parent module invalidate the pin before new children exist.
+export const proxySourceFiles = [
+  'Cargo.toml','Cargo.lock','build.rs','service.def',
+  'src/lib.rs','src/proxy.rs','src/proxy_transport.rs','src/engine_abi.rs','src/lifecycle.rs',
+  'src/routing.rs','src/transport.rs','src/registration.rs','src/host_identity.rs',
+  'src/deployment.rs','src/deployment/retired.rs','src/atomic_record.rs',
+  'src/client.rs','src/wire.rs','src/settlement_boundary.rs',
+];
+export function proxySourceIdentity(root) {
+  const base=path.join(root,'src-tauri/text-service');
+  const files=Object.fromEntries(proxySourceFiles.map(file=>[file,sha(readFileSync(path.join(base,file),'utf8').replaceAll('\r\n','\n'))]));
+  return {files,toolchain:sha(readFileSync(path.join(root,'rust-toolchain.toml'),'utf8').replaceAll('\r\n','\n'))};
+}
+export function pinnedProxy(root, supplied) {
+  const directory=path.join(root,'src-tauri/resources/fixed-proxy');
+  const file=path.join(directory,'abi1.dll'),manifestFile=path.join(directory,'manifest.json');
+  for(const item of [directory,file,manifestFile])if(lstatSync(item).isSymbolicLink())throw Error('Pinned proxy must not be a link');
+  const manifest=JSON.parse(readFileSync(manifestFile,'utf8')),bytes=readFileSync(file),origin=manifest.origin;
+  if(manifest.schemaVersion!==1||manifest.abi!==1||manifest.platform!=='windows-x86_64-msvc'||manifest.file!=='abi1.dll'
+    ||manifest.size!==bytes.length||manifest.sha256!==validateComponent(bytes,'proxy')
+    ||!/^v\d+\.\d+\.\d+$/.test(origin?.tag??'')||! /^[a-f0-9]{40}$/.test(origin?.commit??'')
+    ||! /^[a-f0-9]{64}$/.test(origin?.installerSha256??'')||! /^[a-f0-9]{64}$/.test(origin?.mainSha256??'')
+    ||! /^[a-f0-9]{64}$/.test(origin?.helperSha256??'')||origin?.repository!=='qinghui316/Sayweave'
+    ||origin?.installer!==`Sayweave_${origin.tag.slice(1)}_x64-setup.exe`)
+    throw Error('Pinned proxy bytes or authenticated origin differ');
+  if(JSON.stringify(manifest.source)!==JSON.stringify(proxySourceIdentity(root)))throw Error('Proxy source contract changed; explicit reviewed proxy upgrade required');
+  if(supplied&&!readFileSync(supplied).equals(bytes))throw Error('Supplied proxy differs from pinned formal proxy');
+  return {path:file,manifest};
+}
+export function verifyComponentEmbeddings(executables, components) {
+  const proxy=readFileSync(components.proxy),core=readFileSync(components.core);
+  validateComponent(proxy,'proxy');validateComponent(core,'core');
+  for(const file of executables){
+    const bytes=readFileSync(file);
+    if(!bytes.subarray(0,2).equals(Buffer.from('MZ'))||!bytes.includes(proxy)||!bytes.includes(core))throw Error(`Executable component payload differs: ${path.basename(file)}`);
+  }
+  return {proxySha256:sha(proxy),coreSha256:sha(core),executables:executables.map(file=>({name:path.basename(file),sha256:sha(readFileSync(file))}))};
+}
 export function dllExports(bytes) {
   const within = (offset, size) => { if (!Number.isInteger(offset) || offset < 0 || offset + size > bytes.length) throw Error('Invalid component PE bounds'); return offset; };
   if (bytes.length < 256 || bytes.length > 32 * 1024 * 1024 || bytes.toString('ascii', 0, 2) !== 'MZ') throw Error('Invalid component PE');
@@ -46,10 +85,7 @@ function sources(directory) {
 }
 export function componentSourceKey(root, role, env, toolchain) {
   const base = path.join(root, 'src-tauri/text-service');
-  const files = role === 'core' ? sources(path.join(base, 'src')).filter(file => !['probe.rs','core_switch_probe.rs','proxy.rs','proxy_transport.rs'].includes(path.basename(file))) : [
-    'src/lib.rs', 'src/proxy.rs', 'src/proxy_transport.rs', 'src/engine_abi.rs', 'src/lifecycle.rs',
-    'src/routing.rs', 'src/transport.rs', 'src/registration.rs', 'src/host_identity.rs', 'src/deployment.rs', 'src/deployment/retired.rs', 'src/atomic_record.rs',
-  ].map(file => path.join(base, file));
+  const files = role === 'core' ? sources(path.join(base, 'src')).filter(file => !['probe.rs','core_switch_probe.rs','proxy.rs','proxy_transport.rs'].includes(path.basename(file))) : proxySourceFiles.filter(file=>file.startsWith('src/')).map(file => path.join(base, file));
   const rawManifest = readFileSync(path.join(base, 'Cargo.toml'), 'utf8');
   const manifest = role === 'proxy' ? rawManifest.replace(/^version\s*=.*$/m, 'version = "proxy-independent"') : rawManifest;
   const inputs = { role, abi: 1, profile: 'release', platform: process.platform, architecture: process.arch, toolchain,
@@ -57,12 +93,14 @@ export function componentSourceKey(root, role, env, toolchain) {
     manifest, lock: sha(readFileSync(path.join(base, 'Cargo.lock'))), build: sha(readFileSync(path.join(base, 'build.rs'))),
     exports: sha(readFileSync(path.join(base, 'service.def'))),
     sources: files.map(file => [path.relative(base, file), sha(readFileSync(file))]),
-    ...(role === 'core' ? { buildId: env.SAYWEAVE_ENGINE_BUILD_ID ?? '0' } : {}),
+    ...(role === 'core' ? { buildId: env.SAYWEAVE_ENGINE_BUILD_ID ?? '0',defaultBuildId:readFileSync(path.join(base,'core-build-id.txt'),'utf8').trim() } : {}),
   };
   return sha(JSON.stringify(inputs));
 }
 export function buildTextService(root, env = process.env) {
   if (process.platform !== 'win32' || process.arch !== 'x64') throw Error('TSF currently requires Windows x64');
+  // A cold cache must never turn an ordinary update into a proxy replacement.
+  const proxy=pinnedProxy(root,env.SAYWEAVE_TSF_PROXY_PAYLOAD).path;
   const compiler = spawnSync('rustc', ['-vV'], { cwd: root, env, encoding: 'utf8', windowsHide: true });
   if (compiler.status !== 0) throw Error('Cannot verify component compiler');
   const cache = path.join(root, '.local/text-service-build'); mkdirSync(cache, { recursive: true });
@@ -87,7 +125,7 @@ export function buildTextService(root, env = process.env) {
       sourceCommit: supplied ? null : spawnSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8', windowsHide: true }).stdout.trim(), supplied: Boolean(supplied), sourceTreeDirty: supplied ? null : Boolean(spawnSync('git', ['status','--porcelain','--untracked-files=normal'], {cwd:root,encoding:'utf8',windowsHide:true}).stdout.trim()) }, null, 2));
     return immutable;
   }
-  // Snapshot a supplied core before a proxy build replaces Cargo's public output filename.
-  const core = build('core', env.SAYWEAVE_TSF_PAYLOAD), proxy = build('proxy', env.SAYWEAVE_TSF_PROXY_PAYLOAD);
+  const core = build('core', env.SAYWEAVE_TSF_PAYLOAD);
+  console.log(`Using pinned formal proxy ${sha(readFileSync(proxy))}`);
   return { core, proxy };
 }
