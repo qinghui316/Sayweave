@@ -36,30 +36,6 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
                 .into(),
         );
     }
-    // Installation and a real application are different processes. Start the
-    // host after registration so its TSF profile cache sees the installed TIP.
-    if args.get(2).map(String::as_str) == Some("host") {
-        let proxy = args.get(3).ok_or("host proxy required")?;
-        let first: CurrentEngine = serde_json::from_str(args.get(4).ok_or("first descriptor")?)?;
-        let second: CurrentEngine = serde_json::from_str(args.get(5).ok_or("second descriptor")?)?;
-        let language = args.get(6).ok_or("host language")?.parse()?;
-        if deployment::current_engine()?.as_ref() != Some(&first)
-            || !first.valid()
-            || !second.valid()
-            || first.proxy_sha256 != second.proxy_sha256
-            || first.core_sha256 == second.core_sha256
-            || registration::owned_module()?.as_deref() != Some(proxy.as_str())
-        {
-            return Err("host descriptor differs".into());
-        }
-        return exercise(
-            Path::new(proxy),
-            &first,
-            &second,
-            &mut Some(first.clone()),
-            language,
-        );
-    }
     checked!("authorize_installer", deployment::authorize_installer())?;
     let lock = Pipe(unsafe { CreateMutexW(None, false, w!("Global\\Sayweave.TSF.Installer.v1"))? });
     if !matches!(
@@ -101,7 +77,7 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
         registration::register_installer_machine(&module, language)
     )?;
     let mut current = None;
-    let result = (|| -> Outcome<()> {
+    let result = (|| {
         if !checked!(
             "enable_runner_profile",
             registration::initialize_installer_user(language, user_before)
@@ -117,32 +93,7 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
         if same != module {
             return Err("proxy path changed".into());
         }
-        let output = checked!(
-            "spawn_registered_host",
-            std::process::Command::new(std::env::current_exe()?)
-                .args([
-                    "formal-core-switch",
-                    "host",
-                    &module,
-                    &serde_json::to_string(&first)?,
-                    &serde_json::to_string(&second)?,
-                    &language.to_string()
-                ])
-                .output()
-        )?;
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
-        // A child may fail after publication. Read back only our two exact
-        // descriptors; unknown state cannot be overwritten during cleanup.
-        let observed = deployment::current_engine()?;
-        if observed.as_ref() != Some(&first) && observed.as_ref() != Some(&second) {
-            return Err("registered host descriptor drift".into());
-        }
-        current = observed;
-        if !output.status.success() {
-            return Err(format!("registered host failed: {}", output.status).into());
-        }
-        Ok(())
+        exercise(Path::new(&module), &first, &second, &mut current, language)
     })();
     // Compare-and-restore only our descriptor/registration; never overwrite drift.
     let cleanup = registration::restore_installer_user(language, user_before)
@@ -151,8 +102,9 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
     if let Err(error) = cleanup {
         return Err(format!("cleanup failed: {error}; exercise={result:?}").into());
     }
-    println!("formal_core_switch cleanup_complete=true");
+    println!("formal_core_switch machine_restore_confirmed=true");
     result?;
+    println!("formal_core_switch cleanup_complete=true");
     Ok(())
 }
 
@@ -243,8 +195,15 @@ fn exercise(
             GetForegroundWindow() == top
         );
         drop(class_result);
+        let capability = uuid::Uuid::new_v4().to_string();
+        let _host = checked!(
+            "host_capability",
+            registration::host_capability(std::process::id(), &capability)
+        )?;
         let result = (|| -> Outcome<()> {
-            let activated = checked!("activate_process_tip", registration::activate(false))?;
+            // Match ProfileLease's production activation scope. This fresh CI
+            // session has no user installation or other Sayweave host.
+            let activated = checked!("activate_session_tip", registration::activate(true))?;
             if activated != language
                 || !checked!(
                     "verify_active_tip",
@@ -255,15 +214,10 @@ fn exercise(
                 return Err("owned process TIP activation identity differs".into());
             }
             pump(Duration::from_millis(150));
-            println!("formal_core_switch activation=tsf_process_owned");
+            println!("formal_core_switch activation=tsf_session_owned");
             if GetForegroundWindow() != top {
                 return Err("owned editor must remain foreground".into());
             }
-            let capability = uuid::Uuid::new_v4().to_string();
-            let _host = checked!(
-                "host_capability",
-                registration::host_capability(std::process::id(), &capability)
-            )?;
             let pipe = checked!(
                 "connect_pipe",
                 Pipe::client(std::process::id(), GetCurrentThreadId())
@@ -358,7 +312,11 @@ fn exercise(
             );
             Ok(())
         })();
-        let stopped = registration::deactivate(language, false);
+        let stopped = match sayweave_text_service::client::own_profile_active(language) {
+            Ok(true) => registration::deactivate(language, true),
+            Ok(false) => Ok(()),
+            Err(error) => Err(error),
+        };
         let deactivated = manager.Deactivate();
         let destroyed = DestroyWindow(top);
         pump(Duration::from_millis(100));
@@ -369,13 +327,10 @@ fn exercise(
         if unloaded {
             FreeLibrary(module)?;
         }
-        result?;
-        stopped?;
-        deactivated?;
-        destroyed?;
-        if !unloaded {
-            return Err("proxy resources remain".into());
+        if stopped.is_err() || deactivated.is_err() || destroyed.is_err() || !unloaded {
+            return Err(format!("host cleanup failed: tip={stopped:?}, manager={deactivated:?}, window={destroyed:?}, unloaded={unloaded}; exercise={result:?}").into());
         }
-        Ok(())
+        println!("formal_core_switch host_restore_confirmed=true");
+        result
     }
 }
