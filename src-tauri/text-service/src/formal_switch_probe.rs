@@ -13,6 +13,12 @@ use windows::{
 };
 
 type Outcome<T> = Result<T, Box<dyn std::error::Error>>;
+macro_rules! checked {
+    ($stage:literal, $operation:expr) => {{
+        println!("formal_core_switch stage={}", $stage);
+        $operation.map_err(|error| format!("{}: {error}", $stage))
+    }};
+}
 struct MachineLock(Pipe);
 impl Drop for MachineLock {
     fn drop(&mut self) {
@@ -30,7 +36,7 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
                 .into(),
         );
     }
-    deployment::authorize_installer()?;
+    checked!("authorize_installer", deployment::authorize_installer())?;
     let lock = Pipe(unsafe { CreateMutexW(None, false, w!("Global\\Sayweave.TSF.Installer.v1"))? });
     if !matches!(
         unsafe { WaitForSingleObject(lock.0, 0) },
@@ -54,22 +60,36 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
     if deployment::version(&old) == deployment::version(&new) {
         return Err("core must really change".into());
     }
-    let (module, first) = deployment::prepare_engine(&proxy, &old)?;
+    let (module, first) = checked!("stage_old_core", deployment::prepare_engine(&proxy, &old))?;
     // Existing registration is rejected by register_installer_machine as well.
-    let language = unsafe { registration::profiles()?.GetCurrentLanguage()? };
+    let language = unsafe {
+        checked!(
+            "current_language",
+            registration::profiles()?.GetCurrentLanguage()
+        )?
+    };
     let user_before = registration::installer_user_choice(language)?;
     if user_before.is_some() {
         return Err("fresh runner user profile required".into());
     }
-    registration::register_installer_machine(&module, language)?;
+    checked!(
+        "register_machine",
+        registration::register_installer_machine(&module, language)
+    )?;
     let mut current = None;
     let result = (|| {
-        if !registration::initialize_installer_user(language, user_before)? {
+        if !checked!(
+            "enable_runner_profile",
+            registration::initialize_installer_user(language, user_before)
+        )? {
             return Err("owned runner profile not enabled".into());
         }
-        deployment::publish_engine(None, Some(&first))?;
+        checked!(
+            "publish_old_core",
+            deployment::publish_engine(None, Some(&first))
+        )?;
         current = Some(first.clone());
-        let (same, second) = deployment::prepare_engine(&proxy, &new)?;
+        let (same, second) = checked!("stage_new_core", deployment::prepare_engine(&proxy, &new))?;
         if same != module {
             return Err("proxy path changed".into());
         }
@@ -115,49 +135,60 @@ fn exercise(
     language: u16,
 ) -> Outcome<()> {
     unsafe {
-        let top = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("STATIC"),
-            w!("Sayweave formal core switch"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            50,
-            50,
-            520,
-            240,
-            None,
-            None,
-            None,
-            None,
+        let top = checked!(
+            "create_window",
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Sayweave formal core switch"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                50,
+                50,
+                520,
+                240,
+                None,
+                None,
+                None,
+                None,
+            )
         )?;
-        let editor = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("EDIT"),
-            w!(""),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_MULTILINE as u32),
-            10,
-            10,
-            480,
-            170,
-            Some(top),
-            None,
-            None,
-            None,
+        let editor = checked!(
+            "create_editor",
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("EDIT"),
+                w!(""),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_MULTILINE as u32),
+                10,
+                10,
+                480,
+                170,
+                Some(top),
+                None,
+                None,
+                None,
+            )
         )?;
-        let manager: ITfThreadMgr =
-            CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
-        manager.Activate()?;
+        let manager: ITfThreadMgr = checked!(
+            "create_thread_manager",
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)
+        )?;
+        checked!("activate_thread_manager", manager.Activate())?;
         let _ = SetForegroundWindow(top);
         let _ = SetFocus(Some(editor));
         pump(Duration::from_millis(150));
         // TSF must create/activate the registered TIP and supply its client ID.
         // A manually created service's GetClientId is not TIP activation.
-        let module = load_fixture_module(proxy)?;
-        let keyboard_before = keyboard()?;
+        let module = checked!("load_proxy", load_fixture_module(proxy))?;
+        let keyboard_before = checked!("keyboard_before", keyboard())?;
         let result = (|| -> Outcome<()> {
-            let activated = registration::activate(false)?;
+            let activated = checked!("activate_process_tip", registration::activate(false))?;
             if activated != language
-                || !sayweave_text_service::client::own_profile_active(language)?
-                || keyboard()? != keyboard_before
+                || !checked!(
+                    "verify_active_tip",
+                    sayweave_text_service::client::own_profile_active(language)
+                )?
+                || checked!("keyboard_after", keyboard())? != keyboard_before
             {
                 return Err("owned process TIP activation identity differs".into());
             }
@@ -167,8 +198,14 @@ fn exercise(
                 return Err("owned editor must remain foreground".into());
             }
             let capability = uuid::Uuid::new_v4().to_string();
-            let _host = registration::host_capability(std::process::id(), &capability)?;
-            let pipe = Pipe::client(std::process::id(), GetCurrentThreadId())?;
+            let _host = checked!(
+                "host_capability",
+                registration::host_capability(std::process::id(), &capability)
+            )?;
+            let pipe = checked!(
+                "connect_pipe",
+                Pipe::client(std::process::id(), GetCurrentThreadId())
+            )?;
             let mut records = Vec::new();
             let mut previous: Option<Runtime> = None;
             let mut expected = String::new();
