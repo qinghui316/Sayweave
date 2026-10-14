@@ -4,6 +4,10 @@
 
 安装环境见 [开发说明](development.md)。测试在项目根目录执行，不依赖个人启动器或私有工具安装脚本。
 
+编辑恢复回归复用 `scripts/test-prefix-input.mjs` 的 `SAYWEAVE_BLOCK_REGRESSION=1`、`SAYWEAVE_BLOCK_ACTOR_ONLY=1` 生产链路及当前已构建的 `SAYWEAVE_ACTOR_TEST_EXE`。`SAYWEAVE_BLOCK_BACKSPACE=1` 直接在活动组合中删除，不先用方向键结束组合；可叠加 `SAYWEAVE_BLOCK_EARLY_EDIT=1` 覆盖客户端尚未处理跟踪回执的时序。`SAYWEAVE_BLOCK_PRESENTATION=1` 检查音频路由与已发布录音状态，`SAYWEAVE_BLOCK_USER_NEWLINE=1` 保留编辑器支持的段落换行，`SAYWEAVE_BLOCK_SENTINELS=1` 核对块外正文。三次编辑均检查宿主事件处理后的实际正文。普通 paragraph 中用 `insertText` 塞入裸 LF 会被该夹具自身解析为空格，不能用它冒充段落换行；原失败和不经 TSF 的对照证据仍保留。
+
+同一识别连接的 PCM 暂停／恢复由 `retained_edit_resume_sends_pcm_on_the_same_connection_without_ready_event` 验证；界面真实电平订阅由 `tests/voice-edit-resume.test.tsx` 验证。受控音频、宿主正文、用户实际 Codex 试用分别记录，原生 `submitted/unconfirmed` 不升级为 `confirmed`。本次 f2ab7319 候选的同一 Codex 三步文字与波形验收已通过，不能扩展成所有宿主和时序的保证。
+
 ## 常规检查
 
 已通过的验证在源码、构建身份与覆盖范围未变化时直接复用，保留原提交与记录；新改动只补受影响的检查。本地 I2 合入使用已有验证和精确候选审查，不等待远程 CI。CI 在 PR 或手动触发，普通主线直推不重复检查；实际安装与升级验收仅在相关改动或发版时执行。
