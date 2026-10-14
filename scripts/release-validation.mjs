@@ -43,7 +43,25 @@ export function releaseNotes(value){
 }
 
 export const frozenTestPaths=['tests/e2e/models.spec.ts','tests/e2e/ui-interaction.spec.ts'];
-export const frozenCheckPaths=['scripts/test-richtext-block.mjs'];
+const receiptTestPath='src-tauri/src/installer/record.rs';
+export const frozenCheckPaths=['scripts/test-richtext-block.mjs',receiptTestPath];
+// A native test lives beside production Rust. Only its final cfg(test) module may
+// differ; compare the exact preceding bytes before any overlay or artifact trust.
+export function validateNativeTestOverride(original,reviewed){
+ const marker=Buffer.from('\n#[cfg(test)]\nmod tests {');
+ const prefix=bytes=>{
+  new TextDecoder('utf-8',{fatal:true}).decode(bytes);
+  const start=bytes.indexOf(marker);
+  if(start<0||bytes.indexOf(marker,start+1)!==-1)throw Error('Native test boundary is not unique');
+  return bytes.subarray(0,start);
+ };
+ if(!prefix(original).equals(prefix(reviewed)))throw Error('Frozen native production source differs');
+}
+function verifyNativeTestDelta(root,product,controller,paths){
+ if(paths.includes(receiptTestPath))validateNativeTestOverride(
+  execFileSync('git',['show',`${product}:${receiptTestPath}`],{cwd:root}),
+  execFileSync('git',['show',`${controller}:${receiptTestPath}`],{cwd:root}));
+}
 const controllerPaths=new Set([...frozenTestPaths,...frozenCheckPaths,'.github/workflows/windows-release.yml','scripts/release-validation.mjs','scripts/verify-update-release.mjs','tests/release-validation.test.ts','docs/release.md']);
 export function validateFrozenController(tag,product,controller,ref,paths){
  if(!/^v\d+\.\d+\.\d+$/.test(tag)||! /^[a-f0-9]{40}$/.test(product)||! /^[a-f0-9]{40}$/.test(controller)||product===controller)throw Error('Exact distinct frozen product/controller identities required');
@@ -57,6 +75,7 @@ export async function runFrozenReleaseTests(root=process.cwd(),env=process.env,r
  const git=(args,encoding='utf8')=>execFileSync('git',args,{cwd:root,encoding});
  const paths=git(['diff','--name-only',product,controller]).trim().split(/\r?\n/).filter(Boolean);
  validateFrozenController(tag,product,controller,ref,paths);
+ verifyNativeTestDelta(root,product,controller,paths);
  if(git(['rev-parse',`${ref}^{commit}`]).trim()!==controller)throw Error('Controller tag identity differs');
  for(const commit of [product,controller])git(['merge-base','--is-ancestor',commit,'origin/main']);
  git(['merge-base','--is-ancestor',product,controller]);
@@ -98,6 +117,7 @@ export function verifyReusedChecks(root=process.cwd(),env=process.env){
  validateVerificationRun(identity,run,jobs,id);
  for(const [commit,ref] of [[run.head_sha,`refs/tags/${run.head_branch}`],[env.SAYWEAVE_CONTROLLER_COMMIT,env.SAYWEAVE_CONTROLLER_REF]]){
   validateFrozenController(identity.tag,identity.commit,commit,ref,git(['diff','--name-only',identity.commit,commit]).trim().split(/\r?\n/).filter(Boolean));
+  verifyNativeTestDelta(root,identity.commit,commit,git(['diff','--name-only',identity.commit,commit]).trim().split(/\r?\n/).filter(Boolean));
   if(git(['rev-parse',`${ref}^{commit}`]).trim()!==commit)throw Error('Verification controller tag differs');
   git(['merge-base','--is-ancestor',commit,'origin/main']);git(['merge-base','--is-ancestor',identity.commit,commit]);
  }
@@ -158,7 +178,11 @@ export function trustedProducer(identity,root,env=process.env){
  if(current&&producer.controllerCommit!==env.SAYWEAVE_CONTROLLER_COMMIT)throw Error('Current workflow source differs');
  if(git(['rev-parse',`${producer.ref}^{commit}`])!==producer.controllerCommit)throw Error('Producer controller tag differs');
  git(['merge-base','--is-ancestor',producer.controllerCommit,'origin/main']);
- if(producer.controllerCommit!==identity.commit)validateFrozenController(identity.tag,identity.commit,producer.controllerCommit,producer.ref,git(['diff','--name-only',identity.commit,producer.controllerCommit]).split(/\r?\n/).filter(Boolean));
+ if(producer.controllerCommit!==identity.commit){
+  const paths=git(['diff','--name-only',identity.commit,producer.controllerCommit]).split(/\r?\n/).filter(Boolean);
+  validateFrozenController(identity.tag,identity.commit,producer.controllerCommit,producer.ref,paths);
+  verifyNativeTestDelta(root,identity.commit,producer.controllerCommit,paths);
+ }
  else if(producer.ref!==`refs/tags/${identity.tag}`)throw Error('Product producer tag differs');
  return producer;
 }

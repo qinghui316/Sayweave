@@ -313,13 +313,103 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn ordinary_owner_receipt_preserves_owner_and_confirms_replacement() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("receipt.json");
-        write_receipt(&path, b"old").unwrap();
-        write_receipt(&path, b"new").unwrap();
-        assert_eq!(fs::read(&path).unwrap(), b"new");
-        sayweave_text_service::atomic_record::verify_user_owner(&path).unwrap();
-        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+        // Elevated CI may create files owned by Administrators. This test's contract is
+        // an ordinary user's receipt: use a PRIVATE thread token with that default owner,
+        // never change the process token or weaken production ownership validation.
+        use windows::Win32::{Foundation::*, Security::*, System::Threading::*};
+        struct Token(HANDLE);
+        impl Drop for Token {
+            fn drop(&mut self) {
+                unsafe { CloseHandle(self.0).unwrap() }
+            }
+        }
+        struct Scope;
+        impl Drop for Scope {
+            fn drop(&mut self) {
+                unsafe { RevertToSelf().unwrap() }
+            }
+        }
+        fn information(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> Vec<u64> {
+            let mut needed = 0;
+            unsafe {
+                let error = GetTokenInformation(token, class, None, 0, &mut needed).unwrap_err();
+                assert_eq!(error.code(), ERROR_INSUFFICIENT_BUFFER.to_hresult());
+                let mut data = vec![0u64; (needed as usize).div_ceil(8)];
+                GetTokenInformation(
+                    token,
+                    class,
+                    Some(data.as_mut_ptr().cast()),
+                    needed,
+                    &mut needed,
+                )
+                .unwrap();
+                data
+            }
+        }
+        unsafe {
+            let mut old_thread = HANDLE::default();
+            let no_token = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut old_thread);
+            if no_token.is_ok() {
+                CloseHandle(old_thread).unwrap();
+                panic!("receipt fixture requires a thread without an existing impersonation token");
+            }
+            assert_eq!(no_token.unwrap_err().code(), ERROR_NO_TOKEN.to_hresult());
+            let mut process = HANDLE::default();
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                &mut process,
+            )
+            .unwrap();
+            let process = Token(process);
+            let original_owner = information(process.0, TokenOwner);
+            let user = information(process.0, TokenUser);
+            let user_sid = (*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid;
+            let owner_sid = (*(original_owner.as_ptr().cast::<TOKEN_OWNER>())).Owner;
+            eprintln!(
+                "receipt fixture original default owner equals user: {}",
+                EqualSid(owner_sid, user_sid).is_ok()
+            );
+            let mut copy = HANDLE::default();
+            DuplicateTokenEx(
+                process.0,
+                TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_ADJUST_DEFAULT,
+                None,
+                SecurityImpersonation,
+                TokenImpersonation,
+                &mut copy,
+            )
+            .unwrap();
+            let copy = Token(copy);
+            let owner = TOKEN_OWNER { Owner: user_sid };
+            SetTokenInformation(
+                copy.0,
+                TokenOwner,
+                (&owner as *const TOKEN_OWNER).cast(),
+                std::mem::size_of::<TOKEN_OWNER>() as u32,
+            )
+            .unwrap();
+            SetThreadToken(None, Some(copy.0)).unwrap();
+            let scope = Scope;
+            let root = tempfile::tempdir().unwrap();
+            sayweave_text_service::atomic_record::verify_user_owner(root.path()).unwrap();
+            let path = root.path().join("receipt.json");
+            write_receipt(&path, b"old").unwrap();
+            write_receipt(&path, b"new").unwrap();
+            assert_eq!(fs::read(&path).unwrap(), b"new");
+            sayweave_text_service::atomic_record::verify_user_owner(&path).unwrap();
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+            drop(root);
+            drop(scope);
+            let after = information(process.0, TokenOwner);
+            EqualSid(owner_sid, (*(after.as_ptr().cast::<TOKEN_OWNER>())).Owner).unwrap();
+            assert_eq!(
+                OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &mut old_thread)
+                    .unwrap_err()
+                    .code(),
+                ERROR_NO_TOKEN.to_hresult()
+            );
+        }
     }
     #[test]
     fn live_installer_identity_fences_receipt_recovery_including_pid_reuse() {
