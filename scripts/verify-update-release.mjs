@@ -3,7 +3,7 @@ import {execFileSync,spawnSync} from 'node:child_process';
 import {copyFileSync,existsSync,mkdirSync,readFileSync,writeFileSync} from 'node:fs';
 import {join,resolve} from 'node:path';
 import {pathToFileURL} from 'node:url';
-import {releaseIdentity,verifyBuild,validateRelease,releaseAssets,readPlainFile,nativeSourceHash,verifierBuildConfig,validateVerifierTool,trustedProducer} from './release-validation.mjs';
+import {releaseIdentity,verifyBuild,validateRelease,releaseAssets,readPlainFile,nativeSourceHash,verifierBuildConfig,validateVerifierTool,trustedProducer,verifyRetainedBuild} from './release-validation.mjs';
 
 function buildIdentity(root,env){
  const pkg=JSON.parse(readFileSync(join(root,'package.json'),'utf8'));
@@ -17,7 +17,7 @@ function buildIdentity(root,env){
  return {identity,config,toolchain};
 }
 function producer(identity,root,env){
- if(env.GITHUB_ACTIONS==='true')return trustedProducer(identity,root,env,true);
+ if(env.GITHUB_ACTIONS==='true')return trustedProducer(identity,root,env,'tool');
  return {runId:'local',controllerCommit:identity.commit,ref:`refs/tags/${identity.tag}`,repository:'qinghui316/Sayweave'};
 }
 export function buildVerifier(root=process.cwd(),env=process.env){
@@ -53,6 +53,9 @@ export function verifyUpdateRelease(root=process.cwd(),env=process.env){
  const {identity,config}=buildIdentity(root,env),dir=resolve(root,env.SAYWEAVE_RELEASE_DIR??'release/sayweave');
  const assets=releaseAssets(dir),manifest=JSON.parse(assets.get('latest.json')),receipt=JSON.parse(assets.get('release-receipt.json'));
  validateRelease(identity,manifest,receipt,assets);
+ // Every CI verification (including check-access, acceptance and publish) proves
+ // the package producer separately; a tool-only producer cannot authorize it.
+ if(env.GITHUB_ACTIONS==='true')verifyRetainedBuild(identity,root,env);
  const {toolDir,toolReceipt}=checkVerifier(root,env);
  const publicKey=config.plugins?.updater?.pubkey;if(typeof publicKey!=='string'||!publicKey)throw Error('Updater public key missing');
  // The same complete Rust/minisign implementation as the client, without Cargo.

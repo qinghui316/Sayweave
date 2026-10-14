@@ -64,10 +64,17 @@ describe('retained package resume and partial upload',()=>{
  it('allows a later upload failure to reuse a complete preserved build',()=>expect(validateProducerRun(f.identity,run(),jobs(),producerId).runId).toBe(producerId));
  it('reuses a preserved tool without treating it as a preserved package',()=>{
   const toolJobs=[{name:'draft',steps:jobs()[0]!.steps.filter(s=>s.name==='Build full signature verifier once'||s.name==='Preserve full signature verifier')}];
-  expect(validateProducerRun(f.identity,run(),toolJobs,producerId,false,true).runId).toBe(producerId);
+  expect(validateProducerRun(f.identity,run(),toolJobs,producerId,false,'tool').runId).toBe(producerId);
   expect(()=>validateProducerRun(f.identity,run(),toolJobs,producerId)).toThrow();
   toolJobs[0]!.steps[1]!.conclusion='failure';
-  expect(()=>validateProducerRun(f.identity,run(),toolJobs,producerId,false,true)).toThrow();
+  expect(()=>validateProducerRun(f.identity,run(),toolJobs,producerId,false,'tool')).toThrow();
+ });
+ it('validates a later package producer separately from its earlier tool producer',()=>{
+  const packageJobs=[{name:'draft',steps:jobs()[0]!.steps.filter(s=>s.name==='Build signed NSIS package'||s.name==='Preserve signed release bytes before Release operations')}];
+  expect(validateProducerRun(f.identity,run(),packageJobs,producerId,false,'package').runId).toBe(producerId);
+  expect(()=>validateProducerRun(f.identity,run(),packageJobs,producerId,false,'tool')).toThrow();
+  expect(()=>validateProducerRun(f.identity,run(),packageJobs,producerId)).toThrow();
+  packageJobs[0]!.steps[1]!.conclusion='failure';expect(()=>validateProducerRun(f.identity,run(),packageJobs,producerId,false,'package')).toThrow();
  });
  it('keeps original producer proof when a later rerun was rejected before build',()=>{
   const j=jobs();j.push({name:'draft',steps:[]});expect(validateProducerRun(f.identity,run(),j,producerId).runId).toBe(producerId);
@@ -87,6 +94,11 @@ describe('retained package resume and partial upload',()=>{
  it('rejects rebuild even when the preserved package belongs to this same run',()=>expect(()=>assertNoRetainedPackage(f.identity,artifacts())).toThrow());
  it('does not turn artifact expiry into automatic repackaging',()=>{const a=artifacts();a[0]!.expired=true;expect(()=>assertNoRetainedPackage(f.identity,a)).toThrow();});
  it('requires both exact retained artifacts',()=>expect(()=>validateRetainedArtifacts(f.identity,artifacts(),producerId)).not.toThrow());
+ it('keeps separately retained tool and package artifact identities distinct',()=>{
+  const a=artifacts();expect(()=>validateRetainedArtifacts(f.identity,[a[0]],producerId,'package')).not.toThrow();expect(()=>validateRetainedArtifacts(f.identity,[a[1]],producerId,'tool')).not.toThrow();
+  expect(()=>validateRetainedArtifacts(f.identity,[a[1]],producerId,'package')).toThrow();expect(()=>validateRetainedArtifacts(f.identity,[a[0]],producerId,'tool')).toThrow();
+  expect(()=>validateRetainedArtifacts(f.identity,[a[1]],'100','tool')).toThrow();
+ });
  it.each(['missing','expired','foreign','duplicate'])('refuses %s retained data',kind=>{
   const a=artifacts();if(kind==='missing')a.pop();if(kind==='expired')a[0]!.expired=true;if(kind==='foreign')a[0]!.workflow_run.id=100;if(kind==='duplicate')a.push(a[0]!);expect(()=>validateRetainedArtifacts(f.identity,a,producerId)).toThrow();
  });
