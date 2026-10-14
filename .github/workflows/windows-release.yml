@@ -36,6 +36,10 @@ on:
         type: string
         default: ''
         description: Exact retained signed package and verifier producer for resume-package
+      verifier_run_id:
+        type: string
+        default: ''
+        description: Exact preserved verifier producer when no package was built
 
 permissions:
   contents: read
@@ -52,6 +56,7 @@ env:
   SAYWEAVE_CONTROLLER_REF: ${{ github.ref }}
   SAYWEAVE_RELEASE_PHASE: ${{ inputs.phase || 'build' }}
   SAYWEAVE_PACKAGE_RUN: ${{ inputs.package_run_id }}
+  SAYWEAVE_VERIFIER_RUN: ${{ inputs.verifier_run_id }}
 
 jobs:
   verify:
@@ -65,6 +70,7 @@ jobs:
           EXPECTED_CHECKSUM: ${{ inputs.checksum_sha256 }}
           VERIFICATION_RUN: ${{ inputs.verification_run_id }}
           PACKAGE_RUN: ${{ inputs.package_run_id }}
+          VERIFIER_RUN: ${{ inputs.verifier_run_id }}
         run: |
           if ($env:SAYWEAVE_RELEASE_PHASE -notin @('build','build-frozen','resume-package','check-access','accept-existing')) { throw 'Unknown release phase.' }
           if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen' -and ($env:SAYWEAVE_RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$' -or $env:SAYWEAVE_RELEASE_COMMIT -notmatch '^[a-f0-9]{40}$' -or $env:SAYWEAVE_CONTROLLER_REF -notmatch "^refs/tags/$([regex]::Escape($env:SAYWEAVE_RELEASE_TAG))-release-check-[a-z0-9][a-z0-9.-]*$" -or $env:EXPECTED_RELEASE_ID -notmatch '^[1-9]\d*$' -or $env:EXPECTED_CHECKSUM)) { throw 'Exact frozen product, empty owner draft and diagnostic controller identities are required.' }
@@ -73,6 +79,7 @@ jobs:
           if ($env:SAYWEAVE_RELEASE_PHASE -eq 'resume-package' -and ($env:SAYWEAVE_RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$' -or $env:SAYWEAVE_RELEASE_COMMIT -notmatch '^[a-f0-9]{40}$' -or $env:SAYWEAVE_CONTROLLER_REF -notmatch "^refs/tags/$([regex]::Escape($env:SAYWEAVE_RELEASE_TAG))-release-check-[a-z0-9][a-z0-9.-]*$" -or $env:EXPECTED_RELEASE_ID -notmatch '^[1-9]\d*$' -or $env:EXPECTED_CHECKSUM -notmatch '^[a-f0-9]{64}$' -or $env:PACKAGE_RUN -notmatch '^[1-9]\d*$' -or $env:VERIFICATION_RUN -notmatch '^[1-9]\d*$')) { throw 'Exact retained package/tool and verification identities required.' }
           if ($env:SAYWEAVE_RELEASE_PHASE -in @('check-access','accept-existing') -and $env:PACKAGE_RUN -notmatch '^[1-9]\d*$') { throw 'Existing assets require their retained full verifier producer.' }
           if ($env:SAYWEAVE_RELEASE_PHASE -notin @('resume-package','check-access','accept-existing') -and $env:PACKAGE_RUN) { throw 'Build cannot substitute a retained package producer.' }
+          if ($env:VERIFIER_RUN -and ($env:SAYWEAVE_RELEASE_PHASE -notin @('build-frozen','resume-package','check-access','accept-existing') -or $env:VERIFIER_RUN -notmatch '^[1-9]\d*$')) { throw 'Verifier reuse requires an exact reviewed continuation.' }
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ (inputs.phase == 'build-frozen' || inputs.phase == 'resume-package' || inputs.phase == 'check-access' || inputs.phase == 'accept-existing') && inputs.release_tag || github.ref }}
@@ -366,7 +373,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: release-verifier-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
-          run-id: ${{ inputs.package_run_id || github.run_id }}
+          run-id: ${{ inputs.verifier_run_id || inputs.package_run_id || github.run_id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/release-verifier
       - name: Check preserved verifier before signing
@@ -379,7 +386,11 @@ jobs:
         if: inputs.phase != 'resume-package'
         shell: pwsh
         run: |
-          node scripts/test-formal-core-switch.mjs
+          if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen') {
+            node $env:SAYWEAVE_RELEASE_HELPER formal-frozen
+          } else {
+            node scripts/test-formal-core-switch.mjs
+          }
           if ($LASTEXITCODE -ne 0) { throw 'Ordinary proxy same-process input failed; no signed package built.' }
       - name: Preserve ordinary proxy provenance and same-process evidence
         if: always() && inputs.phase != 'resume-package'
@@ -535,7 +546,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: release-verifier-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
-          run-id: ${{ inputs.package_run_id || github.run_id }}
+          run-id: ${{ inputs.verifier_run_id || inputs.package_run_id || github.run_id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/release-verifier
       - if: inputs.phase == 'accept-existing'
@@ -621,7 +632,7 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: release-verifier-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
-          run-id: ${{ inputs.package_run_id || github.run_id }}
+          run-id: ${{ inputs.verifier_run_id || inputs.package_run_id || github.run_id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/release-verifier
       - name: Re-download and verify approved draft with the same verifier

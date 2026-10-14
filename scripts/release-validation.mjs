@@ -45,6 +45,7 @@ export function releaseNotes(value){
 export const frozenTestPaths=['tests/e2e/models.spec.ts','tests/e2e/ui-interaction.spec.ts','tests/e2e/dictation.spec.ts'];
 const receiptTestPath='src-tauri/src/installer/record.rs';
 export const frozenCheckPaths=['scripts/test-richtext-block.mjs',receiptTestPath];
+export const frozenFormalPaths=['src-tauri/text-service/src/formal_switch_probe.rs'];
 // This one reviewed fixture repair is pinned through EOF, including module closure.
 // A marker/prefix comparison alone cannot reject runtime code appended after tests.
 const receiptTestModules={original:'817d8bf646b7b37d2c990cfbd6cf4e6981daed4f78c4eca57bffd04ca050a619',reviewed:'4a38a0a48e95900d3911eafaa65104fdd8214d9816635d9436fda7904b8fc550'};
@@ -64,7 +65,7 @@ function verifyNativeTestDelta(root,product,controller,paths){
   execFileSync('git',['show',`${product}:${receiptTestPath}`],{cwd:root}),
   execFileSync('git',['show',`${controller}:${receiptTestPath}`],{cwd:root}));
 }
-const controllerPaths=new Set([...frozenTestPaths,...frozenCheckPaths,'.github/workflows/windows-release.yml','scripts/release-validation.mjs','scripts/verify-update-release.mjs','tests/release-validation.test.ts','docs/release.md']);
+const controllerPaths=new Set([...frozenTestPaths,...frozenCheckPaths,...frozenFormalPaths,'.github/workflows/windows-release.yml','scripts/release-validation.mjs','scripts/verify-update-release.mjs','tests/release-validation.test.ts','docs/release.md']);
 export function validateFrozenController(tag,product,controller,ref,paths){
  if(!/^v\d+\.\d+\.\d+$/.test(tag)||! /^[a-f0-9]{40}$/.test(product)||! /^[a-f0-9]{40}$/.test(controller)||product===controller)throw Error('Exact distinct frozen product/controller identities required');
  if(!ref.startsWith(`refs/tags/${tag}-release-check-`)||! /^[a-z0-9][a-z0-9.-]*$/.test(ref.slice(`refs/tags/${tag}-release-check-`.length)))throw Error('Reviewed diagnostic controller tag required');
@@ -72,7 +73,7 @@ export function validateFrozenController(tag,product,controller,ref,paths){
 }
 
 export async function runFrozenReleaseTests(root=process.cwd(),env=process.env,run,kind='e2e'){
- if(!['e2e','check'].includes(kind))throw Error('Unknown frozen validation kind');
+ if(!['e2e','check','formal'].includes(kind))throw Error('Unknown frozen validation kind');
  const tag=env.SAYWEAVE_RELEASE_TAG,product=env.SAYWEAVE_RELEASE_COMMIT,controller=env.SAYWEAVE_CONTROLLER_COMMIT,ref=env.SAYWEAVE_CONTROLLER_REF;
  const git=(args,encoding='utf8')=>execFileSync('git',args,{cwd:root,encoding});
  const paths=git(['diff','--name-only',product,controller]).trim().split(/\r?\n/).filter(Boolean);
@@ -84,15 +85,15 @@ export async function runFrozenReleaseTests(root=process.cwd(),env=process.env,r
  const original=createRequire(import.meta.url)(join(root,'scripts/release-validation.mjs'));
  const version=JSON.parse(readFileSync(join(root,'package.json'),'utf8')).version;
  original.verifyBuild(original.releaseIdentity(version,tag,product),root,[version]);
- const selectedPaths=kind==='check'?frozenCheckPaths.filter(path=>paths.includes(path)):frozenTestPaths;
+ const selectedPaths=kind==='formal'?frozenFormalPaths:kind==='check'?frozenCheckPaths.filter(path=>paths.includes(path)):frozenTestPaths;
  const testSources=selectedPaths.map(path=>{const bytes=git(['show',`${controller}:${path}`],null);new TextDecoder('utf-8',{fatal:true}).decode(bytes);return {path,bytes,sha256:createHash('sha256').update(bytes).digest('hex')};});
  console.log(JSON.stringify({productTag:tag,productCommit:product,controllerCommit:controller,controllerRef:ref,kind,testSources:testSources.map(({path,sha256})=>({path,sha256}))}));
  let failure;
  try{
   for(const {path,bytes} of testSources)writeFileSync(join(root,path),bytes);
   const options={cwd:root,env,stdio:'inherit',windowsHide:true};
-  const result=run?await run():kind==='check'?(process.platform==='win32'?spawnSync(env.ComSpec??'cmd.exe',['/d','/s','/c','npm run check'],options):spawnSync('npm',['run','check'],options)):spawnSync(process.execPath,[join(root,'node_modules/@playwright/test/cli.js'),'test'],options);
-  if(result?.error||result?.status!==0)throw Error(`Reviewed frozen-product ${kind==='check'?'check':'E2E'} failed`,{cause:result?.error});
+  const result=run?await run():kind==='formal'?spawnSync(process.execPath,[join(root,'scripts/test-formal-core-switch.mjs')],options):kind==='check'?(process.platform==='win32'?spawnSync(env.ComSpec??'cmd.exe',['/d','/s','/c','npm run check'],options):spawnSync('npm',['run','check'],options)):spawnSync(process.execPath,[join(root,'node_modules/@playwright/test/cli.js'),'test'],options);
+  if(result?.error||result?.status!==0)throw Error(`Reviewed frozen-product ${kind==='e2e'?'E2E':kind} failed`,{cause:result?.error});
  }catch(error){failure=error;}
  try{
   if(selectedPaths.length)git(['restore','--source',product,'--worktree','--',...selectedPaths]);
@@ -104,9 +105,10 @@ export function validateOwnedDraft(identity,release,id){
  if(!/^[1-9]\d*$/.test(id)||!Number.isSafeInteger(release?.id)||String(release.id)!==id||release.tag_name!==identity.tag||release.target_commitish!==identity.commit||release.draft!==true||release.prerelease!==false||!Array.isArray(release.assets)||release.assets.length!==0)throw Error('Exact empty owner draft required; existing assets are protected');
 }
 export function validateVerificationRun(identity,run,jobs,id){
- if(!/^[1-9]\d*$/.test(id)||String(run?.id)!==id||run.repository?.full_name!==repository||run.path!=='.github/workflows/windows-release.yml'||run.event!=='workflow_dispatch'||run.status!=='completed'||! /^[a-f0-9]{40}$/.test(run.head_sha)||!run.head_branch?.startsWith(`${identity.tag}-release-check-`))throw Error('Verification run identity differs');
+ const product=run.event==='push'&&run.head_sha===identity.commit&&run.head_branch===identity.tag;
+ if(!/^[1-9]\d*$/.test(id)||String(run?.id)!==id||run.repository?.full_name!==repository||run.path!=='.github/workflows/windows-release.yml'||(!product&&(run.event!=='workflow_dispatch'||!run.head_branch?.startsWith(`${identity.tag}-release-check-`)))||run.status!=='completed'||! /^[a-f0-9]{40}$/.test(run.head_sha))throw Error('Verification run identity differs');
  const selected=jobs.filter(job=>job.name==='verify');
- const required=['Verify frozen product and landed controller','Run npm run check','Run reviewed E2E against the frozen product and restore its checkout','Run npm run check:distribution'];
+ const required=product?['Run npm run check','Run npm run test:e2e','Run npm run check:distribution']:['Verify frozen product and landed controller','Run npm run check','Run reviewed E2E against the frozen product and restore its checkout','Run npm run check:distribution'];
  if(selected.length!==1||selected[0].status!=='completed'||selected[0].conclusion!=='success'||required.some(name=>selected[0].steps.filter(step=>step.name===name&&step.conclusion==='success').length!==1))throw Error('Prior product verification is incomplete');
 }
 export function verifyReusedChecks(root=process.cwd(),env=process.env){
@@ -118,7 +120,8 @@ export function verifyReusedChecks(root=process.cwd(),env=process.env){
  const run=api(`actions/runs/${id}`),jobs=api(`actions/runs/${id}/jobs?per_page=100`).jobs;
  validateVerificationRun(identity,run,jobs,id);
  for(const [commit,ref] of [[run.head_sha,`refs/tags/${run.head_branch}`],[env.SAYWEAVE_CONTROLLER_COMMIT,env.SAYWEAVE_CONTROLLER_REF]]){
-  validateFrozenController(identity.tag,identity.commit,commit,ref,git(['diff','--name-only',identity.commit,commit]).trim().split(/\r?\n/).filter(Boolean));
+  if(commit!==identity.commit)validateFrozenController(identity.tag,identity.commit,commit,ref,git(['diff','--name-only',identity.commit,commit]).trim().split(/\r?\n/).filter(Boolean));
+  else if(ref!==`refs/tags/${identity.tag}`)throw Error('Original product verification tag differs');
   verifyNativeTestDelta(root,identity.commit,commit,git(['diff','--name-only',identity.commit,commit]).trim().split(/\r?\n/).filter(Boolean));
   if(git(['rev-parse',`${ref}^{commit}`]).trim()!==commit)throw Error('Verification controller tag differs');
   git(['merge-base','--is-ancestor',commit,'origin/main']);git(['merge-base','--is-ancestor',identity.commit,commit]);
@@ -157,25 +160,25 @@ export function cargoCacheContext(root=process.cwd(),env=process.env){
  const context={platform:process.platform,arch:process.arch,toolchain:execFileSync(env.RUSTC??env.CARGO_BUILD_RUSTC??'rustc',['-vV'],{cwd:root,env,encoding:'utf8'}).trim(),cargo:execFileSync('cargo',['-V'],{cwd:root,env,encoding:'utf8'}).trim(),image:`${env.ImageOS??'local'}:${env.ImageVersion??'local'}`,config:JSON.stringify(config),locks:JSON.stringify(['src-tauri/Cargo.lock','src-tauri/text-service/Cargo.lock'].map(p=>sha256(readFileSync(join(root,p))))),source:`${nativeSourceHash(root)}:${env.SAYWEAVE_BUILD_CHANNEL??'internal'}`};
  return {...cargoCacheKeys(context),context};
 }
-export function validateProducerRun(identity,run,jobs,id,current=false){
+export function validateProducerRun(identity,run,jobs,id,current=false,toolOnly=false){
  if(!exactId(id)||String(run?.id)!==String(id)||run.repository?.full_name!==repository||run.path!=='.github/workflows/windows-release.yml'||!['push','workflow_dispatch'].includes(run.event)||! /^[a-f0-9]{40}$/.test(run.head_sha)||!(run.head_branch===identity.tag||run.head_branch?.startsWith(`${identity.tag}-release-check-`)))throw Error('Package/tool producer identity differs');
  if(!current){
   const draft=jobs.filter(j=>j.name==='draft');
   const passed=(job,names)=>names.every(name=>job.steps.filter(s=>s.name===name&&s.conclusion==='success').length===1);
   const tools=draft.filter(j=>passed(j,['Build full signature verifier once','Preserve full signature verifier']));
   const packages=draft.filter(j=>passed(j,['Build signed NSIS package','Preserve signed release bytes before Release operations']));
-  if(run.status!=='completed'||tools.length!==1||packages.length!==1)throw Error('Package/tool producer did not preserve a complete build');
+  if(run.status!=='completed'||tools.length!==1||(!toolOnly&&packages.length!==1))throw Error('Package/tool producer did not preserve a complete build');
  }
  return {runId:String(id),controllerCommit:run.head_sha,ref:`refs/tags/${run.head_branch}`,repository};
 }
-export function trustedProducer(identity,root,env=process.env){
- const id=env.SAYWEAVE_PACKAGE_RUN||env.GITHUB_RUN_ID;
+export function trustedProducer(identity,root,env=process.env,toolOnly=false){
+ const id=(toolOnly&&env.SAYWEAVE_VERIFIER_RUN)||env.SAYWEAVE_PACKAGE_RUN||env.GITHUB_RUN_ID;
  if(!exactId(id))throw Error('Exact package/tool producer run required');
  const current=String(id)===env.GITHUB_RUN_ID;
  const api=endpoint=>JSON.parse(execFileSync('gh',['api',`repos/${repository}/${endpoint}`],{cwd:root,env,encoding:'utf8'}));
  const run=api(`actions/runs/${id}`),jobs=[];
  if(!current)for(let page=1;;page++){const batch=api(`actions/runs/${id}/jobs?filter=all&per_page=100&page=${page}`).jobs;jobs.push(...batch);if(batch.length<100)break;}
- const producer=validateProducerRun(identity,run,jobs,id,current);
+ const producer=validateProducerRun(identity,run,jobs,id,current,toolOnly);
  const git=args=>execFileSync('git',args,{cwd:root,encoding:'utf8'}).trim();
  if(current&&producer.controllerCommit!==env.SAYWEAVE_CONTROLLER_COMMIT)throw Error('Current workflow source differs');
  if(git(['rev-parse',`${producer.ref}^{commit}`])!==producer.controllerCommit)throw Error('Producer controller tag differs');
@@ -247,8 +250,15 @@ export function preflightPackage(root=process.cwd(),env=process.env){
   for(let page=1;;page++){
    const list=releaseApi(root,env,`actions/artifacts?per_page=100&page=${page}`).artifacts;
    assertNoRetainedPackage(identity,list);
+   if(list.some(a=>a.name===verifierArtifactName(identity)&&String(a.workflow_run?.id)!==env.GITHUB_RUN_ID)&&!env.SAYWEAVE_VERIFIER_RUN)throw Error('A prior verifier exists; select its exact producer instead of rebuilding');
    if(list.some(a=>a.name===verifierArtifactName(identity)&&a.expired===false&&String(a.workflow_run?.id)===env.GITHUB_RUN_ID))reuseTool=true;
    if(list.length<100)break;
+  }
+  if(env.SAYWEAVE_VERIFIER_RUN){
+   const producer=trustedProducer(identity,root,env,true);
+   const matches=releaseApi(root,env,`actions/runs/${producer.runId}/artifacts?per_page=100`).artifacts.filter(a=>a.name===verifierArtifactName(identity));
+   if(matches.length!==1||matches[0].expired||String(matches[0].workflow_run?.id)!==producer.runId)throw Error('Exact retained verifier artifact required');
+   reuseTool=true;
   }
  }
  output({release_id:id,package_run:env.SAYWEAVE_PACKAGE_RUN||env.GITHUB_RUN_ID,reuse_tool:String(reuseTool)},env);
@@ -284,6 +294,7 @@ if(process.argv[1]&&pathToFileURL(resolve(process.argv[1])).href===import.meta.u
  else if(mode==='package-preflight')preflightPackage();
  else if(mode==='upload-package')uploadRetainedPackage().catch(error=>{console.error(error);process.exitCode=1;});
  else if(mode==='check-frozen')runFrozenReleaseTests(process.cwd(),process.env,undefined,'check').catch(error=>{console.error(error);process.exitCode=1;});
+ else if(mode==='formal-frozen')runFrozenReleaseTests(process.cwd(),process.env,undefined,'formal').catch(error=>{console.error(error);process.exitCode=1;});
  else if(mode===undefined)runFrozenReleaseTests().catch(error=>{console.error(error);process.exitCode=1;});
  else throw Error('Unknown frozen release validation mode');
 }

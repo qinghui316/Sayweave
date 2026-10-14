@@ -17,10 +17,11 @@ function buildIdentity(root,env){
  return {identity,config,toolchain};
 }
 function producer(identity,root,env){
- if(env.GITHUB_ACTIONS==='true')return trustedProducer(identity,root,env);
+ if(env.GITHUB_ACTIONS==='true')return trustedProducer(identity,root,env,true);
  return {runId:'local',controllerCommit:identity.commit,ref:`refs/tags/${identity.tag}`,repository:'qinghui316/Sayweave'};
 }
 export function buildVerifier(root=process.cwd(),env=process.env){
+ if(env.SAYWEAVE_VERIFIER_RUN)throw Error('A retained verifier producer was selected; rebuilding is forbidden');
  const {identity,toolchain}=buildIdentity(root,env);
  if(process.platform!=='win32'||process.arch!=='x64')throw Error('Native verifier requires Windows x64');
  const dir=resolve(root,env.SAYWEAVE_VERIFIER_DIR??'release/verifier');

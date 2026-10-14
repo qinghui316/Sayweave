@@ -62,6 +62,13 @@ describe('retained package resume and partial upload',()=>{
  const run=()=>({id:99,repository:{full_name:'qinghui316/Sayweave'},path:'.github/workflows/windows-release.yml',event:'workflow_dispatch',head_sha:'b'.repeat(40),head_branch:`${f.identity.tag}-release-check-five`,status:'completed',conclusion:'failure'});
  const jobs=()=>[{name:'draft',steps:['Build signed NSIS package','Build full signature verifier once','Preserve full signature verifier','Preserve signed release bytes before Release operations','Verify retained package with recorded full verifier'].map(name=>({name,conclusion:'success'}))}];
  it('allows a later upload failure to reuse a complete preserved build',()=>expect(validateProducerRun(f.identity,run(),jobs(),producerId).runId).toBe(producerId));
+ it('reuses a preserved tool without treating it as a preserved package',()=>{
+  const toolJobs=[{name:'draft',steps:jobs()[0]!.steps.filter(s=>s.name==='Build full signature verifier once'||s.name==='Preserve full signature verifier')}];
+  expect(validateProducerRun(f.identity,run(),toolJobs,producerId,false,true).runId).toBe(producerId);
+  expect(()=>validateProducerRun(f.identity,run(),toolJobs,producerId)).toThrow();
+  toolJobs[0]!.steps[1]!.conclusion='failure';
+  expect(()=>validateProducerRun(f.identity,run(),toolJobs,producerId,false,true)).toThrow();
+ });
  it('keeps original producer proof when a later rerun was rejected before build',()=>{
   const j=jobs();j.push({name:'draft',steps:[]});expect(validateProducerRun(f.identity,run(),j,producerId).runId).toBe(producerId);
  });
@@ -131,13 +138,15 @@ describe('frozen product release controller boundaries',()=>{
   expect(()=>validateFrozenController('v0.1.9',product,product,ref,['tests/e2e/models.spec.ts'])).toThrow();
   expect(()=>validateFrozenController('v0.1.9',product,'unknown',ref,['tests/e2e/models.spec.ts'])).toThrow();
  });
- it.each([['e2e',0],['e2e',1],['e2e',2],['check',0],['check',1],['check',2]] as const)('preserves the frozen checkout and failure facts for %s outcome %s',async(kind,status)=>{
+ it.each([['e2e',0],['e2e',1],['e2e',2],['check',0],['check',1],['check',2],['formal',0],['formal',1],['formal',2]] as const)('preserves the frozen checkout and failure facts for %s outcome %s',async(kind,status)=>{
   const root=mkdtempSync(join(tmpdir(),'beaver-frozen-release-'));
   const owned=resolve(root);if(!owned.startsWith(resolve(tmpdir())+sep)||!owned.split(sep).at(-1)?.startsWith('beaver-frozen-release-'))throw Error('Unexpected temporary fixture path');
   const git=(args:string[])=>execFileSync('git',args,{cwd:root,encoding:'utf8',stdio:['ignore','pipe','pipe']}).trim();
   try{
    mkdirSync(join(root,'scripts'),{recursive:true});mkdirSync(join(root,'tests/e2e'),{recursive:true});mkdirSync(join(root,'src-tauri/src/installer'),{recursive:true});
    writeFileSync(join(root,'src-tauri/src/installer/record.rs'),nativeOriginal);
+   mkdirSync(join(root,'src-tauri/text-service/src'),{recursive:true});
+   writeFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'original probe');
    writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9'}));
    writeFileSync(join(root,'scripts/release-validation.mjs'),readFileSync('scripts/release-validation.mjs'));
    writeFileSync(join(root,'scripts/test-richtext-block.mjs'),'original check');
@@ -147,13 +156,15 @@ describe('frozen product release controller boundaries',()=>{
    for(const path of ['models','ui-interaction','dictation'])writeFileSync(join(root,`tests/e2e/${path}.spec.ts`),'reviewed');
    writeFileSync(join(root,'scripts/test-richtext-block.mjs'),'reviewed check');
    writeFileSync(join(root,'src-tauri/src/installer/record.rs'),nativeReviewed);
+   writeFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'reviewed probe');
    git(['add','.']);git(['commit','-m','controller']);const controller=git(['rev-parse','HEAD']);git(['tag','v0.1.9-release-check-e2e-1']);git(['update-ref','refs/remotes/origin/main',controller]);git(['checkout','--detach',product]);
-   const failure=`Reviewed frozen-product ${kind==='check'?'check':'E2E'} failed`;
-   const work=runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{expect(readFileSync(join(root,'tests/e2e/dictation.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(kind==='check'?nativeReviewed:nativeOriginal);expect(readFileSync(join(root,'tests/e2e/models.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe(kind==='check'?'reviewed check':'original check');if(status===2)writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9',unexpected:true}));return {status:status===0?0:1};},kind);
+   const failure=`Reviewed frozen-product ${kind==='e2e'?'E2E':kind} failed`;
+   const work=runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{expect(readFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'utf8')).toBe(kind==='formal'?'reviewed probe':'original probe');expect(readFileSync(join(root,'tests/e2e/dictation.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(kind==='check'?nativeReviewed:nativeOriginal);expect(readFileSync(join(root,'tests/e2e/models.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe(kind==='check'?'reviewed check':'original check');if(status===2)writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9',unexpected:true}));return {status:status===0?0:1};},kind);
    if(status===0)await work;else if(status===1)await expect(work).rejects.toThrow(failure);else{await expect(work).rejects.toMatchObject({name:'AggregateError',errors:[expect.objectContaining({message:failure}),expect.objectContaining({message:'Frozen product checkout was not restored cleanly'})]});expect(git(['status','--porcelain'])).toContain('package.json');git(['restore','--worktree','--','package.json']);}
    for(const path of ['models','ui-interaction','dictation'])expect(readFileSync(join(root,`tests/e2e/${path}.spec.ts`),'utf8')).toBe('original');
    expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe('original check');
    expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(nativeOriginal);
+   expect(readFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'utf8')).toBe('original probe');
    expect(git(['status','--porcelain'])).toBe('');expect(git(['rev-parse','HEAD'])).toBe(product);
    if(status===0){git(['update-ref','refs/remotes/origin/main',product]);let invoked=false;await expect(runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{invoked=true;return {status:0};})).rejects.toThrow();expect(invoked).toBe(false);expect(git(['status','--porcelain'])).toBe('');}
   }finally{
@@ -170,6 +181,13 @@ describe('owner draft and prior verification provenance',()=>{
  });
  const evidence=()=>({run:{id:99,repository:{full_name:'qinghui316/Sayweave'},path:'.github/workflows/windows-release.yml',event:'workflow_dispatch',status:'completed',conclusion:'failure',head_sha:'b'.repeat(40),head_branch:'v0.1.9-release-check-e2e-1'},jobs:[{id:101,name:'verify',status:'completed',conclusion:'success',steps:['Verify frozen product and landed controller','Run npm run check','Run reviewed E2E against the frozen product and restore its checkout','Run npm run check:distribution'].map(name=>({name,conclusion:'success'}))}]});
  it('reuses a completed successful verification despite a later publication failure',()=>{const e=evidence();expect(()=>validateVerificationRun(identity,e.run,e.jobs,'99')).not.toThrow();});
+ it('reuses successful original-tag checks only at the exact product SHA',()=>{
+  const e=evidence();e.run.event='push';e.run.head_branch=identity.tag;e.run.head_sha=identity.commit;
+  e.jobs[0]!.steps=['Run npm run check','Run npm run test:e2e','Run npm run check:distribution'].map(name=>({name,conclusion:'success'}));
+  expect(()=>validateVerificationRun(identity,e.run,e.jobs,'99')).not.toThrow();
+  e.run.head_sha='b'.repeat(40);expect(()=>validateVerificationRun(identity,e.run,e.jobs,'99')).toThrow();
+  e.run.head_sha=identity.commit;e.jobs[0]!.steps[1]!.conclusion='skipped';expect(()=>validateVerificationRun(identity,e.run,e.jobs,'99')).toThrow();
+ });
  it.each(['wrong_repo','wrong_commit','wrong_tag','wrong_workflow','unfinished','failed_verify','skipped_e2e','missing_distribution','ambiguous_job'])('refuses %s verification evidence',kind=>{
   const e=evidence();if(kind==='wrong_repo')e.run.repository.full_name='evil/repo';if(kind==='wrong_commit')e.run.head_sha='unknown';if(kind==='wrong_tag')e.run.head_branch='v0.1.8-release-check-e2e-1';if(kind==='wrong_workflow')e.run.path='.github/workflows/windows-ci.yml';if(kind==='unfinished')e.run.status='in_progress';if(kind==='failed_verify')e.jobs[0]!.conclusion='failure';if(kind==='skipped_e2e')e.jobs[0]!.steps[2]!.conclusion='skipped';if(kind==='missing_distribution')e.jobs[0]!.steps.pop();if(kind==='ambiguous_job')e.jobs.push(e.jobs[0]!);expect(()=>validateVerificationRun(identity,e.run,e.jobs,'99')).toThrow();
  });

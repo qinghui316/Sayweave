@@ -56,22 +56,33 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
     }
     let (module, first) = deployment::prepare_engine(&proxy, &old)?;
     // Existing registration is rejected by register_installer_machine as well.
-    registration::register_installer_machine(&module, 0x0409)?;
+    let language = unsafe { registration::profiles()?.GetCurrentLanguage()? };
+    let user_before = registration::installer_user_choice(language)?;
+    if user_before.is_some() {
+        return Err("fresh runner user profile required".into());
+    }
+    registration::register_installer_machine(&module, language)?;
     let mut current = None;
     let result = (|| {
+        if !registration::initialize_installer_user(language, user_before)? {
+            return Err("owned runner profile not enabled".into());
+        }
         deployment::publish_engine(None, Some(&first))?;
         current = Some(first.clone());
         let (same, second) = deployment::prepare_engine(&proxy, &new)?;
         if same != module {
             return Err("proxy path changed".into());
         }
-        exercise(Path::new(&module), &first, &second, &mut current)
+        exercise(Path::new(&module), &first, &second, &mut current, language)
     })();
     // Compare-and-restore only our descriptor/registration; never overwrite drift.
-    let cleanup = deployment::publish_engine(current.as_ref(), None)
+    let cleanup = registration::restore_installer_user(language, user_before)
+        .and_then(|()| deployment::publish_engine(current.as_ref(), None))
         .and_then(|()| registration::restore_installer_machine(None, &module));
+    if let Err(error) = cleanup {
+        return Err(format!("cleanup failed: {error}; exercise={result:?}").into());
+    }
     result?;
-    cleanup?;
     println!("formal_core_switch cleanup_complete=true");
     Ok(())
 }
@@ -101,6 +112,7 @@ fn exercise(
     first: &CurrentEngine,
     second: &CurrentEngine,
     current: &mut Option<CurrentEngine>,
+    language: u16,
 ) -> Outcome<()> {
     unsafe {
         let top = CreateWindowExW(
@@ -137,12 +149,20 @@ fn exercise(
         let _ = SetForegroundWindow(top);
         let _ = SetFocus(Some(editor));
         pump(Duration::from_millis(150));
-        let (module, processor) = load_processor(proxy)?;
-        let client = manager
-            .cast::<ITfClientId>()?
-            .GetClientId(&registration::CLASS)?;
-        processor.Activate(&manager, client)?;
+        // TSF must create/activate the registered TIP and supply its client ID.
+        // A manually created service's GetClientId is not TIP activation.
+        let module = load_fixture_module(proxy)?;
+        let keyboard_before = keyboard()?;
         let result = (|| -> Outcome<()> {
+            let activated = registration::activate(false)?;
+            if activated != language
+                || !sayweave_text_service::client::own_profile_active(language)?
+                || keyboard()? != keyboard_before
+            {
+                return Err("owned process TIP activation identity differs".into());
+            }
+            pump(Duration::from_millis(150));
+            println!("formal_core_switch activation=tsf_process_owned");
             if GetForegroundWindow() != top {
                 return Err("owned editor must remain foreground".into());
             }
@@ -239,8 +259,7 @@ fn exercise(
             );
             Ok(())
         })();
-        let stopped = processor.Deactivate();
-        drop(processor);
+        let stopped = registration::deactivate(language, false);
         let deactivated = manager.Deactivate();
         let destroyed = DestroyWindow(top);
         pump(Duration::from_millis(100));
