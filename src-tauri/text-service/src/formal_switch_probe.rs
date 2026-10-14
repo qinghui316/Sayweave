@@ -151,8 +151,8 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
     if let Err(error) = cleanup {
         return Err(format!("cleanup failed: {error}; exercise={result:?}").into());
     }
-    result?;
     println!("formal_core_switch cleanup_complete=true");
+    result?;
     Ok(())
 }
 
@@ -230,6 +230,19 @@ fn exercise(
         // A manually created service's GetClientId is not TIP activation.
         let module = checked!("load_proxy", load_fixture_module(proxy))?;
         let keyboard_before = checked!("keyboard_before", keyboard())?;
+        let context_error = manager
+            .GetFocus()
+            .and_then(|document| document.GetTop())
+            .err()
+            .map(|e| e.code());
+        let class_result: windows::core::Result<ITfTextInputProcessor> =
+            CoCreateInstance(&registration::CLASS, None, CLSCTX_INPROC_SERVER);
+        let class_error = class_result.as_ref().err().map(|e| e.code());
+        println!(
+            "formal_core_switch context_error={context_error:?} class_error={class_error:?} foreground={} language={language}",
+            GetForegroundWindow() == top
+        );
+        drop(class_result);
         let result = (|| -> Outcome<()> {
             let activated = checked!("activate_process_tip", registration::activate(false))?;
             if activated != language
