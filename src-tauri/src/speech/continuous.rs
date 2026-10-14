@@ -203,6 +203,10 @@ impl Control {
             })
             .unwrap_or_default()
     }
+    #[cfg(test)]
+    pub(crate) fn fixture_ready(&self, turn: u64, activity: u64) {
+        self.enabled(Route { turn, activity });
+    }
     pub fn readiness(&self) -> watch::Receiver<u64> {
         self.ready.subscribe()
     }
@@ -621,6 +625,50 @@ mod tests {
         control.hold_input();
         control.resume_retained(1, 0);
         assert_eq!(control.audio.current(), 0);
+    }
+    #[tokio::test]
+    async fn retained_edit_resume_sends_pcm_on_the_same_connection_without_ready_event() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let control = Control::new(Arc::new(AtomicU64::new(0)));
+            let route = Route {
+                turn: 1,
+                activity: 0,
+            };
+            control.resume(1, 0);
+            control.enabled(route);
+            let mut readiness = control.readiness();
+            let _ = readiness.borrow_and_update();
+            let (first, mut peer) = RecognitionSession::controlled();
+            let mut stream = Continuous::run(first, control.clone(), route, |_| async {
+                panic!("retained resume must not open another recognition connection")
+            });
+            stream
+                .send_pcm(control.audio.current(), &[100, -100])
+                .await
+                .unwrap();
+            assert_eq!(peer.audio().await, [100, -100]);
+            control.hold_input();
+            stream
+                .send_pcm(control.audio.current(), &[999])
+                .await
+                .unwrap();
+            control.resume_retained(1, 0);
+            stream
+                .send_pcm(control.audio.current(), &[200, -200])
+                .await
+                .unwrap();
+            assert_eq!(peer.audio().await, [200, -200]);
+            assert!(!readiness.has_changed().unwrap());
+            let (finished, ()) = tokio::join!(stream.finish(), peer.finished_audio());
+            finished.unwrap();
+            peer.events.send(Ok(Event::Finished)).await.unwrap();
+            while !matches!(
+                stream.events.recv().await.unwrap().unwrap(),
+                StreamEvent::Finished
+            ) {}
+        })
+        .await
+        .unwrap();
     }
     #[test]
     fn edit_evidence_retains_raw_history_before_async_handoff() {

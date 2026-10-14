@@ -493,6 +493,25 @@ impl SessionDraft {
             v.paused = s.paused_at.is_some() || s.handoff;
         }
     }
+    fn publish_projected(
+        &self,
+        s: &State,
+        published: &mut Option<Presentation>,
+        publish: &impl Fn(Presentation),
+    ) {
+        self.project(s);
+        // A retained ASR socket can resume without changing readiness. Publish
+        // the settled actor state, never the pre-transition view from select!.
+        if s.stopping || self.control.stopping() || *self.cancel.borrow() > 0 {
+            return;
+        }
+        let next = self.presentation();
+        if *published != Some(next) {
+            log::info!(target: "sayweave", "operation=draft_presentation task_id={} turn={} previous={:?} next={:?} audio_route={}", self.task, s.turn, published, next, self.control.audio.current());
+            *published = Some(next);
+            publish(next);
+        }
+    }
     fn observe(&self, s: &mut State, value: NativeTranscript) {
         if let Some(mut revised) = s.revisable.take() {
             revisable::observe(self, s, &mut revised, value);
@@ -1284,6 +1303,7 @@ impl SessionDraft {
         s.stopping = *cancel.borrow() > 0;
         let mut tick = tokio::time::interval(Duration::from_millis(50));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut published = None;
         loop {
             tokio::select! {
                 biased;
@@ -1295,7 +1315,7 @@ impl SessionDraft {
                     if s.ending.is_some(){let _=end.reply.send(Delivery::not_submitted("staleSession"));}
                     else{s.ending=Some(Ending {mode:finish_for_signal(end.mode,*cancel.borrow()),reply:end.reply,deadline:tokio::time::Instant::now()+Duration::from_secs(15),expired:false});}
                 },
-                _=edits.changed()=>{self.request_handoff(&mut s);if !s.stopping{publish(Presentation::Editing);}},
+                _=edits.changed()=>{self.request_handoff(&mut s);},
                 _=cancel.changed()=>{
                     s.stopping=*cancel.borrow()>0;
                     if *cancel.borrow()>=2 && let Some(revised)=&mut s.revisable { revised.stop(); }
@@ -1316,7 +1336,7 @@ impl SessionDraft {
                 result=Self::generation_value(&mut s.unit),if matches!(s.unit,Some(UnitSlot::Generating(_)))=>{
                     if let Some(UnitSlot::Generating(generating))=s.unit.take(){s.unit=Some(UnitSlot::Ready(generating.unit.clone(),result));}
                 },
-                _=readiness.changed()=>{let _=readiness.borrow_and_update();if !s.stopping{publish(self.presentation());}},
+                _=readiness.changed()=>{let _=readiness.borrow_and_update();},
                 _=tick.tick()=>{
                     self.request_handoff(&mut s);
                     if !s.stopping&&let Err(error)=windows_input::composition_target(&self.task,&self.anchor){s.record_failure(&self.task, error.code);}
@@ -1362,7 +1382,7 @@ impl SessionDraft {
                 );
             }
             self.trace_dispatch(&mut s);
-            self.project(&s);
+            self.publish_projected(&s, &mut published, &publish);
         }
     }
     pub async fn finish(&self, latest: &NativeTranscript, mode: Finish) -> Delivery {

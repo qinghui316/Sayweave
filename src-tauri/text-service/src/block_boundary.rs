@@ -74,6 +74,11 @@ pub(super) struct BoundaryProof {
     before: Fingerprint,
     after: RefCell<Fingerprint>,
     revision: Cell<u64>,
+    protected: RefCell<Vec<Rc<ProtectedInterval>>>,
+}
+pub(super) struct ProtectedInterval {
+    range: ITfRange,
+    bytes: Fingerprint,
 }
 unsafe fn fingerprint(
     context: &ITfContext,
@@ -112,6 +117,68 @@ unsafe fn fingerprint(
     }
 }
 impl BoundaryProof {
+    pub(super) fn has_protected(&self) -> bool {
+        !self.protected.borrow().is_empty()
+    }
+    // Contract a capability, never reinterpret or discard native characters.
+    // Original outside anchors and all earlier protected intervals survive.
+    pub(super) unsafe fn prepare_contraction(
+        &self,
+        context: &ITfContext,
+        original: &ITfRange,
+        candidate: &ITfRange,
+        ec: u32,
+        phase: &mut String,
+    ) -> windows::core::Result<ProtectedInterval> {
+        unsafe {
+            if !self.matches(context, original, ec, phase)?
+                || candidate.CompareStart(ec, original, TF_ANCHOR_START)? != 0
+                || candidate.CompareEnd(ec, original, TF_ANCHOR_END)? >= 0
+                || candidate.IsEmpty(ec)?.as_bool()
+            {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            let range = original.Clone()?;
+            range.ShiftStartToRange(ec, candidate, TF_ANCHOR_END)?;
+            range.SetGravity(ec, TF_GRAVITY_FORWARD, TF_GRAVITY_FORWARD)?;
+            let bytes = fingerprint(context, &range, ec, MAX_UNITS, phase)?;
+            if bytes.units == 0 || !bytes.paragraphs_only || self.protected.borrow().len() >= 16 {
+                return Err(failure(TF_E_LOCKED));
+            }
+            Ok(ProtectedInterval { range, bytes })
+        }
+    }
+    pub(super) fn commit_contraction(&self, interval: ProtectedInterval) {
+        self.protected.borrow_mut().insert(0, Rc::new(interval));
+        self.revision.set(self.revision.get() + 1);
+    }
+    pub(super) unsafe fn protected_matches(
+        &self,
+        context: &ITfContext,
+        block: &ITfRange,
+        ec: u32,
+        phase: &mut String,
+    ) -> windows::core::Result<bool> {
+        unsafe {
+            let intervals = self.protected.borrow().clone();
+            let mut previous = block.clone();
+            for interval in intervals {
+                *phase = "blockProtectedAnchor".into();
+                if interval.range.CompareStart(ec, &previous, TF_ANCHOR_END)? != 0
+                    || interval.range.IsEmpty(ec)?.as_bool()
+                {
+                    return Ok(false);
+                }
+                *phase = "blockProtectedText".into();
+                if fingerprint(context, &interval.range, ec, MAX_UNITS, phase)? != interval.bytes {
+                    return Ok(false);
+                }
+                previous = interval.range.clone();
+            }
+            *phase = "blockSuffixAnchor".into();
+            Ok(self.suffix.CompareStart(ec, &previous, TF_ANCHOR_END)? == 0)
+        }
+    }
     fn expected(&self) -> (Fingerprint, Fingerprint) {
         (self.before.clone(), self.after.borrow().clone())
     }
@@ -147,7 +214,7 @@ impl BoundaryProof {
                 let changed = ranges[0].as_ref().ok_or_else(|| failure(E_FAIL))?;
                 // Equality is ambiguous: an edit at the block's end may be a
                 // user extension. It must not be adopted as an outside edit.
-                if changed.CompareStart(ec, block, TF_ANCHOR_END)? <= 0
+                if changed.CompareStart(ec, &self.suffix, TF_ANCHOR_START)? <= 0
                     || changed.CompareEnd(ec, &self.suffix, TF_ANCHOR_END)? > 0
                 {
                     return Ok(false);
@@ -157,7 +224,11 @@ impl BoundaryProof {
             if !complete || !saw_update {
                 return Ok(false);
             }
-            let current = Self::capture(context, block, ec, phase)?;
+            // Include protected intervals only in the temporary envelope used
+            // to locate the ORIGINAL outside suffix, never in the writer.
+            let envelope = block.Clone()?;
+            envelope.ShiftEndToRange(ec, &self.suffix, TF_ANCHOR_START)?;
+            let current = Self::capture(context, &envelope, ec, phase)?;
             if current.before != self.before || self.revision.get() != revision || !commit_outside()
             {
                 return Ok(false);
@@ -176,6 +247,15 @@ impl BoundaryProof {
     ) -> windows::core::Result<()> {
         unsafe {
             let mut phase = "blockGuardCapture".into();
+            if !self.protected.borrow().is_empty() {
+                // A contracted writer cannot move the original suffix inward
+                // or refresh any protected bytes after a SetText.
+                return if self.matches(context, block, ec, &mut phase)? {
+                    Ok(())
+                } else {
+                    Err(failure(TF_E_DISCONNECTED))
+                };
+            }
             let current = Self::capture(context, block, ec, &mut phase)?;
             let (before, after) = self.expected();
             if current.before != before || *current.after.borrow() != after {
@@ -221,6 +301,7 @@ impl BoundaryProof {
                 before,
                 after: RefCell::new(after),
                 revision: Cell::new(0),
+                protected: RefCell::new(Vec::new()),
             })
         }
     }
@@ -247,7 +328,7 @@ impl BoundaryProof {
                 return Ok(false);
             }
             *phase = "blockSuffixAnchor".into();
-            if self.suffix.CompareStart(ec, block, TF_ANCHOR_END)? != 0 {
+            if !self.protected_matches(context, block, ec, phase)? {
                 return Ok(false);
             }
             *phase = "blockSuffixDocument".into();

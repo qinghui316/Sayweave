@@ -173,6 +173,7 @@ async fn richtext_actor() {
     context.task_id.clone_from(&task);
     let control = Control::new(input_state::activity_evidence());
     control.resume(1, anchor.activity);
+    control.fixture_ready(1, anchor.activity);
     let (cancel, _) = watch::channel(0);
     let manager = SessionDraft::new(
         task.clone(),
@@ -188,7 +189,11 @@ async fn richtext_actor() {
         Ordering::Release,
     );
     manager.activate();
-    let actor = tokio::spawn(manager.clone().maintain(|_| {}));
+    let publications = Arc::new(Mutex::new(Vec::new()));
+    let events = publications.clone();
+    let actor = tokio::spawn(manager.clone().maintain(move |value| {
+        events.lock().unwrap().push(value);
+    }));
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines() {
@@ -255,7 +260,7 @@ async fn richtext_actor() {
             if *cancel.borrow() > 0 || control.stopping() {
                 return Err(format!("actor stopped: {:?}", manager.report().and_then(|r|r.error)));
             }
-            emit(serde_json::json!({"accepted":true,"sequence":latest.sequence,"presentation":manager.presentation(),"requests":provider.seen.lock().unwrap().len()}));
+            emit(serde_json::json!({"accepted":true,"sequence":latest.sequence,"presentation":manager.presentation(),"published":publications.lock().unwrap().last().copied(),"audioRoute":control.audio.current(),"requests":provider.seen.lock().unwrap().len()}));
         }
         Err("owned actor command limit".into())
     }.await;

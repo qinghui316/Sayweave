@@ -11,6 +11,16 @@ pub(super) fn inline_identity(text: &str) -> bool {
             .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{fffc}'))
 }
 
+// A candidate for capability contraction, not a text decoder. Every unit after
+// this prefix must remain in independently guarded native ranges in the editor.
+pub(super) fn protected_prefix_units(text: &str) -> Option<i32> {
+    let at = text.find(['\r', '\n'])?;
+    if !inline_identity(&text[..at]) || !text[at..].chars().all(|c| matches!(c, '\r' | '\n')) {
+        return None;
+    }
+    i32::try_from(text[..at].encode_utf16().count()).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -30,6 +40,19 @@ mod tests {
             let original = text.to_owned();
             assert!(!inline_identity(text));
             assert_eq!(text, original);
+        }
+    }
+    #[test]
+    fn contraction_only_identifies_an_inline_prefix_and_preserves_all_tail_units() {
+        for text in ["字\n", "字\r\n", "🙂字\n\n"] {
+            let count = protected_prefix_units(text).unwrap() as usize;
+            let native: Vec<_> = text.encode_utf16().collect();
+            assert!(!native[count..].is_empty());
+            assert_eq!(String::from_utf16(&native).unwrap(), text);
+        }
+        assert_eq!(protected_prefix_units("🙂字\n"), Some(3));
+        for text in ["", "\n", "甲\n乙", "甲\n ", "甲\u{fffc}\n", "完整正文"] {
+            assert_eq!(protected_prefix_units(text), None);
         }
     }
 }

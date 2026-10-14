@@ -130,10 +130,17 @@ export async function runBlockRegression({page,pid,focus,start,root,folder,repor
  }
 }
 
-async function runActor({page,pid,focus,start,read,settled,trace,report}){
+async function runActor({page,pid,focus,start,read:readWhole,settled:settledWhole,trace,report}){
  const executable=process.env.SAYWEAVE_ACTOR_TEST_EXE;
  if(!executable||!path.isAbsolute(executable))throw Error('Built owned actor test executable required');
- await page.evaluate(()=>window.fixtureEditor.set('',0,0));
+ const sentinels=process.env.SAYWEAVE_BLOCK_SENTINELS==='1';
+ const prefix=sentinels?'左|':'',suffix=sentinels?'#右':'';
+ const scoped=sample=>{
+  if(!sample.text.startsWith(prefix)||!sample.text.endsWith(suffix))throw Error('Actor changed outside sentinel text');
+  return {...sample,fullText:sample.text,text:sample.text.slice(prefix.length,suffix.length?-suffix.length:undefined)};
+ };
+ const read=async()=>scoped(await readWhole()),settled=async()=>scoped(await settledWhole());
+ await page.evaluate(({prefix,suffix})=>window.fixtureEditor.set(prefix+suffix,prefix.length,prefix.length),{prefix,suffix});
  await settled();
  const actor=start(executable,['--exact','dictation::drafts::tests::owned::richtext_actor','--ignored','--nocapture','--test-threads=1'],{SAYWEAVE_INPUT_ACCEPTANCE:'1',SAYWEAVE_TSF_OWNED_PID:String(pid),SAYWEAVE_DRAFT_STRATEGY:'revisable'});
  let buffer='',diagnostics='',exited=false;const values=[],pending=[];
@@ -152,8 +159,14 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
   report.actorIdentity=await receive();
   const earlyEdit=process.env.SAYWEAVE_BLOCK_EARLY_EDIT==='1';
   report.actorScenario=earlyEdit?'edit-before-tracking-receipt':'edit-after-tracking-receipt';
-  segments.push({id:1,revision:1,text:'周三开会',confirmed:false});
-  await command({action:'asr',segments});await expectBody('actor first input','周三开会');
+  const backspace=process.env.SAYWEAVE_BLOCK_BACKSPACE==='1';
+  const userNewline=process.env.SAYWEAVE_BLOCK_USER_NEWLINE==='1';
+  if(userNewline&&!backspace)throw Error('User newline regression requires direct Backspace setup');
+  if(userNewline)report.actorNewlineRepresentation='paragraph';
+  const retained=userNewline?'\n':'';
+  const firstText=backspace?'周三开会。':'周三开会';
+  segments.push({id:1,revision:1,text:firstText,confirmed:false});
+  await command({action:'asr',segments});await expectBody('actor first input',firstText);
   if(earlyEdit){
    const deadline=Date.now()+5000;
    while(!diagnostics.includes('owned_bind_barrier=waiting')){
@@ -170,22 +183,24 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
   }
   report.actorTrackingReceiptBeforeEdit=diagnostics.includes('operation=draft_block_bound');
   if(earlyEdit&&report.actorTrackingReceiptBeforeEdit)throw Error('Early-edit timing not exercised: tracking receipt already consumed');
-  for(const [index,replacement,tail,final]of [[0,'周五开会','，不对，改成下周一上午开会','下周一上午开会'],[1,'下周一开会','，改成下午三点开会','下周一下午三点开会'],[2,'下周一下午两点开会','，不对，改成线上四点开会','下周一下午四点线上开会']]){
+  for(const [index,replacement,tail,final]of [[0,backspace?'周三开会':'周五开会','，不对，改成下周一上午开会','下周一上午开会'],[1,'下周一开会','，改成下午三点开会','下周一下午三点开会'],[2,'下周一下午两点开会','，不对，改成线上四点开会','下周一下午四点线上开会']]){
    const before=await read();if(before.text!==lastBody)throw Error('Late actor body change before edit');
-   let left=0,right=0;while(left<Math.min(before.text.length,replacement.length)&&before.text[left]===replacement[left])left++;while(right<Math.min(before.text.length,replacement.length)-left&&before.text.at(-1-right)===replacement.at(-1-right))right++;
+   const expectedEdit=replacement+(index===0?'':retained);
+   let left=0,right=0;while(left<Math.min(before.text.length,expectedEdit.length)&&before.text[left]===expectedEdit[left])left++;while(right<Math.min(before.text.length,expectedEdit.length)-left&&before.text.at(-1-right)===expectedEdit.at(-1-right))right++;
    const eventWatermark=await page.evaluate(()=>window.ownedBlockEvents.length);
-   await command({action:'edited'});
+   if(!(backspace&&index===0))await command({action:'edited'});
    // End the native composition through the owned host's actual key route.
    // Mutating ProseMirror while TSF still owns a stale composition bypasses
    // normal editing and can itself manufacture an old-text commit on handoff.
-   for(const down of [true,false])await focus({action:'fixture-key',process:pid,key:'ArrowLeft',down});
+   for(const down of [true,false])await focus({action:'fixture-key',process:pid,key:backspace&&index===0?'Backspace':'ArrowLeft',down});
+   if(backspace&&index===0)await command({action:'edited'});
    await page.waitForFunction(at=>window.ownedBlockEvents.slice(at).some(e=>e.type==='compositionend'),eventWatermark,{timeout:5000});
    const handedOff=await settled();trace.push({label:'actor edit handoff '+index,settled:handedOff});
-   if(handedOff.text!==before.text)throw Error('Native editing handoff changed body');
+   if(handedOff.text!==(backspace&&index===0?replacement:before.text))throw Error('Native editing handoff changed body');
    if(process.env.SAYWEAVE_BLOCK_SELECTION_PAUSE==='1'){
     // Real editing starts by moving the caret/selection, before changing text.
     // Keep this interval long enough for the production reader to see it.
-    await page.evaluate(at=>window.fixtureEditor.select(at),left);
+    await page.evaluate(at=>window.fixtureEditor.select(at),prefix.length+left);
     const logStart=diagnostics.length,deadline=Date.now()+5000;
     while(!diagnostics.slice(logStart).includes('operation=draft_selection_wait')){
      if(diagnostics.slice(logStart).includes('code=blockReleased')){
@@ -198,8 +213,13 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
     const positioned=await settled();trace.push({label:'actor selection before edit '+index,settled:positioned});
     if(positioned.text!==before.text)throw Error('Caret-only positioning changed body');
    }
-   await page.evaluate(({left,end,text,caret})=>{window.fixtureEditor.edit(left,end,text);window.fixtureEditor.select(caret);},{left,end:before.text.length-right,text:replacement.slice(left,replacement.length-right),caret:replacement.length});
-   const edited=await settled();trace.push({label:'actor manual edit '+index,settled:edited});if(edited.text!==replacement)throw Error('Actor manual edit differs');
+   if(!(backspace&&index===0))await page.evaluate(({left,end,text,caret})=>{window.fixtureEditor.edit(left,end,text);window.fixtureEditor.select(caret);},{left:prefix.length+left,end:prefix.length+before.text.length-right,text:expectedEdit.slice(left,expectedEdit.length-right),caret:prefix.length+replacement.length});
+   // Use this editor's supported paragraph break. A raw LF inserted into a
+   // text node is normalized to a space by its own DOM parser, even during
+   // ordinary typing without TSF. The separate host-control evidence retains
+   // that failure; it is not a user paragraph-break acceptance case.
+   if(userNewline&&index===0)await page.evaluate(at=>{window.fixtureEditor.appendParagraph();window.fixtureEditor.select(at);},prefix.length+replacement.length);
+   const edited=await settled();trace.push({label:'actor manual edit '+index,settled:edited});if(edited.text!==replacement+retained)throw Error('Actor manual edit differs');
    if(index===0){
     report.actorTrackingReceiptAfterEdit=diagnostics.includes('operation=draft_block_bound');
     if(earlyEdit&&report.actorTrackingReceiptAfterEdit)throw Error('Early-edit timing ambiguous: tracking receipt consumed during edit');
@@ -207,16 +227,20 @@ async function runActor({page,pid,focus,start,read,settled,trace,report}){
    }
    segments.forEach(s=>s.confirmed=true);
    segments.push({id:index+2,revision:1,text:tail.slice(0,3),confirmed:false});
-   await command({action:'asr',segments});await expectBody('actor partial '+index,replacement+tail.slice(0,3));
+   await command({action:'asr',segments});await expectBody('actor partial '+index,replacement+tail.slice(0,3)+retained);
    segments.at(-1).revision++;segments.at(-1).text=tail;segments.at(-1).confirmed=true;
-   await command({action:'asr',segments});await expectBody('actor model '+index,final);
+   await command({action:'asr',segments});await expectBody('actor model '+index,final+retained);
+   if(process.env.SAYWEAVE_BLOCK_PRESENTATION==='1'){
+    const state=await command({action:'status'});
+    if(state.published!=='recording'||state.audioRoute!==1)throw Error('Body resumed without published recording and retained audio route: '+JSON.stringify(state));
+   }
   }
   if(process.env.SAYWEAVE_BLOCK_FINISH_SELECTION==='1'){
    const eventWatermark=await page.evaluate(()=>window.ownedBlockEvents.length);
    await command({action:'edited'});
    for(const down of [true,false])await focus({action:'fixture-key',process:pid,key:'ArrowLeft',down});
    await page.waitForFunction(at=>window.ownedBlockEvents.slice(at).some(e=>e.type==='compositionend'),eventWatermark,{timeout:5000});
-   await page.evaluate(()=>window.fixtureEditor.select(1));
+   await page.evaluate(at=>window.fixtureEditor.select(at),prefix.length+1);
    const logStart=diagnostics.length,deadline=Date.now()+5000;
    while(!diagnostics.slice(logStart).includes('operation=draft_selection_wait')){
     if(diagnostics.slice(logStart).includes('code=blockReleased'))throw Error('Final caret move discarded the block');

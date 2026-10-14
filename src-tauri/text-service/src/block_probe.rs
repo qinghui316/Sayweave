@@ -963,6 +963,70 @@ fn unified(
         }
         println!("unified block round={round} actual_body_checked=true");
     }
+    if std::env::var("SAYWEAVE_BLOCK_FOLLOW_FAILURE").as_deref() == Ok("1") {
+        unsafe {
+            fault(10);
+        }
+        op += 1;
+        rev += 1;
+        let failed = exchange(
+            pipe,
+            capability,
+            &task,
+            1,
+            op,
+            rev,
+            Action::Update,
+            "已经发生的写入",
+            false,
+        )?;
+        if failed.applied || failed.mutation == Mutation::NotAttempted {
+            return Err("post-write guard failure falsely confirmed or lost its effect".into());
+        }
+        pump(Duration::from_millis(80));
+        if editor_text(editor)? != "左已经发生的写入右" {
+            return Err("post-write failure body differs".into());
+        }
+        op += 1;
+        let refused = request(
+            pipe,
+            capability,
+            &task,
+            op,
+            command(&current, BlockAction::Read),
+            "",
+        )?;
+        if refused.applied || editor_text(editor)? != "左已经发生的写入右" {
+            return Err("failed writer revived or replayed content".into());
+        }
+        op += 1;
+        let _ = exchange(
+            pipe,
+            capability,
+            &task,
+            1,
+            op,
+            rev,
+            Action::Handoff,
+            "",
+            false,
+        )?;
+        op += 1;
+        if !request(
+            pipe,
+            capability,
+            &task,
+            op,
+            command(&current, BlockAction::Release),
+            "",
+        )?
+        .applied
+        {
+            return Err("failed writer tracking did not retire".into());
+        }
+        println!("post-write guard failure preserves effect, rejects replay and retires=true");
+        return Ok(());
+    }
     op += 1;
     let done = exchange(
         pipe,

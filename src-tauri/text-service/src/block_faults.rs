@@ -18,6 +18,11 @@ pub fn stale_tracking_range() -> bool {
         .compare_exchange(6, 0, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
 }
+pub fn reject_owned_follow() -> bool {
+    FAULT
+        .compare_exchange(10, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
 pub fn acquisition_without_object(shared: &Shared) -> windows::core::Result<()> {
     let fault = FAULT.load(Ordering::Acquire);
     if matches!(fault, 7..=9)

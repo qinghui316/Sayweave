@@ -1087,3 +1087,46 @@ fn failure_diagnostics_are_bounded_and_cancel_keeps_its_terminal_result() {
     assert_eq!(delivery.error.as_deref(), Some("cancelled"));
     assert_eq!(state.stop_error.as_deref(), Some("compositionRejected"));
 }
+
+#[test]
+fn retained_audio_resume_publishes_settled_view_without_readiness_event() {
+    let (actor, mut state, _native) = actor(None);
+    actor.control.resume(state.turn, state.activity);
+    actor.control.fixture_ready(state.turn, state.activity);
+    let mut readiness = actor.control.readiness();
+    let _ = readiness.borrow_and_update();
+    let values = Mutex::new(Vec::new());
+    let publish = |value| values.lock().unwrap().push(value);
+    let mut published = None;
+    actor.publish_projected(&state, &mut published, &publish);
+    actor.control.hold_input();
+    state.handoff = true;
+    state.paused_at = Some(Instant::now());
+    actor.publish_projected(&state, &mut published, &publish);
+    actor.publish_projected(&state, &mut published, &publish);
+    assert_eq!(actor.control.audio.current(), 0);
+    state.handoff = false;
+    state.paused_at = None;
+    actor.control.resume_retained(state.turn, state.activity);
+    assert!(!readiness.has_changed().unwrap());
+    assert_eq!(actor.control.audio.current(), state.turn);
+    actor.publish_projected(&state, &mut published, &publish);
+    assert_eq!(
+        *values.lock().unwrap(),
+        vec![
+            Presentation::Recording,
+            Presentation::Editing,
+            Presentation::Recording
+        ]
+    );
+    actor.control.request_finish();
+    state.handoff = true;
+    actor.publish_projected(&state, &mut published, &publish);
+    state.handoff = false;
+    actor.publish_projected(&state, &mut published, &publish);
+    assert_eq!(
+        values.lock().unwrap().len(),
+        3,
+        "late transitions cannot reopen a finishing task"
+    );
+}

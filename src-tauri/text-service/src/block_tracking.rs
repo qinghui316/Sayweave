@@ -191,8 +191,13 @@ impl OwnedUpdate {
         range: &ITfRange,
         ec: u32,
         authority: impl Fn() -> windows::core::Result<()>,
-    ) {
+    ) -> windows::core::Result<()> {
+        let notification = self.track.data.borrow().notification;
         let result = (|| unsafe {
+            #[cfg(feature = "acceptance")]
+            if block_faults::reject_owned_follow() {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
             authority()?;
             let valid = self.track.data.borrow().valid;
             if !valid || !self.track.field.matches()? {
@@ -212,17 +217,16 @@ impl OwnedUpdate {
             if !self.track.field.matches()? {
                 return Err(failure(TF_E_DISCONNECTED));
             }
+            let position = range_position(context, &self.track.range, ec)?;
             let mut data = self.track.data.borrow_mut();
-            if !data.valid {
+            if !data.valid || data.notification != notification {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             if data.text != text {
                 data.text = text;
                 data.version += 1;
             }
-            drop(data);
-            let position = range_position(context, &self.track.range, ec)?;
-            self.track.data.borrow_mut().position = position;
+            data.position = position;
             Ok::<_, windows::core::Error>(())
         })();
         if result.is_err() {
@@ -243,6 +247,65 @@ impl OwnedUpdate {
                 ec,
                 ("ownedFollow", "blockOwnedFollow", error),
             );
+        }
+        // The writer has already changed text. A failed post-write guard must
+        // reach the receipt as an uncertain/changed failure, never success.
+        result?;
+        if !self.track.data.borrow().valid || self.track.data.borrow().notification != notification
+        {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        Ok(())
+    }
+}
+
+pub(super) struct EndGuard {
+    track: Rc<Track>,
+    shared: Shared,
+}
+pub(super) fn end_guard(shared: &Shared) -> Option<EndGuard> {
+    shared
+        .borrow()
+        .block
+        .clone()
+        .filter(|track| {
+            track
+                .boundary
+                .as_ref()
+                .is_some_and(|boundary| boundary.has_protected())
+        })
+        .map(|track| EndGuard {
+            track,
+            shared: shared.clone(),
+        })
+}
+impl EndGuard {
+    pub(super) unsafe fn check(&self, ec: u32) -> windows::core::Result<()> {
+        unsafe {
+            let track = &self.track;
+            let current = || {
+                self.shared
+                    .borrow()
+                    .block
+                    .as_ref()
+                    .is_some_and(|active| Rc::ptr_eq(active, track))
+            };
+            let serial = track.data.borrow().notification;
+            let mut phase = "blockProtectedEnd".into();
+            if !current()
+                || !track.data.borrow().valid
+                || !track
+                    .boundary
+                    .as_ref()
+                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?
+                    .matches(&track.context, &track.range, ec, &mut phase)?
+                || !track.data.borrow().valid
+                || track.data.borrow().notification != serial
+                || !current()
+            {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            Ok(())
         }
     }
 }
@@ -595,9 +658,122 @@ impl Track {
         }
     }
 
+    // Explicit capability transition before producing a fresh snapshot. The
+    // removed interval is retained as native protected content, not decoded.
+    unsafe fn contract_unproven_tail(
+        &self,
+        ec: u32,
+        phase: &mut String,
+    ) -> windows::core::Result<()> {
+        unsafe {
+            *phase = "blockScopeContraction".into();
+            let (version, lease, notification, native, position) = {
+                let data = self.data.borrow();
+                if !data.valid || data.writing || data.notification_depth != 0 {
+                    return Err(failure(TF_E_LOCKED));
+                }
+                (
+                    data.version,
+                    data.lease,
+                    data.notification,
+                    data.text.clone(),
+                    data.position,
+                )
+            };
+            if self.field.native_identity_text() {
+                return Err(failure(TF_E_LOCKED));
+            }
+            let owner: ITfContextComposition = self.context.cast()?;
+            let mut compositions = [None];
+            let mut fetched = 0;
+            owner
+                .EnumCompositions()?
+                .Next(&mut compositions, &mut fetched)?;
+            if fetched != 0 {
+                *phase = "blockInputMethodBusy".into();
+                return Err(failure(TF_E_LOCKED));
+            }
+            let units =
+                content::protected_prefix_units(&native).ok_or_else(|| failure(TF_E_LOCKED))?;
+            let boundary = self.boundary.as_ref().ok_or_else(|| failure(TF_E_LOCKED))?;
+            if !self.field.matches()?
+                || range_text(&self.range, ec)? != native
+                || range_position(&self.context, &self.range, ec)? != position
+            {
+                return Err(failure(TF_E_LOCKED));
+            }
+            let candidate = self.range.Clone()?;
+            candidate.Collapse(ec, TF_ANCHOR_START)?;
+            let mut moved = 0;
+            candidate.ShiftEnd(ec, units, &mut moved, std::ptr::null())?;
+            if moved != units {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            let candidate_text = range_text(&candidate, ec)?;
+            if !content::inline_identity(&candidate_text)
+                || candidate_text.encode_utf16().count() != units as usize
+                || !native.starts_with(&candidate_text)
+            {
+                return Err(failure(TF_E_LOCKED));
+            }
+            // Selection outside the candidate cannot be silently moved into it.
+            relative_selection(&self.context, &candidate, ec)?;
+            let interval =
+                boundary.prepare_contraction(&self.context, &self.range, &candidate, ec, phase)?;
+            if !boundary.matches(&self.context, &self.range, ec, phase)?
+                || range_text(&self.range, ec)? != native
+                || range_text(&candidate, ec)? != candidate_text
+                || !self.field.matches()?
+            {
+                return Err(failure(TF_E_LOCKED));
+            }
+            relative_selection(&self.context, &candidate, ec)?;
+            {
+                let mut data = self.data.borrow_mut();
+                if !data.valid
+                    || data.version != version
+                    || data.lease != lease
+                    || data.notification != notification
+                    || data.notification_depth != 0
+                {
+                    return Err(failure(TF_E_LOCKED));
+                }
+                // Fence reentrant callbacks until the new range and its guard
+                // have both been installed. Partial failure stays invalid.
+                data.valid = false;
+                data.writable = false;
+                data.lease += 1;
+                data.invalid_reason = "blockScopeContraction".into();
+            }
+            self.range.ShiftEndToRange(ec, &candidate, TF_ANCHOR_END)?;
+            boundary.commit_contraction(interval);
+            if !boundary.matches(&self.context, &self.range, ec, phase)?
+                || range_text(&self.range, ec)? != candidate_text
+                || !self.field.matches()?
+            {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            let position = range_position(&self.context, &self.range, ec)?;
+            relative_selection(&self.context, &self.range, ec)?;
+            let mut data = self.data.borrow_mut();
+            if data.version != version
+                || data.lease != lease + 1
+                || data.notification != notification
+            {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            data.version += 1;
+            data.text = candidate_text;
+            data.position = position;
+            data.pending_proof = false;
+            data.valid = true;
+            Ok(())
+        }
+    }
+
     unsafe fn snapshot(&self, ec: u32, phase: &mut String) -> windows::core::Result<BlockSnapshot> {
         unsafe {
-            let version = self.data.borrow().version;
+            let mut version = self.data.borrow().version;
             if !self.data.borrow().valid {
                 *phase = self.data.borrow().invalid_reason.clone();
                 return Err(failure(TF_E_DISCONNECTED));
@@ -625,7 +801,21 @@ impl Track {
             {
                 return Err(failure(E_ACCESSDENIED));
             }
-            let verified = self.verified_content(ec, phase)?;
+            let verified = match self.verified_content(ec, phase) {
+                Err(error)
+                    if error.code() == TF_E_LOCKED && phase == "blockAwaitingRepresentation" =>
+                {
+                    self.contract_unproven_tail(ec, phase)
+                        .inspect_err(|error| {
+                            if error.code() == TF_E_LOCKED && phase != "blockInputMethodBusy" {
+                                *phase = "blockAwaitingRepresentation".into();
+                            }
+                        })?;
+                    version = self.data.borrow().version;
+                    self.verified_content(ec, phase)?
+                }
+                value => value?,
+            };
             let text = verified.native_text;
             let selection_start = verified.selection_start;
             let selection_end = verified.selection_end;
@@ -684,6 +874,9 @@ impl ITfTextEditSink_Impl for Sink_Impl {
     ) -> windows::core::Result<()> {
         let _callback = Callback::enter();
         let _notification = TextNotification::enter(self.notifications.clone());
+        // Even an invalid/transitioning owner must observe reentry; otherwise
+        // a contraction could mistake a nested edit for an unchanged version.
+        let notification = EditNotification::enter(&self.data);
         if !self.data.borrow().valid {
             return Ok(());
         }
@@ -694,7 +887,6 @@ impl ITfTextEditSink_Impl for Sink_Impl {
             // sinks still invalidate the capability during this interval.
             return Ok(());
         }
-        let notification = EditNotification::enter(&self.data);
         let mut phase = "blockEditContext".into();
         let result = (|| unsafe {
             let context = context.as_ref().ok_or_else(|| failure(E_POINTER))?;
@@ -712,6 +904,12 @@ impl ITfTextEditSink_Impl for Sink_Impl {
             };
             let text = range_text(&self.range, ec)?;
             let position = range_position(context, &self.range, ec)?;
+            if let Some(boundary) = &self.boundary
+                && boundary.has_protected()
+                && !boundary.protected_matches(context, &self.range, ec, &mut phase)?
+            {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
             phase = "blockEditRangeDrift".into();
             if position.start != previous_position.start
                 || position.end - position.start != text.encode_utf16().count() as i32

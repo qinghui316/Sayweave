@@ -205,6 +205,7 @@ fn end_settled_composition(
     generation: u64,
     epoch: u64,
     ec: u32,
+    mutation: &mut Mutation,
 ) -> windows::core::Result<()> {
     edit_identity(shared, request, generation, epoch)?;
     {
@@ -219,7 +220,14 @@ fn end_settled_composition(
             epoch,
         });
     }
+    let protected = block_tracking::end_guard(shared);
+    let before = unsafe { protected.as_ref().map_or(Ok(()), |guard| guard.check(ec)) };
+    let previous_effect = *mutation;
+    if protected.is_some() {
+        *mutation = Mutation::Uncertain;
+    }
     let result = unsafe { composition.EndComposition(ec) };
+    let after = unsafe { protected.as_ref().map_or(Ok(()), |guard| guard.check(ec)) };
     let retired = {
         let mut state = shared.borrow_mut();
         if state.prefix_end.as_ref().is_some_and(|end| {
@@ -234,8 +242,14 @@ fn end_settled_composition(
         }
     };
     drop(retired);
-    result?;
-    edit_identity(shared, request, generation, epoch)
+    let protection = before.and(after);
+    if result.is_ok() && protection.is_err() {
+        release_composition_with_failure(shared, epoch, Some(composition), true);
+    }
+    result.and(protection)?;
+    edit_identity(shared, request, generation, epoch)?;
+    *mutation = previous_effect;
+    Ok(())
 }
 #[derive(Clone, Copy)]
 struct ObservationAdmission {
@@ -2414,7 +2428,7 @@ fn materialize(
         permitted()?;
         shared.borrow_mut().selection = Some(current);
         if let Some(tracking) = tracking {
-            tracking.follow(context, &range, ec, permitted);
+            tracking.follow(context, &range, ec, permitted)?;
         }
         permitted()?;
     }
@@ -2591,7 +2605,11 @@ impl ITfEditSession_Impl for EndOwned_Impl {
             Err(failure(TF_E_DISCONNECTED))
         };
         guard()?;
+        let protected = block_tracking::end_guard(&self.state);
+        let before = unsafe { protected.as_ref().map_or(Ok(()), |guard| guard.check(ec)) };
         let result = unsafe { self.composition.EndComposition(ec) };
+        let after = unsafe { protected.as_ref().map_or(Ok(()), |guard| guard.check(ec)) };
+        let semantic = semantic.and(before).and(after);
         if result.is_ok() {
             release_composition_with_failure(
                 &self.state,
@@ -2644,6 +2662,9 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
         let Some((context, generation)) = binding else {
             return Ok(());
         };
+        let protected = block_tracking::end_guard(&self.state);
+        let protected_before =
+            unsafe { protected.as_ref().map_or(Ok(()), |guard| guard.check(ec)) };
         let mut semantic = Ok(());
         if let Some(context) = context {
             let guard = || {
@@ -2669,6 +2690,8 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
                 &mut Mutation::NotAttempted,
             );
         }
+        let protected_after = unsafe { protected.as_ref().map_or(Ok(()), |guard| guard.check(ec)) };
+        semantic = semantic.and(protected_before).and(protected_after);
         let current = {
             let mut state = self.state.borrow_mut();
             let current = state.epoch == self.epoch
@@ -3066,6 +3089,7 @@ struct RetireOwned {
 impl ITfEditSession_Impl for RetireOwned_Impl {
     fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
         let _callback = Callback::enter();
+        let mut mutation = Mutation::NotAttempted;
         let result = (|| {
             edit_identity(&self.state, &self.request, self.generation, self.epoch)?;
             let peer = {
@@ -3093,6 +3117,7 @@ impl ITfEditSession_Impl for RetireOwned_Impl {
                 self.generation,
                 self.epoch,
                 ec,
+                &mut mutation,
             )?;
             self.state.borrow_mut().version.applied(&self.request);
             release_composition(&self.state, self.epoch, Some(&self.composition));
@@ -3109,10 +3134,10 @@ impl ITfEditSession_Impl for RetireOwned_Impl {
             self.connection,
             result.is_ok(),
             &code,
-            Mutation::NotAttempted,
+            mutation,
             None,
         );
-        if result.is_err() {
+        if result.is_err() && self.state.borrow().composition.as_ref() == Some(&self.composition) {
             mark_handoff_failed(&self.state, self.epoch);
         }
         result
@@ -3380,7 +3405,7 @@ fn settle_prefix(
             let empty = range.Clone()?;
             empty.Collapse(ec, TF_ANCHOR_END)?;
             edit_identity(shared, r, generation, epoch)?;
-            end_settled_composition(shared, composition, r, generation, epoch, ec)?;
+            end_settled_composition(shared, composition, r, generation, epoch, ec, mutation)?;
             empty
         } else {
             composition.ShiftStart(ec, &boundary)?;
@@ -3799,7 +3824,7 @@ fn write_composing(
         if let Some(tracking) = tracking {
             #[cfg(feature = "acceptance")]
             tracking.stale_fixture(ec)?;
-            tracking.follow(context, range, ec, || lease(shared, r, generation, context));
+            tracking.follow(context, range, ec, || lease(shared, r, generation, context))?;
         }
         lease(shared, r, generation, context)?;
         if advance {
@@ -4428,8 +4453,23 @@ fn apply(
                 edit_identity(shared, r, generation, epoch)?;
                 shared.borrow_mut().version.applied(r);
                 prepare_observation(shared, context, &range, None, r);
-                composition.EndComposition(ec)?;
-                release_composition(shared, epoch, Some(&composition));
+                let protected = block_tracking::end_guard(shared);
+                let before = protected.as_ref().map_or(Ok(()), |guard| guard.check(ec));
+                let result = composition.EndComposition(ec);
+                let after = protected.as_ref().map_or(Ok(()), |guard| guard.check(ec));
+                let protection = before.and(after);
+                if result.is_ok() {
+                    release_composition_with_failure(
+                        shared,
+                        epoch,
+                        Some(&composition),
+                        protection.is_err(),
+                    );
+                }
+                if protection.is_err() {
+                    *mutation = Mutation::Uncertain;
+                }
+                result.and(protection)?;
             }
             Action::Begin
             | Action::Revoke
@@ -5048,7 +5088,16 @@ mod tests {
         }
         .into();
         state.borrow_mut().composition = Some(composition.clone());
-        end_settled_composition(&state, &composition, &request, 12, 7, 0).unwrap();
+        end_settled_composition(
+            &state,
+            &composition,
+            &request,
+            12,
+            7,
+            0,
+            &mut Mutation::NotAttempted,
+        )
+        .unwrap();
         let mut current = state.borrow_mut();
         assert!(current.version.owned);
         assert_eq!(current.generation, 12);
