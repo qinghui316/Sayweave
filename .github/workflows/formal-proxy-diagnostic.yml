@@ -51,7 +51,18 @@ jobs:
           if ((Get-FileHash -LiteralPath $tool -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'a4491230769b333e7b19709684c912349e88d78bd482e0afc458b16d8d2c1aa0') { throw 'Retained verifier differs' }
           Copy-Item -LiteralPath "$env:RUNNER_TEMP/formal_switch_probe.rs" -Destination src-tauri/text-service/src/formal_switch_probe.rs
           node scripts/test-formal-core-switch.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic native gate failed' }
+          if ($LASTEXITCODE -ne 0) {
+            $before = Get-Content -LiteralPath '.local/formal-core-switch/body-receipts.log' -Raw -Encoding UTF8
+            Copy-Item -LiteralPath '.local/formal-core-switch/body-receipts.log' -Destination '.local/formal-core-switch/body-before-ctf.log'
+            if ($before -notmatch 'activate_process_tip:.*0x80004005' -or $before -notmatch 'cleanup_complete=true') { throw 'Unexpected failure or incomplete cleanup; no environment comparison' }
+            Get-Process -Id $PID | Select-Object Id,SessionId
+            Get-Process ctfmon -ErrorAction SilentlyContinue | Select-Object Id,SessionId
+            Start-Process -FilePath "$env:SystemRoot/System32/ctfmon.exe" -WindowStyle Hidden
+            Start-Sleep -Seconds 2
+            Get-Process ctfmon -ErrorAction SilentlyContinue | Select-Object Id,SessionId
+            node scripts/test-formal-core-switch.mjs
+            if ($LASTEXITCODE -ne 0) { throw 'Diagnostic gate also failed with text-services process started' }
+          }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
