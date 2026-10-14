@@ -119,6 +119,10 @@ describe('frozen product release controller boundaries',()=>{
   expect(()=>validateNativeTestOverride(Buffer.from(original),Buffer.from(reviewed))).toThrow();
  });
  const product='a'.repeat(40),controller='b'.repeat(40),ref='refs/tags/v0.1.9-release-check-e2e-1';
+ it('allows the reviewed dictation E2E path without permitting neighboring tests',()=>{
+  expect(()=>validateFrozenController('v0.1.9',product,controller,ref,['tests/e2e/dictation.spec.ts'])).not.toThrow();
+  expect(()=>validateFrozenController('v0.1.9',product,controller,ref,['tests/e2e/speech.spec.ts'])).toThrow();
+ });
  it.each(['src/app/App.tsx','src-tauri/src/lib.rs','package.json','.github/workflows/windows-ci.yml','../tests/e2e/models.spec.ts'])('rejects undeclared/product change %s',path=>{
   expect(()=>validateFrozenController('v0.1.9',product,controller,ref,['tests/e2e/models.spec.ts',path])).toThrow();
  });
@@ -137,17 +141,17 @@ describe('frozen product release controller boundaries',()=>{
    writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9'}));
    writeFileSync(join(root,'scripts/release-validation.mjs'),readFileSync('scripts/release-validation.mjs'));
    writeFileSync(join(root,'scripts/test-richtext-block.mjs'),'original check');
-   for(const path of ['models','ui-interaction'])writeFileSync(join(root,`tests/e2e/${path}.spec.ts`),'original');
+   for(const path of ['models','ui-interaction','dictation'])writeFileSync(join(root,`tests/e2e/${path}.spec.ts`),'original');
    git(['init']);git(['config','user.name','fixture']);git(['config','user.email','fixture@example.invalid']);git(['config','commit.gpgsign','false']);git(['config','core.autocrlf','false']);git(['config','core.hooksPath',join(root,'no-hooks')]);
    git(['add','.']);git(['commit','-m','product']);const product=git(['rev-parse','HEAD']);git(['tag','v0.1.9']);
-   for(const path of ['models','ui-interaction'])writeFileSync(join(root,`tests/e2e/${path}.spec.ts`),'reviewed');
+   for(const path of ['models','ui-interaction','dictation'])writeFileSync(join(root,`tests/e2e/${path}.spec.ts`),'reviewed');
    writeFileSync(join(root,'scripts/test-richtext-block.mjs'),'reviewed check');
    writeFileSync(join(root,'src-tauri/src/installer/record.rs'),nativeReviewed);
    git(['add','.']);git(['commit','-m','controller']);const controller=git(['rev-parse','HEAD']);git(['tag','v0.1.9-release-check-e2e-1']);git(['update-ref','refs/remotes/origin/main',controller]);git(['checkout','--detach',product]);
    const failure=`Reviewed frozen-product ${kind==='check'?'check':'E2E'} failed`;
-   const work=runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(kind==='check'?nativeReviewed:nativeOriginal);expect(readFileSync(join(root,'tests/e2e/models.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe(kind==='check'?'reviewed check':'original check');if(status===2)writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9',unexpected:true}));return {status:status===0?0:1};},kind);
+   const work=runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{expect(readFileSync(join(root,'tests/e2e/dictation.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(kind==='check'?nativeReviewed:nativeOriginal);expect(readFileSync(join(root,'tests/e2e/models.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe(kind==='check'?'reviewed check':'original check');if(status===2)writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9',unexpected:true}));return {status:status===0?0:1};},kind);
    if(status===0)await work;else if(status===1)await expect(work).rejects.toThrow(failure);else{await expect(work).rejects.toMatchObject({name:'AggregateError',errors:[expect.objectContaining({message:failure}),expect.objectContaining({message:'Frozen product checkout was not restored cleanly'})]});expect(git(['status','--porcelain'])).toContain('package.json');git(['restore','--worktree','--','package.json']);}
-   for(const path of ['models','ui-interaction'])expect(readFileSync(join(root,`tests/e2e/${path}.spec.ts`),'utf8')).toBe('original');
+   for(const path of ['models','ui-interaction','dictation'])expect(readFileSync(join(root,`tests/e2e/${path}.spec.ts`),'utf8')).toBe('original');
    expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe('original check');
    expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(nativeOriginal);
    expect(git(['status','--porcelain'])).toBe('');expect(git(['rev-parse','HEAD'])).toBe(product);

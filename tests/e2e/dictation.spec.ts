@@ -58,7 +58,7 @@ test('device and shortcut controls fit both window sizes with shared styles and 
   await expect(keyField).toHaveAttribute('aria-pressed','true');await expect(keyField).toHaveText('按下快捷键…');
   await expect(dialog.getByRole('button',{name:'取消录入'})).toBeVisible();await expect(dialog.getByRole('button',{name:'保存快捷键'})).toHaveCount(0);
   await dialog.getByRole('button',{name:'取消录入'}).click();await expect(keyField).toHaveAttribute('aria-pressed','false');await expect(keyField).toHaveText('右 Alt');
-  await keyField.click();await expect(keyField).toHaveAttribute('aria-pressed','true');await dialog.getByRole('heading',{name:'麦克风',exact:true}).click();await expect(keyField).toHaveAttribute('aria-pressed','false');
+  await keyField.click();await expect(keyField).toHaveAttribute('aria-pressed','true');await dialog.getByRole('heading',{name:'音频输入',exact:true}).click();await expect(keyField).toHaveAttribute('aria-pressed','false');
   const chosen=width===1120?'按住':'点按';await dialog.getByRole('radio',{name:chosen,exact:true}).click();await expect(dialog.getByRole('radio',{name:chosen,exact:true})).toBeChecked();
   await expect(dialog.getByText(chosen==='按住'?'按下开始，松开结束。':'按一下开始，再按一下结束。')).toBeVisible();
   for(const control of [device,dialog.getByRole('button',{name:'更改快捷键'}),dialog.getByRole('radio',{name:'点按',exact:true}),dialog.getByRole('radio',{name:'按住',exact:true})]){

@@ -42,7 +42,7 @@ export function releaseNotes(value){
  return `Sayweave ${value.version}\n\n${value.changes.map(change=>`- ${change}`).join('\n')}\n${value.installation?`\n${value.installation}\n`:''}`;
 }
 
-export const frozenTestPaths=['tests/e2e/models.spec.ts','tests/e2e/ui-interaction.spec.ts'];
+export const frozenTestPaths=['tests/e2e/models.spec.ts','tests/e2e/ui-interaction.spec.ts','tests/e2e/dictation.spec.ts'];
 const receiptTestPath='src-tauri/src/installer/record.rs';
 export const frozenCheckPaths=['scripts/test-richtext-block.mjs',receiptTestPath];
 // This one reviewed fixture repair is pinned through EOF, including module closure.
