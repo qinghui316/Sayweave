@@ -91,11 +91,32 @@ describe('retained package resume and partial upload',()=>{
 });
 
 describe('frozen product release controller boundaries',()=>{
- const nativeOriginal='fn production() {}\n#[cfg(test)]\nmod tests { /* original fixture */ }\n';
- const nativeReviewed=nativeOriginal.replace('original fixture','reviewed fixture');
+ // Reconstruct the frozen fixture without requiring release tags in shallow CI clones.
+ // The production validator pins both actual test modules through EOF by SHA256.
+ const nativeReviewed=readFileSync('src-tauri/src/installer/record.rs','utf8').replaceAll('\r\n','\n');
+ const start=nativeReviewed.indexOf('    fn ordinary_owner_receipt_preserves_owner_and_confirms_replacement() {');
+ const end=nativeReviewed.indexOf('    #[test]\n    fn live_installer_identity_fences_receipt_recovery_including_pid_reuse()',start);
+ const nativeOriginal=nativeReviewed.slice(0,start)+`    fn ordinary_owner_receipt_preserves_owner_and_confirms_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("receipt.json");
+        write_receipt(&path, b"old").unwrap();
+        write_receipt(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        sayweave_text_service::atomic_record::verify_user_owner(&path).unwrap();
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+`+nativeReviewed.slice(end);
  it('permits a native test fixture delta but rejects production changes and ambiguous boundaries',()=>{
   expect(()=>validateNativeTestOverride(Buffer.from(nativeOriginal),Buffer.from(nativeReviewed))).not.toThrow();
-  for(const changed of [nativeReviewed.replace('production','changed'),nativeReviewed.replace('#[cfg(test)]','#[cfg(any())]'),nativeReviewed+'\n#[cfg(test)]\nmod tests {}'])expect(()=>validateNativeTestOverride(Buffer.from(nativeOriginal),Buffer.from(changed))).toThrow();
+  for(const changed of ['fn runtime() {}\n'+nativeReviewed,nativeReviewed.replace('#[cfg(test)]','#[cfg(any())]'),nativeReviewed+'\n#[cfg(test)]\nmod tests {}'])expect(()=>validateNativeTestOverride(Buffer.from(nativeOriginal),Buffer.from(changed))).toThrow();
+ });
+ it.each(['append','escape','alter test','alter original'])('rejects unreviewed native suffix changes: %s',kind=>{
+  let original=nativeOriginal,reviewed=nativeReviewed;
+  if(kind==='append')reviewed+='\npub fn injected_runtime() {}\n';
+  if(kind==='escape')reviewed=reviewed.replace('mod tests {','mod tests {}\npub fn injected_runtime() {}\nmod hidden {');
+  if(kind==='alter test')reviewed=reviewed.replace('drop(scope);','std::mem::forget(scope);');
+  if(kind==='alter original')original+='\npub fn injected_runtime() {}\n';
+  expect(()=>validateNativeTestOverride(Buffer.from(original),Buffer.from(reviewed))).toThrow();
  });
  const product='a'.repeat(40),controller='b'.repeat(40),ref='refs/tags/v0.1.9-release-check-e2e-1';
  it.each(['src/app/App.tsx','src-tauri/src/lib.rs','package.json','.github/workflows/windows-ci.yml','../tests/e2e/models.spec.ts'])('rejects undeclared/product change %s',path=>{

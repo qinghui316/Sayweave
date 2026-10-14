@@ -45,17 +45,19 @@ export function releaseNotes(value){
 export const frozenTestPaths=['tests/e2e/models.spec.ts','tests/e2e/ui-interaction.spec.ts'];
 const receiptTestPath='src-tauri/src/installer/record.rs';
 export const frozenCheckPaths=['scripts/test-richtext-block.mjs',receiptTestPath];
-// A native test lives beside production Rust. Only its final cfg(test) module may
-// differ; compare the exact preceding bytes before any overlay or artifact trust.
+// This one reviewed fixture repair is pinned through EOF, including module closure.
+// A marker/prefix comparison alone cannot reject runtime code appended after tests.
+const receiptTestModules={original:'817d8bf646b7b37d2c990cfbd6cf4e6981daed4f78c4eca57bffd04ca050a619',reviewed:'4a38a0a48e95900d3911eafaa65104fdd8214d9816635d9436fda7904b8fc550'};
 export function validateNativeTestOverride(original,reviewed){
  const marker=Buffer.from('\n#[cfg(test)]\nmod tests {');
- const prefix=bytes=>{
+ const prefix=(bytes,expected)=>{
   new TextDecoder('utf-8',{fatal:true}).decode(bytes);
   const start=bytes.indexOf(marker);
   if(start<0||bytes.indexOf(marker,start+1)!==-1)throw Error('Native test boundary is not unique');
+  if(createHash('sha256').update(bytes.subarray(start)).digest('hex')!==expected)throw Error('Native test module differs from the reviewed frozen fixture');
   return bytes.subarray(0,start);
  };
- if(!prefix(original).equals(prefix(reviewed)))throw Error('Frozen native production source differs');
+ if(!prefix(original,receiptTestModules.original).equals(prefix(reviewed,receiptTestModules.reviewed)))throw Error('Frozen native production source differs');
 }
 function verifyNativeTestDelta(root,product,controller,paths){
  if(paths.includes(receiptTestPath))validateNativeTestOverride(
