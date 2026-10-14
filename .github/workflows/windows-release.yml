@@ -385,7 +385,7 @@ jobs:
         if: always() && inputs.phase != 'resume-package'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: release-components-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
+          name: release-components-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}-${{ github.run_attempt }}
           retention-days: 14
           path: |
             src-tauri/resources/fixed-proxy/manifest.json
@@ -419,7 +419,7 @@ jobs:
         if: always() && steps.signed.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: release-payloads-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}
+          name: release-payloads-${{ env.SAYWEAVE_RELEASE_TAG }}-${{ env.SAYWEAVE_RELEASE_COMMIT }}-${{ github.run_attempt }}
           retention-days: 14
           path: .local/component-build/payload-receipt.json
           if-no-files-found: error
