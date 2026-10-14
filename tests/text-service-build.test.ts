@@ -15,11 +15,13 @@ function pe(names:string[]){
 describe('ordinary component build identities',()=>{
  it('reuses proxy across private core changes and invalidates full routing validation or toolchain changes',()=>{
   const root=mkdtempSync(join(tmpdir(),'sayweave-component-key-'));
-  try{const base=join(root,'src-tauri/text-service');mkdirSync(join(base,'src'),{recursive:true});
-   for(const file of ['Cargo.toml','Cargo.lock','build.rs','service.def','src/lib.rs','src/proxy.rs','src/proxy_transport.rs','src/engine_abi.rs','src/lifecycle.rs','src/routing.rs','src/transport.rs','src/registration.rs','src/host_identity.rs','src/deployment.rs','src/service.rs'])writeFileSync(join(base,file),'initial');
+  try{const base=join(root,'src-tauri/text-service');mkdirSync(join(base,'src/deployment'),{recursive:true});
+   for(const file of ['Cargo.toml','Cargo.lock','build.rs','service.def','src/lib.rs','src/proxy.rs','src/proxy_transport.rs','src/engine_abi.rs','src/lifecycle.rs','src/routing.rs','src/transport.rs','src/registration.rs','src/host_identity.rs','src/deployment.rs','src/deployment/retired.rs','src/atomic_record.rs','src/service.rs'])writeFileSync(join(base,file),'initial');
    const key=()=>componentSourceKey(root,'proxy',{},'rustc 1');const before=key();
    writeFileSync(join(base,'src/service.rs'),'changed text write');expect(key()).toBe(before);
    writeFileSync(join(base,'src/routing.rs'),'changed valid() and serde attributes');expect(key()).not.toBe(before);
+   const deployment=key();writeFileSync(join(base,'src/deployment/retired.rs'),'changed cleanup');expect(key()).not.toBe(deployment);
+   const retirement=key();writeFileSync(join(base,'src/atomic_record.rs'),'changed retry');expect(key()).not.toBe(retirement);
    const routing=key();expect(componentSourceKey(root,'proxy',{RUSTFLAGS:'-C opt-level=2'},'rustc 1')).not.toBe(routing);
    expect(componentSourceKey(root,'proxy',{},'rustc 2')).not.toBe(routing);
   }finally{rmSync(root,{recursive:true,force:true});}

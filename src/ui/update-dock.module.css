@@ -1,14 +1,3 @@
-.trigger { width:36px; height:36px; flex:none; display:grid; place-items:center; padding:4px; border-radius:var(--radius-control); background:transparent; }
-.trigger:hover { background:var(--surface-hover); }
-.trigger:focus-visible { outline:2px solid var(--text-primary); outline-offset:2px; }
-.trigger svg { width:24px; height:24px; }
-.track,.progress { fill:none; stroke-width:3; }
-.track { stroke:var(--surface-key); }
-.progress { stroke:var(--text-primary); stroke-linecap:round; }
-.failed { display:grid; place-items:center; width:18px; height:18px; border:1.5px solid currentColor; border-radius:50%; font-size:13px; font-weight:600; }
-.popover { position:fixed; z-index:60; width:min(336px,calc(100vw - 24px)); max-height:calc(100vh - 24px); overflow:auto; padding:var(--space-20); border-radius:var(--radius-card); background:var(--surface-content); color:var(--text-primary); box-shadow:0 12px 32px #00000024; }
-.popover:focus-visible { outline:2px solid var(--text-primary); outline-offset:2px; }
-.header { display:flex; align-items:center; justify-content:space-between; gap:var(--space-12); margin-bottom:var(--space-12); font-size:var(--text-body); font-weight:500; }
-.spin { animation:update-dock-spin 1.2s linear infinite; }
-@keyframes update-dock-spin { to { transform:rotate(360deg); } }
-@media(prefers-reduced-motion:reduce) { .spin { animation:none; } }
+.trigger{width:36px;height:36px;flex:none;display:grid;place-items:center;padding:4px;border-radius:50%;background:transparent;color:var(--text-primary)}
+.trigger:hover{background:var(--surface-hover)}
+.trigger:focus-visible{outline:2px solid var(--text-primary);outline-offset:2px}

@@ -1,5 +1,7 @@
 //! Fixed component deployment. No renderer-supplied path, script or DLL is accepted.
 use crate::registration;
+mod retired;
+pub use retired::RetainedComponents;
 use std::{
     io::Write,
     path::{Path, PathBuf},
@@ -212,11 +214,22 @@ pub fn install(bytes: &[u8], expected_sid: &str) -> windows::core::Result<()> {
 
 /// Stage only fixed embedded bytes. No user SID/profile state is changed here.
 pub fn prepare_installer(bytes: &[u8]) -> windows::core::Result<String> {
+    prepare_installer_until(
+        bytes,
+        std::time::Instant::now() + std::time::Duration::from_secs(120),
+    )
+}
+fn prepare_installer_until(
+    bytes: &[u8],
+    deadline: std::time::Instant,
+) -> windows::core::Result<String> {
     registration::administrator()?;
     if bytes.len() < 1024 || bytes.len() > 32 * 1024 * 1024 || !bytes.starts_with(b"MZ") {
         return Err(fail("invalidPayload"));
     }
-    let old = registration::owned_module()?;
+    let old = registration::owned_module()?
+        .map(|p| local_path(&p).map(|p| p.to_string_lossy().into_owned()))
+        .transpose()?;
     if let Some(old) = &old {
         owned_path(old)?;
     }
@@ -259,18 +272,18 @@ pub fn prepare_installer(bytes: &[u8]) -> windows::core::Result<String> {
     }
     let mut managed = managed_modules(&base)?;
     if let Some(old) = &old
-        && !managed.contains(old)
+        && !managed.iter().any(|p| p.eq_ignore_ascii_case(old))
     {
         managed.push(old.clone());
     }
     let new = module.to_string_lossy().into_owned();
-    if !managed.contains(&new) {
+    if !managed.iter().any(|p| p.eq_ignore_ascii_case(&new)) {
         managed.push(new);
     }
     if managed.len() > 64 {
         return Err(fail("managedVersionLimit"));
     }
-    write_managed(&base, &managed)?;
+    write_managed_until(&base, &managed, deadline)?;
     pending.durable = true;
     Ok(module.to_string_lossy().into_owned())
 }
@@ -493,30 +506,40 @@ fn managed_modules(base: &Path) -> windows::core::Result<Vec<String>> {
     }
     Ok(value)
 }
+fn validate_journal_path(path: &Path) -> windows::core::Result<()> {
+    let root = program_files()?;
+    if !path.starts_with(&root)
+        || path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(fail("journalPathInvalid"));
+    }
+    for ancestor in path.ancestors() {
+        if ancestor.starts_with(&root) && present(ancestor)? {
+            protected(ancestor)?;
+        }
+    }
+    Ok(())
+}
 fn write_managed(base: &Path, paths: &[String]) -> windows::core::Result<()> {
-    let target = base.join("managed.json");
-    if present(&target)? {
-        protected(&target)?;
-    }
-    let temp = base.join(format!("managed-{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| {
-        let data = serde_json::to_vec(paths).map_err(|_| fail("managedInvalid"))?;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|_| fail("managedWriteFailed"))?;
-        file.write_all(&data)
-            .map_err(|_| fail("managedWriteFailed"))?;
-        file.sync_all().map_err(|_| fail("managedWriteFailed"))?;
-        drop(file);
-        protected(&temp)?;
-        std::fs::rename(&temp, &target).map_err(|_| fail("managedWriteFailed"))
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temp);
-    }
-    result
+    write_managed_until(base, paths, crate::atomic_record::budget())
+}
+fn write_managed_until(
+    base: &Path,
+    paths: &[String],
+    deadline: std::time::Instant,
+) -> windows::core::Result<()> {
+    let data = serde_json::to_vec(paths).map_err(|_| fail("managedInvalid"))?;
+    crate::atomic_record::write(
+        &base.join("managed.json"),
+        &data,
+        deadline,
+        validate_journal_path,
+    )
 }
 pub fn cleanup_pending() -> windows::core::Result<bool> {
     let base = program_files()?.join("Sayweave").join("TextService");
@@ -653,12 +676,34 @@ pub fn publish_engine(
         Ok(())
     }
 }
+/// Production preparation requires installer recovery pins and the caller's remaining deadline.
+/// Caller holds Global\Sayweave.TSF.Installer.v1 throughout collection and staging.
+pub fn prepare_engine_retained(
+    proxy: &[u8],
+    core: &[u8],
+    pins: RetainedComponents,
+    deadline: std::time::Instant,
+) -> windows::core::Result<(String, crate::lifecycle::CurrentEngine)> {
+    retired::prepare(proxy, core, pins, deadline)?;
+    prepare_engine_until(proxy, core, deadline)
+}
 pub fn prepare_engine(
     proxy: &[u8],
     core: &[u8],
 ) -> windows::core::Result<(String, crate::lifecycle::CurrentEngine)> {
-    let module = prepare_installer(proxy)?;
-    prepare_installer(core)?;
+    prepare_engine_until(
+        proxy,
+        core,
+        std::time::Instant::now() + std::time::Duration::from_secs(120),
+    )
+}
+fn prepare_engine_until(
+    proxy: &[u8],
+    core: &[u8],
+    deadline: std::time::Instant,
+) -> windows::core::Result<(String, crate::lifecycle::CurrentEngine)> {
+    let module = prepare_installer_until(proxy, deadline)?;
+    prepare_installer_until(core, deadline)?;
     let descriptor = crate::lifecycle::CurrentEngine {
         schema_version: 1,
         revision: uuid::Uuid::new_v4().to_string(),
@@ -887,7 +932,13 @@ fn update_origin(
         .and_then(|r| r.origin)
         .unwrap_or(before)
 }
-pub fn install_bundle(proxy: &[u8], core: &[u8], expected_sid: &str) -> windows::core::Result<()> {
+pub fn install_bundle(
+    proxy: &[u8],
+    core: &[u8],
+    expected_sid: &str,
+    pins: RetainedComponents,
+    deadline: std::time::Instant,
+) -> windows::core::Result<()> {
     registration::administrator()?;
     if expected_sid != crate::transport::current_user_sid()? {
         return Err(fail("initiatingUserChanged"));
@@ -923,7 +974,7 @@ pub fn install_bundle(proxy: &[u8], core: &[u8], expected_sid: &str) -> windows:
         .map(|old| installer_module_hash(&old.module))
         .transpose()?;
     let before_engine = current_engine()?;
-    let (module, target) = prepare_engine(proxy, core)?;
+    let (module, target) = prepare_engine_retained(proxy, core, pins, deadline)?;
     // Carry one original rollback anchor across compatible core-only updates.
     // A proxy migration creates a fresh anchor; normal failure rollback still uses immediate before.
     let origin = update_origin(
@@ -1034,7 +1085,10 @@ pub fn installer_record() -> windows::core::Result<Option<Vec<u8>>> {
         std::fs::read(file).map_err(|_| fail("installerReadFailed"))?,
     ))
 }
-pub fn write_installer_record(bytes: &[u8]) -> windows::core::Result<()> {
+pub fn write_installer_record(
+    bytes: &[u8],
+    deadline: std::time::Instant,
+) -> windows::core::Result<()> {
     registration::administrator()?;
     if bytes.is_empty() || bytes.len() > 128 * 1024 {
         return Err(fail("installerRecordLimit"));
@@ -1043,36 +1097,12 @@ pub fn write_installer_record(bytes: &[u8]) -> windows::core::Result<()> {
     ensure_directory(&app)?;
     let base = app.join("TextService");
     ensure_directory(&base)?;
-    let target = base.join("installer.json");
-    if present(&target)? {
-        protected(&target)?;
-    }
-    let temp = base.join(format!("installer-{}.tmp", uuid::Uuid::new_v4()));
-    let result = (|| {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp)
-            .map_err(|_| fail("installerWriteFailed"))?;
-        file.write_all(bytes)
-            .map_err(|_| fail("installerWriteFailed"))?;
-        file.sync_all().map_err(|_| fail("installerWriteFailed"))?;
-        drop(file);
-        protected(&temp)?;
-        unsafe {
-            MoveFileExW(
-                PCWSTR(wide(&temp.to_string_lossy()).as_ptr()),
-                PCWSTR(wide(&target.to_string_lossy()).as_ptr()),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )?;
-        }
-        protected(&target)
-    })();
-    if result.is_err() && present(&temp).unwrap_or(false) {
-        let _ = std::fs::remove_file(&temp);
-    }
-    result
+    crate::atomic_record::write(
+        &base.join("installer.json"),
+        bytes,
+        deadline,
+        validate_journal_path,
+    )
 }
 pub fn installer_module_hash(module: &str) -> windows::core::Result<String> {
     let file = owned_path(module)?;

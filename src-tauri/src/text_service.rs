@@ -346,7 +346,14 @@ pub fn helper_entry() -> Option<i32> {
             }
             let r = match action {
                 "--sayweave-text-service=install" => {
-                    sayweave_text_service::deployment::install_bundle(PAYLOAD, CORE_PAYLOAD, sid)
+                    sayweave_text_service::deployment::install_bundle(
+                        PAYLOAD,
+                        CORE_PAYLOAD,
+                        sid,
+                        crate::installer::retained_components()
+                            .map_err(|code| Error::new(&code))?,
+                        std::time::Instant::now() + std::time::Duration::from_secs(120),
+                    )
                 }
                 "--sayweave-text-service=remove" => sayweave_text_service::deployment::remove(sid),
                 "--sayweave-text-service=rollback" => {

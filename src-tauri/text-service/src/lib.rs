@@ -1,5 +1,7 @@
 //! In-target TSF composition component. It owns no microphone, network, vault or database.
 #[cfg(windows)]
+pub mod atomic_record;
+#[cfg(windows)]
 pub mod client;
 #[cfg(all(not(feature = "proxy"), any(test, all(windows, feature = "component"))))]
 mod composition_text;

@@ -58,12 +58,13 @@ impl MachineRecord {
         }
         Ok(())
     }
-    fn save(&self) -> Result<()> {
+    fn save(&self, deadline: Instant) -> Result<()> {
         self.validate()?;
         deployment::write_installer_record(
             &serde_json::to_vec(self).map_err(|_| "installerMachineRecord")?,
+            deadline,
         )
-        .map_err(|_| "installerMachineWrite".into())
+        .map_err(|e| format!("installerMachineWrite:{e}"))
     }
     fn verify_module(&self) -> Result<()> {
         if registration::owned_module()
@@ -87,7 +88,7 @@ impl MachineRecord {
         }
         Ok(())
     }
-    fn rollback(&mut self) -> Result<()> {
+    fn rollback(&mut self, deadline: Instant) -> Result<()> {
         if self.phase == Phase::Committed {
             return Err("installerAlreadyCommitted".into());
         }
@@ -113,7 +114,7 @@ impl MachineRecord {
         }
         self.phase = Phase::RolledBack;
         self.error = None;
-        self.save()
+        self.save(deadline)
     }
 }
 pub fn load() -> Result<Option<MachineRecord>> {
@@ -124,6 +125,25 @@ pub fn load() -> Result<Option<MachineRecord>> {
         serde_json::from_slice(&bytes).map_err(|_| "installerMachineRecord")?;
     value.validate()?;
     Ok(Some(value))
+}
+/// Translate the strict installer journal into deployment-owned identities under MachineLock.
+pub(super) fn retained_components() -> Result<deployment::RetainedComponents> {
+    let mut pins = deployment::RetainedComponents::default();
+    if let Some(record) = load()? {
+        pins.module(&record.module, Some(&record.target.payload_hash))
+            .map_err(|_| "installerRetention")?;
+        if let Some(old) = &record.old {
+            pins.module(&old.module, record.old_hash.as_deref())
+                .map_err(|_| "installerRetention")?;
+        }
+        for engine in [&record.before_core, &record.target_core]
+            .into_iter()
+            .flatten()
+        {
+            pins.engine(engine).map_err(|_| "installerRetention")?;
+        }
+    }
+    Ok(pins)
 }
 pub fn deployment_state(payload: &[u8]) -> &'static str {
     match deployment::core_update_pending() {
@@ -178,6 +198,7 @@ pub fn serve(
     let server = ipc::process(std::process::id())?;
     let _lock = super::native::MachineLock::acquire()?;
     let pipe = ipc::server(transaction, &installer.sid)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
     let mut record = if recover {
         let mut prior = load()?.ok_or("installerRecoveryMissing")?;
         if prior.transaction != transaction
@@ -191,7 +212,7 @@ pub fn serve(
         }
         prior.installer = installer;
         prior.server = server;
-        prior.save()?;
+        prior.save(deadline)?;
         prior
     } else {
         if let Some(prior) = load()?
@@ -209,11 +230,13 @@ pub fn serve(
             })
             .transpose()?;
         let before_core = deployment::current_engine().map_err(|_| "componentCoreRead")?;
-        let (module, target_core) = deployment::prepare_engine(
+        let (module, target_core) = deployment::prepare_engine_retained(
             crate::text_service::payload(),
             crate::text_service::core_payload(),
+            retained_components()?,
+            deadline,
         )
-        .map_err(|_| "componentPrepare")?;
+        .map_err(|e| format!("componentPrepare:{e}"))?;
         if deployment::installer_module_hash(&module).map_err(|_| "componentIdentity")?
             != target.payload_hash
         {
@@ -235,16 +258,17 @@ pub fn serve(
             core_publish_started: false,
             error: None,
         };
-        value.save()?;
+        value.save(deadline)?;
         value
     };
     let began = Instant::now();
     loop {
         if !ipc::live(&record.installer) || began.elapsed() > Duration::from_secs(15 * 60) {
-            if let Err(error) = record.rollback() {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            if let Err(error) = record.rollback(deadline) {
                 record.phase = Phase::Recovery;
                 record.error = Some(error.clone());
-                record.save()?;
+                record.save(deadline)?;
                 return Err(error);
             }
             return Ok(());
@@ -319,23 +343,23 @@ fn handle(pipe: &Pipe, record: &mut MachineRecord, recover: bool) -> Result<()> 
                 )
                 .map_err(|_| "componentCommit")?;
                 record.core_publish_started = true;
-                record.save()?;
+                record.save(deadline)?;
                 deployment::publish_engine(
                     record.before_core.as_ref(),
                     record.target_core.as_ref(),
                 )
                 .map_err(|_| "componentCoreCommit")?;
                 record.phase = Phase::MachineCommitted;
-                record.save()?;
+                record.save(deadline)?;
             }
             record.verify_module()
         }
         Some("finalize") if !recover && record.phase == Phase::MachineCommitted => {
             record.verify_module()?;
             record.phase = Phase::Committed;
-            record.save()
+            record.save(deadline)
         }
-        Some("rollback") => record.rollback(),
+        Some("rollback") => record.rollback(deadline),
         _ => Err("installerOperationInvalid".into()),
     }
 }

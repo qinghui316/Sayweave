@@ -1,0 +1,9 @@
+.graphic{width:24px;height:24px;flex:none;fill:none;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
+.track{stroke:var(--surface-key)}
+.progress{stroke:var(--signal);transform:rotate(-90deg);transform-origin:12px 12px;transition:stroke-dashoffset 180ms ease-out}
+.download{stroke:var(--signal)}
+.error{stroke:var(--text-primary);stroke-width:2}
+.spin{animation:update-progress-spin 1.2s linear infinite}
+@keyframes update-progress-spin{to{transform:rotate(270deg)}}
+@media(prefers-reduced-motion:reduce){.progress{transition:none}.spin{animation:none}}
+@media(forced-colors:active){.track{stroke:GrayText}.progress,.download{stroke:Highlight}.error{stroke:CanvasText}}

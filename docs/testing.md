@@ -218,3 +218,12 @@ Current WebView2 runtimes ignore environment/HKCU browser-argument overrides for
 `npm run test:tsf` 保留现有输入检查，并调用 `scripts/test-core-switch.ps1`。轻量自有宿主通过同一代理 COM 对象，在同一 PID/STA 从普通核心 A→B→C 读回实际正文，核对哈希和代次、活动范围拒绝切换、旧请求隔离、候选激活失败恢复、引用保活与多 STA。普通管道回执检查覆盖 Commit 未确认、Deactivate、原控制进程重连读取与精确哈希 ACK，不重放编辑。验收代理的受控导出仅选择测试核心及生命周期故障，普通代理和核心禁止这些导出。输出保留在 `.local/core-switch/current`，不修改系统登记或日常程序。
 
 实际 Codex 验收另行记录首次迁移重开、此后两次更新时 PID/创建身份/STA/代理保持不变、执行核心改变与实际正文。受控宿主通过或模块出现不代替实际输入；Codex 未完成时 Change 保持活动。
+
+
+## 0.1.11 更新可靠性定向检查
+
+更新入口状态使用 `tests/update-dock.test.tsx`、`tests/update-ui.test.tsx`，保存屏障沿用 `tests/settings-update-barrier.test.ts`。`tests/e2e/update-progress.spec.ts` 仅检查侧栏圆环、原有关于入口、真实进度/验签区分、键盘焦点、150%缩放、减少动态与高对比度。
+
+`atomic_record::tests` 使用自有临时目录检查真实读句柄短暂/持续占用、阶段期限、权限/路径拒绝和目标变化。`deployment::retired::tests::protected_collection_and_journal_contention` 为显式管理员隔离测试：只创建 `Program Files/Sayweave/MaintenanceTest-<UUID>`，验证64项清单、双载荷容量、保留身份、打开/映射文件、哈希不符、中断清理及真实DACL拒绝，不修改系统登记、真实事务、正式程序或用户数据库。该测试默认忽略；需要相应授权时单独执行，不加入普通CI的系统维护。
+
+完整检查/E2E/分发检查由正式发布流程执行。发布及文件实验通过不表示用户应用内更新已经通过，实际升级结果另行记录。

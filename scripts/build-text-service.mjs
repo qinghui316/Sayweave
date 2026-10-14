@@ -48,7 +48,7 @@ export function componentSourceKey(root, role, env, toolchain) {
   const base = path.join(root, 'src-tauri/text-service');
   const files = role === 'core' ? sources(path.join(base, 'src')).filter(file => !['probe.rs','core_switch_probe.rs','proxy.rs','proxy_transport.rs'].includes(path.basename(file))) : [
     'src/lib.rs', 'src/proxy.rs', 'src/proxy_transport.rs', 'src/engine_abi.rs', 'src/lifecycle.rs',
-    'src/routing.rs', 'src/transport.rs', 'src/registration.rs', 'src/host_identity.rs', 'src/deployment.rs',
+    'src/routing.rs', 'src/transport.rs', 'src/registration.rs', 'src/host_identity.rs', 'src/deployment.rs', 'src/deployment/retired.rs', 'src/atomic_record.rs',
   ].map(file => path.join(base, file));
   const rawManifest = readFileSync(path.join(base, 'Cargo.toml'), 'utf8');
   const manifest = role === 'proxy' ? rawManifest.replace(/^version\s*=.*$/m, 'version = "proxy-independent"') : rawManifest;

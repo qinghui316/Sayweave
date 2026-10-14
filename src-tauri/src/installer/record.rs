@@ -225,6 +225,27 @@ pub fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     result
 }
+#[cfg(windows)]
+pub fn write_receipt(path: &Path, bytes: &[u8]) -> Result<()> {
+    reject_links(path)?;
+    let parent = path.parent().ok_or("installerPathInvalid")?;
+    fs::create_dir_all(parent).map_err(|e| format!("installerWriteFailed:parent.create:{e}"))?;
+    sayweave_text_service::atomic_record::write(
+        path,
+        bytes,
+        sayweave_text_service::atomic_record::budget(),
+        |p| {
+            reject_links(p).map_err(|e| {
+                windows::core::Error::new(windows::Win32::Foundation::E_ACCESSDENIED, e)
+            })?;
+            for owned in [p.parent().unwrap(), p] {
+                sayweave_text_service::atomic_record::verify_user_owner(owned)?;
+            }
+            Ok(())
+        },
+    )
+    .map_err(|e| format!("installerWriteFailed:{e}"))
+}
 impl UserRecord {
     pub fn validate(&self) -> Result<()> {
         self.target.validate()?;
@@ -287,6 +308,17 @@ mod tests {
         assert!(read(&path, 7).is_err());
         write(&path, b"replacement").unwrap();
         assert_eq!(read(&path, 32).unwrap(), b"replacement");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_owner_receipt_preserves_owner_and_confirms_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("receipt.json");
+        write_receipt(&path, b"old").unwrap();
+        write_receipt(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        sayweave_text_service::atomic_record::verify_user_owner(&path).unwrap();
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     }
     #[test]

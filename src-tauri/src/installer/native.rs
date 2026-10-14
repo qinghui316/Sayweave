@@ -280,7 +280,7 @@ fn save(root: &Path, record: &UserRecord) -> Result<()> {
     if bytes.len() as u64 > MAX_RECORD {
         return Err("installerRecordLimit".into());
     }
-    write(&root.join("receipt.json"), &bytes)
+    super::record::write_receipt(&root.join("receipt.json"), &bytes)
 }
 fn load(root: &Path) -> Result<Option<UserRecord>> {
     let path = root.join("receipt.json");

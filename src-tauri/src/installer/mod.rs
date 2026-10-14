@@ -27,6 +27,12 @@ pub(crate) fn legacy_maintenance_guard(payload: &[u8]) -> Result<impl Drop, Stri
     Ok(lock)
 }
 
+#[cfg(windows)]
+pub(crate) fn retained_components()
+-> Result<sayweave_text_service::deployment::RetainedComponents, String> {
+    machine::retained_components()
+}
+
 pub fn helper_entry() -> Option<i32> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if !args
