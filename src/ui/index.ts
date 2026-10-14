@@ -7,5 +7,7 @@ export * from './AnimatedIcon';
 export * from './CopyFeedbackButton';
 export * from './AsyncStatusFeedback';
 export * from './ActionMenu';
+export * from './ExpandableSearch';
+export * from './SettingsLayout';
 export { MotionScope } from './useMotion';
 export {RubberIndicator,useRubberSelection} from './RubberSelection';

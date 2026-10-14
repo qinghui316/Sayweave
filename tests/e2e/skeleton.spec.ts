@@ -30,11 +30,11 @@ test('search fields fit text and retain their focus ring at the minimum window',
   for(const size of [{width:1120,height:760},{width:960,height:640}]){
     await page.setViewportSize(size);
     for(const [route,label] of [['/#/history','搜索识别文字'],['/#/dictionary','搜索词条']]){
-      await page.goto(route!);if(route==='/#/dictionary')await page.getByRole('button',{name:'搜索词语'}).click();const input=page.getByRole('textbox',{name:label!});await input.focus();
+      await page.goto(route!);const input=page.getByRole('textbox',{name:label!});if(!await input.count())await page.getByRole('button',{name:route==='/#/dictionary'?'搜索词语':'搜索识别文字'}).click();await input.focus();
       const geometry=await input.evaluate(node=>{const css=getComputedStyle(node),box=node.getBoundingClientRect();return {textHeight:node.clientHeight-parseFloat(css.paddingTop)-parseFloat(css.paddingBottom),lineHeight:parseFloat(css.lineHeight),left:box.left,right:box.right,outlineExtent:css.outlineStyle==='none'?0:parseFloat(css.outlineWidth)+parseFloat(css.outlineOffset),containerRight:node.parentElement!.getBoundingClientRect().right};});
       expect(geometry.textHeight).toBeGreaterThanOrEqual(geometry.lineHeight);
       expect(geometry.left).toBeGreaterThanOrEqual(0);expect(geometry.right).toBeLessThanOrEqual(geometry.containerRight);
-      expect(geometry.outlineExtent).toBeLessThanOrEqual(0);if(route==='/#/dictionary')expect(await input.evaluate(node=>getComputedStyle(node.parentElement!.parentElement!,'::before').boxShadow)).not.toBe('none');await input.fill('较长的中文搜索内容，用于检查文字与按钮不会互相遮挡');await expect(input).toBeFocused();
+      expect(geometry.outlineExtent).toBeLessThanOrEqual(0);expect(await input.evaluate(node=>getComputedStyle(node.parentElement!.parentElement!,'::before').boxShadow)).not.toBe('none');await input.fill('较长的中文搜索内容，用于检查文字与按钮不会互相遮挡');await expect(input).toBeFocused();
       expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
     }
   }

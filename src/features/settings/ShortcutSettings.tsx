@@ -1,5 +1,5 @@
 import {useEffect,useRef,useState} from 'react';
-import {Button,InlineMessage,Keycap,SingleChoice} from '../../ui';
+import {Button,InlineMessage,Keycap,SingleChoice,SettingsSection,SettingsRow} from '../../ui';
 import {inputMessage,shortcutLabel,type ShortcutConfigPort,type ShortcutConfig,type ShortcutStatus} from '../../contracts/dictation';
 import type {SettingStore} from '../../settings/store';
 import {useSetting} from '../../settings/use-setting';
@@ -39,9 +39,12 @@ export function ShortcutSettings({port,settings}:{port:ShortcutConfigPort;settin
   catch{if(mounted.current)setError('暂时无法录入，请重试。');if(captureToken.current===token)captureToken.current=null;}
   finally{if(mounted.current)setStarting(false);}
  }
- return <section className={s.shortcutSection}><div className={s.shortcutRow}><div><h3>口述快捷键</h3><p>点击右侧键位框，按下想使用的快捷键。</p></div><div className={s.recorderWrap} ref={recorder}><Button variant="quiet" className={s.shortcutRecorder} aria-label="更改快捷键" aria-pressed={status?.capturing??false} disabled={!state.ready||starting} onClick={()=>void capture()}>{status?.capturing?<span role="status">按下快捷键…</span>:draft?shortcutLabel(draft.binding).split(' + ').map((key,index)=><span className={s.recordedKey} key={key+index}>{index>0&&<span className={s.keyJoin}> + </span>}<Keycap>{key}</Keycap></span>):<span>正在读取</span>}</Button>{status?.capturing&&<Button variant="quiet" onClick={()=>void capture()}>取消录入</Button>}</div></div>
- {status?.capturing&&<p className={s.captureHelp}>按下单键或组合键；Esc 或点击其他位置取消。</p>}
- <div className={s.recordingMode}><span className={s.settingLabel}>录音方式</span><SingleChoice label="录音方式" value={draft?.mode??'toggle'} disabled={!state.ready||status?.capturing} options={[{value:'toggle',label:'点按'},{value:'hold',label:'按住'}]} onValueChange={mode=>settings.update({mode:mode as ShortcutConfig['mode']})}/><p>{draft?.mode==='hold'?'按下开始，松开结束。':'按一下开始，再按一下结束。'}</p></div>
- {status?.pending&&<p role="status">已保存，本次口述结束后生效。</p>}{status?.error&&<InlineMessage status="error">{inputMessage(status.error)}</InlineMessage>}{status?.active&&!status.pending&&<p role="status">已启用：{shortcutLabel(status.active.binding)}</p>}{(error||state.error)&&<InlineMessage status="error">{error||state.error}</InlineMessage>}{state.error&&<Button variant="quiet" onClick={()=>void settings.load()}>重新读取</Button>}
- </section>;
+ return <SettingsSection title="口述控制">
+  <SettingsRow title="口述快捷键" description="点击右侧键位框，按下想使用的快捷键。" feedback={<>
+   {status?.capturing&&<p className={s.captureHelp}>按下单键或组合键；Esc 或点击其他位置取消。</p>}
+   {status?.pending&&<p role="status">已保存，本次口述结束后生效。</p>}{status?.error&&<InlineMessage status="error">{inputMessage(status.error)}</InlineMessage>}{status?.active&&!status.pending&&<p role="status">已启用：{shortcutLabel(status.active.binding)}</p>}
+   {(error||state.error)&&<InlineMessage status="error">{error||state.error}</InlineMessage>}{state.error&&<Button variant="quiet" onClick={()=>void settings.load()}>重新读取</Button>}
+  </>}><div className={s.recorderWrap} ref={recorder}><Button variant="quiet" className={s.shortcutRecorder} aria-label="更改快捷键" aria-pressed={status?.capturing??false} disabled={!state.ready||starting} onClick={()=>void capture()}>{status?.capturing?<span role="status">按下快捷键…</span>:draft?shortcutLabel(draft.binding).split(' + ').map((key,index)=><span className={s.recordedKey} key={key+index}>{index>0&&<span className={s.keyJoin}> + </span>}<Keycap>{key}</Keycap></span>):<span>正在读取</span>}</Button>{status?.capturing&&<Button variant="quiet" onClick={()=>void capture()}>取消录入</Button>}</div></SettingsRow>
+  <SettingsRow title="录音方式" description={draft?.mode==='hold'?'按下开始，松开结束。':'按一下开始，再按一下结束。'}><SingleChoice label="录音方式" value={draft?.mode??'toggle'} disabled={!state.ready||status?.capturing} options={[{value:'toggle',label:'点按'},{value:'hold',label:'按住'}]} onValueChange={mode=>settings.update({mode:mode as ShortcutConfig['mode']})}/></SettingsRow>
+ </SettingsSection>;
 }

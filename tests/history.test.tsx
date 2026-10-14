@@ -20,7 +20,7 @@ it('copies and searches the full processed version independently of raw text',as
  render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
  const row=await screen.findByRole('listitem');fireEvent.click(within(row).getByRole('button',{name:'复制'}));
  await waitFor(()=>expect(copy).toHaveBeenCalledWith(full));
- fireEvent.change(screen.getByRole('textbox',{name:'搜索识别文字'}),{target:{value:'识别原文'}});
+ fireEvent.click(screen.getByRole('button',{name:'搜索识别文字'}));fireEvent.change(screen.getByRole('textbox',{name:'搜索识别文字'}),{target:{value:'识别原文'}});
  await screen.findByText('识别原文');fireEvent.click(within(screen.getByRole('listitem')).getByRole('button',{name:'复制'}));
  await waitFor(()=>expect(copy).toHaveBeenLastCalledWith('识别原文'));
 });
@@ -97,7 +97,7 @@ it('copies the full matched old version and opens versions inline with keyboard 
  const r=record(1,'当前成功');const full='旧文字😀'.repeat(90);r.attempts.push({...r.attempts[0]!,id:'old',createdAt:1,text:full});
  const f=fixture([r]),copy=vi.spyOn(f.speech,'copy').mockResolvedValue();
  render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
- await screen.findByText('当前成功');fireEvent.change(screen.getByRole('textbox',{name:'搜索识别文字'}),{target:{value:'旧文字'}});
+ await screen.findByText('当前成功');fireEvent.click(screen.getByRole('button',{name:'搜索识别文字'}));fireEvent.change(screen.getByRole('textbox',{name:'搜索识别文字'}),{target:{value:'旧文字'}});
  await screen.findByText('匹配旧版本');const row=screen.getByRole('listitem');fireEvent.click(within(row).getByRole('button',{name:'复制'}));
  await waitFor(()=>expect(copy).toHaveBeenCalledWith(full));expect(within(row).getByRole('button',{name:'已复制'})).toBeVisible();
  const user=userEvent.setup();within(row).getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('menuitem',{name:'识别版本'}));

@@ -1,0 +1,14 @@
+.section { margin:0; }
+.section + .section { margin-top:32px; }
+.sectionTitle { margin:0 0 24px; padding-bottom:12px; border-bottom:1px solid var(--surface-key); font-size:16px; line-height:24px; font-weight:500; }
+.rows { display:flex; flex-direction:column; gap:24px; }
+.row { display:grid; grid-template-columns:minmax(0,1fr) 220px; column-gap:24px; row-gap:8px; align-items:start; }
+.copy { min-width:0; }
+.title { font-size:14px; line-height:22px; font-weight:400; }
+.description { margin:4px 0 0; font-size:12px; line-height:18px; color:var(--text-secondary); overflow-wrap:anywhere; }
+.control { display:flex; flex-direction:column; align-items:flex-end; gap:8px; min-width:0; }
+.control>[role="radiogroup"] { align-self:flex-end; padding-inline:0; }
+.control>[role="combobox"],.control>input { width:100%; }
+.feedback { grid-column:1/-1; min-width:0; display:flex; flex-direction:column; align-items:flex-start; gap:8px; font-size:12px; line-height:18px; color:var(--text-secondary); }
+.feedback p { margin:0; }
+@container settings-content (max-width:479px) { .row { grid-template-columns:minmax(0,1fr); }.control { align-items:flex-start; }.control>[role="radiogroup"] { align-self:flex-start; }.control>[role="combobox"],.control>input { max-width:100%; }.feedback { grid-column:1; } }

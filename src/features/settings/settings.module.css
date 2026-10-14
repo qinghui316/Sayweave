@@ -1,20 +1,21 @@
-.shell { height: 100%; display: grid; grid-template-columns: 208px minmax(0,1fr); }
-.nav { background: var(--surface-canvas); padding: var(--space-24) var(--space-16); display: flex; flex-direction: column; gap: var(--space-4); }
-.item { background: transparent; display: flex; align-items: center; gap: var(--space-10); height: var(--nav-height); padding: var(--space-10); border-radius: var(--radius-control); text-align: left; font-size: var(--text-body); font-weight: 400; line-height: var(--line-body); }.item:hover { background: var(--surface-hover); }.selected,.selected:hover { background:transparent; color:var(--text-inverse); }
-.content { min-height: 0; min-width: 0; display: flex; flex-direction: column; padding: var(--space-28) var(--space-32); gap: var(--space-20); }.content header { flex: none; padding-right: var(--space-32); }.content h2 { font-size: var(--text-page); line-height: var(--line-page); font-weight: 500; }
-.panelSlot { min-height: 0; min-width: 0; flex: 1; display: flex; }
-.scroll { flex: 1; overflow-y: auto; overflow-x: hidden; min-height: 0; min-width: 0; padding: var(--space-8) var(--space-8) var(--space-24); margin: 0 calc(-1 * var(--space-8)); }.scroll section { margin-bottom: var(--space-28); }.scroll h3,.scroll h4 { font-size: var(--text-mode); line-height: var(--line-mode); font-weight: 500; }.scroll p { margin-top: var(--space-8); color: var(--text-secondary); }.scroll section>button { margin-top: var(--space-16); }.notice { padding-top: var(--space-16); font-size: var(--text-small); }
-.settingRow { display: flex; align-items: center; justify-content: space-between; gap: var(--space-20); padding-top: var(--space-24); }.settingRow p { font-size: var(--text-small); max-width: 360px; }.settingRow button { flex: none; }
-.aboutRow { display: flex; align-items: center; justify-content: space-between; margin-bottom: var(--space-24); }.aboutRow span { color: var(--text-secondary); font-size: var(--text-small); }
-.aboutUpdate { display:flex; align-items:center; justify-content:space-between; min-height:56px; padding:0 var(--space-8); margin-bottom:var(--space-24); border-radius:var(--radius-control); background:var(--surface-hover); }.aboutUpdate h3 {font-size:var(--text-body);font-weight:500;}
-
-.deviceRow { display: flex; align-items: flex-end; gap: var(--space-12); margin-top: var(--space-16); }.deviceRow>div { flex: 1; min-width: 0; }.deviceRow>button { flex: none; }
-.shortcutSection .settingRow { padding-top: var(--space-16); }.recordingMode { margin-top: var(--space-20); }.settingLabel { display: block; font-size: var(--text-body); margin-bottom: var(--space-8); }.recordingMode p { font-size: var(--text-small); }.shortcutSection>p[role="status"] { font-size: var(--text-small); }
-
-.scroll .deviceSection { margin-bottom: var(--space-24); }.deviceSection>p { font-size: var(--text-small); }.deviceRow { margin-top: var(--space-12); }.shortcutSection .recordingMode { margin-top: var(--space-12); }.recordingMode [role="tablist"] { margin-bottom: var(--space-8); }
-
-.shortcutRow { display: grid; grid-template-columns: minmax(0,1fr) 220px; align-items: start; gap: var(--space-20); }.shortcutRow p { font-size: var(--text-small); }.recorderWrap { display: flex; flex-direction: column; align-items: flex-end; gap: var(--space-8); }.shortcutRecorder { display: flex; flex-wrap: wrap; align-items: center; width: 100%; min-height: var(--control-height); height: auto; padding: var(--space-4) var(--space-8); border: 1px solid var(--surface-key); background: var(--surface-canvas); text-align: left; gap: var(--space-4); }.shortcutRecorder[aria-pressed="true"] { border-color: var(--text-primary); }.recordedKey { display: inline-flex; align-items: center; }.shortcutRecorder kbd { min-height: 24px; padding: 2px var(--space-8); border-radius: 6px; background: var(--surface-content); font-size: var(--text-small); }.keyJoin { color: var(--text-secondary); padding: 0 var(--space-4); }.shortcutSection .captureHelp { font-size: var(--text-small); }.shortcutSection .recordingMode { display: grid; grid-template-columns: minmax(0,1fr) 220px; align-items: start; gap: var(--space-20); margin-top: var(--space-24); }.recordingMode .settingLabel { padding-top: var(--space-8); }
+.shell { height:100%; display:grid; grid-template-columns:208px minmax(0,1fr); }
+.nav { background:var(--surface-canvas); padding:24px 16px; display:flex; flex-direction:column; gap:4px; }
+.item { background:transparent; display:flex; align-items:center; gap:10px; height:var(--nav-height); padding:10px; border-radius:var(--radius-control); text-align:left; font-size:var(--text-body); font-weight:400; line-height:var(--line-body); }
+.item:hover { background:var(--surface-hover); }.selected,.selected:hover { background:transparent; color:var(--text-inverse); }
+.content { container:settings-content / inline-size; min-height:0; min-width:0; display:flex; flex-direction:column; padding:28px 32px; gap:24px; }
+.content>header { flex:none; padding-right:32px; }
+.content>header h2 { font-size:24px; line-height:32px; font-weight:500; }
+.panelSlot { min-height:0; min-width:0; flex:1; display:flex; }
+.scroll { flex:1; overflow-y:auto; overflow-x:hidden; min-height:0; min-width:0; padding:4px 8px 24px; margin:0 -8px; scrollbar-gutter:stable; }
+.scroll>section[aria-label="输入恢复"] { margin-top:32px; display:flex; flex-direction:column; align-items:flex-start; gap:12px; }
+.notice { padding-top:16px; font-size:var(--text-small); }
+.aboutRow { display:flex; align-items:center; justify-content:space-between; gap:24px; min-height:36px; margin-top:32px; }
+.aboutRow h3 { font-size:14px; line-height:22px; font-weight:400; }
+.aboutRow span { color:var(--text-secondary); font-size:12px; line-height:18px; }
+.recorderWrap { width:100%; display:flex; flex-direction:column; align-items:flex-end; gap:8px; }
+.shortcutRecorder { display:flex; flex-wrap:wrap; align-items:center; width:100%; min-height:var(--control-height); height:auto; padding:4px 8px; border:1px solid var(--surface-key); background:var(--surface-canvas); text-align:left; gap:4px; }
+.shortcutRecorder[aria-pressed="true"] { border-color:var(--text-primary); }
+.recordedKey { display:inline-flex; align-items:center; }.shortcutRecorder kbd { min-height:24px; padding:2px 8px; border-radius:6px; background:var(--surface-content); font-size:var(--text-small); }.keyJoin { color:var(--text-secondary); padding:0 4px; }
+.captureHelp { font-size:12px; line-height:18px; }
 .processing { margin-bottom:var(--space-20);padding-bottom:var(--space-16);border-bottom:1px solid var(--surface-key); }.processingRow { display:flex;align-items:center;justify-content:space-between;gap:var(--space-20); }.processingRow>div { min-width:0; }.processing h3 { font-size:var(--text-mode);line-height:var(--line-mode);font-weight:500; }.processing p { margin-top:var(--space-8);font-size:var(--text-small);line-height:var(--line-small);color:var(--text-secondary); }.processing .processingModel { overflow-wrap:anywhere; }.processing>button { margin-top:var(--space-12); }
 .processingRow + .processingRow { margin-top:var(--space-20); }
-
-.aboutRow{min-height:44px;margin-top:var(--space-24);margin-bottom:0}.settingRow>div:first-child{min-width:0}.deviceRow button{height:36px}.deviceRow{align-items:flex-end}
