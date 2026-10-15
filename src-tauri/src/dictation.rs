@@ -873,9 +873,6 @@ impl DictationCoordinator {
             #[cfg(windows)]
             if let Some(report) = draft.as_ref().and_then(|d| d.report()) {
                 coordinator.update(&app, &id, |s| {
-                    if !report.cancelled && report.error.is_some() {
-                        s.error = report.error.clone();
-                    }
                     if !report.text.is_empty() || report.cancelled {
                         s.text = report.text;
                     }

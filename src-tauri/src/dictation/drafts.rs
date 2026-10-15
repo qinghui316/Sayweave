@@ -355,9 +355,12 @@ impl State {
                 self.record_failure(task, secondary);
             }
             self.report.error = Some(first.clone());
-            // Submission/restore_error retain actual effects independently of
-            // the first failure. A later empty teardown must not erase its cause.
-            if !self.report.cancelled {
+            // Keep actual rollback/uncertain effects and a winning cancellation.
+            // Ordinary teardown refusal is secondary to the failed live update.
+            if !self.report.cancelled
+                && !delivery.restore_error
+                && delivery.submission != Submission::Uncertain
+            {
                 delivery.error = Some(first);
             }
         }
