@@ -116,8 +116,8 @@
       "file": "words.webp",
       "width": 1680,
       "height": 1140,
-      "bytes": 26626,
-      "sha256": "43712a3af661838dcfa127c8d0db1b3e843eaca8f3fe1905a2a8f8737e4a1916",
+      "bytes": 23678,
+      "sha256": "1886218402701157498c16cc4cfe135b473ea24fe869a74a954026260a4cd95f",
       "kind": "current-product-frontend-with-isolated-example-ports"
     },
     {
@@ -138,16 +138,17 @@
     },
     {
       "file": "brand-light.svg",
-      "bytes": 26094,
-      "sha256": "d3104be16cd18829109ab06565f6c265be50eb06c24542dd8b7ccbef89580c98",
+      "bytes": 26090,
+      "sha256": "f5c1a5e3eaaeafe3a2581911c7238de90b488b7403d42317a93d119cca243612",
       "kind": "official-vector-contours"
     },
     {
       "file": "brand-dark.svg",
-      "bytes": 26094,
-      "sha256": "c88be6a7b8460d1cfef23d90c1671ee310f7cc2a0cae9b510c970b625966c264",
+      "bytes": 26090,
+      "sha256": "a03bd598cff4e1a3040328fa66f16b4b180558f8b6eb83e4d522e1b1d6d4047f",
       "kind": "official-vector-contours"
     }
   ],
-  "gifBytes": 14607835
+  "gifBytes": 14607835,
+  "byteIdentity": "Git blob; SVG text line endings are LF"
 }
