@@ -36,8 +36,10 @@ struct TargetWatch {
     identity_changed: bool,
 }
 static WATCH: Mutex<Option<TargetWatch>> = Mutex::new(None);
-pub(super) fn start_anchor() -> Result<Anchor, Error> {
-    let mut a = anchor()?;
+pub(super) fn start_anchor() -> Result<Option<Anchor>, Error> {
+    let Some(mut a) = read_anchor()? else {
+        return Ok(None);
+    };
     a.capture_id = CAPTURE_ID.fetch_add(1, Ordering::AcqRel) + 1;
     if let Ok(mut watch) = WATCH.lock() {
         // A second toggle/queued key must not replace the active task's event evidence.
@@ -50,7 +52,7 @@ pub(super) fn start_anchor() -> Result<Anchor, Error> {
             });
         }
     }
-    Ok(a)
+    Ok(Some(a))
 }
 pub(super) fn bind_watch(
     id: &str,
@@ -434,23 +436,26 @@ fn lifetime(pid: u32) -> Result<u64, Error> {
     }
 }
 pub(super) fn anchor() -> Result<Anchor, Error> {
+    read_anchor()?.ok_or_else(|| err("targetUnavailable"))
+}
+fn read_anchor() -> Result<Option<Anchor>, Error> {
     unsafe {
         let captured_tick = GetTickCount();
         let window = GetForegroundWindow();
         if window.0.is_null() {
-            return Err(err("targetUnavailable"));
+            return Ok(None);
         }
         let mut process = 0;
         let tid = GetWindowThreadProcessId(window, Some(&mut process));
         if process == std::process::id() {
-            return Err(err("targetUnavailable"));
+            return Ok(None);
         }
         let mut gui = GUITHREADINFO {
             cbSize: size_of::<GUITHREADINFO>() as u32,
             ..Default::default()
         };
         GetGUIThreadInfo(tid, &mut gui).map_err(|_| err("targetProbeFailed"))?;
-        Ok(Anchor {
+        Ok(Some(Anchor {
             capture_id: 0,
             window: window.0 as usize,
             focus: gui.hwndFocus.0 as usize,
@@ -459,7 +464,7 @@ pub(super) fn anchor() -> Result<Anchor, Error> {
             generation: CHANGES.load(Ordering::Acquire),
             captured_tick,
             activity: crate::input_state::activity(),
-        })
+        }))
     }
 }
 fn same(a: &Anchor) -> bool {

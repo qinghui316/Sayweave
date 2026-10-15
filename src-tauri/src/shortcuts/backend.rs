@@ -41,7 +41,7 @@ pub enum Event {
         generation: u64,
         revision: i64,
         pressed: bool,
-        anchor: Option<Anchor>,
+        anchor: Result<Option<Anchor>, Error>,
         task: TaskStamp,
     },
     Captured(String, u64),
@@ -201,7 +201,7 @@ fn release(b: &mut Bridge) {
                 generation: b.generation,
                 revision: b.config.revision,
                 pressed: false,
-                anchor: None,
+                anchor: Ok(None),
                 task: stamp(b),
             },
         );
@@ -379,7 +379,7 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                             generation: b.generation,
                             revision: b.config.revision,
                             pressed: true,
-                            anchor: WindowsInputService::anchor(),
+                            anchor: WindowsInputService::start_target(),
                             task: stamp(b),
                         },
                     );
@@ -665,7 +665,7 @@ impl Backend {
                     generation: b.generation,
                     revision: b.config.revision,
                     pressed: true,
-                    anchor: WindowsInputService::anchor(),
+                    anchor: WindowsInputService::start_target(),
                     task: stamp(b),
                 },
             );

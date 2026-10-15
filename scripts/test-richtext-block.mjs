@@ -62,10 +62,11 @@ export async function runPostDictationIme({page,pid,focus,start,folder,report}){
  };
  const dictate=async mode=>{
   const actor=start(executable,['--exact','dictation::drafts::tests::owned::richtext_actor','--ignored','--nocapture','--test-threads=1'],{SAYWEAVE_INPUT_ACCEPTANCE:'1',SAYWEAVE_TSF_OWNED_PID:String(pid),SAYWEAVE_DRAFT_STRATEGY:'revisable'});
-  let buffer='',diagnostics='',exited=false;const values=[],pending=[];
+  let buffer='',diagnostics='',exited=false,exitResult;const values=[],pending=[];
   actor.stderr.on('data',data=>diagnostics+=data.toString('utf8'));
   actor.stdout.on('data',data=>{buffer+=data.toString('utf8');let at;while((at=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,at);buffer=buffer.slice(at+1);const index=line.indexOf('ACTOR_JSON:');if(index<0){diagnostics+=line+'\n';continue;}const value=JSON.parse(line.slice(index+11));if(pending.length)pending.shift().resolve(value);else values.push(value);}});
-  actor.once('exit',code=>{exited=true;for(const item of pending.splice(0))item.reject(Error('Actor exit '+code+': '+diagnostics));});
+  const exit=new Promise(resolve=>actor.once('exit',(code,signal)=>{exited=true;exitResult={code,signal};for(const item of pending.splice(0))item.reject(Error('Actor exit '+code+': '+diagnostics));resolve(exitResult);}));
+  const retirement=async()=>{let timer;try{return await Promise.race([exit,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('Owned IME actor retirement timeout')),5500);})]);}finally{clearTimeout(timer);}};
   const receive=()=>values.length?Promise.resolve(values.shift()):new Promise((resolve,reject)=>{
    if(exited){reject(Error(diagnostics));return;}
    const item={resolve:value=>{clearTimeout(timer);resolve(value);},reject:error=>{clearTimeout(timer);reject(error);}};
@@ -82,13 +83,17 @@ export async function runPostDictationIme({page,pid,focus,start,folder,report}){
     if(actual.text!=='块外｜'+text)throw Error('First stream actual body differs');
    }
    const result=await command({action:mode==='stop'?'stop':'finish'});trace.push({label:'actor terminal',...result});
+   if(!result.finished||!result.delivery||result.delivery.restoreError||result.delivery.submission==='uncertain'||(result.error&&!(mode==='stop'&&result.error==='cancelled')))throw Error('Owned IME actor terminal was not safely settled');
+   const failure=result.delivery.error;
+   if(failure&&!(failure==='inputUnconfirmed'&&result.delivery.submission==='submitted')&&!(mode==='stop'&&failure==='cancelled'))throw Error('Owned IME actor delivery failed: '+failure);
    actor.stdin.end();
-   if(!exited)await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Owned IME actor retirement timeout')),5500);actor.once('exit',code=>{clearTimeout(timer);if(code===0)resolve();else reject(Error(diagnostics));});});
+   const status=await retirement();trace.push({label:'actor exit',...status});
+   if(status.code!==0||status.signal)throw Error('Owned IME actor exit failed: '+JSON.stringify(status));
    if(!diagnostics.includes('phase=resourcesReleased result=complete'))throw Error('Native retirement was not confirmed before IME typing');
    return (await settled('after native retirement')).text;
   }finally{
-   if(!exited){actor.stdin.end();await new Promise(resolve=>{const timer=setTimeout(resolve,5500);actor.once('exit',()=>{clearTimeout(timer);resolve();});});}
-   trace.push({label:'actor diagnostics',diagnostics});
+   if(!exited){actor.stdin.end();await retirement().catch(()=>{});}
+   trace.push({label:'actor diagnostics',diagnostics,exit:exitResult??null});
   }
  };
  try{

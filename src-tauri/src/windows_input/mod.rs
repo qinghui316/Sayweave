@@ -268,15 +268,19 @@ impl WindowsInputService {
     pub fn set_owner(&self, window: usize) {
         self.owner.store(window, Ordering::Release);
     }
-    pub fn anchor() -> Option<Anchor> {
+    pub(crate) fn start_target() -> Result<Option<Anchor>, Error> {
         #[cfg(windows)]
         {
-            native::start_anchor().ok()
+            native::start_anchor()
         }
         #[cfg(not(windows))]
         {
-            None
+            Ok(None)
         }
+    }
+    #[cfg(any(test, feature = "desktop-acceptance"))]
+    pub fn anchor() -> Option<Anchor> {
+        Self::start_target().ok().flatten()
     }
     pub(crate) fn bind_target(
         &self,

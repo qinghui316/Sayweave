@@ -322,7 +322,7 @@ async function resultOnlyScenario(page){
   await focus('password');const count=report.connections.length;
   expect((await rejected(page,'dictation_start')).code).toBe('targetPassword');expect(report.connections.length).toBe(count);
   const refusal=await invoke(page,'dictation_snapshot');expect(refusal.admission).toBe('rejected');await dismiss(page,{taskId:refusal.taskId,presentationId:refusal.presentationId});
-  await focus('editable');mode='normal';
+  await focus('editable');await target.locator('#editable').evaluate(node=>node.setSelectionRange(node.value.length,node.value.length));mode='normal';
   const live=await externalRound(page,async()=>{await expect.poll(()=>target.locator('#editable').inputValue()).toBe('块外｜正在识别');});
   expect(live.dictation.inputRoute).toBe('live');expect(live.dictation.delivery.submission).toBe('submitted');
   const actual=await stableBodies();expect(actual.text.editable).toBe('块外｜原生受控识别完成。');

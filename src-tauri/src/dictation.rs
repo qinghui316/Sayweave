@@ -160,7 +160,7 @@ impl DictationCoordinator {
         let source = source.retry_source().as_str();
         let mut reserved = self.reserve(&app, source, 0, None, None)?;
         reserved.expected_task = Some(task);
-        self.start_reserved(app, source, None, Some(record), None, reserved)
+        self.start_reserved(app, source, Ok(None), Some(record), None, reserved)
             .await
     }
     pub fn busy(&self) -> bool {
@@ -258,7 +258,7 @@ impl DictationCoordinator {
         epoch: u64,
         pressed: bool,
         mode: Mode,
-        anchor: Option<Anchor>,
+        anchor: Result<Option<Anchor>, Error>,
         task: TaskStamp,
     ) {
         let active = {
@@ -302,8 +302,13 @@ impl DictationCoordinator {
         if !pressed {
             return;
         }
-        let Ok(reserved) = self.reserve(app, "external", epoch, Some(&task), anchor.as_ref())
-        else {
+        let Ok(reserved) = self.reserve(
+            app,
+            "external",
+            epoch,
+            Some(&task),
+            anchor.as_ref().ok().and_then(Option::as_ref),
+        ) else {
             return;
         };
         let app = app.clone();
@@ -323,7 +328,25 @@ impl DictationCoordinator {
         retry: Option<String>,
         expected: Option<(String, i64)>,
     ) -> Result<SpeechSnapshot, Error> {
-        let reserved = self.reserve(&app, source, epoch, None, anchor.as_ref())?;
+        self.start_target(app, source, epoch, Ok(anchor), retry, expected)
+            .await
+    }
+    async fn start_target(
+        &self,
+        app: tauri::AppHandle,
+        source: &str,
+        epoch: u64,
+        anchor: Result<Option<Anchor>, Error>,
+        retry: Option<String>,
+        expected: Option<(String, i64)>,
+    ) -> Result<SpeechSnapshot, Error> {
+        let reserved = self.reserve(
+            &app,
+            source,
+            epoch,
+            None,
+            anchor.as_ref().ok().and_then(Option::as_ref),
+        )?;
         self.start_reserved(app, source, anchor, retry, expected, reserved)
             .await
     }
@@ -429,7 +452,7 @@ impl DictationCoordinator {
         &self,
         app: tauri::AppHandle,
         source: &str,
-        anchor: Option<Anchor>,
+        anchor: Result<Option<Anchor>, Error>,
         retry: Option<String>,
         expected: Option<(String, i64)>,
         reserved: Reservation,
@@ -444,7 +467,14 @@ impl DictationCoordinator {
         app.state::<ShortcutService>().active_task(Some(id.clone()));
         self.update(&app, &id, |_| {});
         let input = app.state::<WindowsInputService>();
-        let mut anchor = anchor;
+        let mut anchor = match anchor {
+            Ok(value) => value,
+            Err(error) => {
+                self.reject_preparation(&app, &id, speech_source, &error, &gate)
+                    .await;
+                return Err(error);
+            }
+        };
         let preparation_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         gate.set_preparation_budget(std::time::Duration::from_secs(15));
         let optional = async {
@@ -1413,11 +1443,11 @@ pub async fn dictation_start(
 ) -> Result<SpeechSnapshot, Error> {
     caller(window.label())?;
     service
-        .start(
+        .start_target(
             app.clone(),
             "external",
             0,
-            WindowsInputService::anchor(),
+            WindowsInputService::start_target(),
             None,
             None,
         )
