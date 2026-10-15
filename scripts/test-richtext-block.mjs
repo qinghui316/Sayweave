@@ -39,15 +39,19 @@ export async function runOwnedTermination({focus,start,report,pid}){
   if(!terminated.terminated)throw Error('Host termination failed '+JSON.stringify(terminated));
   await expectBody('after host events','周三开会');
   source.revision++;source.text='周三开会，不对，改成下周一上午开会';source.confirmed=true;
-  await command({action:'asr',segments:[source]});
-  await expectBody('reacquired model result','下周一上午开会');
+  let stopped;
+  try{
+   await command({action:'asr',segments:[source]});
+   const deadline=Date.now()+5000;
+   while(Date.now()<deadline){await new Promise(resolve=>setTimeout(resolve,30));await command({action:'status'});}
+  }catch(error){stopped=String(error);}
+  // v0.1.13 stops on this injected host termination. This verifies the
+  // rollback boundary, not the cause of the historical spontaneous callback.
+  if(!stopped?.includes('actor stopped:'))throw Error('Baseline termination did not stop the actor: '+stopped);
   if(!/code=draftOwnershipTerminated:[^\n]+mutation=NotAttempted/.test(diagnostics))throw Error('Exact no-write termination receipt not observed');
-  const state=await command({action:'status'});
-  if(state.audioRoute!==1||state.published!=='recording')throw Error('Recording projection did not resume');
-  report.actorDelivery=await command({action:'finish'});
-  if(!report.actorDelivery.finished||report.actorDelivery.error||report.actorDelivery.requests!==1)throw Error('Final settlement differs');
-  await expectBody('after final host events','下周一上午开会');
-  report.terminationRecovered=true;
+  if(diagnostics.includes('operation=draft_reacquire')||diagnostics.includes('operation=draft_reanchor'))throw Error('Unexpected automatic recovery after host termination');
+  await expectBody('after baseline stop and host events','周三开会');
+  report.terminationBaseline={injected:true,stopped:true,retained:'周三开会',naturalCauseProven:false};
  }finally{
   if(!ended){actor.stdin.end();await new Promise(resolve=>{const timer=setTimeout(resolve,5500);actor.once('exit',()=>{clearTimeout(timer);resolve();});});}
   report.actorDiagnostics=diagnostics;
@@ -218,6 +222,14 @@ async function runActor({page,pid,focus,start,read:readWhole,settled:settledWhol
   const retained=userNewline?'\n':'';
   const firstText=backspace?'周三开会。':'周三开会';
   segments.push({id:1,revision:1,text:firstText,confirmed:false});
+  if(process.env.SAYWEAVE_BLOCK_INITIAL_STREAM==='1'){
+   if(earlyEdit)throw Error('Initial streaming must not bypass the first-write edit barrier');
+   for(const text of ['周','周三','周三开']){
+    segments[0].text=text;segments[0].revision++;
+    await command({action:'asr',segments});await expectBody('actor initial stream '+text,text);
+   }
+   segments[0].text=firstText;segments[0].revision++;
+  }
   await command({action:'asr',segments});await expectBody('actor first input',firstText);
   if(earlyEdit){
    const deadline=Date.now()+5000;

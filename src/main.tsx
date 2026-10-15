@@ -1,5 +1,5 @@
 import {applyTheme} from './design/themes';
-import {parseAppearance} from './contracts/appearance';
+import {initialAppearanceTheme} from './adapters/appearance-tauri';
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import '@fontsource/noto-sans-sc/400.css';
@@ -11,7 +11,5 @@ import './design/base.css';
 import { App } from './app/App';
 
 document.documentElement.dataset.surface = new URLSearchParams(location.search).get('surface') === 'overlay' ? 'overlay' : 'main';
-let initialTheme='light';
-try{const native=(window as unknown as {__SAYWEAVE_APPEARANCE__?:unknown}).__SAYWEAVE_APPEARANCE__;initialTheme=parseAppearance(native??JSON.parse(localStorage.getItem('sayweave.appearance')??'null')).themeId;}catch{/* First run uses the existing light palette. */}
-applyTheme(initialTheme);
+applyTheme(initialAppearanceTheme());
 ReactDOM.createRoot(document.getElementById('root')!).render(<React.StrictMode><App /></React.StrictMode>);

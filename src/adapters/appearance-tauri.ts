@@ -1,6 +1,11 @@
 import {invoke,isTauri} from '@tauri-apps/api/core';
 import {listen} from '@tauri-apps/api/event';
 import {parseAppearance,type Appearance,type AppearancePort} from '../contracts/appearance';
+import {startupTheme} from '../design/themes';
+export function initialAppearanceTheme():string{
+ const native=(window as unknown as {__SAYWEAVE_APPEARANCE__?:unknown}).__SAYWEAVE_APPEARANCE__;
+ return startupTheme(isTauri(),native,()=>localStorage.getItem('sayweave.appearance'));
+}
 class NativeAppearance implements AppearancePort {
  async read(){return parseAppearance(await invoke('appearance_read'));}
  async save(value:Appearance){return parseAppearance(await invoke('appearance_save',{value}));}

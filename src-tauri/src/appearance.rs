@@ -43,6 +43,7 @@ impl AppearanceService {
     pub fn new(root: &Path) -> Self {
         let path = root.join("appearance.json");
         let value = read_file(&path).unwrap_or_default();
+        log::info!(target:"sayweave", "operation=appearance source=startup theme={} revision={}", value.theme_id, value.revision);
         Self {
             path,
             value: Mutex::new(value),
@@ -51,6 +52,7 @@ impl AppearanceService {
     pub fn read(&self) -> Result<Appearance, String> {
         let mut value = self.value.lock().map_err(|_| "unavailable")?;
         *value = read_file(&self.path)?;
+        log::info!(target:"sayweave", "operation=appearance source=read theme={} revision={}", value.theme_id, value.revision);
         Ok(value.clone())
     }
     pub fn startup(&self) -> Appearance {
@@ -80,6 +82,7 @@ impl AppearanceService {
             &serde_json::to_vec(&next).map_err(|_| "appearanceWrite")?,
         )?;
         *current = next.clone();
+        log::info!(target:"sayweave", "operation=appearance source=saved theme={} revision={}", next.theme_id, next.revision);
         Ok(next)
     }
 }
@@ -142,10 +145,9 @@ pub fn bootstrap(value: &Appearance) -> String {
     // All CSS is bundled data, not user-supplied markup. Both windows consume this same snapshot.
     let current = theme(&value.theme_id);
     format!(
-        "window.__SAYWEAVE_APPEARANCE__={};",
-        serde_json::to_string(value).unwrap()
-    ) + &format!(
-        "(()=>{{const t={};const apply=()=>{{const r=document.documentElement;if(!r)return;for(const [k,v] of Object.entries(t.vars))r.style.setProperty(k,v);r.dataset.theme=t.id;r.style.colorScheme=t.scheme;}};apply();document.addEventListener('DOMContentLoaded',apply,{{once:true}});}})();",
+        "{}({},{});",
+        include_str!("../../src/design/appearance-bootstrap.mjs"),
+        serde_json::to_string(value).unwrap(),
         serde_json::json!({"id":current.id,"scheme":current.scheme,"vars":current.vars})
     )
 }
@@ -228,6 +230,15 @@ mod tests {
             .unwrap();
         assert_eq!(AppearanceService::new(dir.path()).read().unwrap(), saved);
         assert!(service.save(first).is_err());
+        let light = service
+            .save(Appearance {
+                theme_id: "light".into(),
+                revision: saved.revision,
+            })
+            .unwrap();
+        let restarted = AppearanceService::new(dir.path());
+        assert_eq!(restarted.startup(), light);
+        assert_eq!(restarted.read().unwrap(), light);
         assert!(allowed("voice-overlay", true).is_err());
         assert!(allowed("voice-overlay", false).is_ok());
     }
