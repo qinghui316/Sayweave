@@ -571,6 +571,41 @@ fn uia_readonly(
         exact_uia_bool(&attribute).map_err(|_| err("targetEditabilityUnknown"))
     }
 }
+fn non_editing_control(element: &IUIAutomationElement) -> Result<bool, Error> {
+    unsafe {
+        let kind = probe!(element.CurrentControlType()).map_err(|_| err("targetProbeFailed"))?;
+        if ![
+            UIA_ButtonControlTypeId,
+            UIA_HyperlinkControlTypeId,
+            UIA_ImageControlTypeId,
+            UIA_ListItemControlTypeId,
+            UIA_ListControlTypeId,
+            UIA_MenuItemControlTypeId,
+            UIA_TabItemControlTypeId,
+            UIA_TextControlTypeId,
+            UIA_TreeItemControlTypeId,
+            UIA_ToolBarControlTypeId,
+            UIA_StatusBarControlTypeId,
+            UIA_TitleBarControlTypeId,
+            UIA_SeparatorControlTypeId,
+        ]
+        .contains(&kind)
+        {
+            return Ok(false);
+        }
+        for property in [
+            UIA_IsTextPatternAvailablePropertyId,
+            UIA_IsValuePatternAvailablePropertyId,
+        ] {
+            let value = probe!(element.GetCurrentPropertyValue(property))
+                .map_err(|_| err("targetProbeFailed"))?;
+            if exact_uia_bool(&value)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
 // Probe only target nature. TSF owns the selection/range and performs write-time checks.
 // A probe failure never releases the task's shared WATCH.
 fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<(), Error> {
@@ -617,6 +652,9 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<(), Error> {
                 .as_bool()
             {
                 return Err(err("targetReadonly"));
+            }
+            if non_editing_control(&element)? {
+                return Err(err("targetNotEditable"));
             }
             // The TSF Begin edit session checks compositions in the actual input context.
             // UIA range availability is not a second composition admission policy.

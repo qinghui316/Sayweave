@@ -530,7 +530,12 @@ impl DictationCoordinator {
             && let Some(target) = anchor.clone()
         {
             let assessment = input.capture(id.clone(), target).await;
-            if let Some(code) = crate::windows_input::draft_rejection(&assessment) {
+            if crate::windows_input::result_only_target(&assessment) {
+                // No native range was acquired. Forget the provisional target
+                // before audio starts; this task cannot follow later focus.
+                input.forget(id.clone());
+                anchor = None;
+            } else if let Some(code) = crate::windows_input::draft_rejection(&assessment) {
                 let error = Error::new(&code);
                 self.reject_preparation(&app, &id, speech_source, &error, &gate)
                     .await;
@@ -544,6 +549,7 @@ impl DictationCoordinator {
             match Draft::begin(id.clone(), 1, target, gate.clone()).await {
                 Ok(draft) => Some(draft),
                 Err(error) if error.code == "targetReadonlyContext" => {
+                    input.forget(id.clone());
                     anchor = None;
                     None
                 }
@@ -606,7 +612,7 @@ impl DictationCoordinator {
                 InputRoute::ResultOnly
             }
         });
-        // The microphone cannot start until the target has acknowledged Begin.
+        // Live input requires acknowledged Begin; result-only has no write owner.
         self.update(&app, &id, |s| s.admission = Admission::Ready);
         let (terminal_tx, terminal_rx) = oneshot::channel();
         let result = app
@@ -772,11 +778,13 @@ impl DictationCoordinator {
                     #[cfg(not(windows))]
                     let inline: Option<Delivery> = None;
                     let delivery = inline.unwrap_or_else(|| {
-                        Delivery::not_submitted(if gate.cancelled() {
-                            "cancelled"
+                        if gate.cancelled() {
+                            Delivery::not_submitted("cancelled")
+                        } else if session_anchor.is_none() {
+                            Delivery::result_only()
                         } else {
-                            "targetUnavailable"
-                        })
+                            Delivery::not_submitted("targetUnavailable")
+                        }
                     });
                     if terminal.persistent {
                         if session_anchor.is_none() {

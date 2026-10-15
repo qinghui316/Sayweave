@@ -979,7 +979,15 @@ impl Host {
         })?;
         // prepare_engine already verified the actual proxy and executing core.
         super::native::composition_begin_target(&host.task, &host.anchor)?;
-        host.exchange(Action::Begin, "", false)?;
+        if let Err(error) = host.exchange(Action::Begin, "", false) {
+            if error.code == "targetReadonlyContext" {
+                // This is the only refused Begin that can admit recording
+                // without a target. Check activation/pipe cleanup explicitly;
+                // Drop alone cannot report a failed profile release.
+                host.close()?;
+            }
+            return Err(error);
+        }
         host.range_open = true;
         // Begin itself does not change text. Do not publish a writable draft if input moved
         // while the target's asynchronous edit session was being scheduled/executed.

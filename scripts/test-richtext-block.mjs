@@ -2,6 +2,130 @@
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {writeFileSync} from 'node:fs';
+import {execFileSync} from 'node:child_process';
+
+// Bounded comparison through the installed native service and the actual IME.
+// Only the owned editor is seeded programmatically; all subsequent typing uses
+// guarded Win32 key injection, never DOM text replacement or CDP insertText.
+export async function runPostDictationIme({page,pid,focus,start,folder,report}){
+ const executable=process.env.SAYWEAVE_ACTOR_TEST_EXE;
+ if(!executable||!path.isAbsolute(executable))throw Error('Built owned actor required');
+ const repetitions=Number(process.env.SAYWEAVE_IME_REPETITIONS??10);
+ if(!Number.isInteger(repetitions)||repetitions<1||repetitions>10)throw Error('IME comparison limit is 1..10');
+ const modes=process.env.SAYWEAVE_IME_MODES?.split(',')??['direct','finish','stop'];
+ if(!modes.length||new Set(modes).size!==modes.length||modes.some(mode=>!['direct','finish','stop'].includes(mode)))throw Error('Unknown IME comparison modes');
+ const initialText=process.env.SAYWEAVE_IME_SAME_BODY==='1'?'块外｜下周一上午开会':'块外｜';
+ if(initialText!=='块外｜'&&modes.some(mode=>mode!=='direct'))throw Error('Same-body control is direct typing only');
+ const trace=[],trials=[];report.imeTrials=trials;report.imeRepetitions=repetitions;report.imeModes=modes;
+ report.imeInitialText=initialText;
+ await page.evaluate(()=>{
+  window.ownedImeEvents=[];window.ownedImeComposing=false;window.ownedImeChanges=0;
+  new MutationObserver(()=>window.ownedImeChanges++).observe(document.querySelector('#prosemirror'),{subtree:true,characterData:true,childList:true});
+  for(const type of ['keydown','keyup','compositionstart','compositionupdate','compositionend','beforeinput','input'])document.addEventListener(type,event=>{
+   if(!event.target.closest?.('#prosemirror'))return;
+   if(type==='compositionstart')window.ownedImeComposing=true;
+   if(type==='compositionend')window.ownedImeComposing=false;
+   const record=phase=>window.ownedImeEvents.push({type,phase,key:event.key,code:event.code,data:event.data,inputType:event.inputType,text:window.fixtureEditor.read(),composing:window.ownedImeComposing});
+   record('capture');queueMicrotask(()=>record('microtask'));setTimeout(()=>record('after-task'),0);
+  },true);
+ });
+ const settled=async label=>{
+  const value=await page.evaluate(async()=>{
+   let previous='',stable=0;const deadline=performance.now()+2000,samples=[];
+   while(performance.now()<deadline){
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+    const sample={text:window.fixtureEditor.read(),dom:window.fixtureEditor.inspect(),composing:window.ownedImeComposing,events:window.ownedImeEvents.length,changes:window.ownedImeChanges};
+    const key=JSON.stringify(sample);stable=key===previous?stable+1:0;previous=key;samples.push(sample);
+    if(stable>=2)return {...sample,samples};
+   }
+   throw Error('Owned IME host did not settle');
+  });
+  const foreground=await focus({action:'read'});
+  if(foreground.foregroundProcess!==pid)throw Error('Owned IME foreground changed');
+  trace.push({label,...value});return value;
+ };
+ const key=async(code,down)=>{
+  const result=await focus({action:'fixture-key',process:pid,key:code,down});
+  if(!result.keyResult?.accepted)throw Error('Owned native key was not dispatched: '+code);
+ };
+ const tap=async code=>{await key(code,true);await key(code,false);};
+ const type=async text=>{for(const letter of text)await tap('Key'+letter.toUpperCase());};
+ const chinese=async prefix=>{
+  await tap('Escape');await settled('before IME mode probe');
+  for(let attempt=0;attempt<2;attempt++){
+   await tap('KeyQ');const probe=await settled('IME mode probe');
+   if(probe.composing){await tap('Escape');const cleared=await settled('cancel owned mode probe');if(cleared.text!==prefix)throw Error('IME probe cancellation changed committed body');return;}
+   if(probe.text!==prefix+'q')throw Error('Unable to establish IME mode from owned events');
+   await tap('Backspace');await settled('remove owned probe');await tap('ShiftLeft');
+  }
+  throw Error('A Chinese IME composition was not observed');
+ };
+ const dictate=async mode=>{
+  const actor=start(executable,['--exact','dictation::drafts::tests::owned::richtext_actor','--ignored','--nocapture','--test-threads=1'],{SAYWEAVE_INPUT_ACCEPTANCE:'1',SAYWEAVE_TSF_OWNED_PID:String(pid),SAYWEAVE_DRAFT_STRATEGY:'revisable'});
+  let buffer='',diagnostics='',exited=false;const values=[],pending=[];
+  actor.stderr.on('data',data=>diagnostics+=data.toString('utf8'));
+  actor.stdout.on('data',data=>{buffer+=data.toString('utf8');let at;while((at=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,at);buffer=buffer.slice(at+1);const index=line.indexOf('ACTOR_JSON:');if(index<0){diagnostics+=line+'\n';continue;}const value=JSON.parse(line.slice(index+11));if(pending.length)pending.shift().resolve(value);else values.push(value);}});
+  actor.once('exit',code=>{exited=true;for(const item of pending.splice(0))item.reject(Error('Actor exit '+code+': '+diagnostics));});
+  const receive=()=>values.length?Promise.resolve(values.shift()):new Promise((resolve,reject)=>{
+   if(exited){reject(Error(diagnostics));return;}
+   const item={resolve:value=>{clearTimeout(timer);resolve(value);},reject:error=>{clearTimeout(timer);reject(error);}};
+   const timer=setTimeout(()=>{const at=pending.indexOf(item);if(at>=0)pending.splice(at,1);reject(Error('Owned IME actor timeout'));},18000);pending.push(item);
+  });
+  const command=async value=>{actor.stdin.write(JSON.stringify(value)+'\n');return receive();};
+  try{
+   const identity=await receive();trace.push({label:'actor identity',...identity});
+   const source={id:1,revision:1,text:'周',confirmed:false};
+   for(const text of ['周','周三','周三开会']){
+    source.text=text;source.revision++;await command({action:'asr',segments:[source]});
+    const deadline=Date.now()+5000;let actual;
+    do{actual=await settled('first native stream '+text);if(actual.text==='块外｜'+text)break;await command({action:'status'});}while(Date.now()<deadline);
+    if(actual.text!=='块外｜'+text)throw Error('First stream actual body differs');
+   }
+   const result=await command({action:mode==='stop'?'stop':'finish'});trace.push({label:'actor terminal',...result});
+   actor.stdin.end();
+   if(!exited)await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Owned IME actor retirement timeout')),5500);actor.once('exit',code=>{clearTimeout(timer);if(code===0)resolve();else reject(Error(diagnostics));});});
+   if(!diagnostics.includes('phase=resourcesReleased result=complete'))throw Error('Native retirement was not confirmed before IME typing');
+   return (await settled('after native retirement')).text;
+  }finally{
+   if(!exited){actor.stdin.end();await new Promise(resolve=>{const timer=setTimeout(resolve,5500);actor.once('exit',()=>{clearTimeout(timer);resolve();});});}
+   trace.push({label:'actor diagnostics',diagnostics});
+  }
+ };
+ try{
+  for(const mode of modes)for(let round=0;round<repetitions;round++)for(const sequence of ['letters-then-shift','shift-then-letters']){
+   const trial={mode,round,sequence};trials.push(trial);
+   await page.evaluate(text=>window.fixtureEditor.set(text,text.length,text.length),initialText);await page.bringToFront();
+   if((await focus({action:'focus-process',process:pid})).foregroundProcess!==pid)throw Error('Owned IME target not foreground');
+   await chinese(initialText);
+   if(!report.imeModules){
+    const command=`(Get-Process -Id ${pid}).Modules | Where-Object {$_.FileName -match 'DoubaoIME|tsf-oime'} | Select-Object -ExpandProperty FileName | ConvertTo-Json`;
+    const raw=execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',command],{encoding:'utf8',windowsHide:true});
+    report.imeModules=JSON.parse(raw||'[]');
+    if(!JSON.stringify(report.imeModules).includes('DoubaoIME'))throw Error('The owned browser did not load Doubao IME');
+   }
+   // Establish mode before dictation. A probe/escape after completion could
+   // itself clear the very handoff residue this comparison is observing.
+   let prefix=initialText;if(mode!=='direct')prefix=await dictate(mode);
+   if(sequence==='shift-then-letters')await tap('ShiftLeft');
+   await type('hello');trial.first=await settled('English first token');
+   if(sequence==='letters-then-shift')await tap('ShiftLeft');
+   trial.shifted=await settled('English after Shift');
+   await type('world');trial.continued=await settled('English continued');
+   if(!trial.shifted.text.startsWith(prefix+'hello')||!trial.continued.text.startsWith(prefix+'hello')){
+    report.firstDivergence={kind:'committedEnglishLost',mode,round,sequence,prefix,afterShift:trial.shifted.text,continued:trial.continued.text};
+    throw Error('English prefix was lost through the real IME key path');
+   }
+   if(trial.continued.composing)await tap('ShiftLeft');
+   trial.final=await settled('English final');
+   if(trial.final.text!==prefix+'helloworld')throw Error('Final IME body differs');
+   trial.passed=true;
+  }
+  report.imePassed=true;report.naturalTerminationReproduced=false;
+ }finally{
+  report.imeEventCount=await page.evaluate(()=>window.ownedImeEvents.length);
+  writeFileSync(path.join(folder,'ime-trace.json'),JSON.stringify({trace,trials,events:await page.evaluate(()=>window.ownedImeEvents),firstDivergence:report.firstDivergence},null,2));
+ }
+}
 
 // Existing Win32 fixture exposes its host-owned TSF termination operation.
 // The same production SessionDraft/adapter/local model actor consumes updates.

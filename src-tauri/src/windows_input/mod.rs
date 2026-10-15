@@ -73,16 +73,31 @@ pub enum Verification {
 impl Delivery {
     pub fn not_submitted(code: &str) -> Self {
         Self {
-            state: "copy".into(),
             error: Some(code.into()),
+            stage: "capture".into(),
+            ..Self::result_only()
+        }
+    }
+    pub(crate) fn result_only() -> Self {
+        Self {
+            state: "copy".into(),
+            error: None,
             restore_error: false,
             elapsed_ms: 0,
             submission: Submission::NotSubmitted,
             verification: Verification::NotAttempted,
-            stage: "capture".into(),
+            stage: "result".into(),
             submitted_events: 0,
         }
     }
+}
+/// Only positive target-nature evidence selects recording without a write owner.
+/// Probe failures still defer to TSF; component/permission failures are not absence.
+pub(crate) fn result_only_target(result: &Result<(), Error>) -> bool {
+    result
+        .as_ref()
+        .err()
+        .is_some_and(|error| matches!(error.code.as_str(), "targetReadonly" | "targetNotEditable"))
 }
 /// Lack of UIA readback is not a rejection of TSF. Positive password/readonly/target-change
 /// evidence, however, is shared by every input strategy and cannot be overridden by another probe.
@@ -353,6 +368,39 @@ impl Default for WindowsInputService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_positive_target_nature_selects_copy_recording() {
+        assert!(!result_only_target(&Ok(())));
+        for code in ["targetReadonly", "targetNotEditable"] {
+            assert!(result_only_target(&Err(Error::new(code))));
+        }
+        for code in [
+            "targetProbeFailed",
+            "targetEditabilityUnknown",
+            "targetSafetyUnknown",
+            "targetPassword",
+            "targetPermission",
+            "inputComposition",
+            "targetChanged",
+            "compositionRuntimeUnavailable",
+            "componentVersionMismatch",
+            "compositionCleanup",
+        ] {
+            assert!(!result_only_target(&Err(Error::new(code))), "{code}");
+        }
+    }
+    #[test]
+    fn deliberate_copy_is_not_an_input_failure_or_a_submission() {
+        let result = Delivery::result_only();
+        assert_eq!(result.state, "copy");
+        assert_eq!(result.error, None);
+        assert_eq!(result.submission, Submission::NotSubmitted);
+        assert_eq!(result.verification, Verification::NotAttempted);
+        assert_eq!(result.submitted_events, 0);
+        let failure = Delivery::not_submitted("compositionRejected");
+        assert_eq!(failure.error.as_deref(), Some("compositionRejected"));
+        assert_eq!(failure.stage, "capture");
+    }
     #[test]
     fn delayed_events_before_capture_do_not_invalidate_a_new_target() {
         assert!(!event_after_capture(99, 100));

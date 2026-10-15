@@ -203,6 +203,37 @@ pub fn final_presentation(
 mod tests {
     use super::*;
     #[test]
+    fn deliberate_no_target_result_is_copyable_but_empty_and_cancel_stay_quiet() {
+        let result = Delivery::result_only();
+        assert_eq!(
+            final_presentation(true, "hello 世界", Some(&result), None, true),
+            Presentation::Result
+        );
+        assert_eq!(
+            final_presentation(true, "", None, Some("emptyText"), true),
+            Presentation::Idle
+        );
+        assert_eq!(
+            final_presentation(
+                true,
+                "未完成",
+                Some(&Delivery::not_submitted("cancelled")),
+                Some("cancelled"),
+                true
+            ),
+            Presentation::Idle
+        );
+        assert_eq!(
+            final_presentation(false, "已有正文", Some(&result), None, true),
+            Presentation::Idle
+        );
+        let failure = Delivery::not_submitted("compositionRejected");
+        assert_eq!(
+            final_presentation(true, "文字", Some(&failure), None, true),
+            Presentation::Error
+        );
+    }
+    #[test]
     fn finish_projection_is_idempotent_and_cannot_reopen_a_released_task() {
         for live in [
             Presentation::Preparing,

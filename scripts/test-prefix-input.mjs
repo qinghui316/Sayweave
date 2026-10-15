@@ -73,7 +73,10 @@ try{
  await page.setContent('<input id="input"><textarea id="area"></textarea><div id="editable" contenteditable="true"></div>');
  const bundle=await build({configFile:false,logLevel:'error',build:{write:false,lib:{entry:path.join(root,'tests/fixtures/input-target.ts'),name:'InputFixture',formats:['iife']}}});
  await page.addScriptTag({content:(Array.isArray(bundle)?bundle[0]:bundle).output[0].code});
- if(process.env.SAYWEAVE_BLOCK_REGRESSION==='1'){
+ if(process.env.SAYWEAVE_BLOCK_IME==='1'){
+  const {runPostDictationIme}=await import('./test-richtext-block.mjs');
+  await runPostDictationIme({page,pid,focus,start,folder,report});
+ }else if(process.env.SAYWEAVE_BLOCK_REGRESSION==='1'){
   const {runBlockRegression}=await import('./test-richtext-block.mjs');
   await runBlockRegression({page,pid,focus,start,root,folder,report});
  }else{

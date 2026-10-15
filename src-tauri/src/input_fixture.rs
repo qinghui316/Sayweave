@@ -247,8 +247,8 @@ unsafe extern "system" fn process_window(window: HWND, parameter: LPARAM) -> BOO
         if process == target.process
             && IsWindowVisible(window).as_bool()
             && GetWindow(window, GW_OWNER).unwrap_or_default().0.is_null()
-            && (!target.overlay
-                || GetWindowLongPtrW(window, GWL_EXSTYLE) as u32 & WS_EX_NOACTIVATE.0 != 0)
+            && ((GetWindowLongPtrW(window, GWL_EXSTYLE) as u32 & WS_EX_NOACTIVATE.0 != 0)
+                == target.overlay)
         {
             target.window = window;
             return BOOL(0);
@@ -443,6 +443,7 @@ fn main() {
                     continue;
                 }
                 let mut auxiliary_result = None;
+                let mut key_result = None;
                 if matches!(
                     value["action"].as_str(),
                     Some("auxiliary-info" | "auxiliary-notice" | "auxiliary-activate")
@@ -629,6 +630,16 @@ fn main() {
                         Some("Backspace") => Some(VK_BACK),
                         Some("Delete") => Some(VK_DELETE),
                         Some("ArrowLeft") => Some(VK_LEFT),
+                        Some("ShiftLeft") => Some(VK_LSHIFT),
+                        Some("ShiftRight") => Some(VK_RSHIFT),
+                        Some("Escape") => Some(VK_ESCAPE),
+                        Some("Enter") => Some(VK_RETURN),
+                        Some("Space") => Some(VK_SPACE),
+                        Some(key) if key.len() == 4 && key.starts_with("Key") => key
+                            .as_bytes()
+                            .get(3)
+                            .filter(|key| key.is_ascii_uppercase())
+                            .map(|key| VIRTUAL_KEY(*key as u16)),
                         _ => None,
                     };
                     if let Some(key) = key {
@@ -658,8 +669,12 @@ fn main() {
                                 },
                             },
                         };
-                        if allowed && SendInput(&[event], std::mem::size_of::<INPUT>() as i32) == 1
-                        {
+                        let sent = allowed
+                            && SendInput(&[event], std::mem::size_of::<INPUT>() as i32) == 1;
+                        key_result = Some(
+                            serde_json::json!({"accepted":sent,"process":pid,"key":key.0,"down":down}),
+                        );
+                        if sent {
                             if down && !injected_keys.contains(&key) {
                                 injected_keys.push(key);
                             }
@@ -678,6 +693,12 @@ fn main() {
                         let kind = RegisterClipboardFormatW(windows::core::PCWSTR(name.as_ptr()));
                         let _ = SetClipboardData(kind, None);
                         let _ = CloseClipboard();
+                    }
+                }
+                if value["action"] == "focus-desktop" {
+                    let desktop = GetShellWindow();
+                    if !desktop.0.is_null() {
+                        focus_window(desktop);
                     }
                 }
                 if value["action"] == "focus" {
@@ -762,7 +783,7 @@ fn main() {
                 let selection = message(editor, 0x00B0, WPARAM(0), LPARAM(0)).0 as usize;
                 println!(
                     "{}",
-                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window,"controlledEdit":controlled_edit,"controlledEditSteps":controlled_edit_steps,"auxiliary":auxiliary_result})
+                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"foregroundWindow":GetForegroundWindow().0 as usize,"desktopWindow":GetShellWindow().0 as usize,"clipboardSequence":windows::Win32::System::DataExchange::GetClipboardSequenceNumber(),"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window,"controlledEdit":controlled_edit,"controlledEditSteps":controlled_edit_steps,"auxiliary":auxiliary_result,"keyResult":key_result})
                 );
                 io::stdout().flush().unwrap();
                 let _ = ok.send(());

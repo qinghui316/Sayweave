@@ -243,14 +243,15 @@ async fn richtext_actor() {
                     ready.notify_one();
                 }
                 Some("status") => {},
-                Some("finish") => {
+                Some("finish" | "stop") => {
+                    let stopped = command["action"] == "stop";
                     control.request_finish();
-                    cancel.send_replace(1);
-                    let delivery = manager.finish(&latest, Finish::Commit).await;
+                    cancel.send_replace(if stopped { 2 } else { 1 });
+                    let delivery = manager.finish(&latest, if stopped { Finish::Abort } else { Finish::Commit }).await;
                     let report = manager.report().ok_or("missing actor report")?;
                     emit(serde_json::json!({"finished":true,"delivery":delivery,"text":report.text,"error":report.error,"requests":provider.seen.lock().unwrap().len()}));
                     finished = true;
-                    if report.error.is_some() || delivery.restore_error || delivery.submission == Submission::Uncertain {
+                    if report.error.as_deref().is_some_and(|error| !stopped || error != "cancelled") || delivery.restore_error || delivery.submission == Submission::Uncertain {
                         return Err("actor delivery was not safely settled".into());
                     }
                     return Ok(());
