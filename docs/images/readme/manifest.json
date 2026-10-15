@@ -1,0 +1,153 @@
+{
+  "websiteCommit": "72a96c1709d8186ba07a94a32db82c19bba815d6",
+  "productCommit": "b525e2fd7583e8907a2c72ca2e48bce9eeaca2e3",
+  "files": [
+    {
+      "file": "hero.gif",
+      "width": 820,
+      "height": 235,
+      "frames": 240,
+      "durationMs": 12000,
+      "bytes": 741327,
+      "sha256": "9c20df9a57a9dc06475aee01f8d011d291415b0d505dbe702b3002269fd83faa",
+      "scene": "hero",
+      "crop": [
+        154,
+        407,
+        1132,
+        324
+      ],
+      "sourceVideoSha256": "32a44688f402805769c01a76a0def70257a5cde21a741f14f23d385555072bcc"
+    },
+    {
+      "file": "comparison.gif",
+      "width": 820,
+      "height": 484,
+      "frames": 290,
+      "durationMs": 14500,
+      "bytes": 2736812,
+      "sha256": "32d452c406470809a4ba0022220584ad417040cb7dca333a8525e748bfe15e2c",
+      "scene": "comparison",
+      "crop": [
+        600,
+        224,
+        766,
+        452
+      ],
+      "sourceVideoSha256": "01198e4224d1e3153581e1fef65bbe84b42ed35d293125c142867bd3dc592e1c"
+    },
+    {
+      "file": "cleanup.gif",
+      "width": 820,
+      "height": 441,
+      "frames": 280,
+      "durationMs": 14000,
+      "bytes": 2690787,
+      "sha256": "87ef4b82dc8cecba25065423540d5192872e78758780ac4733fc7226f37a51d7",
+      "scene": "cleanup",
+      "crop": [
+        600,
+        244,
+        766,
+        412
+      ],
+      "sourceVideoSha256": "7f81cd561035e68459659bb40797840ca51ff3b3bbbfd0b0c2bcfb2d17f1393d"
+    },
+    {
+      "file": "handoff.gif",
+      "width": 820,
+      "height": 595,
+      "frames": 320,
+      "durationMs": 16000,
+      "bytes": 2796202,
+      "sha256": "dcdfab2fc389ba645e4df327dd20346e0b29c14c4cdbbdff72e0c3eb7a2124c1",
+      "scene": "handoff",
+      "crop": [
+        600,
+        172,
+        766,
+        556
+      ],
+      "sourceVideoSha256": "b0382e8f7003314275b5031ae386d753efdd365d1ea749def50101b71a6f6d8c"
+    },
+    {
+      "file": "dictionary.gif",
+      "width": 820,
+      "height": 527,
+      "frames": 270,
+      "durationMs": 18000,
+      "bytes": 3385426,
+      "sha256": "5ec4c3e1b461c089195e95def8bc9301abe71d2e4ab59ebcabaf1088d1e9c8bf",
+      "scene": "dictionary",
+      "crop": [
+        600,
+        204,
+        766,
+        492
+      ],
+      "sourceVideoSha256": "e26dae5b4764d9e625ab6fbef6f7af8458ed616898bfd24ace9295dd95ee09ea"
+    },
+    {
+      "file": "personalization.gif",
+      "width": 820,
+      "height": 677,
+      "frames": 270,
+      "durationMs": 18000,
+      "bytes": 2257281,
+      "sha256": "ad5cafb47987425f7847cb0d92de66e950c76111b942aab7e589e364b8e91a3d",
+      "scene": "personalization",
+      "crop": [
+        600,
+        134,
+        766,
+        632
+      ],
+      "sourceVideoSha256": "14eb4d47628b1a804cf0bdc360b2ae16859cea15367a935a12df0d13b477a350"
+    },
+    {
+      "file": "home.webp",
+      "width": 1680,
+      "height": 1140,
+      "bytes": 89808,
+      "sha256": "8ba4d27137b3402c16b56f75fea9e30cec8ff3065fb9f4cdac854a475c5fe714",
+      "kind": "current-product-frontend-with-isolated-example-ports"
+    },
+    {
+      "file": "words.webp",
+      "width": 1680,
+      "height": 1140,
+      "bytes": 26626,
+      "sha256": "43712a3af661838dcfa127c8d0db1b3e843eaca8f3fe1905a2a8f8737e4a1916",
+      "kind": "current-product-frontend-with-isolated-example-ports"
+    },
+    {
+      "file": "history.webp",
+      "width": 1680,
+      "height": 1140,
+      "bytes": 48008,
+      "sha256": "c14d6aa6ef2d48cbad400d41c47fc96170997fc2fddfddb0501f8c7e6518a00b",
+      "kind": "current-product-frontend-with-isolated-example-ports"
+    },
+    {
+      "file": "appearance.webp",
+      "width": 1680,
+      "height": 1140,
+      "bytes": 74246,
+      "sha256": "2f2a324c3a6d9a2dca01658db15282c2117ef11b3465427b5b388e9dd0d76c26",
+      "kind": "current-product-frontend-with-isolated-example-ports"
+    },
+    {
+      "file": "brand-light.svg",
+      "bytes": 26094,
+      "sha256": "d3104be16cd18829109ab06565f6c265be50eb06c24542dd8b7ccbef89580c98",
+      "kind": "official-vector-contours"
+    },
+    {
+      "file": "brand-dark.svg",
+      "bytes": 26094,
+      "sha256": "c88be6a7b8460d1cfef23d90c1671ee310f7cc2a0cae9b510c970b625966c264",
+      "kind": "official-vector-contours"
+    }
+  ],
+  "gifBytes": 14607835
+}

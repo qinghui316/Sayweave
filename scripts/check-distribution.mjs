@@ -8,6 +8,11 @@ const roots = new Set(['.gitattributes', '.gitignore', 'README.md', 'LICENSE', '
   'eslint.config.js', 'index.html', 'playwright.config.ts', 'rust-toolchain.toml',
   'tsconfig.json', 'vite.config.ts']);
 const docs = new Set(['architecture.md', 'revisable-draft.md', 'development.md', 'design.md', 'testing.md', 'local-data.md', 'motion.md', 'models.md', 'speech.md', 'history.md', 'dictation.md', 'personalization.md', 'release.md','storage.md']);
+const readmeMedia = new Set([
+  'brand-light.svg', 'brand-dark.svg',
+  'hero.gif', 'comparison.gif', 'cleanup.gif', 'handoff.gif', 'dictionary.gif', 'personalization.gif',
+  'home.webp', 'words.webp', 'history.webp', 'appearance.webp', 'provenance.md', 'manifest.json',
+].map(file => `images/readme/${file}`));
 const releaseNotes = /^release-notes\/v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.json$/;
 const publicWorkflow = file => ['windows-release.yml','windows-ci.yml'].includes(file.replace('.github/workflows/','')) && file.startsWith('.github/workflows/');
 const scripts = new Set(["windows-update-debug-policy.mjs",'release-validation.mjs','test-windows-installed-startup.mjs','windows-update-startup.mjs','windows-update-packages.mjs','windows-update-registration.mjs','windows-update-artifacts.mjs','reuse-windows-update-evidence.mjs','windows-update-fixtures.mjs','test-windows-update.mjs','test-windows-update.ps1','check-boundaries.mjs', 'check-native-boundaries.mjs', 'check-text.mjs', 'check-distribution.mjs', 'generate-update-manifest.mjs', 'verify-update-release.mjs',
@@ -25,7 +30,7 @@ function allowed(file) {
   if (roots.has(file)) return true;
   if (publicWorkflow(file)) return true;
   if (file.startsWith('src/') || file.startsWith('src-tauri/')) return true;
-  if (file.startsWith('docs/')) return docs.has(file.slice(5));
+  if (file.startsWith('docs/')) return docs.has(file.slice(5)) || readmeMedia.has(file.slice(5));
   if (releaseNotes.test(file)) return true;
   if (file.startsWith('scripts/')) return scripts.has(file.slice(8));
   if (file.startsWith('tests/')) {
