@@ -49,7 +49,7 @@ npm run desktop:build
 
 ### 登录 Windows 后启动
 
-正式安装器在安装事务提交并核验成功后，为安装用户一次性登记 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 中的 `Sayweave`：带引号的安装 EXE 绝对路径加私有参数 `--autostart`。产品键的 `LoginStartupInitialized` 标记完成后，日常启动、升级及覆盖安装都不重建或改写启动值；用户可在 Windows「设置 → 应用 → 启动」或任务管理器中关闭、启用。正常退出仅结束本次运行。启动登记警告独立于安装成功结果；辅助程序返回2时，安装器不回滚已提交程序。卸载完成后只清理仍指向本安装及该参数的启动值。
+正式安装器在安装事务提交并核验成功后，为安装用户一次性登记 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 中的 `Sayweave`：带引号的安装 EXE 绝对路径加私有参数 `--autostart`。产品键的 `LoginStartupInitialized` 标记完成后，日常启动、升级及覆盖安装都不重建或改写启动值；用户可在 Windows「设置 → 应用 → 启动」或任务管理器中关闭、启用。正常退出仅结束本次运行。启动登记警告独立于安装成功结果；辅助程序返回2时，安装器不回滚已提交程序。卸载完成后只清理指向本安装、参数为空或仅为 `--autostart` 的启动值。
 
 登录启动隐藏主窗口并驻留托盘，初始化原有设置和快捷键，不自动录音；托盘打开主界面。重复的 `--autostart` 进程在原单实例锁处静默退出。开发渠道不登记生产启动项。原生窗口验证可用已有 `scripts/test-desktop.ps1 -Autostart`，使用隔离资料，检查隐藏、焦点、托盘与重复启动；真正的 Windows 登录验证单独记录。
 
