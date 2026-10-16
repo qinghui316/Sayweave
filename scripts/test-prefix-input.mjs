@@ -47,6 +47,7 @@ async function command(file,args){const child=start(file,args);let output='';chi
 function requestFixture(child){let buffer='',pending;child.stdout.on('data',data=>{buffer+=data.toString('utf8');let index;while((index=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,index);buffer=buffer.slice(index+1);if(line&&pending){const resolve=pending;pending=null;resolve(JSON.parse(line));}}});return async value=>{if(pending)throw Error('One owned fixture request at a time');const response=new Promise(resolve=>{pending=resolve;});child.stdin.write(JSON.stringify(value)+'\n');const timeout=wait(5000).then(()=>{throw Error('Owned focus helper timeout');});return Promise.race([response,timeout]);};}
 try{
  if(process.platform!=='win32')throw Error('Windows TSF prefix acceptance requires Windows');
+ if(process.env.SAYWEAVE_BLOCK_COMMIT_EARLY==='1'){process.env.SAYWEAVE_INITIAL_BARRIER=path.join(folder,'initial-continue');report.initialCommitBarrier=process.env.SAYWEAVE_INITIAL_BARRIER;}
  await command('cargo',['build','--manifest-path','src-tauri/text-service/Cargo.toml','--bin','tsf-probe',...(process.env.SAYWEAVE_BLOCK_REGRESSION==='1'?['--features','acceptance']:[])]);
  await command('cargo',['build','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance','--bin','input-fixture']);
  helper=start(path.join(root,'src-tauri/target/debug/input-fixture.exe'),['composition'],{SAYWEAVE_INPUT_ACCEPTANCE:'1'});

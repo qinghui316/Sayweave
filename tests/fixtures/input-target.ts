@@ -1,6 +1,6 @@
 import {Schema} from 'prosemirror-model';
-import {EditorState, TextSelection} from 'prosemirror-state';
-import {EditorView} from 'prosemirror-view';
+import {EditorState, Plugin, PluginKey, TextSelection} from 'prosemirror-state';
+import {Decoration, DecorationSet, EditorView} from 'prosemirror-view';
 
 function semanticSelection(editor:EditorView){const offset=(position:number)=>{let blocks=0;editor.state.doc.forEach((_node,start,index)=>{if(start<position)blocks=index;});return position-1-blocks;};return {start:offset(editor.state.selection.from),end:offset(editor.state.selection.to)};}
 
@@ -10,6 +10,23 @@ const host=document.createElement('div');host.id='prosemirror';document.body.app
 // This minimal fixture owns only paragraph/text nodes; other application UI is unchanged.
 const style=document.createElement('style');style.textContent='.ProseMirror{position:relative;white-space:pre-wrap;white-space:break-spaces;word-wrap:break-word;font-variant-ligatures:none;}';document.head.append(style);
 const view=new EditorView(host,{state:EditorState.create({schema})});
+// Owned regression for a floating non-editable suggestion in an empty field.
+// The suggestion disappears for IME key 229 or when committed text arrives.
+const predictionKey=new PluginKey<boolean>('owned-floating-prediction');
+function prediction(text:string){
+ const reset=()=>requestAnimationFrame(()=>{if(!view.isDestroyed&&!view.composing)view.dispatch(view.state.tr.setMeta(predictionKey,false));});
+ return new Plugin<boolean>({
+  key:predictionKey,
+  state:{init:()=>false,apply:(tr,hidden)=>tr.getMeta(predictionKey)??hidden},
+  props:{
+   handleDOMEvents:{keydown(editor,event){if(event.keyCode===229){editor.dispatch(editor.state.tr.setMeta(predictionKey,true));reset();}return false;},compositionend(){reset();return false;}},
+   decorations(state){if(state.doc.textContent||view.composing||predictionKey.getState(state))return null;
+    return DecorationSet.create(state.doc,[Decoration.widget(1,()=>{const span=document.createElement('span');span.dataset.ownedPrediction='';span.inert=true;span.setAttribute('aria-hidden','true');span.textContent=text;span.style.cssText='float:inline-start;width:100%;margin-inline-end:-100%';return span;},{side:1,ignoreSelection:true})]);},
+  },
+ });
+}
+declare global {interface Window {fixturePrediction(text:string|null):void}}
+window.fixturePrediction=text=>view.updateState(view.state.reconfigure({plugins:text?[prediction(text)]:[]}));
 declare global {interface Window {fixtureEditor:{set(text:string,start:number,end:number):void;edit(from:number,to:number,text:string):void;appendParagraph():void;select(position:number,end?:number):void;read():string;inspect():unknown}}}
 window.fixtureEditor={
  set(text,start,end){const doc=schema.node('doc',null,text.split('\n').map(line=>schema.node('paragraph',null,line?schema.text(line):undefined)));const position=(offset:number)=>offset+1+(text.slice(0,offset).match(/\n/g)?.length??0);view.updateState(EditorState.create({schema,doc,selection:TextSelection.create(doc,position(start),position(end))}));view.focus();},
@@ -17,7 +34,7 @@ window.fixtureEditor={
  appendParagraph(){view.dispatch(view.state.tr.insert(view.state.doc.content.size,schema.nodes.paragraph.create()));},
  select(position,end=position){view.dispatch(view.state.tr.setSelection(TextSelection.create(view.state.doc,position+1,end+1)));},
  read(){return view.state.doc.textBetween(0,view.state.doc.content.size,'\n');},
- inspect(){const selection=getSelection();return {html:view.dom.innerHTML,selection:{from:view.state.selection.from,to:view.state.selection.to},semanticSelection:semanticSelection(view),domSelection:selection?{anchor:{parent:selection.anchorNode?.parentElement?.tagName,offset:selection.anchorOffset,text:selection.anchorNode?.textContent},focus:{parent:selection.focusNode?.parentElement?.tagName,offset:selection.focusOffset,text:selection.focusNode?.textContent}}:null,document:view.state.doc.toJSON()};},
+ inspect(){const selection=getSelection();return {composing:view.composing,html:view.dom.innerHTML,selection:{from:view.state.selection.from,to:view.state.selection.to},semanticSelection:semanticSelection(view),domSelection:selection?{anchor:{parent:selection.anchorNode?.parentElement?.tagName,offset:selection.anchorOffset,text:selection.anchorNode?.textContent},focus:{parent:selection.focusNode?.parentElement?.tagName,offset:selection.focusOffset,text:selection.focusNode?.textContent}}:null,document:view.state.doc.toJSON()};},
 };
 
 // A second real view permits inline hard breaks, as full rich editors commonly
@@ -32,5 +49,5 @@ window.fixtureInlineEditor={
  appendParagraph(){inlineView.dispatch(inlineView.state.tr.insert(inlineView.state.doc.content.size,inlineSchema.nodes.paragraph.create()));},
  select(position,end=position){inlineView.dispatch(inlineView.state.tr.setSelection(TextSelection.create(inlineView.state.doc,position+1,end+1)));},
  read(){return inlineView.state.doc.textBetween(0,inlineView.state.doc.content.size,'\n',node=>node.type.name==='hard_break'?'\n':'');},
- inspect(){const selection=getSelection();return {html:inlineView.dom.innerHTML,selection:{from:inlineView.state.selection.from,to:inlineView.state.selection.to},semanticSelection:semanticSelection(inlineView),domSelection:selection?{anchor:{parent:selection.anchorNode?.parentElement?.tagName,offset:selection.anchorOffset,text:selection.anchorNode?.textContent},focus:{parent:selection.focusNode?.parentElement?.tagName,offset:selection.focusOffset,text:selection.focusNode?.textContent}}:null,document:inlineView.state.doc.toJSON()};},
+ inspect(){const selection=getSelection();return {composing:inlineView.composing,html:inlineView.dom.innerHTML,selection:{from:inlineView.state.selection.from,to:inlineView.state.selection.to},semanticSelection:semanticSelection(inlineView),domSelection:selection?{anchor:{parent:selection.anchorNode?.parentElement?.tagName,offset:selection.anchorOffset,text:selection.anchorNode?.textContent},focus:{parent:selection.focusNode?.parentElement?.tagName,offset:selection.focusOffset,text:selection.focusNode?.textContent}}:null,document:inlineView.state.doc.toJSON()};},
 };

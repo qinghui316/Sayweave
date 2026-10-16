@@ -215,6 +215,12 @@ Current WebView2 runtimes ignore environment/HKCU browser-argument overrides for
 
 ## 口述编辑后结束
 
+### 首次输入诊断夹具
+
+`scripts/test-prefix-input.mjs` 与 `scripts/test-richtext-block.mjs` 复用真实 `SessionDraft`、TSF 适配器及本地受控模型。`SAYWEAVE_BLOCK_INITIAL_STREAM=1` 检查逐次正文，`SAYWEAVE_BLOCK_FIRST_ONLY=1` 只运行首次流式及结束；普通完整场景继续覆盖三次手动修改，`SAYWEAVE_BLOCK_BACKSPACE=1` 增加直接删除后续说。每一步核对宿主事件处理后的正文，并在下一次更新前及释放后复核。
+
+`SAYWEAVE_BLOCK_FLOATING_PREDICTION=1` 启用自有非编辑浮动建议，用于保留首次输入取消组合的失败回归。该问题仍为已知问题。`SAYWEAVE_BLOCK_COMMIT_EARLY=1` 保留本轮实验的首次写入屏障夹具，依赖归档实验核心的 `SAYWEAVE_INITIAL_BARRIER`，当前稳定核心没有该屏障；它不属于稳定候选的通过记录。屏障只证明原生回执尚未返回，不能证明跟踪尚未建立。原始故障、重复正文和提前编辑超时报告继续保留原产物身份。
+
 复用 `npm run test:composition` 的自有编辑器入口核对实际正文：编辑后立即结束、短延迟交接、恢复空范围、恢复后无新文字、继续输入再结束和迟到旧识别。受控原生答复测试另行锁定准备成功／拒绝与结束的准确先后顺序；延迟实机样本不代替准确竞态证明。组件保持普通已验证 DLL，核对目标实际加载身份。Codex 和物理麦克风由用户后续试用，不能由这些夹具记录为通过。
 
 ## 同进程核心切换

@@ -326,6 +326,7 @@ async function runActor({page,pid,focus,start,read:readWhole,settled:settledWhol
  };
  const read=async()=>scoped(await readWhole()),settled=async()=>scoped(await settledWhole());
  await page.evaluate(({prefix,suffix})=>window.fixtureEditor.set(prefix+suffix,prefix.length,prefix.length),{prefix,suffix});
+ if(process.env.SAYWEAVE_BLOCK_FLOATING_PREDICTION==='1'){await page.evaluate(()=>window.fixturePrediction('示例建议 · 按 Tab 接受'));report.floatingPrediction=await page.locator('[data-owned-prediction]').count()===1;if(!report.floatingPrediction&&!sentinels)throw Error('Floating prediction fixture absent');}
  await settled();
  const actor=start(executable,['--exact','dictation::drafts::tests::owned::richtext_actor','--ignored','--nocapture','--test-threads=1'],{SAYWEAVE_INPUT_ACCEPTANCE:'1',SAYWEAVE_TSF_OWNED_PID:String(pid),SAYWEAVE_DRAFT_STRATEGY:'revisable'});
  let buffer='',diagnostics='',exited=false;const values=[],pending=[];
@@ -343,6 +344,9 @@ async function runActor({page,pid,focus,start,read:readWhole,settled:settledWhol
  try{
   report.actorIdentity=await receive();
   const earlyEdit=process.env.SAYWEAVE_BLOCK_EARLY_EDIT==='1';
+  const firstOnly=process.env.SAYWEAVE_BLOCK_FIRST_ONLY==='1';
+  const commitEarly=process.env.SAYWEAVE_BLOCK_COMMIT_EARLY==='1';
+  if(commitEarly&&(!process.env.SAYWEAVE_INITIAL_BARRIER||earlyEdit||process.env.SAYWEAVE_BLOCK_BACKSPACE!=='1'))throw Error('Initial commit barrier requires direct Backspace and separate receipt timing');
   report.actorScenario=earlyEdit?'edit-before-tracking-receipt':'edit-after-tracking-receipt';
   const backspace=process.env.SAYWEAVE_BLOCK_BACKSPACE==='1';
   const userNewline=process.env.SAYWEAVE_BLOCK_USER_NEWLINE==='1';
@@ -370,24 +374,27 @@ async function runActor({page,pid,focus,start,read:readWhole,settled:settledWhol
   // Update now installs native tracking before returning its receipt. Keep
   // both timings: edit before the client consumes that receipt, or after it.
   const bindDeadline=Date.now()+5000;
-  while(!earlyEdit&&!diagnostics.includes('operation=draft_block_bound')){
+  while(!earlyEdit&&!commitEarly&&!diagnostics.includes('operation=draft_block_bound')){
    if(Date.now()>=bindDeadline)throw Error('Production initial block did not bind');
    await command({action:'status'});await settled();
   }
   report.actorTrackingReceiptBeforeEdit=diagnostics.includes('operation=draft_block_bound');
+  if(commitEarly){report.firstWriteBeforeNativeReceipt=!diagnostics.includes('revision=1 action=Update applied=true');if(!report.firstWriteBeforeNativeReceipt)throw Error('Initial commit barrier did not hold the native operation receipt');}
   if(earlyEdit&&report.actorTrackingReceiptBeforeEdit)throw Error('Early-edit timing not exercised: tracking receipt already consumed');
-  for(const [index,replacement,tail,final]of [[0,backspace?'周三开会':'周五开会','，不对，改成下周一上午开会','下周一上午开会'],[1,'下周一开会','，改成下午三点开会','下周一下午三点开会'],[2,'下周一下午两点开会','，不对，改成线上四点开会','下周一下午四点线上开会']]){
+  for(const [index,replacement,tail,final]of (firstOnly?[]:[[0,backspace?'周三开会':'周五开会','，不对，改成下周一上午开会','下周一上午开会'],[1,'下周一开会','，改成下午三点开会','下周一下午三点开会'],[2,'下周一下午两点开会','，不对，改成线上四点开会','下周一下午四点线上开会']])){
    const before=await read();if(before.text!==lastBody)throw Error('Late actor body change before edit');
    const expectedEdit=replacement+(index===0?'':retained);
    let left=0,right=0;while(left<Math.min(before.text.length,expectedEdit.length)&&before.text[left]===expectedEdit[left])left++;while(right<Math.min(before.text.length,expectedEdit.length)-left&&before.text.at(-1-right)===expectedEdit.at(-1-right))right++;
    const eventWatermark=await page.evaluate(()=>window.ownedBlockEvents.length);
+   const domWasComposing=await page.evaluate(()=>window.fixtureEditor.inspect().composing);
    if(!(backspace&&index===0))await command({action:'edited'});
    // End the native composition through the owned host's actual key route.
    // Mutating ProseMirror while TSF still owns a stale composition bypasses
    // normal editing and can itself manufacture an old-text commit on handoff.
    for(const down of [true,false])await focus({action:'fixture-key',process:pid,key:backspace&&index===0?'Backspace':'ArrowLeft',down});
    if(backspace&&index===0)await command({action:'edited'});
-   await page.waitForFunction(at=>window.ownedBlockEvents.slice(at).some(e=>e.type==='compositionend'),eventWatermark,{timeout:5000});
+   if(commitEarly&&index===0)writeFileSync(process.env.SAYWEAVE_INITIAL_BARRIER,'continue');
+   if(domWasComposing)await page.waitForFunction(at=>window.ownedBlockEvents.slice(at).some(e=>e.type==='compositionend'),eventWatermark,{timeout:5000});
    const handedOff=await settled();trace.push({label:'actor edit handoff '+index,settled:handedOff});
    if(handedOff.text!==(backspace&&index===0?replacement:before.text))throw Error('Native editing handoff changed body');
    if(process.env.SAYWEAVE_BLOCK_SELECTION_PAUSE==='1'){
@@ -445,8 +452,8 @@ async function runActor({page,pid,focus,start,read:readWhole,settled:settledWhol
   report.actorDelivery=await command({action:'finish'});
   report.actorFinishMs=Date.now()-finishStarted;
   if(process.env.SAYWEAVE_BLOCK_FINISH_SELECTION==='1'&&report.actorFinishMs>3000)throw Error('Caret-only finish waited for another edit');
-  if(!report.actorDelivery.finished||report.actorDelivery.error||report.actorDelivery.requests!==3)throw Error('Actor final settlement or request count differs');
-  await expectBody('actor final settled',lastBody);
+  if(!report.actorDelivery.finished||report.actorDelivery.error||report.actorDelivery.requests!==(firstOnly?1:3))throw Error('Actor final settlement or request count differs');
+  await expectBody('actor final settled',firstOnly?'下周一上午开会':lastBody);
   actor.stdin.end();
   if(!exited)await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Actor cleanup timeout')),5000);actor.once('exit',code=>{clearTimeout(timer);if(code===0)resolve();else reject(Error('Actor failed '+code+': '+diagnostics));});});
   report.actorPassed=true;
