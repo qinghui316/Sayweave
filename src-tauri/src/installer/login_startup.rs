@@ -166,6 +166,18 @@ mod native {
         if !exe.is_absolute() || path.contains(['"', '\0', '\r', '\n']) {
             return Err("startupPath".into());
         }
+        // Canonical filesystem paths are not Shell command paths. Convert only
+        // the local-drive namespace verified by the installer, never devices/UNC.
+        let path = match exe.components().next() {
+            Some(std::path::Component::Prefix(prefix)) => match prefix.kind() {
+                std::path::Prefix::Disk(_) => path,
+                std::path::Prefix::VerbatimDisk(_) => {
+                    path.strip_prefix(r"\\?\").ok_or("startupPath")?
+                }
+                _ => return Err("startupPath".into()),
+            },
+            _ => return Err("startupPath".into()),
+        };
         let command = format!("\"{path}\" {ARGUMENT}");
         if command.encode_utf16().count() > 260 {
             return Err("startupCommandLimit".into());
@@ -213,22 +225,46 @@ mod native {
         fn remove(&mut self) -> Result<()>;
     }
     fn initialize(store: &mut impl Store, directory: &Path) -> Result<()> {
-        // A completed marker also preserves a user-removed entry. Never resurrect it.
-        if store.initialized()? {
-            return Ok(());
-        }
-        match store.entry()? {
-            Some(value) if owns(&value, directory) => {}
-            Some(_) => return Err("startupConflict".into()),
-            None => {
-                let expected = command(directory)?;
-                store.write_entry(&expected)?;
-                if store.entry()?.as_deref() != Some(&expected) {
-                    return Err("startupWriteUnconfirmed".into());
+        let initialized = store.initialized()?;
+        let entry = match store.entry() {
+            // User-replaced values cannot authorize the legacy migration.
+            Err(error)
+                if initialized
+                    && matches!(error.as_str(), "startupValueType" | "startupValueLimit") =>
+            {
+                return Ok(());
+            }
+            result => result?,
+        };
+        match entry {
+            Some(value) => {
+                let legacy = format!(
+                    "\"{}\" {ARGUMENT}",
+                    directory.join("sayweave.exe").display()
+                );
+                if value == legacy && legacy.encode_utf16().count() <= 260 {
+                    let expected = command(directory)?;
+                    if value != expected {
+                        write_command(store, &expected)?;
+                    }
+                } else if !initialized && !owns(&value, directory) {
+                    return Err("startupConflict".into());
                 }
             }
+            None if !initialized => write_command(store, &command(directory)?)?,
+            None => {} // A completed marker preserves a user-removed entry.
         }
-        store.mark()
+        if !initialized {
+            store.mark()?;
+        }
+        Ok(())
+    }
+    fn write_command(store: &mut impl Store, command: &str) -> Result<()> {
+        store.write_entry(command)?;
+        if store.entry()?.as_deref() != Some(command) {
+            return Err("startupWriteUnconfirmed".into());
+        }
+        Ok(())
     }
     fn remove_owned(store: &mut impl Store, directory: &Path) -> Result<()> {
         if let Some(value) = store.entry()?
@@ -326,19 +362,28 @@ mod native {
             deleted: usize,
             fail_write: bool,
             fail_mark: bool,
+            fail_read: bool,
+            mismatch_write: bool,
         }
         impl Store for Memory {
             fn initialized(&mut self) -> Result<bool> {
                 Ok(self.marker)
             }
             fn entry(&mut self) -> Result<Option<String>> {
+                if self.fail_read {
+                    return Err("startupRead:5".into());
+                }
                 Ok(self.entry.clone())
             }
             fn write_entry(&mut self, value: &str) -> Result<()> {
                 if self.fail_write {
                     return Err("accessDenied:5".into());
                 }
-                self.entry = Some(value.into());
+                self.entry = Some(if self.mismatch_write {
+                    "changed".into()
+                } else {
+                    value.into()
+                });
                 self.writes += 1;
                 Ok(())
             }
@@ -441,6 +486,227 @@ mod native {
             assert!(value.starts_with('"'));
             assert!(command(Path::new("relative")).is_err());
             assert!(command(Path::new(&format!(r"C:\{}", "a".repeat(260)))).is_err());
+        }
+        #[test]
+        fn installed_canonical_directory_produces_a_shell_path() {
+            use windows::Win32::System::Com::{
+                COINIT_APARTMENTTHREADED, CoInitializeEx, CoTaskMemFree, CoUninitialize,
+            };
+            #[link(name = "shell32")]
+            unsafe extern "system" {
+                fn SHParseDisplayName(
+                    name: *const u16,
+                    context: *mut std::ffi::c_void,
+                    item: *mut *mut std::ffi::c_void,
+                    attributes: u32,
+                    result: *mut u32,
+                ) -> windows::core::HRESULT;
+            }
+            struct Fixture(std::path::PathBuf);
+            impl Drop for Fixture {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_file(self.0.join("sayweave.exe"));
+                    let _ = std::fs::remove_dir(&self.0);
+                }
+            }
+            let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join(".local")
+                .join(format!("启动路径 test {}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&directory).unwrap();
+            let fixture = Fixture(directory);
+            std::fs::write(fixture.0.join("sayweave.exe"), b"owned Shell path fixture").unwrap();
+            let canonical = metadata::normalized_directory(&fixture.0).unwrap();
+            let value = command(&canonical).unwrap();
+            let expected = format!(
+                "\"{}\" --autostart",
+                fixture.0.join("sayweave.exe").display()
+            );
+            assert_eq!(value, expected);
+            assert!(owns(&value, &canonical));
+            unsafe {
+                CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+                let mut item = std::ptr::null_mut();
+                let path = metadata::wide(
+                    value
+                        .strip_suffix("\" --autostart")
+                        .unwrap()
+                        .trim_start_matches('"'),
+                );
+                let result = SHParseDisplayName(
+                    path.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut item,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                CoTaskMemFree(Some(item));
+                CoUninitialize();
+                result.ok().unwrap();
+            }
+        }
+        #[test]
+        fn initialized_legacy_command_is_migrated_once() {
+            let directory = Path::new(r"\\?\C:\Sayweave 测试");
+            let mut store = Memory {
+                marker: true,
+                entry: Some(format!(
+                    "\"{}\" --autostart",
+                    directory.join("sayweave.exe").display()
+                )),
+                ..Default::default()
+            };
+            initialize(&mut store, directory).unwrap();
+            assert_eq!(
+                store.entry.as_deref(),
+                Some("\"C:\\Sayweave 测试\\sayweave.exe\" --autostart")
+            );
+            assert_eq!(store.writes, 1);
+            initialize(&mut store, directory).unwrap();
+            assert_eq!(store.writes, 1);
+        }
+        #[test]
+        fn initialized_user_choices_are_not_rewritten() {
+            let directory = Path::new(r"\\?\C:\Sayweave");
+            for entry in [
+                None,
+                Some("\"C:\\Sayweave\\sayweave.exe\" --autostart".into()),
+                Some("\"C:\\Sayweave\\sayweave.exe\"".into()),
+                Some("\"C:\\Other\\sayweave.exe\" --autostart".into()),
+                Some("\"\\\\?\\C:\\Sayweave\\sayweave.exe\" --autostart --other".into()),
+            ] {
+                let mut store = Memory {
+                    marker: true,
+                    entry: entry.clone(),
+                    ..Default::default()
+                };
+                initialize(&mut store, directory).unwrap();
+                assert_eq!(store.entry, entry);
+                assert_eq!(store.writes, 0);
+            }
+        }
+        #[test]
+        fn legacy_repair_and_interrupted_marker_share_verified_write() {
+            let directory = Path::new(r"\\?\C:\Sayweave");
+            let old = format!(
+                "\"{}\" --autostart",
+                directory.join("sayweave.exe").display()
+            );
+            let mut store = Memory {
+                entry: Some(old.clone()),
+                fail_mark: true,
+                ..Default::default()
+            };
+            assert_eq!(
+                initialize(&mut store, directory).unwrap_err(),
+                "markerDenied:5"
+            );
+            assert_eq!(
+                store.entry.as_deref(),
+                Some("\"C:\\Sayweave\\sayweave.exe\" --autostart")
+            );
+            store.fail_mark = false;
+            initialize(&mut store, directory).unwrap();
+            assert!(store.marker);
+            assert_eq!(store.writes, 1);
+            for (fail_read, fail_write, mismatch_write, expected) in [
+                (true, false, false, "startupRead:5"),
+                (false, true, false, "accessDenied:5"),
+                (false, false, true, "startupWriteUnconfirmed"),
+            ] {
+                let mut store = Memory {
+                    marker: true,
+                    entry: Some(old.clone()),
+                    fail_read,
+                    fail_write,
+                    mismatch_write,
+                    ..Default::default()
+                };
+                assert_eq!(initialize(&mut store, directory).unwrap_err(), expected);
+                assert!(store.marker);
+                if !mismatch_write {
+                    assert_eq!(store.entry.as_deref(), Some(old.as_str()));
+                }
+            }
+        }
+        #[test]
+        fn only_local_drive_namespaces_and_exact_command_limit_are_supported() {
+            for directory in [
+                r"\\?\UNC\server\share",
+                r"\\server\share",
+                r"\\.\C:\Sayweave",
+                r"\\?\GLOBALROOT\Device\HarddiskVolume1",
+                r"C:relative",
+            ] {
+                assert_eq!(command(Path::new(directory)).unwrap_err(), "startupPath");
+            }
+            let overhead = command(Path::new(r"C:\")).unwrap().encode_utf16().count() + 1;
+            let directory = format!(r"C:\{}", "a".repeat(260 - overhead));
+            assert_eq!(
+                command(Path::new(&directory))
+                    .unwrap()
+                    .encode_utf16()
+                    .count(),
+                260
+            );
+            assert_eq!(
+                command(Path::new(&(directory + "a"))).unwrap_err(),
+                "startupCommandLimit"
+            );
+        }
+        #[test]
+        fn native_legacy_repair_preserves_disabled_approval_and_deleted_entry() {
+            let root = format!(
+                r"Software\SayweaveTests\LoginStartup\{}",
+                uuid::Uuid::new_v4()
+            );
+            struct Cleanup(String);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    unsafe {
+                        let _ = RegDeleteTreeW(
+                            HKEY_CURRENT_USER,
+                            PCWSTR(metadata::wide(&self.0).as_ptr()),
+                        );
+                    }
+                }
+            }
+            let _cleanup = Cleanup(root.clone());
+            let run = format!(r"{root}\Run");
+            let product = format!(r"{root}\Product");
+            let approval = format!(r"{root}\StartupApproved\Run");
+            let directory = Path::new(r"\\?\C:\Sayweave 测试");
+            let mut store = Registry {
+                run: &run,
+                product: &product,
+                name: "OwnedTest",
+            };
+            let disabled = [3u8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+            set(&approval, "OwnedTest", REG_BINARY, &disabled).unwrap();
+            store
+                .write_entry(&format!(
+                    "\"{}\" --autostart",
+                    directory.join("sayweave.exe").display()
+                ))
+                .unwrap();
+            store.mark().unwrap();
+            initialize(&mut store, directory).unwrap();
+            assert_eq!(
+                store.entry().unwrap().as_deref(),
+                Some("\"C:\\Sayweave 测试\\sayweave.exe\" --autostart")
+            );
+            assert_eq!(
+                query(&approval, "OwnedTest").unwrap().unwrap(),
+                (REG_BINARY, disabled.to_vec())
+            );
+            store.remove().unwrap();
+            initialize(&mut store, directory).unwrap();
+            assert!(store.entry().unwrap().is_none());
+            assert!(store.initialized().unwrap());
+            set(&run, "OwnedTest", REG_BINARY, &[1, 2, 3]).unwrap();
+            initialize(&mut store, directory).unwrap();
+            assert_eq!(query(&run, "OwnedTest").unwrap().unwrap().1, vec![1, 2, 3]);
         }
         #[test]
         fn native_registry_roundtrip_keeps_unrelated_values_and_validates_marker() {
