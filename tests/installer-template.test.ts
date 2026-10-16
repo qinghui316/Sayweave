@@ -36,4 +36,16 @@ describe('installer ownership and ordering',()=>{
   expect(template).toContain('nsis_tauri_utils::SemverCompare "${VERSION}" $R0');
   expect(template).toContain('fixed root start-menu shortcut only');
  });
+ it('accepts committed startup warnings without rollback or blocking passive update',()=>{
+  const install=section('Install'),commit=install.slice(install.indexOf('--sayweave-installer=commit'));
+  expect(commit).toContain('${If} $SayweaveMaintenanceResult != 0\n  ${AndIf} $SayweaveMaintenanceResult != 2');
+  const settled=commit.indexOf('StrCpy $SayweaveTransactionCommitted 1');
+  expect(settled).toBeGreaterThan(commit.indexOf('Call SayweaveRollback'));
+  expect(settled).toBeLessThan(commit.indexOf('${If} $SayweaveMaintenanceResult = 2'));
+  const warning=commit.slice(commit.indexOf('${If} $SayweaveMaintenanceResult = 2'));
+  expect(warning).toContain('${If} $PassiveMode != 1\n      MessageBox');
+  expect(warning).not.toContain('Call SayweaveRollback');
+  const uninstall=section('Uninstall');
+  expect(uninstall.indexOf('${If} $SayweaveMaintenanceResult = 2')).toBeLessThan(uninstall.indexOf('${ElseIf} $SayweaveMaintenanceResult != 0'));
+ });
 });

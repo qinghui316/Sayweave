@@ -214,6 +214,7 @@ pub fn restore(snapshot: &KeyBackup, install_dir: &str) -> Result<()> {
         "Installer Language",
         "currentUser",
         "perMachine",
+        super::login_startup::MARKER,
     ];
     if current
         .values

@@ -42,6 +42,81 @@ fn viewport(app: &tauri::AppHandle, expected: (f64, f64)) -> Result<(), String> 
     )
 }
 async fn verify(app: &tauri::AppHandle, menu_ids: Vec<String>) -> Result<(), String> {
+    if crate::installer::login_startup::LaunchReason::current()
+        == crate::installer::login_startup::LaunchReason::Autostart
+    {
+        // Observe after initial native/frontend event handling, before any test opens it.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        step(app, "autostart-hidden-idle", |app| {
+            let main = app.get_webview_window("main").ok_or("missing main")?;
+            let snapshot = read(app).map_err(|e| format!("{e:?}"))?;
+            require(
+                !main.is_visible().map_err(|e| e.to_string())?,
+                "autostart main visible",
+            )?;
+            require(
+                !main.is_focused().map_err(|e| e.to_string())?,
+                "autostart took focus",
+            )?;
+            require(
+                !snapshot.windows.main
+                    && !snapshot.windows.overlay
+                    && snapshot.session.phase == Phase::Idle,
+                "autostart runtime not hidden/idle",
+            )
+        })
+        .await?;
+        let shortcut_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = app
+                .state::<crate::shortcuts::ShortcutService>()
+                .status()
+                .map_err(|e| format!("{e:?}"))?;
+            if status.active.is_some() && !status.pending && status.error.is_none() {
+                break;
+            }
+            if std::time::Instant::now() >= shortcut_deadline {
+                return Err("hidden launch shortcut initialization incomplete".into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        println!("SAYWEAVE_ACCEPTANCE autostart-shortcuts-ready: PASS");
+        let mut duplicate =
+            std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+                .arg("--autostart")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| e.to_string())?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while duplicate.try_wait().map_err(|e| e.to_string())?.is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = duplicate.kill();
+                let _ = duplicate.wait();
+                return Err("duplicate autostart did not exit silently".into());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let output = duplicate.wait_with_output().map_err(|e| e.to_string())?;
+        require(
+            String::from_utf8_lossy(&output.stderr).contains("SAYWEAVE_ALREADY_RUNNING"),
+            "duplicate did not reach existing instance lock",
+        )?;
+        step(app, "autostart-duplicate-keeps-main-hidden", |app| {
+            let main = app.get_webview_window("main").ok_or("missing main")?;
+            require(
+                !main.is_visible().map_err(|e| e.to_string())?,
+                "duplicate opened main",
+            )?;
+            tray_action(app, "open").map_err(|e| format!("{e:?}"))?;
+            require(
+                main.is_visible().map_err(|e| e.to_string())?
+                    && read(app).map_err(|e| format!("{e:?}"))?.windows.main,
+                "tray did not open hidden main",
+            )
+        })
+        .await?;
+    }
     step(app, "overlay-identity-without-ui-dispatch", |app| {
         let window = app
             .get_webview_window("voice-overlay")

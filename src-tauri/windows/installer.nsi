@@ -622,11 +622,18 @@ Section Install
 
   ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=commit "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
   ${If} $SayweaveMaintenanceResult != 0
+  ${AndIf} $SayweaveMaintenanceResult != 2
     Call SayweaveRollback
     SetErrorLevel 1
     Abort "程序或输入组件安装未完成。已恢复的版本可继续使用；若恢复未完成，请重新运行此安装包。"
   ${EndIf}
   StrCpy $SayweaveTransactionCommitted 1
+  ${If} $SayweaveMaintenanceResult = 2
+    DetailPrint "程序安装已完成，但开机自启动未能完成配置。"
+    ${If} $PassiveMode != 1
+      MessageBox MB_ICONEXCLAMATION|MB_OK "程序安装已完成，但开机自启动未能完成配置。" /SD IDOK
+    ${EndIf}
+  ${EndIf}
 
   ; Auto close this page for passive mode
   ${If} $PassiveMode = 1
@@ -673,7 +680,10 @@ Section Uninstall
   System::Call 'kernel32::GetCurrentProcessId() i.r0'
   StrCpy $SayweaveInstallerPid $0
   ExecWait '"$PLUGINSDIR\sayweave-uninstall-maintenance.exe" --sayweave-installer=uninstall "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}"' $SayweaveMaintenanceResult
-  ${If} $SayweaveMaintenanceResult != 0
+  ${If} $SayweaveMaintenanceResult = 2
+    DetailPrint "程序卸载已完成，但所属启动项未能完成清理。"
+    MessageBox MB_ICONEXCLAMATION|MB_OK "程序卸载已完成，但所属启动项未能完成清理。" /SD IDOK
+  ${ElseIf} $SayweaveMaintenanceResult != 0
     SetErrorLevel 1
     Abort "卸载未完成。请先正常退出 Sayweave；若安装恢复尚未完成，请重新运行安装包。"
   ${EndIf}

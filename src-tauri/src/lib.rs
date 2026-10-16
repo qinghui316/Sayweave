@@ -531,8 +531,11 @@ async fn dictionary_delete(
         _ => Err(DataError::new("unavailable")),
     }
 }
-fn already_running() {
+fn already_running(launch: installer::login_startup::LaunchReason) {
     eprintln!("SAYWEAVE_ALREADY_RUNNING");
+    if !launch.main_visible() {
+        return;
+    }
     #[cfg(feature = "desktop-acceptance")]
     if std::env::var("SAYWEAVE_SECOND_INSTANCE_ACCEPTANCE").as_deref() == Ok("1") {
         return;
@@ -559,6 +562,7 @@ fn already_running() {
     }
 }
 pub fn run() {
+    let launch = installer::login_startup::LaunchReason::current();
     tls::initialize();
     tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
@@ -574,7 +578,7 @@ pub fn run() {
         )
         .manage(dictation::DictationCoordinator::default())
         .manage(windows_input::WindowsInputService::new())
-        .manage(Runtime(Mutex::new(Snapshot::default())))
+        .manage(Runtime(Mutex::new(Snapshot::with_main_visibility(launch.main_visible()))))
         .manage(lifecycle::Lifecycle::default())
         .on_page_load(|webview, payload| {
             if webview.label() == "main"
@@ -669,7 +673,7 @@ pub fn run() {
             #[cfg(feature = "desktop-acceptance")]
             acceptance_main_size
         ])
-        .setup(|app| {
+        .setup(move |app| {
             eprintln!("SAYWEAVE_STARTUP phase=setup pid={}", std::process::id());
             if app.config().identifier != env!("SAYWEAVE_BUILD_IDENTIFIER") {
                 return Err("compiled application identity mismatch".into());
@@ -757,7 +761,7 @@ pub fn run() {
                     });
                 }
                 Err(error) if error.code == "alreadyRunning" => {
-                    already_running();
+                    already_running(launch);
                     app.handle().exit(0);
                     return Ok(());
                 }
@@ -802,9 +806,11 @@ pub fn run() {
                 .data_directory(root.join("webview2"))
                 .background_color(appearance::background(&appearance_initial.theme_id))
                 .initialization_script(&appearance_bootstrap)
+                .visible(launch.main_visible())
+                .focused(launch.main_visible())
                 .build()?;
             let build = build_info::current();
-            log::info!(target: "sayweave", "operation=startup phase=main_window_created pid={} version={} commit={} channel={}", std::process::id(), build.version, build.commit, build.channel);
+            log::info!(target: "sayweave", "operation=startup phase=main_window_created pid={} version={} commit={} channel={} reason={launch:?} main_visible={}", std::process::id(), build.version, build.commit, build.channel, launch.main_visible());
             if let Some(main) = app.get_webview_window("main")
                 && let Some(monitor) = main.primary_monitor()?
             {

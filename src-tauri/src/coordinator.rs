@@ -46,6 +46,15 @@ impl Default for Snapshot {
     }
 }
 impl Snapshot {
+    pub fn with_main_visibility(visible: bool) -> Self {
+        Self {
+            windows: Windows {
+                main: visible,
+                overlay: false,
+            },
+            ..Self::default()
+        }
+    }
     pub fn demo(&mut self, action: &str, id: u64) -> Result<(), RuntimeError> {
         use Phase::*;
         let active = matches!(self.session.phase, Connecting | Recording | Processing);
@@ -136,6 +145,16 @@ pub fn resize_is_current(current: &Snapshot, requested: &Snapshot) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hidden_launch_changes_only_initial_main_visibility() {
+        let hidden = Snapshot::with_main_visibility(false);
+        assert!(!hidden.windows.main);
+        assert!(!hidden.windows.overlay);
+        let mut opened = hidden;
+        opened.windows.main = true;
+        assert_eq!(opened, Snapshot::default());
+        assert_eq!(Snapshot::with_main_visibility(true), Snapshot::default());
+    }
     #[test]
     fn stale_native_display_does_not_block_admission_or_overwrite_demo() {
         let mut runtime = Snapshot::default();

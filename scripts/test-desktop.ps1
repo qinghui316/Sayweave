@@ -1,3 +1,4 @@
+param([switch]$Autostart)
 $ErrorActionPreference='Stop'
 $projectRoot=Split-Path $PSScriptRoot -Parent
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -22,7 +23,12 @@ $acceptanceId=[guid]::NewGuid().ToString()
 & node scripts/storage.mjs begin-desktop $acceptanceId | Out-Null
 if($LASTEXITCODE -ne 0){throw 'Storage reservation failed before desktop launch.'}
 $env:SAYWEAVE_DATA_ACCEPTANCE_ID=$acceptanceId
-try { $env:SAYWEAVE_DESKTOP_ACCEPTANCE='1'; $app=Start-Process $exe -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $projectRoot '.local/desktop-acceptance.log') -RedirectStandardError (Join-Path $projectRoot '.local/desktop-acceptance-errors.log') } finally { $env:SAYWEAVE_DESKTOP_ACCEPTANCE=$oldFlag; $env:SAYWEAVE_DATA_ACCEPTANCE_ID=$oldDataId }
+try {
+  $env:SAYWEAVE_DESKTOP_ACCEPTANCE='1'
+  $start=@{FilePath=$exe;WindowStyle='Hidden';PassThru=$true;RedirectStandardOutput=(Join-Path $projectRoot '.local/desktop-acceptance.log');RedirectStandardError=(Join-Path $projectRoot '.local/desktop-acceptance-errors.log')}
+  if($Autostart){$start.ArgumentList=@('--autostart')}
+  $app=Start-Process @start
+} finally { $env:SAYWEAVE_DESKTOP_ACCEPTANCE=$oldFlag; $env:SAYWEAVE_DATA_ACCEPTANCE_ID=$oldDataId }
 $started=$app.StartTime
 $null=$app.Handle
 $children=@{}

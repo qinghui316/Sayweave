@@ -2,6 +2,7 @@
 //! None of these entries starts Tauri, opens SQLite, or reads Windows credentials.
 #[cfg(windows)]
 mod ipc;
+pub(crate) mod login_startup;
 #[cfg(windows)]
 mod machine;
 #[cfg(windows)]
@@ -45,6 +46,10 @@ pub fn helper_entry() -> Option<i32> {
     {
         Some(match native::dispatch(&args) {
             Ok(()) => 0,
+            Err(error) if error == login_startup::WARNING => {
+                eprintln!("SAYWEAVE_INSTALLER result=committed startup=warning");
+                2
+            }
             Err(error) => {
                 log::error!(target:"sayweave", "installer result=failed code={error}");
                 1

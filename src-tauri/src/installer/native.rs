@@ -519,7 +519,8 @@ fn machine_for(record: &UserRecord) -> Result<machine::MachineRecord> {
 fn commit(directory: &Path, installer: &Process, target: &Target) -> Result<()> {
     let (root, mut record) = current_record(directory, installer, target)?;
     if record.phase == Phase::Committed {
-        return verify_ready(&record);
+        verify_ready(&record)?;
+        return initialize_startup(&record);
     }
     let result = (|| {
         installed_files(&mut record)?;
@@ -555,7 +556,15 @@ fn commit(directory: &Path, installer: &Process, target: &Target) -> Result<()> 
         save(&root, &record)?;
         return Err(error);
     }
-    Ok(())
+    initialize_startup(&record)
+}
+fn initialize_startup(record: &UserRecord) -> Result<()> {
+    super::login_startup::install(Path::new(&record.install_dir), &record.keys[0].path).map_err(
+        |error| {
+            eprintln!("SAYWEAVE_INSTALLER operation=startup_register error={error}");
+            super::login_startup::WARNING.into()
+        },
+    )
 }
 fn restore_files(root: &Path, record: &UserRecord) -> Result<()> {
     // Validate all identities before any restoration. Unknown edits retain the recovery anchor.
@@ -740,9 +749,14 @@ fn uninstall(directory: &Path, keys: [String; 2], process: &Process) -> Result<(
     // cannot prove it has no other consumers, so retain its registration/DLLs and
     // per-user TSF choice. Never traverse SQLite, recordings or Credential Manager.
     eprintln!("Sayweave: shared input component retained; user data and enable choice retained.");
+    let startup =
+        super::login_startup::uninstall(directory, &record.keys[0].path).map_err(|error| {
+            eprintln!("SAYWEAVE_INSTALLER operation=startup_remove error={error}");
+            super::login_startup::WARNING.to_owned()
+        });
     remove_backups(&root, &record);
     let _ = fs::remove_dir(directory);
-    Ok(())
+    startup
 }
 fn verify_ready(record: &UserRecord) -> Result<()> {
     let machine = machine::load()?.ok_or("installerProofMissing")?;
