@@ -191,11 +191,13 @@ pub(super) fn observe(
     r: &mut State,
     value: NativeTranscript,
 ) {
-    if value.task_id != actor.task
-        || value.turn != s.turn
-        || value.sequence <= s.latest.sequence
-        || r.stopped
-    {
+    if value.task_id != actor.task || value.turn != s.turn || value.sequence <= s.latest.sequence {
+        return;
+    }
+    if r.stopped {
+        // Revoked writing does not revoke this recognition source. Final ASR
+        // can first arrive after a settled seal and before the End envelope.
+        s.latest = value;
         return;
     }
     if s.handoff || r.read_needed || s.activity != input_state::activity() {
@@ -602,13 +604,7 @@ fn sealed(actor: &SessionDraft, s: &mut super::State, r: &mut State) {
     if s.stopping || actor.control.stopping() || !s.input_delivery.live() {
         // End may race the settled Release receipt. Its accepted final source
         // still belongs to this task, even though no fresh write is permitted.
-        let has_tail = offset < source.text.chars().count();
         s.latest = source;
-        if has_tail && s.input_delivery.live() {
-            s.input_delivery = delivery::InputDelivery::Retiring;
-            s.report.result_only = true;
-            actor.control.detach_input();
-        }
         r.stop();
         return;
     }
@@ -676,6 +672,24 @@ pub(super) fn schedule(
         } else {
             sealed(actor, s, r);
         }
+        return Ok(());
+    }
+    if s.ending.is_some()
+        && r.stopped
+        && r.sealed_submission
+        && r.block.confirmed().0 == 0
+        && s.draft.is_none()
+        && r.snapshot.is_none()
+        && r.absorbed_coverage
+            .as_ref()
+            .and_then(|mark| mark.offset(&s.latest.segments))
+            != Some(s.latest.text.chars().count())
+    {
+        // Decide delivery only after final source arrives. Both the old range
+        // and composition are settled, and no fresh write is allowed at End.
+        s.input_delivery = delivery::InputDelivery::Retiring;
+        s.report.result_only = true;
+        actor.control.detach_input();
         return Ok(());
     }
     if s.handoff {
@@ -1503,21 +1517,11 @@ mod tests {
                     s.ending = Some(ending());
                 }
                 sealed(&actor, &mut s, &mut r);
-                assert!(
-                    s.report.result_only,
-                    "the unconsumed tail must remain deliverable"
-                );
                 assert_eq!(s.latest.text, "周三开会");
                 assert!(r.stopped);
                 assert!(s.native.is_none());
                 assert_eq!(actor.control.audio.current(), 0);
                 assert!(s.stop_error.is_none());
-                s.revisable = Some(r);
-                actor.delivery_retired(
-                    &mut s,
-                    &NativeKind::RetireClose,
-                    NativeValue::Closed(Ok(())),
-                );
                 if !end_already_received {
                     assert!(actor.result_delivery(&mut s).is_none());
                     let mut final_source = s.latest.clone();
@@ -1525,9 +1529,20 @@ mod tests {
                     final_source.text.push('。');
                     final_source.segments[0].text.push('。');
                     final_source.segments[0].revision += 1;
-                    actor.observe(&mut s, final_source);
+                    observe(&actor, &mut s, &mut r, final_source);
                     s.ending = Some(ending());
                 }
+                schedule(&actor, &mut s, &mut r).unwrap();
+                assert!(
+                    s.report.result_only,
+                    "the unconsumed tail must remain deliverable"
+                );
+                s.revisable = Some(r);
+                actor.delivery_retired(
+                    &mut s,
+                    &NativeKind::RetireClose,
+                    NativeValue::Closed(Ok(())),
+                );
                 let delivery = actor.result_delivery(&mut s).unwrap();
                 assert_eq!(delivery.submission, Submission::Submitted);
                 assert_eq!(delivery.state, "unconfirmed");
@@ -1572,6 +1587,58 @@ mod tests {
             assert_eq!(delivery.restore_error, restore_error);
             assert_eq!(delivery.error.as_deref(), Some(error));
         }
+    }
+    #[test]
+    fn final_source_first_arriving_after_seal_still_reaches_result_delivery() {
+        let (actor, mut s, _) = actor(None);
+        s.draft = None;
+        let mut r = State::new();
+        baseline(&mut r, "周");
+        s.latest = NativeTranscript {
+            task_id: actor.task.clone(),
+            turn: 1,
+            sequence: 1,
+            text: "周".into(),
+            segments: vec![crate::contracts::processing::SourceSegment {
+                id: 1,
+                revision: 1,
+                text: "周".into(),
+                confirmed: false,
+            }],
+        };
+        s.written_raw = "周".into();
+        r.visible_coverage =
+            crate::processing::draft_source::Watermark::capture(&s.latest.segments, 1);
+        r.handoff();
+        r.snapshot = None;
+        r.sealing = true;
+        actor.control.request_finish();
+        sealed(&actor, &mut s, &mut r);
+        assert!(
+            !s.report.result_only,
+            "all acknowledged source uses ordinary ending"
+        );
+        let mut source = s.latest.clone();
+        source.sequence = 2;
+        source.text = "周三开会".into();
+        source.segments[0].revision = 2;
+        source.segments[0].text = source.text.clone();
+        observe(&actor, &mut s, &mut r, source);
+        assert_eq!(
+            s.latest.text, "周三开会",
+            "stopped write permission must not discard final ASR"
+        );
+        let (reply, _) = oneshot::channel();
+        s.ending = Some(Ending {
+            mode: Finish::Commit,
+            reply,
+            deadline: Instant::now() + Duration::from_secs(15),
+            expired: false,
+        });
+        schedule(&actor, &mut s, &mut r).unwrap();
+        assert!(s.report.result_only);
+        assert!(s.native.is_none());
+        assert_eq!(actor.control.audio.current(), 0);
     }
     #[test]
     fn sealed_idle_block_keeps_audio_without_claiming_an_empty_native_range() {
