@@ -7,8 +7,6 @@ use crate::processing::draft::{
 use sayweave_text_service::wire::{BlockAction, BlockCommand, BlockSnapshot};
 
 pub(super) struct State {
-    pub(super) mode: InputMode,
-    caret_pending: bool,
     block: Block,
     order: u64,
     offset: usize,
@@ -39,8 +37,6 @@ impl State {
     }
     pub fn new() -> Self {
         Self {
-            mode: InputMode::Revisable,
-            caret_pending: false,
             block: Block::new(uuid::Uuid::new_v4().to_string()),
             order: 1,
             offset: 0,
@@ -289,9 +285,7 @@ pub(super) fn start_generation(
     s: &mut super::State,
     r: &mut State,
 ) -> Result<(), Error> {
-    if r.mode == InputMode::Caret
-        || r.caret_pending
-        || r.stopped
+    if r.stopped
         || (s.stopping || actor.control.stopping()) && s.ending.is_none()
         || r.read_needed
         || s.handoff
@@ -529,50 +523,6 @@ fn release(actor: &SessionDraft, s: &mut super::State, r: &State, abandon: bool)
         )
     });
 }
-fn continue_at_caret(
-    actor: &SessionDraft,
-    s: &mut super::State,
-    r: &mut State,
-) -> Result<(), Error> {
-    // Coverage is produced by an acknowledged write, never by reading or
-    // searching the host body. A changed partial ASR boundary cannot replay.
-    let coverage = r
-        .visible_coverage
-        .clone()
-        .ok_or_else(|| Error::new("sourceChanged"))?;
-    let latest = r.pending_source.clone().unwrap_or_else(|| s.latest.clone());
-    let offset = coverage
-        .offset(&latest.segments)
-        .ok_or_else(|| Error::new("sourceChanged"))?;
-    r.pending_source = None;
-    let text = r.block.confirmed().1.to_owned();
-    archive_block(actor, s, r, &text, false);
-    cancel(actor, s, r);
-    r.reset_block();
-    r.mode = InputMode::Caret;
-    r.caret_pending = false;
-    r.offset = offset;
-    r.absorbed_coverage = Some(coverage);
-    r.pending_coverage = None;
-    r.sealed_source = units::slice(&latest.text, 0..offset);
-    s.latest.sequence = 0;
-    s.activity = input_state::activity();
-    s.handoff = false;
-    s.merge_at = None;
-    s.paused_at = Some(Instant::now());
-    observe(actor, s, r, latest);
-    log::info!(target:"sayweave", "operation=draft_input_mode task_id={} turn={} mode=caret source_end={offset}",actor.task,s.turn);
-    Ok(())
-}
-fn handoff_complete(actor: &SessionDraft, s: &mut super::State, r: &mut State) {
-    if r.mode == InputMode::Caret {
-        if let Err(error) = continue_at_caret(actor, s, r) {
-            s.record_failure(&actor.task, error.code);
-        }
-        return;
-    }
-    handed_off(s, r);
-}
 fn handed_off(s: &mut super::State, r: &mut State) {
     if r.snapshot.is_none() {
         // No tracked block exists to reacquire: the next native range really
@@ -598,13 +548,6 @@ pub(super) fn schedule(
     if s.native.is_some() {
         return Ok(());
     }
-    if r.mode == InputMode::Caret
-        && s.draft.is_none()
-        && r.proof_deadline.is_some_and(|d| Instant::now() >= d)
-    {
-        s.record_failure(&actor.task, "inputComposition".into());
-        return Ok(());
-    }
     if r.cleanup_failed {
         if s.ending.is_none() {
             return Ok(());
@@ -627,7 +570,7 @@ pub(super) fn schedule(
                 NativeValue::HandedOff(draft.handoff_receipt().await)
             });
         } else {
-            handoff_complete(actor, s, r);
+            handed_off(s, r);
         }
         return Ok(());
     }
@@ -639,16 +582,6 @@ pub(super) fn schedule(
     if s.ending.as_ref().is_some_and(|e| e.mode != Finish::Commit) {
         r.stop();
         cancel(actor, s, r);
-    }
-    if r.mode == InputMode::Caret
-        && s.ending.is_some()
-        && s.draft.is_none()
-        && r.block.visible() != r.block.confirmed().1
-    {
-        // Finish may flush a held composition, but does not authorize a new
-        // position for speech that never reached the host.
-        s.record_failure(&actor.task, "inputUnconfirmed".into());
-        return Ok(());
     }
     if s.draft.is_none()
         && r.proof_deadline.is_some_and(|d| Instant::now() >= d)
@@ -712,10 +645,10 @@ pub(super) fn schedule(
         release(actor, s, r, false);
         return Ok(());
     }
-    let finish_tail = r.mode != InputMode::Caret
-        && s.ending
-            .as_ref()
-            .is_some_and(|e| e.mode == Finish::Commit && !e.expired)
+    let finish_tail = s
+        .ending
+        .as_ref()
+        .is_some_and(|e| e.mode == Finish::Commit && !e.expired)
         && !r.stopped
         && !crate::contracts::draft::equivalent_text(&r.block.visible(), r.block.confirmed().1);
     if s.draft.is_none()
@@ -726,12 +659,6 @@ pub(super) fn schedule(
             .is_none_or(|a| a.elapsed() >= Duration::from_millis(300))
             && !input_state::editing_key_held()
         {
-            if r.mode == InputMode::Caret {
-                // The old block is already retired. Preparation starts after
-                // editing releases the caret, not while the user still types.
-                r.proof_deadline
-                    .get_or_insert_with(|| Instant::now() + Duration::from_secs(15));
-            }
             let anchor = windows_input::reanchor_turn(&actor.task, &actor.anchor)?;
             if anchor.activity != s.activity {
                 actor.control.hold_input();
@@ -772,8 +699,7 @@ pub(super) fn schedule(
             .map(|coverage| (revision, coverage));
             let sequence = r.sequence;
             let permit = r.permit.clone();
-            let initial_block =
-                (!r.bound && r.mode == InputMode::Revisable).then(|| r.block.id().to_owned());
+            let initial_block = (!r.bound).then(|| r.block.id().to_owned());
             job(
                 s,
                 Effect::Write {
@@ -817,10 +743,10 @@ pub(super) fn schedule(
         }
         return Ok(());
     }
-    let covered = r.mode == InputMode::Caret
-        || r.block
-            .snapshot(true)
-            .is_none_or(|snapshot| !r.block.needs_generation(&snapshot));
+    let covered = r
+        .block
+        .snapshot(true)
+        .is_none_or(|snapshot| !r.block.needs_generation(&snapshot));
     let finishing = s.ending.is_some() && s.unit.is_none() && covered;
     let splitting = r.capacity
         && s.unit.is_none()
@@ -900,12 +826,7 @@ pub(super) fn native_done(
                     r.handoff();
                 } else {
                     s.paused_at = None;
-                    if r.mode == InputMode::Caret {
-                        r.proof_deadline = None;
-                        actor.control.resume_retained(*turn, *activity);
-                    } else {
-                        actor.control.resume(*turn, *activity);
-                    }
+                    actor.control.resume(*turn, *activity);
                 }
             }
             Err(error)
@@ -1046,10 +967,6 @@ pub(super) fn native_done(
                     r.handoff();
                     s.paused_at = Some(Instant::now());
                 }
-                Ok(ReacquireOutcome::Unavailable) => {
-                    r.caret_pending = true;
-                    release(actor, s, r, false);
-                }
                 Ok(ReacquireOutcome::Invalidated) => release(actor, s, r, true),
                 Ok(ReacquireOutcome::Uncertain) => {
                     r.uncertain = true;
@@ -1059,14 +976,11 @@ pub(super) fn native_done(
             }
         }
         (NativeKind::Revisable(Effect::Handoff), NativeValue::HandedOff(outcome)) => {
-            let safe = outcome.handed_off;
-            if !safe {
+            if !outcome.handed_off {
                 s.record_failure(&actor.task, "compositionCleanup".into());
             }
             s.last_handoff = Some(outcome);
-            if safe {
-                handoff_complete(actor, s, r);
-            }
+            handed_off(s, r);
         }
         (NativeKind::Revisable(Effect::Read { activity }), NativeValue::Block(result)) => {
             match result {
@@ -1169,13 +1083,6 @@ pub(super) fn native_done(
                 }
                 Ok(reply)
                     if windows_input::composition::block_refusal(&reply)
-                        == windows_input::composition::BlockRefusal::Unavailable =>
-                {
-                    r.caret_pending = true;
-                    release(actor, s, r, false);
-                }
-                Ok(reply)
-                    if windows_input::composition::block_refusal(&reply)
                         == windows_input::composition::BlockRefusal::AwaitingProof =>
                 {
                     s.paused_at = Some(Instant::now());
@@ -1195,11 +1102,7 @@ pub(super) fn native_done(
             match result {
                 Ok(reply) if reply.applied => {
                     r.snapshot = None;
-                    if r.caret_pending {
-                        if let Err(error) = continue_at_caret(actor, s, r) {
-                            s.record_failure(&actor.task, error.code);
-                        }
-                    } else if r.rollover {
+                    if r.rollover {
                         r.reset_block();
                         let latest = s.latest.clone();
                         s.latest.sequence = 0;
@@ -1241,17 +1144,14 @@ pub(super) fn native_done(
         }
         (NativeKind::Revisable(Effect::Close), NativeValue::Closed(result)) => {
             s.report.cancelled = s.ending.as_ref().is_some_and(|e| e.mode == Finish::Abort);
-            // An acknowledged native write remains submitted even when a
-            // released carrier cannot expose the user's final edited body.
-            let submitted = !s.written_raw.is_empty() || !s.report.text.is_empty();
             let mut delivery = Delivery::not_submitted(if s.report.cancelled {
                 "cancelled"
-            } else if !submitted {
+            } else if s.report.text.trim().is_empty() {
                 "emptyText"
             } else {
                 "inputUnconfirmed"
             });
-            if submitted {
+            if !s.report.text.is_empty() {
                 delivery.submission = Submission::Submitted;
                 delivery.verification = crate::windows_input::Verification::Unavailable;
                 delivery.stage = "composition".into();
@@ -1279,235 +1179,6 @@ mod tests {
     use super::super::tests::{actor, block_reply, command};
     use super::*;
     use crate::windows_input::composition::Command;
-    fn source(task: &str, sequence: u64, old: &str, new: &str) -> NativeTranscript {
-        let mut segments = vec![crate::contracts::processing::SourceSegment {
-            id: 1,
-            revision: 1,
-            text: old.into(),
-            confirmed: true,
-        }];
-        if !new.is_empty() {
-            segments.push(crate::contracts::processing::SourceSegment {
-                id: 2,
-                revision: sequence,
-                text: new.into(),
-                confirmed: false,
-            });
-        }
-        NativeTranscript {
-            task_id: task.into(),
-            turn: 1,
-            sequence,
-            text: format!("{old}{new}"),
-            segments,
-        }
-    }
-    #[tokio::test]
-    async fn caret_transition_seals_old_source_and_writes_only_new_tail_without_tracking() {
-        let (actor, mut s, native) = actor(None);
-        let mut r = State::new();
-        baseline(&mut r, "周三开会");
-        s.latest = source(&actor.task, 1, "周三开会", "");
-        s.written_raw = s.latest.text.clone();
-        r.visible_coverage =
-            crate::processing::draft_source::Watermark::capture(&s.latest.segments, 4);
-        r.pending_source = Some(source(&actor.task, 2, "周三开会", "地点在上海"));
-        let old_permit = r.permit.clone();
-        r.permit.store(false, Ordering::Release);
-        continue_at_caret(&actor, &mut s, &mut r).unwrap();
-        assert_eq!(s.turn, 1);
-        assert_eq!(r.mode, InputMode::Caret);
-        assert!(!old_permit.load(Ordering::Acquire));
-        assert!(!Arc::ptr_eq(&old_permit, &r.permit));
-        assert_eq!(r.block.visible(), "地点在上海");
-        assert!(
-            r.proof_deadline.is_none(),
-            "editing has not released a new position yet"
-        );
-        assert!(
-            s.report.text.is_empty(),
-            "host user edits are not fabricated"
-        );
-        start_generation(&actor, &mut s, &mut r).unwrap();
-        assert!(s.unit.is_none());
-        schedule(&actor, &mut s, &mut r).unwrap();
-        let Command::Replace(turn, text, _, _, reply) = command(&native).await else {
-            panic!("shared untracked writer")
-        };
-        assert_eq!(turn, 1);
-        assert_eq!(text, "地点在上海");
-        reply.send(Ok(())).unwrap();
-        let value = SessionDraft::native_value(&mut s.native).await.unwrap();
-        let completed = s.native.take().unwrap();
-        native_done(&actor, &mut s, &mut r, &completed.kind, value);
-        assert!(s.stop_error.is_none());
-        assert!(
-            r.visible_coverage
-                .as_ref()
-                .is_some_and(|v| v.offset(&s.latest.segments) == Some(9))
-        );
-        let mut latest = s.latest.clone();
-        latest.sequence += 1;
-        latest.text.push_str("北京");
-        latest
-            .segments
-            .push(crate::contracts::processing::SourceSegment {
-                id: 3,
-                revision: 1,
-                text: "北京".into(),
-                confirmed: true,
-            });
-        r.pending_source = Some(latest);
-        r.handoff();
-        continue_at_caret(&actor, &mut s, &mut r).unwrap();
-        assert_eq!(s.turn, 1);
-        assert_eq!(r.block.visible(), "北京");
-        assert!(s.unit.is_none());
-    }
-    #[test]
-    fn caret_boundary_change_is_refused_without_consuming_a_new_input_block() {
-        let (actor, mut s, _) = actor(None);
-        let mut r = State::new();
-        baseline(&mut r, "开会");
-        let mut prior = source(&actor.task, 1, "开会", "");
-        prior.segments[0].confirmed = false;
-        r.visible_coverage =
-            crate::processing::draft_source::Watermark::capture(&prior.segments, 2);
-        s.latest = prior;
-        r.pending_source = Some(source(&actor.task, 2, "会议", "在周一"));
-        let id = r.block.id().to_owned();
-        assert_eq!(
-            continue_at_caret(&actor, &mut s, &mut r).unwrap_err().code,
-            "sourceChanged"
-        );
-        assert_eq!(r.block.id(), id);
-        assert_eq!(r.mode, InputMode::Revisable);
-        assert_eq!(r.pending_source.as_ref().unwrap().text, "会议在周一");
-    }
-    #[tokio::test]
-    async fn unavailable_scope_needs_a_successful_release_before_caret_mode() {
-        let (actor, mut s, native) = actor(None);
-        s.draft = None;
-        let mut r = State::new();
-        baseline(&mut r, "原块");
-        let mut refusal = block_reply(&actor.task, None, false);
-        refusal.code = "blockRetainedScopeUnavailable:80040204".into();
-        let activity = s.activity;
-        native_done(
-            &actor,
-            &mut s,
-            &mut r,
-            &NativeKind::Revisable(Effect::Read { activity }),
-            NativeValue::block(Ok(refusal)),
-        );
-        assert_eq!(r.mode, InputMode::Revisable);
-        assert!(r.caret_pending);
-        let Command::Block(_, _, request, text, _, reply) = command(&native).await else {
-            panic!("release old scope")
-        };
-        assert_eq!(request.action, BlockAction::Release);
-        assert!(text.is_empty());
-        reply.send(Err(Error::new("compositionCleanup"))).unwrap();
-        let value = SessionDraft::native_value(&mut s.native).await.unwrap();
-        let completed = s.native.take().unwrap();
-        native_done(&actor, &mut s, &mut r, &completed.kind, value);
-        assert_eq!(r.mode, InputMode::Revisable);
-        assert_eq!(s.stop_error.as_deref(), Some("compositionCleanup"));
-    }
-    #[test]
-    fn acknowledged_scope_release_keeps_the_recognition_source_and_only_the_new_tail() {
-        let (actor, mut s, _) = actor(None);
-        s.draft = None;
-        let mut r = State::new();
-        baseline(&mut r, "周三开会");
-        s.latest = source(&actor.task, 1, "周三开会", "");
-        s.written_raw = s.latest.text.clone();
-        r.visible_coverage =
-            crate::processing::draft_source::Watermark::capture(&s.latest.segments, 4);
-        r.pending_source = Some(source(&actor.task, 2, "周三开会", "地点在上海"));
-        r.handoff();
-        r.caret_pending = true;
-        actor.control.hold_input();
-        native_done(
-            &actor,
-            &mut s,
-            &mut r,
-            &NativeKind::Revisable(Effect::Release { abandon: false }),
-            NativeValue::block(Ok(block_reply(&actor.task, None, true))),
-        );
-        assert_eq!(s.turn, 1);
-        assert_eq!(r.mode, InputMode::Caret);
-        assert_eq!(r.block.visible(), "地点在上海");
-        assert!(r.snapshot.is_none());
-        assert!(s.draft.is_none());
-        assert!(s.stop_error.is_none());
-        assert_eq!(
-            actor.control.audio.current(),
-            0,
-            "new position is not ready"
-        );
-        assert!(s.report.text.is_empty());
-    }
-    #[test]
-    fn caret_begin_receipt_cannot_reopen_audio_after_finish_intent() {
-        let (actor, mut s, _) = actor(None);
-        let draft = s.draft.take().unwrap();
-        let mut r = State::new();
-        r.mode = InputMode::Caret;
-        actor.control.resume(s.turn, s.activity);
-        actor.control.fixture_ready(s.turn, s.activity);
-        actor.control.hold_input();
-        actor.control.request_finish();
-        let kind = NativeKind::Begin {
-            turn: s.turn,
-            activity: s.activity,
-        };
-        native_done(&actor, &mut s, &mut r, &kind, NativeValue::Begun(Ok(draft)));
-        assert_eq!(actor.control.audio.current(), 0);
-        assert!(s.stop_error.is_none());
-    }
-    #[test]
-    fn caret_without_a_new_tail_keeps_the_prior_submission_fact_at_finish_or_cancel() {
-        for mode in [Finish::Commit, Finish::Abort] {
-            let (actor, mut s, _) = actor(None);
-            let mut r = State::new();
-            r.mode = InputMode::Caret;
-            s.written_raw = "周三开会".into();
-            ending(&mut s, false);
-            s.ending.as_mut().unwrap().mode = mode.clone();
-            let delivery = native_done(
-                &actor,
-                &mut s,
-                &mut r,
-                &NativeKind::Revisable(Effect::Close),
-                NativeValue::Closed(Ok(())),
-            )
-            .unwrap();
-            assert_eq!(delivery.submission, Submission::Submitted);
-            assert_eq!(
-                delivery.verification,
-                crate::windows_input::Verification::Unavailable
-            );
-            assert_eq!(s.report.cancelled, mode == Finish::Abort);
-            assert_ne!(delivery.error.as_deref(), Some("emptyText"));
-            assert!(
-                s.report.text.is_empty(),
-                "committed user edits remain unknown"
-            );
-        }
-    }
-    #[test]
-    fn caret_finish_never_opens_a_new_range_for_an_unwritten_tail() {
-        let (actor, mut s, _) = actor(None);
-        s.draft = None;
-        let mut r = State::new();
-        r.mode = InputMode::Caret;
-        r.block.observe("未输入尾字".into(), 5).unwrap();
-        ending(&mut s, false);
-        schedule(&actor, &mut s, &mut r).unwrap();
-        assert!(s.native.is_none());
-        assert_eq!(s.stop_error.as_deref(), Some("inputUnconfirmed"));
-    }
     #[test]
     fn invalid_scope_release_does_not_start_an_asr_turn_at_the_new_focus() {
         let (actor, mut s, _) = actor(None);

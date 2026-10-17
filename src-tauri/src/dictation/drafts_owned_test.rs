@@ -405,7 +405,7 @@ async fn richtext_actor() {
     let mut latest = NativeTranscript::default();
     let mut finished = false;
     let result: Result<(), String> = async {
-        let deadline = Instant::now() + Duration::from_secs(180);
+        let deadline = Instant::now() + Duration::from_secs(90);
         for _ in 0..2000 {
             if Instant::now() >= deadline { return Err("owned actor deadline".into()); }
             let line = receiver.recv_timeout(Duration::from_secs(15)).map_err(|e|e.to_string())?;
@@ -431,8 +431,6 @@ async fn richtext_actor() {
                     manager.update(&latest);
                 }
                 Some("edited") => { input_state::edited(); }
-                Some("edit-start") => { input_state::edit_key_pressed(0xff); }
-                Some("edit-end") => { input_state::key_released(0xff); }
                 Some("release-bind") => {
                     let (lock, ready) = &RELEASE_UPDATE;
                     *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
@@ -474,11 +472,10 @@ async fn richtext_actor() {
             if *cancel.borrow() > 0 || control.stopping() {
                 return Err(format!("actor stopped: {:?}", manager.report().and_then(|r|r.error)));
             }
-            emit(serde_json::json!({"accepted":true,"activity":input_state::activity(),"editingKeyHeld":input_state::editing_key_held(),"sequence":latest.sequence,"resultOnly":manager.result_only(),"inputMode":manager.input_mode(),"presentation":manager.presentation(),"published":publications.lock().unwrap().last().copied(),"audioRoute":control.audio.current(),"requests":provider.seen.lock().unwrap().len()}));
+            emit(serde_json::json!({"accepted":true,"activity":input_state::activity(),"editingKeyHeld":input_state::editing_key_held(),"sequence":latest.sequence,"resultOnly":manager.result_only(),"presentation":manager.presentation(),"published":publications.lock().unwrap().last().copied(),"audioRoute":control.audio.current(),"requests":provider.seen.lock().unwrap().len()}));
         }
         Err("owned actor command limit".into())
     }.await;
-    input_state::key_released(0xff);
     // Also unblock native retirement if the driver exits during the edit.
     *RELEASE_UPDATE.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
     RELEASE_UPDATE.1.notify_one();

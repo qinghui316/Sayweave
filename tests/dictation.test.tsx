@@ -8,11 +8,6 @@ import {parseDeliveryReports} from '../src/contracts/history';
 import {ShortcutSettings} from '../src/features/settings/ShortcutSettings';
 import {VoiceSurface} from '../src/features/voice';
 describe('dictation contracts',()=>{
- it('accepts the optional caret mode and rejects an unknown mode',()=>{
-  expect(parseDictation(initialDictation()).inputMode).toBeUndefined();
-  expect(parseDictation({...initialDictation(),inputMode:'caret'}).inputMode).toBe('caret');
-  expect(()=>parseDictation({...initialDictation(),inputMode:'follow-anywhere'})).toThrow();
- });
  it('rejects malformed state and exposes no native target identity',()=>{
   expect(parseDictation(initialDictation()).source).toBe('trial');
   expect(()=>parseDictation({...initialDictation(),delivery:{state:'submitted',error:null,restoreError:false,elapsedMs:1}})).toThrow();

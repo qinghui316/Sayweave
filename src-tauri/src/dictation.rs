@@ -31,13 +31,6 @@ pub enum InputRoute {
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum InputMode {
-    #[default]
-    Revisable,
-    Caret,
-}
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub enum Admission {
     #[default]
     Pending,
@@ -48,7 +41,6 @@ pub enum Admission {
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub input_route: InputRoute,
-    pub input_mode: InputMode,
     pub admission: Admission,
     pub sequence: u64,
     pub task_id: Option<String>,
@@ -64,7 +56,6 @@ impl Default for Snapshot {
     fn default() -> Self {
         Self {
             input_route: InputRoute::None,
-            input_mode: InputMode::Revisable,
             admission: Admission::Pending,
             sequence: 1,
             task_id: None,
@@ -791,7 +782,6 @@ impl DictationCoordinator {
                                 .state::<DictationCoordinator>()
                                 .update(&handle, &task_id, |s| {
                                     s.presentation = presentation;
-                                    s.input_mode = projection.input_mode();
                                     if projection.result_only() {
                                         s.input_route = InputRoute::ResultOnly;
                                     }

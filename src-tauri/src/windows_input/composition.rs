@@ -254,22 +254,18 @@ pub(crate) enum ReacquireOutcome {
         snapshot: BlockSnapshot,
     },
     AwaitingProof,
-    Unavailable,
     Invalidated,
     Uncertain,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlockRefusal {
     AwaitingProof,
-    Unavailable,
     Invalidated,
     Uncertain,
 }
 pub(crate) fn block_refusal(reply: &Reply) -> BlockRefusal {
     if reply.mutation != Mutation::NotAttempted {
         BlockRefusal::Uncertain
-    } else if reply.code.starts_with("blockRetainedScopeUnavailable:") {
-        BlockRefusal::Unavailable
     } else if reply.code.starts_with("blockAwaitingRepresentation:")
         || reply.code.starts_with("blockInputMethodBusy:")
         || reply.code.starts_with("blockSnapshotChanged:")
@@ -316,7 +312,6 @@ impl Connection {
         if !reply.applied {
             return Ok(match block_refusal(&reply) {
                 BlockRefusal::AwaitingProof => ReacquireOutcome::AwaitingProof,
-                BlockRefusal::Unavailable => ReacquireOutcome::Unavailable,
                 BlockRefusal::Invalidated => ReacquireOutcome::Invalidated,
                 BlockRefusal::Uncertain => ReacquireOutcome::Uncertain,
             });
@@ -702,10 +697,10 @@ impl Drop for Apartment {
     }
 }
 struct Host {
-    revoking_primary: Option<(u64, u64, u64)>,
+    revoking_primary: Option<(u64, u64)>,
     block: Option<BlockSnapshot>,
     supports_observation: bool,
-    abandoned_optional: Vec<(u64, u64, u64)>,
+    abandoned_optional: Vec<(u64, u64)>,
     optional_disabled: bool,
     observer_reversal: u64,
     sink: Option<Arc<ObservationSink>>,
@@ -715,8 +710,6 @@ struct Host {
     poll_at: Instant,
     task: String,
     turn: u64,
-    // Native range lifetimes can advance while recognition keeps its source turn.
-    native_turn: u64,
     anchor: Anchor,
     gate: Arc<DeliveryGate>,
     pipe: Pipe,
@@ -827,7 +820,7 @@ impl Host {
             return;
         }
         self.receipts.insert(
-            (self.native_turn, self.operation, region),
+            (self.turn, self.operation, region),
             SourceReceipt {
                 operation: self.operation,
                 revision: self.revision,
@@ -881,7 +874,7 @@ impl Host {
                 .or_else(|| {
                     self.raw_tail.as_ref().filter(|r| {
                         value.region == OutputRegion::Tail
-                            && value.turn == self.native_turn
+                            && value.turn == self.turn
                             && r.operation == value.operation
                     })
                 });
@@ -901,7 +894,7 @@ impl Host {
                     value.task, value.turn, value.operation, value.region, value.sequence
                 ),
                 task: value.task,
-                turn: self.turn,
+                turn: value.turn,
                 operation: value.operation,
                 sequence: value.sequence,
                 region: if value.region == OutputRegion::Prefix {
@@ -1007,7 +1000,6 @@ impl Host {
             poll_at: Instant::now(),
             task,
             turn,
-            native_turn: turn,
             anchor,
             gate,
             pipe,
@@ -1062,7 +1054,6 @@ impl Host {
     }
     fn begin_turn(&mut self, turn: u64, anchor: Anchor) -> Result<(), Error> {
         if self.range_open
-            || self.block.is_some()
             || turn < self.turn
             || self.failure.is_some()
             || anchor.window != self.anchor.window
@@ -1074,8 +1065,6 @@ impl Host {
             return Err(Error::new("staleSession"));
         }
         self.stop_observation();
-        self.acknowledge_receipt()?;
-        self.native_turn = next_native_turn(self.native_turn, turn)?;
         self.anchor = anchor;
         self.turn = turn;
         self.revision = 0;
@@ -1114,7 +1103,7 @@ impl Host {
                 control_protocol: 1,
                 capability: self.capability.clone(),
                 task: self.task.clone(),
-                turn: self.native_turn,
+                turn: self.turn,
                 operation,
                 deadline_tick: deadline.min(now + 15_000),
                 action: ControlAction::PrepareEngine,
@@ -1136,7 +1125,7 @@ impl Host {
                         .map_err(|_| Error::new("compositionTargetVersion"))?;
                     if reply.control_protocol != 1
                         || reply.task != self.task
-                        || reply.turn != self.native_turn
+                        || reply.turn != self.turn
                         || reply.operation != operation
                     {
                         return Err(Error::new("compositionProtocol"));
@@ -1305,18 +1294,16 @@ impl Host {
                     if key.matches(&identity) {
                         continue;
                     } // Duplicate of the receipt already assigned to its caller.
-                    let pending = pending_business_receipt(
+                    if !pending_business_receipt(
                         &reply,
                         &self.engine,
                         &self.task,
-                        self.native_turn,
+                        self.turn,
                         (self.operation, self.revision),
                         &self.abandoned_optional,
-                    ) || (reply.engine == self.engine
-                        && reply.task == self.task
-                        && self.revoking_primary
-                            == Some((reply.turn, reply.operation, reply.revision)));
-                    if !pending || self.receipt_inbox.len() >= 4 {
+                    ) && self.revoking_primary != Some((reply.operation, reply.revision))
+                        || self.receipt_inbox.len() >= 4
+                    {
                         return Err(Error::new("compositionProtocol"));
                     }
                     self.receipt_inbox.push_back(bytes);
@@ -1412,7 +1399,7 @@ impl Host {
             protocol: sayweave_text_service::wire::PROTOCOL,
             capability: self.capability.clone(),
             task: self.task.clone(),
-            turn: self.native_turn,
+            turn: self.turn,
             operation: self.operation,
             revision: self.revision,
             deadline_tick: deadline
@@ -1461,7 +1448,8 @@ impl Host {
             if let Some(frame) = frame {
                 let reply: Reply = serde_json::from_slice(&frame)
                     .map_err(|_| Error::new("compositionProtocol"))?;
-                if reply.engine != self.engine || reply.task != self.task {
+                if reply.engine != self.engine || reply.task != self.task || reply.turn != self.turn
+                {
                     return Err(Error::new("compositionProtocol"));
                 }
                 // Only a timed-out optional read may finish after its caller
@@ -1469,16 +1457,12 @@ impl Host {
                 // write. Unknown/core mismatches remain protocol failures.
                 if discard_optional_reply(
                     &mut self.abandoned_optional,
-                    reply.turn,
                     reply.operation,
                     reply.revision,
                 ) {
                     self.retained_ack = ReceiptKey::from_frame(&frame);
                     self.acknowledge_receipt()?;
                     continue;
-                }
-                if reply.turn != request.turn {
-                    return Err(Error::new("compositionProtocol"));
                 }
                 if revocation
                     .as_ref()
@@ -1519,7 +1503,7 @@ impl Host {
                 if reply.applied {
                     self.range_epoch = reply.range_epoch;
                 }
-                log::info!(target:"sayweave", "operation=composition_edit task_id={} turn={} native_turn={} revision={} action={:?} applied={} code={} mutation={:?} elapsed_ms={}", self.task, self.turn, request.turn, request.revision, action, reply.applied, reply.code, reply.mutation, at.elapsed().as_millis());
+                log::info!(target:"sayweave", "operation=composition_edit task_id={} turn={} revision={} action={:?} applied={} code={} mutation={:?} elapsed_ms={}", self.task, self.turn, request.revision, action, reply.applied, reply.code, reply.mutation, at.elapsed().as_millis());
                 primary = Some(reply);
                 continue;
             }
@@ -1538,7 +1522,7 @@ impl Host {
                     protocol: request.protocol,
                     capability: self.capability.clone(),
                     task: self.task.clone(),
-                    turn: request.turn,
+                    turn: self.turn,
                     operation: self.operation,
                     revision: request.revision,
                     deadline_tick: unsafe { GetTickCount64() } + 2000,
@@ -1546,7 +1530,7 @@ impl Host {
                     text: String::new(),
                     prefix: None,
                 };
-                self.revoking_primary = Some((request.turn, request.operation, request.revision));
+                self.revoking_primary = Some((request.operation, request.revision));
                 self.pipe
                     .send(
                         &serde_json::to_vec(&revoke)
@@ -1561,21 +1545,15 @@ impl Host {
                         if self.abandoned_optional.len() >= 16 {
                             return Err(Error::new("compositionProtocol"));
                         }
-                        self.abandoned_optional.push((
-                            revoke.turn,
-                            revoke.operation,
-                            revoke.revision,
-                        ));
+                        self.abandoned_optional
+                            .push((revoke.operation, revoke.revision));
                     }
                     self.revoking_primary = None;
                     return Ok(reply);
                 }
                 if optional {
-                    self.abandoned_optional.push((
-                        request.turn,
-                        request.operation,
-                        request.revision,
-                    ));
+                    self.abandoned_optional
+                        .push((request.operation, request.revision));
                     // Never evict an outstanding identity to make room for
                     // another read. Stop optional work at the fixed bound.
                     self.optional_disabled = self.abandoned_optional.len() >= 16;
@@ -1888,22 +1866,18 @@ fn pending_business_receipt(
     task: &str,
     turn: u64,
     current: (u64, u64),
-    abandoned: &[(u64, u64, u64)],
+    abandoned: &[(u64, u64)],
 ) -> bool {
     reply.engine == *engine
         && reply.task == task
-        && ((reply.turn == turn && (reply.operation, reply.revision) == current)
-            || abandoned.contains(&(reply.turn, reply.operation, reply.revision)))
+        && reply.turn == turn
+        && ((reply.operation, reply.revision) == current
+            || abandoned.contains(&(reply.operation, reply.revision)))
 }
-fn discard_optional_reply(
-    abandoned: &mut Vec<(u64, u64, u64)>,
-    turn: u64,
-    operation: u64,
-    revision: u64,
-) -> bool {
+fn discard_optional_reply(abandoned: &mut Vec<(u64, u64)>, operation: u64, revision: u64) -> bool {
     if let Some(index) = abandoned
         .iter()
-        .position(|value| *value == (turn, operation, revision))
+        .position(|value| *value == (operation, revision))
     {
         abandoned.swap_remove(index);
         true
@@ -1990,12 +1964,6 @@ fn target_ready(task: &str, anchor: &Anchor, gate: &DeliveryGate) -> Result<(), 
 fn editor_endpoint(anchor: &Anchor) -> Result<(u32, u32), Error> {
     super::native::editor_endpoint(anchor)
 }
-fn next_native_turn(current: u64, source: u64) -> Result<u64, Error> {
-    current
-        .checked_add(1)
-        .map(|next| next.max(source))
-        .ok_or_else(|| Error::new("staleSession"))
-}
 fn pump() {
     unsafe {
         let mut message = MSG::default();
@@ -2009,36 +1977,6 @@ fn pump() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn new_native_range_advances_without_changing_the_recognition_source_turn() {
-        let source_turn = 1;
-        let mut version = sayweave_text_service::wire::DraftVersion::default();
-        let mut request: Request = serde_json::from_value(serde_json::json!({
-            "protocol": sayweave_text_service::wire::PROTOCOL,
-            "engine":{"proxy_instance":uuid::Uuid::new_v4().to_string(),"engine_generation":1},
-            "capability":uuid::Uuid::new_v4().to_string(),
-            "task":uuid::Uuid::new_v4().to_string(),"turn":source_turn,
-            "operation":1,"revision":0,"deadline_tick":1000,"action":"begin","text":""
-        }))
-        .unwrap();
-        assert!(version.accepts(&request));
-        version.applied(&request);
-        request.action = Action::Handoff;
-        request.operation += 1;
-        assert!(version.accepts(&request));
-        version.applied(&request);
-        request.action = Action::Begin;
-        request.operation += 1;
-        assert!(!version.accepts(&request));
-        request.turn = next_native_turn(version.turn, source_turn).unwrap();
-        assert!(version.accepts(&request));
-        version.applied(&request);
-        let next = next_native_turn(version.turn, source_turn).unwrap();
-        assert_eq!(next, 3);
-        assert_eq!(source_turn, 1);
-        assert_eq!(next_native_turn(3, 7).unwrap(), 7);
-        assert!(next_native_turn(u64::MAX, source_turn).is_err());
-    }
     #[test]
     fn write_effect_and_tracking_refusal_are_independent_receipt_facts() {
         let reply = |phase: &str, mutation: Mutation| -> Reply {
@@ -2093,10 +2031,6 @@ mod tests {
         }
         reply.code = "blockScopeInvalid:800401fd".into();
         assert_eq!(block_refusal(&reply), BlockRefusal::Invalidated);
-        reply.code = "blockRetainedScopeUnavailable:80040204".into();
-        assert_eq!(block_refusal(&reply), BlockRefusal::Unavailable);
-        reply.mutation = Mutation::Changed;
-        assert_eq!(block_refusal(&reply), BlockRefusal::Uncertain);
         reply.code = "blockSnapshotChanged:80040500".into();
         reply.mutation = Mutation::Uncertain;
         assert_eq!(block_refusal(&reply), BlockRefusal::Uncertain);
@@ -2118,7 +2052,7 @@ mod tests {
             &task,
             1,
             (11, 3),
-            &[(1, 10, 2)]
+            &[(10, 2)]
         ));
         reply.operation = 10;
         reply.revision = 2;
@@ -2128,7 +2062,7 @@ mod tests {
             &task,
             1,
             (11, 3),
-            &[(1, 10, 2)]
+            &[(10, 2)]
         ));
         reply.operation = 12;
         assert!(!pending_business_receipt(
@@ -2137,7 +2071,7 @@ mod tests {
             &task,
             1,
             (11, 3),
-            &[(1, 10, 2)]
+            &[(10, 2)]
         ));
         reply.operation = 11;
         reply.revision = 3;
@@ -2148,7 +2082,7 @@ mod tests {
             &task,
             1,
             (11, 3),
-            &[(1, 10, 2)]
+            &[(10, 2)]
         ));
     }
 
@@ -2286,11 +2220,11 @@ mod tests {
     #[test]
     fn late_optional_receipt_is_discarded_without_accepting_unknown_write_receipts() {
         // ObserveStart(2,0) exceeded its budget; Update(3,1) is now waiting.
-        let mut abandoned = vec![(1, 2, 0)];
+        let mut abandoned = vec![(2, 0)];
         let frames = [(2, 0), (3, 1)];
         let mut accepted = vec![];
         for (operation, revision) in frames {
-            if !discard_optional_reply(&mut abandoned, 1, operation, revision) {
+            if !discard_optional_reply(&mut abandoned, operation, revision) {
                 assert_eq!((operation, revision), (3, 1));
                 accepted.push((operation, revision));
             }
@@ -2298,100 +2232,9 @@ mod tests {
         assert_eq!(accepted, vec![(3, 1)]);
         assert!(abandoned.is_empty());
         // A duplicate or a wrong revision is not silently swallowed.
-        assert!(!discard_optional_reply(&mut abandoned, 1, 2, 0));
-        abandoned.push((1, 4, 1));
-        assert!(!discard_optional_reply(&mut abandoned, 1, 4, 2));
-        assert_eq!(abandoned, vec![(1, 4, 1)]);
-    }
-    #[test]
-    fn old_native_turn_optional_receipt_keeps_its_exact_ack_identity() {
-        let engine = EngineBinding {
-            proxy_instance: uuid::Uuid::new_v4().to_string(),
-            engine_generation: 4,
-        };
-        let task = uuid::Uuid::new_v4().to_string();
-        let mut reply: Reply = serde_json::from_value(serde_json::json!({
-            "engine":engine,"task":task,"turn":1,"operation":10,"revision":2,
-            "applied":true,"code":"ok","mutation":"notAttempted"
-        }))
-        .unwrap();
-        let mut abandoned = vec![(1, 10, 2)];
-        // ObserveStop from range1 can arrive while Begin for range2 is waiting.
-        assert!(pending_business_receipt(
-            &reply,
-            &engine,
-            &task,
-            2,
-            (11, 3),
-            &abandoned
-        ));
-        let frame = serde_json::to_vec(&reply).unwrap();
-        let ack = ReceiptKey::from_frame(&frame).unwrap();
-        assert_eq!((ack.turn, ack.operation), (1, 10));
-        assert!(discard_optional_reply(
-            &mut abandoned,
-            reply.turn,
-            reply.operation,
-            reply.revision
-        ));
-        assert!(!pending_business_receipt(
-            &reply,
-            &engine,
-            &task,
-            2,
-            (11, 3),
-            &abandoned
-        ));
-        // Equal operation/revision on another native turn is not that receipt.
-        abandoned.push((1, 10, 2));
-        reply.turn = 2;
-        assert!(!discard_optional_reply(
-            &mut abandoned,
-            reply.turn,
-            reply.operation,
-            reply.revision
-        ));
-        reply.turn = 1;
-        reply.operation = 11;
-        reply.revision = 3;
-        assert!(!pending_business_receipt(
-            &reply,
-            &engine,
-            &task,
-            2,
-            (11, 3),
-            &abandoned
-        ));
-        reply.turn = 2;
-        assert!(pending_business_receipt(
-            &reply,
-            &engine,
-            &task,
-            2,
-            (11, 3),
-            &abandoned
-        ));
-        reply.turn = 1;
-        reply.operation = 10;
-        reply.revision = 2;
-        reply.engine.engine_generation += 1;
-        assert!(!pending_business_receipt(
-            &reply,
-            &engine,
-            &task,
-            2,
-            (11, 3),
-            &abandoned
-        ));
-        reply.engine = engine.clone();
-        reply.task = uuid::Uuid::new_v4().to_string();
-        assert!(!pending_business_receipt(
-            &reply,
-            &engine,
-            &task,
-            2,
-            (11, 3),
-            &abandoned
-        ));
+        assert!(!discard_optional_reply(&mut abandoned, 2, 0));
+        abandoned.push((4, 1));
+        assert!(!discard_optional_reply(&mut abandoned, 4, 2));
+        assert_eq!(abandoned, vec![(4, 1)]);
     }
 }
