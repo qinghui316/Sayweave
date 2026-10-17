@@ -33,7 +33,16 @@ impl Binding {
                 _ => (),
             }
             probe.push_str("/carrierStatus");
-            let document = if carrier_context.GetStatus()?.dwStaticFlags & TF_SS_TRANSITORY != 0 {
+            let status = carrier_context.GetStatus()?;
+            probe.push_str(&format!(
+                ".static={}.dynamic={}",
+                status.dwStaticFlags, status.dwDynamicFlags
+            ));
+            match carrier.GetBase() {
+                Ok(base) => probe.push_str(&format!("/base.same={}", base == carrier_context)),
+                Err(error) => probe.push_str(&format!("/base.error={:08x}", error.code().0 as u32)),
+            }
+            let document = if status.dwStaticFlags & TF_SS_TRANSITORY != 0 {
                 parent_document(carrier, probe)?.unwrap_or_else(|| carrier.clone())
             } else {
                 probe.push_str("/direct");
@@ -110,6 +119,31 @@ impl Binding {
                 && windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == self.window
                 && GetAncestor(self.window, GA_ROOT) == self.root
                 && GetForegroundWindow() == self.root
+        }
+    }
+
+    // Callback-time facts supplement the first-refusal record. They do not
+    // grant a scope or change the saved document selected by Begin.
+    pub(super) fn focus_diagnostic(
+        &self,
+        document: Option<&ITfDocumentMgr>,
+        previous: Option<&ITfDocumentMgr>,
+        matched: &Option<windows::core::Result<bool>>,
+    ) -> serde_json::Value {
+        unsafe {
+            let window = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus();
+            serde_json::json!({
+                "document_present": document.is_some(),
+                "document_is_carrier": document == Some(&self.carrier),
+                "document_is_previous": document == previous,
+                "previous_is_carrier": previous == Some(&self.carrier),
+                "document_matches": matched.as_ref().and_then(|value| value.as_ref().ok()).copied(),
+                "document_error": matched.as_ref().and_then(|value| value.as_ref().err()).map(|error| error.code().0 as u32),
+                "window_alive": IsWindow(Some(self.window)).as_bool(),
+                "window_matches": window == self.window,
+                "root_matches": GetAncestor(self.window, GA_ROOT) == self.root,
+                "foreground_matches": GetForegroundWindow() == self.root,
+            })
         }
     }
 
@@ -277,7 +311,24 @@ fn parent_value(
             Ok(Some(document))
         }
         Err(error) if error.code() == E_NOINTERFACE => {
-            probe.push_str("=80004002/direct");
+            probe.push_str("=80004002");
+            // Some transitory providers expose an object without the documented
+            // document-manager interface. Observe its actual standard interfaces
+            // without treating one of them as authority for another document.
+            let context = unknown.cast::<ITfContext>();
+            probe.push_str(&format!(
+                "/contextInterface={:08x}",
+                context.as_ref().err().map_or(0, |e| e.code().0 as u32)
+            ));
+            if let Ok(context) = context {
+                match unsafe { context.GetDocumentMgr() } {
+                    Ok(_) => probe.push_str("/contextOwner=00000000"),
+                    Err(error) => {
+                        probe.push_str(&format!("/contextOwner={:08x}", error.code().0 as u32))
+                    }
+                }
+            }
+            probe.push_str("/direct");
             Ok(None)
         }
         Err(error) => Err(error),

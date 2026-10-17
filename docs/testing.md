@@ -8,6 +8,8 @@
 
 原生入口检查另覆盖父属性缺失、空值、错误类型和不支持的接口；Direct 不因父能力后来出现而升级，已选 Parent 丢失后不降级到新范围。同文档焦点丢失仍粘性撤销跟踪。启动诊断按任务／轮次／操作绑定，附加元数据不改变只读或组词等待的业务分类。
 
+人工编辑时，可在同一 `richtext_actor` 入口显式启用 `SAYWEAVE_ACTOR_PHYSICAL_INPUT=1`，复用桌面的键盘、鼠标和焦点事件所有者；测试结束释放监听。按实际编辑事件及按键释放设置续写屏障，状态输出包含活动序号和按键持有状态。单次注入 `edited` 只覆盖那次通知，不能代替后续真实按键；固定等待超过既有15秒期限的退出须与早期接管失败分开。原生首拒记录保留焦点回调当时的文档／窗口匹配事实，即使后续无法取得编辑锁也可取回；这些元数据不授予写入许可。
+
 同一入口的 `SAYWEAVE_BLOCK_CONTROL=controlled-input` 使用受控 React 输入框，默认 `richtext` 保留富文本。每次宿主事件稳定后同时断言原生可见值与 React 状态，收尾后再次核对。后续程序化局部编辑与直接 Backspace 分别记录，不将前者视为真实输入法测试。普通原生 EDIT 的持续父文档验证使用既有 `input-fixture` 和同一 SessionDraft actor，核对三轮修改、删除后续说、块外标记及同窗同正文的换框反例；临时载体清空与持久正文保留分别观察。载体读回调超期后不得再执行捕获的父锁操作，原生效果等级和实际正文分别留证。
 
 同一识别连接的 PCM 暂停／恢复由 `retained_edit_resume_sends_pcm_on_the_same_connection_without_ready_event` 验证；界面真实电平订阅由 `tests/voice-edit-resume.test.tsx` 验证。受控音频、宿主正文、用户实际 Codex 试用分别记录，原生 `submitted/unconfirmed` 不升级为 `confirmed`。本次 f2ab7319 候选的同一 Codex 三步文字与波形验收已通过，不能扩展成所有宿主和时序的保证。

@@ -1,6 +1,31 @@
 #[cfg(windows)]
 mod backend;
 pub use backend::TaskStamp;
+// The owned actor can observe real manual edits through the same hook owner as
+// the desktop. The receiver retains trigger events for the fixture's lifetime.
+#[cfg(all(test, windows))]
+pub(crate) struct FixturePhysicalInput {
+    backend: backend::Backend,
+    _events: tokio::sync::mpsc::Receiver<backend::Event>,
+}
+#[cfg(all(test, windows))]
+impl FixturePhysicalInput {
+    pub(crate) fn start(task: &str) -> Result<Self, crate::history::types::Error> {
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        let backend = backend::Backend::start(sender)?;
+        backend.task_active(Some(task.into()));
+        Ok(Self {
+            backend,
+            _events: receiver,
+        })
+    }
+}
+#[cfg(all(test, windows))]
+impl Drop for FixturePhysicalInput {
+    fn drop(&mut self) {
+        self.backend.stop();
+    }
+}
 pub mod commands;
 #[cfg(test)]
 mod tests;

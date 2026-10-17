@@ -157,6 +157,8 @@ async fn richtext_actor() {
         "only the owned foreground editor is allowed"
     );
     let task = uuid::Uuid::new_v4().to_string();
+    let _physical = (std::env::var("SAYWEAVE_ACTOR_PHYSICAL_INPUT").as_deref() == Ok("1"))
+        .then(|| crate::shortcuts::FixturePhysicalInput::start(&task).unwrap());
     input.bind_target(&task, &anchor, None);
     let gate = Arc::new(windows_input::DeliveryGate::default());
     let draft = Draft::begin(task.clone(), 1, anchor.clone(), gate)
@@ -207,7 +209,9 @@ async fn richtext_actor() {
         println!("ACTOR_JSON:{value}");
         std::io::stdout().flush().unwrap();
     };
-    emit(serde_json::json!({"ready":true,"task":task,"process":pid}));
+    emit(
+        serde_json::json!({"ready":true,"task":task,"process":pid,"activity":input_state::activity()}),
+    );
     let mut latest = NativeTranscript::default();
     let mut finished = false;
     let result: Result<(), String> = async {
@@ -261,7 +265,7 @@ async fn richtext_actor() {
             if *cancel.borrow() > 0 || control.stopping() {
                 return Err(format!("actor stopped: {:?}", manager.report().and_then(|r|r.error)));
             }
-            emit(serde_json::json!({"accepted":true,"sequence":latest.sequence,"resultOnly":manager.result_only(),"presentation":manager.presentation(),"published":publications.lock().unwrap().last().copied(),"audioRoute":control.audio.current(),"requests":provider.seen.lock().unwrap().len()}));
+            emit(serde_json::json!({"accepted":true,"activity":input_state::activity(),"editingKeyHeld":input_state::editing_key_held(),"sequence":latest.sequence,"resultOnly":manager.result_only(),"presentation":manager.presentation(),"published":publications.lock().unwrap().last().copied(),"audioRoute":control.audio.current(),"requests":provider.seen.lock().unwrap().len()}));
         }
         Err("owned actor command limit".into())
     }.await;

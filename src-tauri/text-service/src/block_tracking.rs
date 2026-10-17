@@ -44,6 +44,7 @@ struct Data {
     position: RangePosition,
     valid: bool,
     invalid_reason: String,
+    focus_diagnostic: Option<serde_json::Value>,
     writable: bool,
     lease: u64,
     writing: bool,
@@ -503,6 +504,7 @@ impl Track {
                 position: range_position(context, &range, ec)?,
                 valid: true,
                 invalid_reason: "blockInvalid".into(),
+                focus_diagnostic: None,
                 writable: false,
                 lease: 0,
                 writing: false,
@@ -1153,15 +1155,24 @@ impl ITfThreadMgrEventSink_Impl for FocusSink_Impl {
     fn OnSetFocus(
         &self,
         document: Ref<ITfDocumentMgr>,
-        _: Ref<ITfDocumentMgr>,
+        previous: Ref<ITfDocumentMgr>,
     ) -> windows::core::Result<()> {
         let _callback = Callback::enter();
         let _notification = TextNotification::enter(self.notifications.clone());
-        if document
+        let matched = document
             .as_ref()
-            .is_none_or(|d| !unsafe { self.native.matches_document(d) }.unwrap_or(false))
+            .map(|d| unsafe { self.native.matches_document(d) });
+        if !matched
+            .as_ref()
+            .is_some_and(|value| value.as_ref().is_ok_and(|value| *value))
             || !self.native.focus_matches()
         {
+            let diagnostic =
+                self.native
+                    .focus_diagnostic(document.as_ref(), previous.as_ref(), &matched);
+            if self.data.borrow().valid {
+                self.data.borrow_mut().focus_diagnostic = Some(diagnostic);
+            }
             self.invalidate("blockDocumentFocus");
         }
         Ok(())
@@ -1336,12 +1347,20 @@ pub(super) fn dispatch(shared: &Shared, request: &Request, connection: u64) {
         Ok(())
     })();
     if let Err(error) = result {
+        // A callback can revoke the retained document before a new edit lock
+        // can be acquired. Keep its first-refusal facts even in that case.
+        let diagnostic = shared
+            .borrow()
+            .block
+            .as_ref()
+            .map(|track| evidence::suffix(&track.data))
+            .unwrap_or_default();
         reply_outcome(
             shared,
             request,
             connection,
             false,
-            &format!("block:{:08x}", error.code().0 as u32),
+            &format!("block:{:08x}{diagnostic}", error.code().0 as u32),
             Mutation::NotAttempted,
             None,
         );
@@ -1369,6 +1388,7 @@ mod acquisition_tests {
             position: RangePosition { start: 0, end: 1 },
             valid: true,
             invalid_reason: "block".into(),
+            focus_diagnostic: None,
             writable: true,
             lease: 5,
             writing: false,
@@ -2018,6 +2038,7 @@ mod native_lifetime_tests {
                             position: RangePosition { start: 0, end: 4 },
                             valid: true,
                             invalid_reason: String::new(),
+                            focus_diagnostic: None,
                             writable: true,
                             lease: 1,
                             writing: false,
@@ -2047,6 +2068,10 @@ mod native_lifetime_tests {
                                 sink.OnSetFocus(&document, None)?;
                                 assert!(!data.borrow().valid);
                                 assert_eq!(data.borrow().invalid_reason, "blockDocumentFocus");
+                                let suffix = evidence::suffix(&data);
+                                assert!(suffix.contains("\"document_is_carrier\":true"));
+                                assert!(suffix.contains("\"document_matches\":true"));
+                                assert!(suffix.contains("\"window_alive\":false"));
                             }
                             document.Pop(TF_POPF_ALL)?;
                             assert!(!data.borrow().valid && !data.borrow().writable);

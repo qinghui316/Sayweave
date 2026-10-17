@@ -22,6 +22,8 @@ struct Frame {
     valid: bool,
     writable: bool,
     writing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focus: Option<serde_json::Value>,
     end_version: u64,
     end_lease: u64,
     end_valid: bool,
@@ -104,6 +106,7 @@ pub(super) unsafe fn capture(
             valid: d.valid,
             writable: d.writable,
             writing: d.writing,
+            focus: d.focus_diagnostic.clone(),
             end_version: d.version,
             end_lease: d.lease,
             end_valid: d.valid,
@@ -133,6 +136,7 @@ pub(super) unsafe fn capture(
                 valid: frame.valid,
                 writable: frame.writable,
                 writing: frame.writing,
+                focus: frame.focus.clone(),
                 end_version: frame.version,
                 end_lease: frame.lease,
                 end_valid: frame.valid,
@@ -262,18 +266,22 @@ pub(super) unsafe fn capture(
     drop(retired_ui);
 }
 pub(super) fn suffix(data: &Rc<RefCell<Data>>) -> String {
-    let (baseline, ui_baseline, first) = {
+    let (baseline, ui_baseline, first, focus) = {
         let d = data.borrow();
         (
             d.evidence.baseline.clone(),
             d.evidence.ui_baseline.clone(),
             d.evidence.first.clone(),
+            d.focus_diagnostic.clone(),
         )
     };
-    if first.is_none() {
+    if first.is_none() && focus.is_none() {
         return String::new();
     }
-    let value = serde_json::json!({"before":baseline.as_deref(),"ui_before":ui_baseline.as_deref(),"first":first.as_deref()});
+    let mut value = serde_json::json!({"before":baseline.as_deref(),"ui_before":ui_baseline.as_deref(),"first":first.as_deref()});
+    if let Some(focus) = focus {
+        value["focus"] = focus;
+    }
     let encoded = value.to_string();
     if encoded.len() > 4096 {
         return ":structure=oversize".into();
