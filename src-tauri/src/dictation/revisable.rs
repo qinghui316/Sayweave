@@ -676,10 +676,10 @@ pub(super) fn schedule(
     }
     if s.ending.is_some()
         && r.stopped
-        && r.sealed_submission
         && r.block.confirmed().0 == 0
         && s.draft.is_none()
         && r.snapshot.is_none()
+        && !s.latest.text.is_empty()
         && r.absorbed_coverage
             .as_ref()
             .and_then(|mark| mark.offset(&s.latest.segments))
@@ -1639,6 +1639,57 @@ mod tests {
         assert!(s.report.result_only);
         assert!(s.native.is_none());
         assert_eq!(actor.control.audio.current(), 0);
+    }
+    #[tokio::test]
+    async fn ending_before_first_write_retains_source_without_inventing_submission() {
+        for text in ["", "首批尚未写入"] {
+            let (actor, mut s, _) = actor(None);
+            s.draft = None;
+            let mut r = State::new();
+            s.latest = NativeTranscript {
+                task_id: actor.task.clone(),
+                turn: 1,
+                sequence: 1,
+                text: text.into(),
+                segments: vec![crate::contracts::processing::SourceSegment {
+                    id: 1,
+                    revision: 1,
+                    text: text.into(),
+                    confirmed: true,
+                }],
+            };
+            r.sealing = true;
+            actor.control.request_finish();
+            sealed(&actor, &mut s, &mut r);
+            let (reply, _) = oneshot::channel();
+            s.ending = Some(Ending {
+                mode: Finish::Commit,
+                reply,
+                deadline: Instant::now() + Duration::from_secs(15),
+                expired: false,
+            });
+            if text.is_empty() {
+                assert!(!s.report.result_only);
+                continue;
+            }
+            schedule(&actor, &mut s, &mut r).unwrap();
+            assert!(
+                s.report.result_only,
+                "unwritten source still requires delivery"
+            );
+            assert!(s.native.is_none());
+            s.revisable = Some(r);
+            actor.delivery_retired(
+                &mut s,
+                &NativeKind::RetireClose,
+                NativeValue::Closed(Ok(())),
+            );
+            let delivery = actor.result_delivery(&mut s).unwrap();
+            assert_eq!(delivery.submission, Submission::NotSubmitted);
+            assert_eq!(s.report.result_raw, text);
+            assert!(s.report.text.is_empty());
+            assert_eq!(actor.control.audio.current(), 0);
+        }
     }
     #[test]
     fn sealed_idle_block_keeps_audio_without_claiming_an_empty_native_range() {
