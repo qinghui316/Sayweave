@@ -1347,20 +1347,12 @@ pub(super) fn dispatch(shared: &Shared, request: &Request, connection: u64) {
         Ok(())
     })();
     if let Err(error) = result {
-        // A callback can revoke the retained document before a new edit lock
-        // can be acquired. Keep its first-refusal facts even in that case.
-        let diagnostic = shared
-            .borrow()
-            .block
-            .as_ref()
-            .map(|track| evidence::suffix(&track.data))
-            .unwrap_or_default();
         reply_outcome(
             shared,
             request,
             connection,
             false,
-            &format!("block:{:08x}{diagnostic}", error.code().0 as u32),
+            &format!("block:{:08x}", error.code().0 as u32),
             Mutation::NotAttempted,
             None,
         );
