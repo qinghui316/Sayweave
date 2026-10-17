@@ -6,6 +6,8 @@
 
 编辑恢复回归复用 `scripts/test-prefix-input.mjs` 的 `SAYWEAVE_BLOCK_REGRESSION=1`、`SAYWEAVE_BLOCK_ACTOR_ONLY=1` 生产链路及当前已构建的 `SAYWEAVE_ACTOR_TEST_EXE`。`SAYWEAVE_BLOCK_BACKSPACE=1` 直接在活动组合中删除，不先用方向键结束组合；可叠加 `SAYWEAVE_BLOCK_EARLY_EDIT=1` 覆盖客户端尚未处理跟踪回执的时序。`SAYWEAVE_BLOCK_PRESENTATION=1` 检查音频路由与已发布录音状态，`SAYWEAVE_BLOCK_USER_NEWLINE=1` 保留编辑器支持的段落换行，`SAYWEAVE_BLOCK_SENTINELS=1` 核对块外正文。三次编辑均检查宿主事件处理后的实际正文。普通 paragraph 中用 `insertText` 塞入裸 LF 会被该夹具自身解析为空格，不能用它冒充段落换行；原失败和不经 TSF 的对照证据仍保留。
 
+原生入口检查另覆盖父属性缺失、空值、错误类型和不支持的接口；Direct 不因父能力后来出现而升级，已选 Parent 丢失后不降级到新范围。同文档焦点丢失仍粘性撤销跟踪。启动诊断按任务／轮次／操作绑定，附加元数据不改变只读或组词等待的业务分类。
+
 同一入口的 `SAYWEAVE_BLOCK_CONTROL=controlled-input` 使用受控 React 输入框，默认 `richtext` 保留富文本。每次宿主事件稳定后同时断言原生可见值与 React 状态，收尾后再次核对。后续程序化局部编辑与直接 Backspace 分别记录，不将前者视为真实输入法测试。普通原生 EDIT 的持续父文档验证使用既有 `input-fixture` 和同一 SessionDraft actor，核对三轮修改、删除后续说、块外标记及同窗同正文的换框反例；临时载体清空与持久正文保留分别观察。载体读回调超期后不得再执行捕获的父锁操作，原生效果等级和实际正文分别留证。
 
 同一识别连接的 PCM 暂停／恢复由 `retained_edit_resume_sends_pcm_on_the_same_connection_without_ready_event` 验证；界面真实电平订阅由 `tests/voice-edit-resume.test.tsx` 验证。受控音频、宿主正文、用户实际 Codex 试用分别记录，原生 `submitted/unconfirmed` 不升级为 `confirmed`。本次 f2ab7319 候选的同一 Codex 三步文字与波形验收已通过，不能扩展成所有宿主和时序的保证。

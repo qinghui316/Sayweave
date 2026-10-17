@@ -13,46 +13,49 @@ pub(super) struct Binding {
 }
 
 impl Binding {
-    pub(super) unsafe fn focused(manager: &ITfThreadMgr) -> windows::core::Result<Self> {
-        unsafe { Self::from_document(&manager.GetFocus()?) }
+    #[cfg(test)]
+    pub(super) unsafe fn from_document(carrier: &ITfDocumentMgr) -> windows::core::Result<Self> {
+        unsafe { Self::discover(carrier, &mut String::new()) }
     }
 
-    pub(super) unsafe fn from_document(carrier: &ITfDocumentMgr) -> windows::core::Result<Self> {
+    pub(super) unsafe fn discover(
+        carrier: &ITfDocumentMgr,
+        probe: &mut String,
+    ) -> windows::core::Result<Self> {
         unsafe {
+            probe.push_str("carrierTop");
             let carrier_context = carrier.GetTop()?;
-            if carrier_context.GetDocumentMgr()? != *carrier {
-                return Err(failure(TF_E_DISCONNECTED));
+            probe.push_str("/carrierOwner");
+            match carrier_context.GetDocumentMgr() {
+                Ok(owner) if owner != *carrier => return Err(failure(TF_E_DISCONNECTED)),
+                Err(error) if error.code() == E_NOINTERFACE => probe.push_str("=80004002"),
+                Err(error) => return Err(error),
+                _ => (),
             }
+            probe.push_str("/carrierStatus");
             let document = if carrier_context.GetStatus()?.dwStaticFlags & TF_SS_TRANSITORY != 0 {
-                // GetCompartment creates missing entries. Inspect only a native
-                // relation which already exists; never create or retarget it.
-                let compartments: ITfCompartmentMgr = carrier.cast()?;
-                let ids = compartments.EnumCompartments()?;
-                let mut parent = None;
-                for _ in 0..64 {
-                    let mut id = [GUID::zeroed()];
-                    let mut fetched = 0;
-                    ids.Next(&mut id, Some(&mut fetched)).ok()?;
-                    if fetched == 0 {
-                        break;
-                    }
-                    if id[0] == GUID_COMPARTMENT_TRANSITORYEXTENSION_PARENT {
-                        let value = compartments.GetCompartment(&id[0])?.GetValue()?;
-                        parent = Some(IUnknown::try_from(&value)?.cast::<ITfDocumentMgr>()?);
-                        break;
-                    }
-                }
-                // Without a parent, retain the original carrier path. A range
-                // which later disappears still fails the existing block proof.
-                parent.unwrap_or_else(|| carrier.clone())
+                parent_document(carrier, probe)?.unwrap_or_else(|| carrier.clone())
             } else {
+                probe.push_str("/direct");
                 carrier.clone()
             };
+            probe.push_str("/documentTop");
             let context = document.GetTop()?;
-            if context.GetDocumentMgr()? != document
-                || (document != *carrier
-                    && (context == carrier_context
-                        || context.GetStatus()?.dwStaticFlags & TF_SS_TRANSITORY != 0))
+            probe.push_str("/documentOwner");
+            let owner = context.GetDocumentMgr();
+            if owner.as_ref().is_ok_and(|owner| *owner != document) {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            if let Err(error) = owner {
+                if error.code() != E_NOINTERFACE || document != *carrier {
+                    return Err(error);
+                }
+                probe.push_str("=80004002");
+            }
+            probe.push_str("/documentStatus");
+            if document != *carrier
+                && (context == carrier_context
+                    || context.GetStatus()?.dwStaticFlags & TF_SS_TRANSITORY != 0)
             {
                 return Err(failure(TF_E_DISCONNECTED));
             }
@@ -66,6 +69,29 @@ impl Binding {
                 root: GetAncestor(window, GA_ROOT),
             })
         }
+    }
+
+    // Verify the route chosen by Begin. Availability changes never select a
+    // different document for a live write or a retained block.
+    pub(super) unsafe fn matches_document(
+        &self,
+        carrier: &ITfDocumentMgr,
+    ) -> windows::core::Result<bool> {
+        unsafe {
+            if *carrier != self.carrier || carrier.GetTop()? != self.carrier_context {
+                return Ok(false);
+            }
+            if self.document != self.carrier
+                && parent_document(carrier, &mut String::new())?.as_ref() != Some(&self.document)
+            {
+                return Ok(false);
+            }
+            Ok(self.document.GetTop()? == self.context)
+        }
+    }
+
+    pub(super) unsafe fn current(&self, manager: &ITfThreadMgr) -> windows::core::Result<bool> {
+        unsafe { Ok(self.matches_document(&manager.GetFocus()?)? && self.focus_matches()) }
     }
 
     pub(super) fn same(&self, other: &Self) -> bool {
@@ -195,13 +221,162 @@ impl ITfEditSession_Impl for CarrierRead_Impl {
     }
 }
 
-pub(super) unsafe fn focused(manager: &ITfThreadMgr) -> windows::core::Result<ITfContext> {
-    unsafe { Ok(Binding::focused(manager)?.context) }
+// Absence/type/interface availability is optional discovery evidence. Other
+// failures, notably explicit permission denial, keep their original HRESULT.
+unsafe fn parent_document(
+    carrier: &ITfDocumentMgr,
+    probe: &mut String,
+) -> windows::core::Result<Option<ITfDocumentMgr>> {
+    unsafe {
+        probe.push_str("/compartmentInterface");
+        let compartments: ITfCompartmentMgr = match carrier.cast() {
+            Ok(value) => value,
+            Err(error) if error.code() == E_NOINTERFACE => {
+                probe.push_str("=80004002/direct");
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        probe.push_str("/enumerate");
+        let ids = compartments.EnumCompartments()?;
+        for _ in 0..64 {
+            let mut id = [GUID::zeroed()];
+            let mut fetched = 0;
+            ids.Next(&mut id, Some(&mut fetched)).ok()?;
+            if fetched == 0 {
+                probe.push_str("/absent/direct");
+                return Ok(None);
+            }
+            if id[0] == GUID_COMPARTMENT_TRANSITORYEXTENSION_PARENT {
+                probe.push_str("/value");
+                let value = compartments.GetCompartment(&id[0])?.GetValue()?;
+                probe.push_str(&format!(".vt={}", value.Anonymous.Anonymous.vt.0));
+                return parent_value(&value, probe);
+            }
+        }
+        Err(failure(E_UNEXPECTED))
+    }
+}
+
+fn parent_value(
+    value: &windows::Win32::System::Variant::VARIANT,
+    probe: &mut String,
+) -> windows::core::Result<Option<ITfDocumentMgr>> {
+    let unknown = match IUnknown::try_from(value) {
+        Ok(value) => value,
+        Err(error) if error.code() == windows::Win32::Foundation::TYPE_E_TYPEMISMATCH => {
+            probe.push_str("/notObject/direct");
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    probe.push_str("/documentInterface");
+    match unknown.cast() {
+        Ok(document) => {
+            probe.push_str("/parent");
+            Ok(Some(document))
+        }
+        Err(error) if error.code() == E_NOINTERFACE => {
+            probe.push_str("=80004002/direct");
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) unsafe fn retained(
+    shared: &Shared,
+    manager: &ITfThreadMgr,
+) -> windows::core::Result<Binding> {
+    let native = { shared.borrow().native_context.clone() }
+        .or_else(|| block_tracking::binding(shared))
+        .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
+    if unsafe { native.current(manager)? } {
+        Ok(native)
+    } else {
+        Err(failure(TF_E_DISCONNECTED))
+    }
+}
+
+pub(super) unsafe fn focused(
+    shared: &Shared,
+    manager: &ITfThreadMgr,
+) -> windows::core::Result<ITfContext> {
+    unsafe { Ok(retained(shared, manager)?.context) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_parent_values_preserve_direct_input_and_pinned_routes() {
+        use windows::Win32::System::Variant::VARIANT;
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+            let result = (|| -> windows::core::Result<()> {
+                let manager: ITfThreadMgr =
+                    CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
+                let client = manager.Activate()?;
+                let result = (|| -> windows::core::Result<()> {
+                    let carrier = manager.CreateDocumentMgr()?;
+                    let parent = manager.CreateDocumentMgr()?;
+                    for document in [&carrier, &parent] {
+                        let (mut context, mut cookie) = (None, 0);
+                        document.CreateContext(client, 0, None, &mut context, &mut cookie)?;
+                        document.Push(&context.ok_or_else(|| failure(E_POINTER))?)?;
+                    }
+                    let direct = Binding::from_document(&carrier)?;
+                    let mut probe = String::new();
+                    assert!(parent_document(&carrier, &mut probe)?.is_none());
+                    assert!(probe.contains("absent/direct"));
+                    let compartments: ITfCompartmentMgr = carrier.cast()?;
+                    let slot = compartments
+                        .GetCompartment(&GUID_COMPARTMENT_TRANSITORYEXTENSION_PARENT)?;
+                    // The enumerated slot exists, but GetValue returns VT_EMPTY.
+                    probe.clear();
+                    assert!(parent_document(&carrier, &mut probe)?.is_none());
+                    assert!(probe.contains("vt=0/notObject/direct"));
+                    for value in [VARIANT::from(7i32), VARIANT::from("owned value")] {
+                        slot.SetValue(client, &value)?;
+                        assert!(parent_document(&carrier, &mut String::new())?.is_none());
+                    }
+                    let non_document: IUnknown = manager.cast()?;
+                    slot.SetValue(client, &VARIANT::from(non_document))?;
+                    probe.clear();
+                    assert!(parent_document(&carrier, &mut probe)?.is_none());
+                    assert!(probe.contains("documentInterface=80004002"));
+                    let parent_unknown: IUnknown = parent.cast()?;
+                    slot.SetValue(client, &VARIANT::from(parent_unknown))?;
+                    assert_eq!(
+                        parent_document(&carrier, &mut String::new())?,
+                        Some(parent.clone())
+                    );
+                    // Direct admission does not change when a parent appears.
+                    assert!(direct.matches_document(&carrier)?);
+                    assert_eq!(direct.document, carrier);
+                    let selected = Binding {
+                        document: parent.clone(),
+                        context: parent.GetTop()?,
+                        ..direct.clone()
+                    };
+                    assert!(selected.matches_document(&carrier)?);
+                    compartments
+                        .ClearCompartment(client, &GUID_COMPARTMENT_TRANSITORYEXTENSION_PARENT)?;
+                    // A selected parent cannot silently become Direct.
+                    assert!(!selected.matches_document(&carrier)?);
+                    assert!(direct.matches_document(&carrier)?);
+                    parent.Pop(TF_POPF_ALL)?;
+                    carrier.Pop(TF_POPF_ALL)?;
+                    Ok(())
+                })();
+                manager.Deactivate()?;
+                result
+            })();
+            CoUninitialize();
+            result.unwrap();
+        }
+    }
 
     #[test]
     fn expired_carrier_callback_cannot_use_a_parent_cookie() {

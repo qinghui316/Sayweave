@@ -1670,7 +1670,17 @@ impl Host {
         });
         let result = self
             .exchange_block_reply(Action::Update, text, None, false, permit, block)
-            .map_err(WriteFailure::uncertain)
+            .map_err(|error| {
+                if self.transport_attempted {
+                    WriteFailure::uncertain(error)
+                } else {
+                    WriteFailure {
+                        error,
+                        mutation: Mutation::NotAttempted,
+                        tracking_failed: false,
+                    }
+                }
+            })
             .and_then(|r| update_receipt(r, text, block_id.as_deref()));
         if result.is_ok()
             || result
@@ -1879,6 +1889,8 @@ fn completed_prefix(receipt: Option<u64>, revision: u64, stored: &str, requested
     receipt == Some(revision) && stored.is_empty() && requested.is_empty()
 }
 fn reply_error(code: &str) -> &'static str {
+    // Native diagnostic metadata follows the stable business code.
+    let code = code.split_whitespace().next().unwrap_or(code);
     if code.starts_with("edit:selectionMapping:") {
         return "selectionMapping";
     }
@@ -2092,6 +2104,13 @@ mod tests {
             )),
             "targetReadonlyContext"
         );
+        assert_eq!(
+            reply_error(&format!(
+                "editLease:{:08x} nativeContext=focus/carrierStatus",
+                windows::Win32::UI::TextServices::TF_E_READONLY.0 as u32
+            )),
+            "targetReadonlyContext"
+        );
         let locked = format!(
             "{:08x}",
             windows::Win32::UI::TextServices::TF_E_LOCKED.0 as u32
@@ -2104,6 +2123,12 @@ mod tests {
         ] {
             assert_eq!(
                 reply_error(&format!("{phase}:{locked}")),
+                "inputComposition"
+            );
+            assert_eq!(
+                reply_error(&format!(
+                    "{phase}:{locked} nativeContext=focus/documentStatus"
+                )),
                 "inputComposition"
             );
         }

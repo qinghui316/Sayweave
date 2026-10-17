@@ -27,6 +27,14 @@ pub(super) struct Track {
     boundary: Option<Rc<BoundaryProof>>,
     _lease: Lease,
 }
+
+pub(super) fn binding(shared: &Shared) -> Option<edit_context::Binding> {
+    shared
+        .borrow()
+        .block
+        .as_ref()
+        .map(|track| track.field.binding())
+}
 struct Data {
     id: String,
     epoch: u64,
@@ -351,7 +359,7 @@ pub(super) unsafe fn bind_owned(
             .manager
             .clone()
             .ok_or_else(|| failure(E_FAIL))?;
-        if edit_context::focused(&manager)? != *context {
+        if edit_context::focused(shared, &manager)? != *context {
             return Err(failure(TF_E_DISCONNECTED));
         }
         let track = Rc::new(Track::bind(shared, context, r, ec)?);
@@ -402,7 +410,7 @@ pub(super) unsafe fn bind_owned(
                 writable: false,
             }
         };
-        if edit_context::focused(&manager)? != *context || !track.field.matches()? {
+        if edit_context::focused(shared, &manager)? != *context || !track.field.matches()? {
             return Err(failure(TF_E_DISCONNECTED));
         }
         edit_authorized(shared, r, connection, generation)?;
@@ -468,7 +476,8 @@ impl Track {
                 .manager
                 .clone()
                 .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
-            let field = BlockScope::capture(&manager, context)?;
+            let field =
+                BlockScope::capture(&manager, context, edit_context::retained(shared, &manager)?)?;
             range.SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_FORWARD)?;
             // Unavailable/oversized outside evidence keeps the original strict
             // notification rule. It does not block ordinary composition input.
@@ -1150,8 +1159,8 @@ impl ITfThreadMgrEventSink_Impl for FocusSink_Impl {
         let _notification = TextNotification::enter(self.notifications.clone());
         if document
             .as_ref()
-            .and_then(|d| unsafe { edit_context::Binding::from_document(d) }.ok())
-            .is_none_or(|current| !self.native.same(&current))
+            .is_none_or(|d| !unsafe { self.native.matches_document(d) }.unwrap_or(false))
+            || !self.native.focus_matches()
         {
             self.invalidate("blockDocumentFocus");
         }
@@ -1286,7 +1295,7 @@ pub(super) fn dispatch(shared: &Shared, request: &Request, connection: u64) {
                 state.client,
             )
         };
-        if edit_context::focused(&manager)? != context {
+        if edit_context::focused(shared, &manager)? != context {
             return Err(failure(TF_E_DISCONNECTED));
         }
         let edit: ITfEditSession = EditBlock {
@@ -1633,7 +1642,8 @@ unsafe fn acquire_composition(
             }
             Ok(())
         });
-        let composition = guarded_operation(shared, context, mutation, guard, move || {
+        let composition = guarded_operation(shared, context, mutation, guard, move |attempted| {
+            attempted.set(true);
             owner.StartComposition(ec, &start_range, &sink)
         })?;
         // StartComposition may synchronously terminate the candidate or reenter
@@ -1759,7 +1769,7 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                 .manager
                 .clone()
                 .ok_or_else(|| failure(E_FAIL))?;
-            if edit_context::focused(&manager)? != self.context {
+            if edit_context::focused(shared, &manager)? != self.context {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             if command.action == BlockAction::Bind {
@@ -1992,55 +2002,73 @@ mod native_lifetime_tests {
                     CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
                 let client = manager.Activate()?;
                 let result = (|| -> windows::core::Result<()> {
-                    let document = manager.CreateDocumentMgr()?;
-                    let mut context = None;
-                    let mut cookie = 0;
-                    document.CreateContext(client, 0, None, &mut context, &mut cookie)?;
-                    let context = context.ok_or_else(|| failure(E_FAIL))?;
-                    document.Push(&context)?;
-                    let data = Rc::new(RefCell::new(Data {
-                        id: "owned-lifetime".into(),
-                        epoch: 1,
-                        version: 1,
-                        operation: 1,
-                        text: "周三开会".into(),
-                        position: RangePosition { start: 0, end: 4 },
-                        valid: true,
-                        invalid_reason: String::new(),
-                        writable: true,
-                        lease: 1,
-                        writing: false,
-                        evidence: evidence::Record::default(),
-                        semantic_boundary: None,
-                        pending_proof: false,
-                        reacquired: false,
-                        notification: 0,
-                        notification_depth: 0,
-                    }));
-                    let sink: ITfThreadMgrEventSink = FocusSink {
-                        context: context.clone(),
-                        native: edit_context::Binding::from_document(&document)?,
-                        data: data.clone(),
-                        notifications: Rc::new(TextNotifications::default()),
-                        _lease: Lease::new(),
-                    }
-                    .into();
-                    let source: ITfSource = manager.cast()?;
-                    let subscription = source.AdviseSink(&ITfThreadMgrEventSink::IID, &sink)?;
-                    let result = (|| -> windows::core::Result<()> {
-                        assert!(data.borrow().valid && data.borrow().writable);
-                        document.Pop(TF_POPF_ALL)?;
-                        assert!(!data.borrow().valid && !data.borrow().writable);
-                        assert_eq!(data.borrow().invalid_reason, "blockContextPopped");
+                    for focus_loss in [false, true] {
+                        let document = manager.CreateDocumentMgr()?;
+                        let mut context = None;
+                        let mut cookie = 0;
+                        document.CreateContext(client, 0, None, &mut context, &mut cookie)?;
+                        let context = context.ok_or_else(|| failure(E_FAIL))?;
                         document.Push(&context)?;
-                        assert_eq!(document.GetTop()?, context);
-                        assert!(!data.borrow().valid && !data.borrow().writable);
-                        assert_eq!(data.borrow().text, "周三开会");
-                        document.Pop(TF_POPF_ALL)?;
-                        Ok(())
-                    })();
-                    source.UnadviseSink(subscription)?;
-                    result
+                        let data = Rc::new(RefCell::new(Data {
+                            id: "owned-lifetime".into(),
+                            epoch: 1,
+                            version: 1,
+                            operation: 1,
+                            text: "周三开会".into(),
+                            position: RangePosition { start: 0, end: 4 },
+                            valid: true,
+                            invalid_reason: String::new(),
+                            writable: true,
+                            lease: 1,
+                            writing: false,
+                            evidence: evidence::Record::default(),
+                            semantic_boundary: None,
+                            pending_proof: false,
+                            reacquired: false,
+                            notification: 0,
+                            notification_depth: 0,
+                        }));
+                        let retained = edit_context::Binding::from_document(&document)?;
+                        let sink: ITfThreadMgrEventSink = FocusSink {
+                            context: context.clone(),
+                            native: retained.clone(),
+                            data: data.clone(),
+                            notifications: Rc::new(TextNotifications::default()),
+                            _lease: Lease::new(),
+                        }
+                        .into();
+                        let source: ITfSource = manager.cast()?;
+                        let subscription = source.AdviseSink(&ITfThreadMgrEventSink::IID, &sink)?;
+                        let result = (|| -> windows::core::Result<()> {
+                            assert!(data.borrow().valid && data.borrow().writable);
+                            if focus_loss {
+                                assert!(retained.matches_document(&document)?);
+                                assert!(!retained.focus_matches());
+                                sink.OnSetFocus(&document, None)?;
+                                assert!(!data.borrow().valid);
+                                assert_eq!(data.borrow().invalid_reason, "blockDocumentFocus");
+                            }
+                            document.Pop(TF_POPF_ALL)?;
+                            assert!(!data.borrow().valid && !data.borrow().writable);
+                            assert_eq!(
+                                data.borrow().invalid_reason,
+                                if focus_loss {
+                                    "blockDocumentFocus"
+                                } else {
+                                    "blockContextPopped"
+                                }
+                            );
+                            document.Push(&context)?;
+                            assert_eq!(document.GetTop()?, context);
+                            assert!(!data.borrow().valid && !data.borrow().writable);
+                            assert_eq!(data.borrow().text, "周三开会");
+                            document.Pop(TF_POPF_ALL)?;
+                            Ok(())
+                        })();
+                        source.UnadviseSink(subscription)?;
+                        result?;
+                    }
+                    Ok(())
                 })();
                 manager.Deactivate()?;
                 result

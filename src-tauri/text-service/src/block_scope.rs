@@ -26,10 +26,10 @@ impl BlockScope {
     pub(super) unsafe fn capture(
         manager: &ITfThreadMgr,
         context: &ITfContext,
+        native: edit_context::Binding,
     ) -> windows::core::Result<Self> {
         unsafe {
-            let native = edit_context::Binding::focused(manager)?;
-            if native.context != *context {
+            if native.context != *context || !native.current(manager)? {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             native.permits()?;
@@ -86,9 +86,7 @@ impl BlockScope {
                 || windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() != self.window
                 || GetAncestor(self.window, GA_ROOT) != self.root
                 || GetForegroundWindow() != self.root
-                || !self
-                    .native
-                    .same(&edit_context::Binding::focused(&self.manager)?)
+                || !self.native.current(&self.manager)?
                 || self.context.GetActiveView()?.cast::<IUnknown>()?
                     != self.view.cast::<IUnknown>()?
             {

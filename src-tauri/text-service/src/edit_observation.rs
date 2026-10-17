@@ -76,6 +76,7 @@ unsafe fn field_is_empty(context: &ITfContext, ec: u32) -> windows::core::Result
     }
 }
 pub(super) struct Watch {
+    native_context: edit_context::Binding,
     field: super::initial_selection::FocusIdentity,
     context: ITfContext,
     data: Rc<RefCell<Reading>>,
@@ -106,6 +107,7 @@ impl Drop for Watch {
 impl Watch {
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn attach(
+        native_context: edit_context::Binding,
         context: &ITfContext,
         range: &ITfRange,
         client: u32,
@@ -174,6 +176,7 @@ impl Watch {
                 ));
             }
             Ok(Self {
+                native_context,
                 field,
                 context: context.clone(),
                 data,
@@ -185,6 +188,7 @@ impl Watch {
     }
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn native(
+        native_context: edit_context::Binding,
         context: &ITfContext,
         position: (usize, u32),
         client: u32,
@@ -240,6 +244,7 @@ impl Watch {
                 client,
             )?;
             Ok(Self {
+                native_context,
                 field,
                 context: context.clone(),
                 data,
@@ -255,9 +260,7 @@ impl Watch {
         stop: bool,
     ) -> Option<ObservedEdit> {
         unsafe {
-            let focused = manager
-                .and_then(|m| edit_context::focused(m).ok())
-                .is_some_and(|c| c == self.context);
+            let focused = manager.is_some_and(|m| self.native_context.current(m).unwrap_or(false));
             let now = GetTickCount64();
             let field = self.field.matches();
             let complete = self._native.as_ref().is_none_or(|native| native.complete());

@@ -136,6 +136,7 @@ struct State {
     version: DraftVersion,
     context: Option<ITfContext>,
     native_context: Option<edit_context::Binding>,
+    native_probe: Option<(String, u64, u64, String)>,
     composition: Option<ITfComposition>,
     prefix_end: Option<PrefixEnd>,
     // An original selection is observed but is not composing until the first
@@ -163,6 +164,7 @@ struct ObservationCandidate {
     connection: u64,
     epoch: u64,
     context: ITfContext,
+    native_context: edit_context::Binding,
     range: ITfRange,
     boundary: Option<ITfRange>,
     expected: String,
@@ -461,9 +463,11 @@ fn restore_original_selection(
     text: Option<&OriginalText>,
     ec: u32,
     guard: impl Fn() -> windows::core::Result<()>,
+    attempted: &Cell<bool>,
 ) -> windows::core::Result<()> {
     unsafe {
         guard()?;
+        attempted.set(true);
         backup.Restore(ec, range)?;
         if let Some(text) = text {
             guard()?;
@@ -1393,6 +1397,21 @@ fn send_reply(
             revision: r.revision,
             applied,
             code: {
+                let context_diagnostic;
+                let code = if r.action == Action::Begin {
+                    if let Some((_, _, _, probe)) =
+                        s.native_probe.as_ref().filter(|(task, turn, op, _)| {
+                            task == &r.task && *turn == r.turn && *op == r.operation
+                        })
+                    {
+                        context_diagnostic = format!("{code} nativeContext={probe}");
+                        context_diagnostic.as_str()
+                    } else {
+                        code
+                    }
+                } else {
+                    code
+                };
                 let diagnostic;
                 let code = if matches!(
                     r.action,
@@ -1599,7 +1618,11 @@ fn prepare_observation(
     };
     // Retain existing objects only. No range traversal, sink installation or COM
     // edit request is inserted into the composition's write transaction.
+    let Some(native_context) = state.native_context.clone() else {
+        return;
+    };
     let candidate = ObservationCandidate {
+        native_context,
         request: request.clone(),
         connection: state.connection,
         epoch: state.observation_epoch,
@@ -1630,9 +1653,10 @@ fn observation_current(shared: &Shared, candidate: &ObservationCandidate) -> boo
         return false;
     }
     let manager = shared.borrow().manager.clone();
-    let focused = unsafe { manager.and_then(|m| edit_context::focused(&m).ok()) };
+    let focused =
+        unsafe { manager.is_some_and(|m| candidate.native_context.current(&m).unwrap_or(false)) };
     let state = shared.borrow();
-    let valid = focused.as_ref() == Some(&candidate.context)
+    let valid = focused
         && state.active
         && state.connected
         && state.connection == candidate.connection
@@ -1680,6 +1704,7 @@ fn activate_observations_with_flags(shared: &Shared, flags: TF_CONTEXT_EDIT_CONT
         unsafe {
             if let Some((window, start)) = candidate.native {
                 if let Ok(watch) = edit_observation::Watch::native(
+                    candidate.native_context.clone(),
                     &candidate.context,
                     (window, start),
                     client,
@@ -1756,6 +1781,7 @@ impl ITfEditSession_Impl for ObserveAttach_Impl {
                     return Err(failure(TF_E_DISCONNECTED));
                 }
                 edit_observation::Watch::attach(
+                    candidate.native_context.clone(),
                     &candidate.context,
                     &range,
                     self.client,
@@ -1818,7 +1844,7 @@ fn lease(
         {
             return Err(failure(TF_E_DISCONNECTED));
         }
-        let native = edit_context::Binding::focused(&manager)?;
+        let native = edit_context::retained(shared, &manager)?;
         if native.context != *context {
             return Err(failure(TF_E_DISCONNECTED));
         }
@@ -1920,14 +1946,14 @@ fn with_authority<T: 'static>(
             state.client,
         )
     };
-    let native = unsafe { edit_context::Binding::focused(&manager)? };
+    let native = unsafe { edit_context::retained(shared, &manager)? };
     if native.context != *context {
         return Err(failure(TF_E_DISCONNECTED));
     }
     let shared = shared.clone();
     let original = native.clone();
     native.with_carrier(client, move || {
-        if !original.same(&unsafe { edit_context::Binding::focused(&manager)? }) {
+        if !unsafe { original.current(&manager)? } {
             return Err(failure(TF_E_DISCONNECTED));
         }
         original.permits()?;
@@ -1952,14 +1978,11 @@ fn guarded_operation<T: 'static>(
     context: &ITfContext,
     mutation: &mut Mutation,
     guard: MutationGuard,
-    work: impl FnOnce() -> windows::core::Result<T> + 'static,
+    work: impl FnOnce(&Cell<bool>) -> windows::core::Result<T> + 'static,
 ) -> windows::core::Result<T> {
     let entered = Rc::new(Cell::new(false));
     let attempted = entered.clone();
-    let result = with_authority(shared, context, guard, move || {
-        attempted.set(true);
-        work()
-    });
+    let result = with_authority(shared, context, guard, move || work(&attempted));
     if entered.get() {
         *mutation = Mutation::Uncertain;
     }
@@ -1971,7 +1994,7 @@ fn guarded_mutation(
     context: &ITfContext,
     mutation: &mut Mutation,
     guard: MutationGuard,
-    work: impl FnOnce() -> windows::core::Result<()> + 'static,
+    work: impl FnOnce(&Cell<bool>) -> windows::core::Result<()> + 'static,
 ) -> windows::core::Result<()> {
     guarded_operation(shared, context, mutation, guard, work)?;
     *mutation = Mutation::Changed;
@@ -2026,6 +2049,9 @@ fn schedule(
     connection: u64,
     inherited_settlement: Option<Settlement>,
 ) -> Result<(), (&'static str, windows::core::Error)> {
+    if r.action == Action::Begin {
+        shared.borrow_mut().native_probe = None;
+    }
     unsafe {
         let (manager, client, generation) = {
             let s = shared.borrow();
@@ -2047,7 +2073,27 @@ fn schedule(
                 s.generation,
             )
         };
-        let focused = edit_context::focused(&manager);
+        let focused = if r.action == Action::Begin {
+            let mut probe = String::from("focus/");
+            let selected = manager
+                .GetFocus()
+                .and_then(|document| edit_context::Binding::discover(&document, &mut probe));
+            if let Err(error) = &selected {
+                probe.push_str(&format!("/error={:08x}", error.code().0 as u32));
+            }
+            let mut state = shared.borrow_mut();
+            if state.generation != generation || !state.version.accepts(r) || state.cleanup {
+                return Err(("editIdentity", failure(TF_E_DISCONNECTED)));
+            }
+            state.native_probe = Some((r.task.clone(), r.turn, r.operation, probe));
+            selected.map(|native| {
+                let context = native.context.clone();
+                state.native_context = Some(native);
+                context
+            })
+        } else {
+            edit_context::focused(shared, &manager)
+        };
         let owned_release = {
             let state = shared.borrow();
             if r.action == Action::Handoff {
@@ -2456,7 +2502,7 @@ fn materialize(
     let manager = manager.ok_or_else(|| failure(TF_E_DISCONNECTED))?;
     unsafe {
         permitted()?;
-        let native = edit_context::Binding::focused(&manager)?;
+        let native = edit_context::retained(shared, &manager)?;
         if native.context != *context {
             return Err(failure(TF_E_DISCONNECTED));
         }
@@ -2505,27 +2551,34 @@ fn materialize(
             }
             Ok(())
         });
-        guarded_mutation(shared, context, mutation, write_guard.clone(), move || {
-            {
-                let mut state = write_shared.borrow_mut();
-                if state.epoch != epoch {
+        guarded_mutation(
+            shared,
+            context,
+            mutation,
+            write_guard.clone(),
+            move |attempted| {
+                {
+                    let mut state = write_shared.borrow_mut();
+                    if state.epoch != epoch {
+                        return Err(failure(TF_E_DISCONNECTED));
+                    }
+                    state
+                        .text
+                        .as_mut()
+                        .ok_or_else(|| failure(TF_E_DISCONNECTED))?
+                        .phase = TextPhase::Materializing;
+                }
+                if write_tracking.as_ref().is_some_and(|t| !t.arm()) {
                     return Err(failure(TF_E_DISCONNECTED));
                 }
-                state
-                    .text
-                    .as_mut()
-                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?
-                    .phase = TextPhase::Materializing;
-            }
-            if write_tracking.as_ref().is_some_and(|t| !t.arm()) {
-                return Err(failure(TF_E_DISCONNECTED));
-            }
-            write_range.SetText(
-                ec,
-                TF_ST_CORRECTION,
-                &write_semantic.encode_utf16().collect::<Vec<_>>(),
-            )
-        })?;
+                attempted.set(true);
+                write_range.SetText(
+                    ec,
+                    TF_ST_CORRECTION,
+                    &write_semantic.encode_utf16().collect::<Vec<_>>(),
+                )
+            },
+        )?;
         permitted()?;
         let actual = range_text(&range, ec)?;
         permitted()?;
@@ -2594,7 +2647,7 @@ impl KeySink {
         }
         let shared = self.state.upgrade()?;
         let manager = shared.borrow().manager.clone()?;
-        let native = unsafe { edit_context::Binding::focused(&manager) }.ok()?;
+        let native = unsafe { edit_context::retained(&shared, &manager) }.ok()?;
         if !native.owns_context(context.as_ref()?) {
             return None;
         }
@@ -3508,8 +3561,9 @@ fn settle_prefix(
             context,
             mutation,
             mutation_guard(shared, r, generation, epoch, context),
-            move || {
+            move |attempted| {
                 start_effect(&write_shared, &write_request)?;
+                attempted.set(true);
                 write_range.SetText(ec, TF_ST_CORRECTION, &write_combined)
             },
         )?;
@@ -3903,11 +3957,12 @@ fn write_composing(
             context,
             mutation,
             mutation_guard(shared, r, generation, epoch, context),
-            move || {
+            move |attempted| {
                 if write_tracking.as_ref().is_some_and(|t| !t.arm()) {
                     return Err(failure(TF_E_DISCONNECTED));
                 }
                 start_effect(&write_shared, &write_request)?;
+                attempted.set(true);
                 write_range.SetText(
                     ec,
                     TF_ST_CORRECTION,
@@ -4154,7 +4209,7 @@ fn apply_prepared(
                     let guard = mutation_guard(shared, r, generation, epoch, context);
                     let (write_context, write_range, write_guard) =
                         (context.clone(), prepared.range.clone(), guard.clone());
-                    guarded_mutation(shared, context, mutation, guard, move || {
+                    guarded_mutation(shared, context, mutation, guard, move |attempted| {
                         restore_original_selection(
                             &write_context,
                             &write_range,
@@ -4162,6 +4217,7 @@ fn apply_prepared(
                             semantic.as_ref(),
                             ec,
                             || write_guard(),
+                            attempted,
                         )
                     })?;
                     Ok(())
@@ -4258,7 +4314,7 @@ fn apply(
                 .manager
                 .clone()
                 .ok_or_else(|| failure(E_FAIL))?;
-            let native = edit_context::Binding::focused(&manager)?;
+            let native = edit_context::retained(shared, &manager)?;
             if native.context != *context {
                 return Err(failure(TF_E_DISCONNECTED));
             }
@@ -4356,8 +4412,7 @@ fn apply(
                             manager.clone(),
                         );
                         let guard: MutationGuard = Rc::new(move || {
-                            if !guard_native.same(&edit_context::Binding::focused(&guard_manager)?)
-                            {
+                            if !guard_native.current(&guard_manager)? {
                                 return Err(failure(TF_E_DISCONNECTED));
                             }
                             lease(&guard_shared, &guard_request, generation, &guard_context)
@@ -4423,7 +4478,7 @@ fn apply(
                 let _ = source.UnadviseSink(cookie);
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            let still_focused = edit_context::Binding::focused(&manager);
+            let still_focused = native.current(&manager);
             let current = {
                 let state = shared.borrow();
                 state.active
@@ -4433,11 +4488,7 @@ fn apply(
                     && r.live(GetTickCount64())
                     && state.capability.as_ref() == Some(&r.capability)
             };
-            if !current
-                || !still_focused
-                    .as_ref()
-                    .is_ok_and(|current| native.same(current))
-            {
+            if !current || !still_focused.as_ref().is_ok_and(|current| *current) {
                 let _ = source.UnadviseSink(cookie);
                 return Err(failure(TF_E_DISCONNECTED));
             }
@@ -4628,7 +4679,7 @@ fn apply(
                         let guard = mutation_guard(shared, r, generation, epoch, context);
                         let (write_context, write_range, write_guard) =
                             (context.clone(), range.clone(), guard.clone());
-                        guarded_mutation(shared, context, mutation, guard, move || {
+                        guarded_mutation(shared, context, mutation, guard, move |attempted| {
                             restore_original_selection(
                                 &write_context,
                                 &write_range,
@@ -4636,6 +4687,7 @@ fn apply(
                                 semantic.as_ref(),
                                 ec,
                                 || write_guard(),
+                                attempted,
                             )
                         })?;
                         // Restore the selected content; let the host retain its
@@ -4662,7 +4714,10 @@ fn apply(
                             context,
                             mutation,
                             mutation_guard(shared, r, generation, epoch, context),
-                            move || write_range.SetText(ec, TF_ST_CORRECTION, &[]),
+                            move |attempted| {
+                                attempted.set(true);
+                                write_range.SetText(ec, TF_ST_CORRECTION, &[])
+                            },
                         )?;
                     }
                 }
