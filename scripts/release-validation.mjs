@@ -54,7 +54,7 @@ export const frozenFormalPaths=['src-tauri/text-service/src/formal_switch_probe.
 const receiptTestModules={original:'817d8bf646b7b37d2c990cfbd6cf4e6981daed4f78c4eca57bffd04ca050a619',reviewed:'4a38a0a48e95900d3911eafaa65104fdd8214d9816635d9436fda7904b8fc550'};
 const nativeTestModules=new Map([
  [receiptTestPath,{marker:'\n#[cfg(test)]\nmod tests {',...receiptTestModules}],
- [startupTestPath,{marker:'\n    #[cfg(test)]\n    mod tests {',original:'167ad7649ec217716adf5f2f71d618bc0132f1556940a61ae712a73dd1ef0627',reviewed:'7ae3440675b8e9275db952acb5b0594c35c72e861fdcbfb7f431979280c8290c'}],
+ [startupTestPath,{marker:'\n    #[cfg(test)]\n    mod tests {',original:'167ad7649ec217716adf5f2f71d618bc0132f1556940a61ae712a73dd1ef0627',reviewed:'a734f3cfe59a0906829a281175d29235cc44147bf355e0745e8efac48cd95196'}],
  [archiveTestPath,{marker:'\n#[cfg(test)]\nmod tests {',original:'e7fdbbc88165abe9246db27a3033b137dc7c347f08ef3029b01fd22761d29f61',reviewed:'5ad59bf7e4fdefe16e1f3a0f7b57b04d070fa5f2d0dcef255b524e2918c2482d'}],
 ]);
 export function validateNativeTestOverride(original,reviewed,path=receiptTestPath){

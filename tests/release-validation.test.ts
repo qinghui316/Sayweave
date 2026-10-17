@@ -125,6 +125,8 @@ describe('frozen product release controller boundaries',()=>{
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     }
 `+nativeReviewed.slice(end);
+ const startupExpectedBefore="            let expected = format!(\n                \"\\\"{}\\\" --autostart\",\n                fixture.0.join(\"sayweave.exe\").display()\n            );\n            assert_eq!(value, expected);\n            assert!(owns(&value, &canonical));\n";
+ const startupExpectedAfter="            let executable = fixture.0.join(\"sayweave.exe\").canonicalize().unwrap();\n            let executable = executable.to_str().unwrap().strip_prefix(r\"\\\\?\\\").unwrap();\n            assert_eq!(executable.as_bytes().get(1..3), Some(b\":\\\\\".as_slice()));\n            let expected = format!(\"\\\"{executable}\\\" --autostart\");\n            assert_eq!(value, expected);\n            assert!(owns(&value, &canonical));\n            let path = metadata::wide(fixture.0.to_str().unwrap());\n            let mut short = vec![0u16; 32768];\n            let length = unsafe {\n                windows::Win32::Storage::FileSystem::GetShortPathNameW(\n                    windows::core::PCWSTR(path.as_ptr()),\n                    Some(&mut short),\n                )\n            } as usize;\n            assert!(length > 0 && length < short.len());\n            let short = std::path::PathBuf::from(String::from_utf16(&short[..length]).unwrap());\n            let alias = metadata::normalized_directory(&short).unwrap();\n            assert_eq!(alias, canonical);\n            assert_eq!(command(&alias).unwrap(), value);\n            println!(\"owned_startup_fixture_short_alias={}\", short != fixture.0);\n";
  const continuationFixtures=[
   {path:'src-tauri/src/installer/login_startup.rs',before:`            let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
@@ -143,7 +145,7 @@ describe('frozen product release controller boundaries',()=>{
         for _ in 0..pending {
             replay_batch(&mut repo, temp.path(), false, std::time::Duration::ZERO, 1).unwrap();
         }`},
- ].map(({path,before,after})=>{const reviewed=readFileSync(path,'utf8').replaceAll('\r\n','\n');return {path,reviewed,original:reviewed.replace(after,before)};});
+ ].map(({path,before,after})=>{const reviewed=readFileSync(path,'utf8').replaceAll('\r\n','\n');let original=reviewed.replace(after,before);if(path==='src-tauri/src/installer/login_startup.rs')original=original.replace(startupExpectedAfter,startupExpectedBefore);return {path,reviewed,original};});
  const meterReviewed=readFileSync('tests/voice-edit-resume.test.tsx','utf8').replaceAll('\r\n','\n');
  const meterFixture={path:'tests/voice-edit-resume.test.tsx',reviewed:meterReviewed,original:meterReviewed.replace(" vi.spyOn(performance,'now').mockReturnValue(1000);\n",'').replace('vi.restoreAllMocks();','')};
  const frozenFixtures=[...continuationFixtures,meterFixture];

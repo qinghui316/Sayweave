@@ -516,12 +516,26 @@ mod native {
             std::fs::write(fixture.0.join("sayweave.exe"), b"owned Shell path fixture").unwrap();
             let canonical = metadata::normalized_directory(&fixture.0).unwrap();
             let value = command(&canonical).unwrap();
-            let expected = format!(
-                "\"{}\" --autostart",
-                fixture.0.join("sayweave.exe").display()
-            );
+            let executable = fixture.0.join("sayweave.exe").canonicalize().unwrap();
+            let executable = executable.to_str().unwrap().strip_prefix(r"\\?\").unwrap();
+            assert_eq!(executable.as_bytes().get(1..3), Some(b":\\".as_slice()));
+            let expected = format!("\"{executable}\" --autostart");
             assert_eq!(value, expected);
             assert!(owns(&value, &canonical));
+            let path = metadata::wide(fixture.0.to_str().unwrap());
+            let mut short = vec![0u16; 32768];
+            let length = unsafe {
+                windows::Win32::Storage::FileSystem::GetShortPathNameW(
+                    windows::core::PCWSTR(path.as_ptr()),
+                    Some(&mut short),
+                )
+            } as usize;
+            assert!(length > 0 && length < short.len());
+            let short = std::path::PathBuf::from(String::from_utf16(&short[..length]).unwrap());
+            let alias = metadata::normalized_directory(&short).unwrap();
+            assert_eq!(alias, canonical);
+            assert_eq!(command(&alias).unwrap(), value);
+            println!("owned_startup_fixture_short_alias={}", short != fixture.0);
             unsafe {
                 CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
                 let mut item = std::ptr::null_mut();
