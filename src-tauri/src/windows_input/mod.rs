@@ -291,6 +291,11 @@ impl WindowsInputService {
     pub fn anchor() -> Option<Anchor> {
         Self::start_target().ok().flatten()
     }
+    /// Evidence-only tests must not replace the task's captured target watch.
+    #[cfg(all(test, windows))]
+    pub(crate) fn observed_anchor() -> Option<Anchor> {
+        native::anchor().ok()
+    }
     pub(crate) fn bind_target(
         &self,
         id: &str,

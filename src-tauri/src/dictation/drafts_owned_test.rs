@@ -43,7 +43,7 @@ impl ActualBodyReader {
     fn read(&self) -> windows::core::Result<String> {
         use windows::Win32::{Foundation::E_ACCESSDENIED, UI::Accessibility::*};
         let reject = |stage: &str| windows::core::Error::new(E_ACCESSDENIED, stage);
-        let current = windows_input::WindowsInputService::anchor()
+        let current = windows_input::WindowsInputService::observed_anchor()
             .ok_or_else(|| reject("actual-body native focus absent"))?;
         if current.window != self.anchor.window
             || current.process != self.anchor.process
