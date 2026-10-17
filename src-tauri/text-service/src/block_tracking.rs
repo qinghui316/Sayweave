@@ -15,6 +15,7 @@ mod evidence;
 
 pub(super) struct Track {
     pub context: ITfContext,
+    client: u32,
     range: ITfRange,
     field: BlockScope,
     task: String,
@@ -350,7 +351,7 @@ pub(super) unsafe fn bind_owned(
             .manager
             .clone()
             .ok_or_else(|| failure(E_FAIL))?;
-        if manager.GetFocus()?.GetTop()? != *context {
+        if edit_context::focused(&manager)? != *context {
             return Err(failure(TF_E_DISCONNECTED));
         }
         let track = Rc::new(Track::bind(shared, context, r, ec)?);
@@ -401,7 +402,7 @@ pub(super) unsafe fn bind_owned(
                 writable: false,
             }
         };
-        if manager.GetFocus()?.GetTop()? != *context || !track.field.matches()? {
+        if edit_context::focused(&manager)? != *context || !track.field.matches()? {
             return Err(failure(TF_E_DISCONNECTED));
         }
         edit_authorized(shared, r, connection, generation)?;
@@ -523,6 +524,7 @@ impl Track {
             let manager_source: ITfSource = manager.cast()?;
             let focus: ITfThreadMgrEventSink = FocusSink {
                 context: context.clone(),
+                native: field.binding(),
                 data: data.clone(),
                 notifications: notifications.clone(),
                 _lease: Lease::new(),
@@ -539,6 +541,7 @@ impl Track {
                 };
             let track = Self {
                 context: context.clone(),
+                client,
                 range,
                 field,
                 task: request.task.clone(),
@@ -801,6 +804,12 @@ impl Track {
             if !self.field.matches()? {
                 return Err(failure(TF_E_DISCONNECTED));
             }
+            *phase = "blockCarrierAccess".into();
+            self.field.check_carrier(self.client).inspect_err(|error| {
+                if error.code() == TF_E_LOCKED {
+                    *phase = "blockInputMethodBusy".into();
+                }
+            })?;
             *phase = "blockSnapshotForeground".into();
             let foreground = GetForegroundWindow();
             *phase = "blockSnapshotView".into();
@@ -1101,6 +1110,7 @@ pub(super) fn invalidate(shared: &Shared, reason: &'static str) {
 #[implement(ITfThreadMgrEventSink)]
 struct FocusSink {
     context: ITfContext,
+    native: edit_context::Binding,
     data: Rc<RefCell<Data>>,
     notifications: Rc<TextNotifications>,
     _lease: Lease,
@@ -1123,7 +1133,10 @@ impl ITfThreadMgrEventSink_Impl for FocusSink_Impl {
     fn OnUninitDocumentMgr(&self, document: Ref<ITfDocumentMgr>) -> windows::core::Result<()> {
         let _callback = Callback::enter();
         let _notification = TextNotification::enter(self.notifications.clone());
-        if unsafe { self.context.GetDocumentMgr() }.ok().as_ref() == document.as_ref() {
+        if document
+            .as_ref()
+            .is_some_and(|doc| self.native.owns_document(doc))
+        {
             self.invalidate("blockDocumentRetired");
         }
         Ok(())
@@ -1137,9 +1150,8 @@ impl ITfThreadMgrEventSink_Impl for FocusSink_Impl {
         let _notification = TextNotification::enter(self.notifications.clone());
         if document
             .as_ref()
-            .and_then(|d| unsafe { d.GetTop() }.ok())
-            .as_ref()
-            != Some(&self.context)
+            .and_then(|d| unsafe { edit_context::Binding::from_document(d) }.ok())
+            .is_none_or(|current| !self.native.same(&current))
         {
             self.invalidate("blockDocumentFocus");
         }
@@ -1151,16 +1163,21 @@ impl ITfThreadMgrEventSink_Impl for FocusSink_Impl {
         if let Some(context) = context.as_ref()
             && context != &self.context
         {
-            let own = unsafe { self.context.GetDocumentMgr() };
             let added = unsafe { context.GetDocumentMgr() };
-            if own.is_err() || own.ok() == added.ok() {
+            if added
+                .as_ref()
+                .map_or(true, |document| self.native.owns_document(document))
+            {
                 self.invalidate("blockContextPushed");
             }
         }
         Ok(())
     }
     fn OnPopContext(&self, context: Ref<ITfContext>) -> windows::core::Result<()> {
-        if context.as_ref() == Some(&self.context) {
+        if context
+            .as_ref()
+            .is_some_and(|context| self.native.owns_context(context))
+        {
             self.invalidate("blockContextPopped");
         }
         Ok(())
@@ -1269,7 +1286,7 @@ pub(super) fn dispatch(shared: &Shared, request: &Request, connection: u64) {
                 state.client,
             )
         };
-        if manager.GetFocus()?.GetTop()? != context {
+        if edit_context::focused(&manager)? != context {
             return Err(failure(TF_E_DISCONNECTED));
         }
         let edit: ITfEditSession = EditBlock {
@@ -1535,6 +1552,7 @@ unsafe fn acquire_composition(
                 cookie,
             });
             state.context = Some(context.clone());
+            state.native_context = Some(track.field.binding());
             state.text_cookie = Some(cookie);
             state.expected = native.clone();
             state.text = Some(text);
@@ -1558,7 +1576,6 @@ unsafe fn acquire_composition(
             };
         }
         *phase = "blockStartComposition".into();
-        *mutation = Mutation::Uncertain;
         let delegate: ITfCompositionSink = CompositionSink {
             state: shared.clone(),
             epoch,
@@ -1576,9 +1593,49 @@ unsafe fn acquire_composition(
         .into();
         let owner: ITfContextComposition = context.cast()?;
         #[cfg(feature = "acceptance")]
-        block_faults::acquisition_without_object(shared)?;
+        block_faults::acquisition_without_object(shared)
+            .inspect_err(|_| *mutation = Mutation::Uncertain)?;
+        *phase = "blockCarrierAccess".into();
+        track
+            .field
+            .check_carrier(track.client)
+            .inspect_err(|error| {
+                if error.code() == TF_E_LOCKED {
+                    *phase = "blockInputMethodBusy".into();
+                }
+            })?;
+        edit_authorized(shared, r, edit.connection, edit.generation)?;
         // The Windows wrapper rejects a successful HRESULT with a null object.
-        let composition = owner.StartComposition(ec, &track.range, &sink)?;
+        let (
+            guard_shared,
+            guard_request,
+            data,
+            start_range,
+            connection,
+            generation,
+            version,
+            lease,
+        ) = (
+            shared.clone(),
+            r.clone(),
+            track.data.clone(),
+            track.range.clone(),
+            edit.connection,
+            edit.generation,
+            snapshot.version,
+            snapshot.lease,
+        );
+        let guard: MutationGuard = Rc::new(move || {
+            edit_authorized(&guard_shared, &guard_request, connection, generation)?;
+            let data = data.borrow();
+            if !data.valid || data.version != version || data.lease != lease {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            Ok(())
+        });
+        let composition = guarded_operation(shared, context, mutation, guard, move || {
+            owner.StartComposition(ec, &start_range, &sink)
+        })?;
         // StartComposition may synchronously terminate the candidate or reenter
         // the service. Never attach its returned object to a newer owner.
         let still_owned = {
@@ -1702,7 +1759,7 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                 .manager
                 .clone()
                 .ok_or_else(|| failure(E_FAIL))?;
-            if manager.GetFocus()?.GetTop()? != self.context {
+            if edit_context::focused(&manager)? != self.context {
                 return Err(failure(TF_E_DISCONNECTED));
             }
             if command.action == BlockAction::Bind {
@@ -1962,6 +2019,7 @@ mod native_lifetime_tests {
                     }));
                     let sink: ITfThreadMgrEventSink = FocusSink {
                         context: context.clone(),
+                        native: edit_context::Binding::from_document(&document)?,
                         data: data.clone(),
                         notifications: Rc::new(TextNotifications::default()),
                         _lease: Lease::new(),

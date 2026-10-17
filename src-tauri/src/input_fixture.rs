@@ -33,18 +33,299 @@ unsafe extern "system" fn fixture_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) ->
 fn message(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe { SendMessageW(h, m, Some(w), Some(l)) }
 }
+#[windows::core::implement(windows::Win32::UI::TextServices::ITfEditSession)]
+struct ContextReader {
+    context: windows::Win32::UI::TextServices::ITfContext,
+    result: std::rc::Rc<std::cell::RefCell<Option<serde_json::Value>>>,
+}
+impl windows::Win32::UI::TextServices::ITfEditSession_Impl for ContextReader_Impl {
+    fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        use windows::Win32::UI::TextServices::TF_ANCHOR_END;
+        let mut phase = "getStart";
+        let result = (|| unsafe {
+            let range = self.context.GetStart(ec)?;
+            phase = "getEnd";
+            let end = self.context.GetEnd(ec)?;
+            phase = "extend";
+            range.ShiftEndToRange(ec, &end, TF_ANCHOR_END)?;
+            phase = "getText";
+            let mut buffer = [0u16; 1024];
+            let mut fetched = 0;
+            range.GetText(ec, 0, &mut buffer, &mut fetched)?;
+            Ok::<_, windows::core::Error>(fetched)
+        })();
+        *self.result.borrow_mut() = Some(serde_json::json!({
+            "units":result.as_ref().ok(), "limit":1024, "phase":phase,
+            "error":result.err().map(|e|format!("{:08x}",e.code().0 as u32)),
+        }));
+        Ok(())
+    }
+}
+fn context_read(
+    manager: &windows::Win32::UI::TextServices::ITfThreadMgr,
+    context: &windows::Win32::UI::TextServices::ITfContext,
+) -> serde_json::Value {
+    use windows::Win32::UI::TextServices::*;
+    unsafe {
+        let client = match manager.Activate() {
+            Ok(client) => client,
+            Err(e) => {
+                return serde_json::json!({"activationError":format!("{:08x}",e.code().0 as u32)});
+            }
+        };
+        let value = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let edit: ITfEditSession = ContextReader {
+            context: context.clone(),
+            result: value.clone(),
+        }
+        .into();
+        let request = context.RequestEditSession(client, &edit, TF_ES_SYNC | TF_ES_READ);
+        drop(edit);
+        let deactivate = manager.Deactivate();
+        let read = value.borrow().clone();
+        serde_json::json!({"requestError":request.as_ref().err().map(|e|format!("{:08x}",e.code().0 as u32)),
+            "sessionResult":request.ok().map(|r|format!("{:08x}",r.0 as u32)),
+            "deactivateError":deactivate.err().map(|e|format!("{:08x}",e.code().0 as u32)),"read":read})
+    }
+}
 fn context_status() -> serde_json::Value {
     use windows::Win32::{System::Com::*, UI::TextServices::*};
+    use windows::core::Interface;
     let result = (|| unsafe {
         let manager: ITfThreadMgr =
             CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
-        let context = manager.GetFocus()?.GetTop()?;
+        let document = manager.GetFocus()?;
+        let context = document.GetTop()?;
         let status = context.GetStatus()?;
+        let mut relations = vec![];
+        let mut complete = false;
+        let topology = (|| -> windows::core::Result<()> {
+            let compartments = document.cast::<ITfCompartmentMgr>()?;
+            // Enumerate first: GetCompartment would create an absent entry.
+            let ids = compartments.EnumCompartments()?;
+            for _ in 0..64 {
+                let mut id = [windows::core::GUID::zeroed()];
+                let mut fetched = 0;
+                ids.Next(&mut id, Some(&mut fetched)).ok()?;
+                if fetched == 0 {
+                    complete = true;
+                    break;
+                }
+                let relation = if id[0] == GUID_COMPARTMENT_TRANSITORYEXTENSION_PARENT {
+                    "parent"
+                } else if id[0] == GUID_COMPARTMENT_TRANSITORYEXTENSION_DOCUMENTMANAGER {
+                    "transitory"
+                } else {
+                    continue;
+                };
+                let related = (|| {
+                    let value = compartments.GetCompartment(&id[0])?.GetValue()?;
+                    let related =
+                        windows::core::IUnknown::try_from(&value)?.cast::<ITfDocumentMgr>()?;
+                    let top = related.GetTop()?;
+                    let status = top.GetStatus()?;
+                    Ok::<_, windows::core::Error>(serde_json::json!({
+                        "sameDocument": related == document,
+                        "sameContext": top == context,
+                        "topIsBase": related.GetBase()? == top,
+                        "staticFlags": status.dwStaticFlags,
+                        "dynamicFlags": status.dwDynamicFlags,
+                        "read": context_read(&manager, &top),
+                    }))
+                })();
+                relations.push(serde_json::json!({"relation":relation,
+                    "document":related.as_ref().ok(),
+                    "error":related.err().map(|e|format!("{:08x}",e.code().0 as u32))}));
+            }
+            Ok(())
+        })();
         Ok::<_, windows::core::Error>(serde_json::json!({
             "staticFlags": status.dwStaticFlags,
             "dynamicFlags": status.dwDynamicFlags,
             "transitory": status.dwStaticFlags & TF_SS_TRANSITORY != 0,
+            "topIsBase": document.GetBase()? == context,
+            "compositions": context_compositions(&context),
+            "relations": relations,
+            "relationsComplete": complete,
+            "relationsError": topology.err().map(|e|format!("{:08x}",e.code().0 as u32)),
+            "read": context_read(&manager, &context),
         }))
+    })();
+    result.unwrap_or_else(|e| serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}))
+}
+fn context_compositions(
+    context: &windows::Win32::UI::TextServices::ITfContext,
+) -> serde_json::Value {
+    use windows::{Win32::UI::TextServices::*, core::Interface};
+    let result = (|| unsafe {
+        let owner: ITfContextComposition = context.cast()?;
+        let enumeration = owner.EnumCompositions()?;
+        let mut values = vec![];
+        for _ in 0..8 {
+            let mut next = [None];
+            let mut fetched = 0;
+            enumeration.Next(&mut next, &mut fetched)?;
+            if fetched == 0 {
+                break;
+            }
+            let composition = next[0].as_ref().ok_or(E_POINTER)?;
+            values.push(
+                serde_json::json!({"owner":format!("{:?}",composition.GetOwnerClsid()?),
+                "sameContext":composition.GetRange()?.GetContext()? == *context}),
+            );
+        }
+        Ok::<_, windows::core::Error>(values)
+    })();
+    serde_json::json!({"values":result.as_ref().ok(),"error":result.err().map(|e|format!("{:08x}",e.code().0 as u32))})
+}
+#[windows::core::implement(windows::Win32::UI::TextServices::ITfCompositionSink)]
+struct ParentProbeSink;
+impl windows::Win32::UI::TextServices::ITfCompositionSink_Impl for ParentProbeSink_Impl {
+    fn OnCompositionTerminated(
+        &self,
+        _: u32,
+        _: windows::core::Ref<windows::Win32::UI::TextServices::ITfComposition>,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+#[windows::core::implement(windows::Win32::UI::TextServices::ITfEditSession)]
+struct ParentWriteGuard {
+    delegate: windows::Win32::UI::TextServices::ITfEditSession,
+    parent_cookie: u32,
+}
+impl windows::Win32::UI::TextServices::ITfEditSession_Impl for ParentWriteGuard_Impl {
+    fn DoEditSession(&self, _: u32) -> windows::core::Result<()> {
+        unsafe { self.delegate.DoEditSession(self.parent_cookie) }
+    }
+}
+#[windows::core::implement(windows::Win32::UI::TextServices::ITfEditSession)]
+struct ParentWriteProbe {
+    context: windows::Win32::UI::TextServices::ITfContext,
+    carrier: windows::Win32::UI::TextServices::ITfContext,
+    client: u32,
+    guarded: bool,
+    result: std::rc::Rc<std::cell::RefCell<Option<serde_json::Value>>>,
+}
+impl windows::Win32::UI::TextServices::ITfEditSession_Impl for ParentWriteProbe_Impl {
+    fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
+        use windows::{Win32::UI::TextServices::*, core::Interface};
+        if !self.guarded {
+            let delegate: ITfEditSession = ParentWriteProbe {
+                context: self.context.clone(),
+                carrier: self.carrier.clone(),
+                client: self.client,
+                guarded: true,
+                result: self.result.clone(),
+            }
+            .into();
+            let read: ITfEditSession = ParentWriteGuard {
+                delegate,
+                parent_cookie: ec,
+            }
+            .into();
+            return unsafe {
+                self.carrier
+                    .RequestEditSession(self.client, &read, TF_ES_SYNC | TF_ES_READ)?
+                    .ok()
+            };
+        }
+        let mut phase = "selection";
+        let mut changed = false;
+        let before = context_compositions(&self.carrier);
+        let child_read = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let child_session: ITfEditSession = ContextReader {
+            context: self.carrier.clone(),
+            result: child_read.clone(),
+        }
+        .into();
+        let child_request = unsafe {
+            self.carrier
+                .RequestEditSession(self.client, &child_session, TF_ES_SYNC | TF_ES_READ)
+        };
+        let nested_read = serde_json::json!({"requestError":child_request.as_ref().err().map(|e|format!("{:08x}",e.code().0 as u32)),
+            "sessionResult":child_request.ok().map(|r|format!("{:08x}",r.0 as u32)),"read":child_read.borrow().clone()});
+        let result = (|| unsafe {
+            let mut selected = [TF_SELECTION::default()];
+            let mut fetched = 0;
+            let read =
+                self.context
+                    .GetSelection(ec, TF_DEFAULT_SELECTION, &mut selected, &mut fetched);
+            let range = std::mem::ManuallyDrop::take(&mut selected[0].range);
+            read?;
+            if fetched != 1 {
+                return Err(E_FAIL.into());
+            }
+            let range = range.ok_or_else(|| windows::core::Error::from_hresult(E_POINTER))?;
+            phase = "composition";
+            let owner = self.context.cast::<ITfContextComposition>()?;
+            let sink: ITfCompositionSink = ParentProbeSink.into();
+            let composition = owner.StartComposition(ec, &range, &sink)?;
+            phase = "write";
+            let owned = composition.GetRange()?;
+            owned.SetText(ec, 0, &"父文档探针".encode_utf16().collect::<Vec<_>>())?;
+            changed = true;
+            phase = "end";
+            composition.EndComposition(ec)
+        })();
+        *self.result.borrow_mut() = Some(
+            serde_json::json!({"phase":phase,"changed":changed,"carrierBefore":before,"carrierAfter":context_compositions(&self.carrier),"nestedCarrierRead":nested_read,
+            "error":result.err().map(|e|format!("{:08x}",e.code().0 as u32))}),
+        );
+        Ok(())
+    }
+}
+fn parent_write_probe() -> serde_json::Value {
+    use windows::{
+        Win32::{System::Com::*, UI::TextServices::*},
+        core::Interface,
+    };
+    let result = (|| unsafe {
+        let manager: ITfThreadMgr =
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
+        let document = manager.GetFocus()?;
+        let compartments = document.cast::<ITfCompartmentMgr>()?;
+        let ids = compartments.EnumCompartments()?;
+        let mut parent = None;
+        for _ in 0..64 {
+            let mut id = [windows::core::GUID::zeroed()];
+            let mut fetched = 0;
+            ids.Next(&mut id, Some(&mut fetched)).ok()?;
+            if fetched == 0 {
+                break;
+            }
+            if id[0] == GUID_COMPARTMENT_TRANSITORYEXTENSION_PARENT {
+                let value = compartments.GetCompartment(&id[0])?.GetValue()?;
+                parent = Some(
+                    windows::core::IUnknown::try_from(&value)?
+                        .cast::<ITfDocumentMgr>()?
+                        .GetTop()?,
+                );
+                break;
+            }
+        }
+        let context = parent.ok_or_else(|| windows::core::Error::from_hresult(E_NOINTERFACE))?;
+        if context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0 {
+            return Err(E_ACCESSDENIED.into());
+        }
+        let client = manager.Activate()?;
+        let value = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let edit: ITfEditSession = ParentWriteProbe {
+            context: context.clone(),
+            carrier: document.GetTop()?,
+            client,
+            guarded: false,
+            result: value.clone(),
+        }
+        .into();
+        let request = context.RequestEditSession(client, &edit, TF_ES_SYNC | TF_ES_READWRITE);
+        drop(edit);
+        let deactivate = manager.Deactivate();
+        let proof = value.borrow().clone();
+        Ok::<_, windows::core::Error>(serde_json::json!({
+            "requestError":request.as_ref().err().map(|e|format!("{:08x}",e.code().0 as u32)),
+            "sessionResult":request.ok().map(|r|format!("{:08x}",r.0 as u32)),
+            "deactivateError":deactivate.err().map(|e|format!("{:08x}",e.code().0 as u32)),"write":proof}))
     })();
     result.unwrap_or_else(|e| serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}))
 }
@@ -415,6 +696,7 @@ fn main() {
         let mut injected_keys = Vec::new();
         let mut auxiliary = HWND::default();
         let mut auxiliary_editor = HWND::default();
+        let mut sibling = HWND::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.message == WM_APP + 7 {
                 let value = r.recv().unwrap();
@@ -429,6 +711,17 @@ fn main() {
                 }
                 if value["action"] == "inspect-context" {
                     println!("{}", context_status());
+                    io::stdout().flush().unwrap();
+                    let _ = ok.send(());
+                    continue;
+                }
+                if value["action"] == "parent-write-probe" {
+                    let result = if GetForegroundWindow() == top && GetFocus() == editor {
+                        parent_write_probe()
+                    } else {
+                        serde_json::json!({"error":"ownedForegroundRequired"})
+                    };
+                    println!("{result}");
                     io::stdout().flush().unwrap();
                     let _ = ok.send(());
                     continue;
@@ -758,6 +1051,34 @@ fn main() {
                     focus_window(top);
                     let _ = SetFocus(Some(editor));
                 }
+                if value["action"] == "focus-sibling" && GetForegroundWindow() == top {
+                    if sibling.0.is_null() {
+                        sibling = CreateWindowExW(
+                            WINDOW_EX_STYLE(0),
+                            w!("EDIT"),
+                            w!(""),
+                            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                            20,
+                            80,
+                            400,
+                            80,
+                            Some(top),
+                            None,
+                            None,
+                            None,
+                        )
+                        .unwrap();
+                        let mut text = [0u16; 4096];
+                        GetWindowTextW(editor, &mut text);
+                        message(
+                            sibling,
+                            WM_SETTEXT,
+                            WPARAM(0),
+                            LPARAM(text.as_ptr() as isize),
+                        );
+                    }
+                    let _ = SetFocus(Some(sibling));
+                }
                 // The test runner passes the PID of its own launched browser/editor. This command
                 // is absent from production and never receives a personal application's identity.
                 if value["action"] == "focus-process"
@@ -833,9 +1154,18 @@ fn main() {
                 let mut buf = [0u16; 4096];
                 let len = GetWindowTextW(editor, &mut buf) as usize;
                 let selection = message(editor, 0x00B0, WPARAM(0), LPARAM(0)).0 as usize;
+                let sibling_value = if sibling.0.is_null() {
+                    None
+                } else {
+                    let mut text = [0u16; 4096];
+                    let size = GetWindowTextW(sibling, &mut text) as usize;
+                    Some(
+                        serde_json::json!({"window":sibling.0 as usize,"focused":GetFocus()==sibling,"text":String::from_utf16_lossy(&text[..size])}),
+                    )
+                };
                 println!(
                     "{}",
-                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"foregroundWindow":GetForegroundWindow().0 as usize,"desktopWindow":GetShellWindow().0 as usize,"clipboardSequence":windows::Win32::System::DataExchange::GetClipboardSequenceNumber(),"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window,"controlledEdit":controlled_edit,"controlledEditSteps":controlled_edit_steps,"auxiliary":auxiliary_result,"keyResult":key_result})
+                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"foregroundWindow":GetForegroundWindow().0 as usize,"nativeFocus":GetFocus().0 as usize,"sibling":sibling_value,"desktopWindow":GetShellWindow().0 as usize,"clipboardSequence":windows::Win32::System::DataExchange::GetClipboardSequenceNumber(),"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window,"controlledEdit":controlled_edit,"controlledEditSteps":controlled_edit_steps,"auxiliary":auxiliary_result,"keyResult":key_result})
                 );
                 io::stdout().flush().unwrap();
                 let _ = ok.send(());

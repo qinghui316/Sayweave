@@ -192,6 +192,13 @@ export async function runOwnedTermination({focus,start,report,pid}){
 }
 
 export async function runBlockRegression({page,pid,focus,start,root,folder,report}){
+ const control=process.env.SAYWEAVE_BLOCK_CONTROL??'richtext';
+ if(!['richtext','controlled-input'].includes(control))throw Error('Unknown owned block control');
+ report.blockControl=control;
+ if(control==='controlled-input'){
+  if(process.env.SAYWEAVE_BLOCK_USER_NEWLINE==='1'||process.env.SAYWEAVE_BLOCK_FLOATING_PREDICTION==='1'||process.env.SAYWEAVE_BLOCK_BOUNDARIES==='1')throw Error('This scenario requires the rich-text host');
+  await page.evaluate(()=>window.fixtureControlledInput());
+ }
  const baselineMode=process.env.SAYWEAVE_BLOCK_BASELINE??'semantic-control';
  if(!['semantic-control','native-readback'].includes(baselineMode))throw Error('Unknown owned baseline mode');
  report.baselineMode=baselineMode;
@@ -215,7 +222,8 @@ export async function runBlockRegression({page,pid,focus,start,root,folder,repor
  child.once('exit',code=>{ended=true;for(const item of pending.splice(0))item.reject(Error('Owned block probe exited '+code+': '+errors));});
  const next=()=>queue.length?Promise.resolve(queue.shift()):new Promise((resolve,reject)=>{if(ended){reject(Error(errors));return;}const item={resolve:value=>{clearTimeout(timer);resolve(value);},reject:error=>{clearTimeout(timer);reject(error);}};const timer=setTimeout(()=>{const i=pending.indexOf(item);if(i>=0)pending.splice(i,1);reject(Error('Owned block response timeout: '+errors));},18000);pending.push(item);});
  const read=()=>page.evaluate(()=>({text:window.fixtureEditor.read(),dom:window.fixtureEditor.inspect()}));
- const settled=()=>page.evaluate(async()=>{
+ const settled=async()=>{
+  const result=await page.evaluate(async()=>{
   const samples=[];const deadline=performance.now()+2000;let previous='',stable=0;
   while(performance.now()<deadline){
    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
@@ -224,8 +232,14 @@ export async function runBlockRegression({page,pid,focus,start,root,folder,repor
    const key=JSON.stringify(sample);samples.push(sample);stable=key===previous?stable+1:0;previous=key;
    if(stable>=2)return {...sample,samples};
   }
-  throw Error('Owned editor did not settle within the existing bounded read');
- });
+   throw Error('Owned editor did not settle within the existing bounded read');
+  });
+  if(control==='controlled-input'&&result.dom.controlledValue!==result.text){
+   report.firstDivergence={label:'controlled input after host events',kind:'controlledValue',actual:result.text,controlledValue:result.dom.controlledValue};
+   throw Error('Rendered input and controlled React value differ after host events');
+  }
+  return result;
+ };
  let revision=0,turn=1,snapshot,lastBody;
  const step=async(label,action,text='',block,requireApplied=true)=>{
   const before=await read();if(lastBody!==undefined&&before.text!==lastBody)throw Error('Late host body change before '+label);
@@ -401,7 +415,7 @@ async function runActor({page,pid,focus,start,read:readWhole,settled:settledWhol
    if(domWasComposing)await page.waitForFunction(at=>window.ownedBlockEvents.slice(at).some(e=>e.type==='compositionend'),eventWatermark,{timeout:5000});
    const handedOff=await settled();trace.push({label:'actor edit handoff '+index,settled:handedOff});
    if(handedOff.text!==(backspace&&index===0?replacement:before.text))throw Error('Native editing handoff changed body');
-   if(process.env.SAYWEAVE_BLOCK_SELECTION_PAUSE==='1'){
+   if(process.env.SAYWEAVE_BLOCK_SELECTION_PAUSE==='1'&&!(backspace&&index===0)){
     // Real editing starts by moving the caret/selection, before changing text.
     // Keep this interval long enough for the production reader to see it.
     await page.evaluate(at=>window.fixtureEditor.select(at),prefix.length+left);

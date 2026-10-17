@@ -196,6 +196,8 @@ SAYWEAVE_SPEECH operation=transport_connect connection_id=<UUID> stage=tls_webso
 
 本分支的口述协调器管理 Session 身份与结束手势，语音服务管理采集及识别连接，SessionDraft 管理 Turn、累计草稿与编辑交接，Windows 输入模块管理 TSF 范围与提交。原始识别、存档、外部输入和展示结果分别维护，详见 [职责与边界](dictation.md)。组件只在目标线程操作组合范围；录音、密钥及数据库留在主程序。设置、网络与系统输入不占用数据库线程。组件维护与口述共用准入锁，维护期间不能启动新任务。有外部目标的任务在组件就绪及草稿建立后才启动录音；设置与准入共用当前用户状态查询。
 
+外层应用与实际编辑端点分别持有身份。TSF 原生文档解析统一服务于组合写入与连续块跟踪：临时载体的安全属性和持续父文档的写入权限共同约束一次操作。输入交付资格与口述会话分开结算，真正目标丢失时由现有结果路由保留后续识别。具体文档关系、同块接管及权限规则归 [Windows 输入](dictation.md#应用编辑端点与原生文档) 所有。
+
 
 ### Interaction presentation boundaries
 

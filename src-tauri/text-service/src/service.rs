@@ -4,6 +4,8 @@
 mod block_faults;
 #[path = "block_tracking.rs"]
 mod block_tracking;
+#[path = "edit_context.rs"]
+mod edit_context;
 #[path = "edit_observation.rs"]
 mod edit_observation;
 #[path = "initial_selection.rs"]
@@ -133,6 +135,7 @@ struct State {
     materialize_allowed: bool,
     version: DraftVersion,
     context: Option<ITfContext>,
+    native_context: Option<edit_context::Binding>,
     composition: Option<ITfComposition>,
     prefix_end: Option<PrefixEnd>,
     // An original selection is observed but is not composing until the first
@@ -1627,11 +1630,7 @@ fn observation_current(shared: &Shared, candidate: &ObservationCandidate) -> boo
         return false;
     }
     let manager = shared.borrow().manager.clone();
-    let focused = unsafe {
-        manager
-            .and_then(|m| m.GetFocus().ok())
-            .and_then(|m| m.GetTop().ok())
-    };
+    let focused = unsafe { manager.and_then(|m| edit_context::focused(&m).ok()) };
     let state = shared.borrow();
     let valid = focused.as_ref() == Some(&candidate.context)
         && state.active
@@ -1819,7 +1818,18 @@ fn lease(
         {
             return Err(failure(TF_E_DISCONNECTED));
         }
-        if manager.GetFocus()?.GetTop()? != *context {
+        let native = edit_context::Binding::focused(&manager)?;
+        if native.context != *context {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        native.permits()?;
+        if r.action != Action::Begin
+            && shared
+                .borrow()
+                .native_context
+                .as_ref()
+                .is_some_and(|prior| !prior.same(&native))
+        {
             return Err(failure(TF_E_DISCONNECTED));
         }
         let view = context.GetActiveView()?.GetWnd()?;
@@ -1878,6 +1888,118 @@ fn edit_identity(
     }
     Ok(())
 }
+type MutationGuard = Rc<dyn Fn() -> windows::core::Result<()>>;
+
+fn mutation_guard(
+    shared: &Shared,
+    r: &Request,
+    generation: u64,
+    epoch: u64,
+    context: &ITfContext,
+) -> MutationGuard {
+    let (shared, r, context) = (shared.clone(), r.clone(), context.clone());
+    Rc::new(move || {
+        lease(&shared, &r, generation, &context)?;
+        edit_identity(&shared, &r, generation, epoch)
+    })
+}
+
+fn with_authority<T: 'static>(
+    shared: &Shared,
+    context: &ITfContext,
+    guard: MutationGuard,
+    work: impl FnOnce() -> windows::core::Result<T> + 'static,
+) -> windows::core::Result<T> {
+    let (manager, client) = {
+        let state = shared.borrow();
+        (
+            state
+                .manager
+                .clone()
+                .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
+            state.client,
+        )
+    };
+    let native = unsafe { edit_context::Binding::focused(&manager)? };
+    if native.context != *context {
+        return Err(failure(TF_E_DISCONNECTED));
+    }
+    let shared = shared.clone();
+    let original = native.clone();
+    native.with_carrier(client, move || {
+        if !original.same(&unsafe { edit_context::Binding::focused(&manager)? }) {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        original.permits()?;
+        guard()?;
+        if shared
+            .borrow()
+            .native_context
+            .as_ref()
+            .is_some_and(|saved| !saved.same(&original))
+        {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        if !original.focus_matches() {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        work()
+    })
+}
+
+fn guarded_operation<T: 'static>(
+    shared: &Shared,
+    context: &ITfContext,
+    mutation: &mut Mutation,
+    guard: MutationGuard,
+    work: impl FnOnce() -> windows::core::Result<T> + 'static,
+) -> windows::core::Result<T> {
+    let entered = Rc::new(Cell::new(false));
+    let attempted = entered.clone();
+    let result = with_authority(shared, context, guard, move || {
+        attempted.set(true);
+        work()
+    });
+    if entered.get() {
+        *mutation = Mutation::Uncertain;
+    }
+    result
+}
+
+fn guarded_mutation(
+    shared: &Shared,
+    context: &ITfContext,
+    mutation: &mut Mutation,
+    guard: MutationGuard,
+    work: impl FnOnce() -> windows::core::Result<()> + 'static,
+) -> windows::core::Result<()> {
+    guarded_operation(shared, context, mutation, guard, work)?;
+    *mutation = Mutation::Changed;
+    Ok(())
+}
+
+fn guarded_selection(
+    shared: &Shared,
+    context: &ITfContext,
+    ec: u32,
+    range: &ITfRange,
+    guard: MutationGuard,
+) -> windows::core::Result<()> {
+    let (context, range) = (context.clone(), range.clone());
+    let target = context.clone();
+    with_authority(shared, &target, guard, move || unsafe {
+        let mut selected = TF_SELECTION {
+            range: ManuallyDrop::new(Some(range)),
+            style: TF_SELECTIONSTYLE {
+                ase: TF_AE_NONE,
+                fInterimChar: false.into(),
+            },
+        };
+        let result = context.SetSelection(ec, std::slice::from_ref(&selected));
+        ManuallyDrop::drop(&mut selected.range);
+        result
+    })
+}
 fn hosted_channel_alive(state: &State, capability: &str) -> bool {
     let Some(guard) = state.host_guard else {
         return false;
@@ -1925,7 +2047,7 @@ fn schedule(
                 s.generation,
             )
         };
-        let focused = manager.GetFocus().and_then(|d| d.GetTop());
+        let focused = edit_context::focused(&manager);
         let owned_release = {
             let state = shared.borrow();
             if r.action == Action::Handoff {
@@ -2110,6 +2232,7 @@ fn release_composition_with_failure(
         s.empty_range = None;
         s.prepared = None;
         s.native_position = None;
+        s.native_context = None;
         s.key_failure = semantic_failed;
         (
             s.context.take(),
@@ -2299,7 +2422,7 @@ fn materialize(
     composition: &ITfComposition,
     epoch: u64,
     ec: u32,
-    guard: &impl Fn() -> windows::core::Result<()>,
+    guard: &MutationGuard,
     preserve_selection: bool,
     mutation: &mut Mutation,
 ) -> windows::core::Result<()> {
@@ -2333,18 +2456,26 @@ fn materialize(
     let manager = manager.ok_or_else(|| failure(TF_E_DISCONNECTED))?;
     unsafe {
         permitted()?;
-        if manager.GetFocus()?.GetTop()? != *context {
+        let native = edit_context::Binding::focused(&manager)?;
+        if native.context != *context {
             return Err(failure(TF_E_DISCONNECTED));
         }
+        native.permits()?;
         let mut process = 0;
-        GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut process));
+        let focus = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus();
+        let thread = GetWindowThreadProcessId(focus, Some(&mut process));
         let view = context.GetActiveView()?.GetWnd()?;
-        if process != std::process::id()
+        if focus.0.is_null()
+            || process != std::process::id()
+            || thread != windows::Win32::System::Threading::GetCurrentThreadId()
+            || GetAncestor(focus, GA_ROOT) != GetForegroundWindow()
             || !view.0.is_null() && GetAncestor(view, GA_ROOT) != GetForegroundWindow()
             || context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0
         {
             return Err(failure(TF_E_DISCONNECTED));
         }
+        let client = shared.borrow().client;
+        native.check_carrier(client)?;
         ensure_enabled_context(context)?;
         let range = composition.GetRange()?;
         if password(context, &range, ec)? || range_text(&range, ec)? != expected {
@@ -2356,29 +2487,45 @@ fn materialize(
             None
         };
         permitted()?;
-        {
-            let mut s = shared.borrow_mut();
-            if s.epoch != epoch {
+        let semantic = text.commit_text();
+        let tracking = block_tracking::owned_update(shared, context, &range, ec)?.map(Rc::new);
+        permitted()?;
+        let (write_shared, write_range, write_tracking, write_semantic, parent_guard) = (
+            shared.clone(),
+            range.clone(),
+            tracking.clone(),
+            semantic.clone(),
+            guard.clone(),
+        );
+        let permit_shared = shared.clone();
+        let write_guard: MutationGuard = Rc::new(move || {
+            parent_guard()?;
+            if !permit_shared.borrow().materialize_allowed {
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            s.text
-                .as_mut()
-                .ok_or_else(|| failure(TF_E_DISCONNECTED))?
-                .phase = TextPhase::Materializing;
-        }
-        *mutation = Mutation::Uncertain;
-        let semantic = text.commit_text();
-        let tracking = block_tracking::owned_update(shared, context, &range, ec)?;
-        permitted()?;
-        if tracking.as_ref().is_some_and(|t| !t.arm()) {
-            return Err(failure(TF_E_DISCONNECTED));
-        }
-        range.SetText(
-            ec,
-            TF_ST_CORRECTION,
-            &semantic.encode_utf16().collect::<Vec<_>>(),
-        )?;
-        *mutation = Mutation::Changed;
+            Ok(())
+        });
+        guarded_mutation(shared, context, mutation, write_guard.clone(), move || {
+            {
+                let mut state = write_shared.borrow_mut();
+                if state.epoch != epoch {
+                    return Err(failure(TF_E_DISCONNECTED));
+                }
+                state
+                    .text
+                    .as_mut()
+                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?
+                    .phase = TextPhase::Materializing;
+            }
+            if write_tracking.as_ref().is_some_and(|t| !t.arm()) {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            write_range.SetText(
+                ec,
+                TF_ST_CORRECTION,
+                &write_semantic.encode_utf16().collect::<Vec<_>>(),
+            )
+        })?;
         permitted()?;
         let actual = range_text(&range, ec)?;
         permitted()?;
@@ -2420,16 +2567,7 @@ fn materialize(
             }
         };
         permitted()?;
-        let mut selected = TF_SELECTION {
-            range: ManuallyDrop::new(Some(caret)),
-            style: TF_SELECTIONSTYLE {
-                ase: TF_AE_NONE,
-                fInterimChar: false.into(),
-            },
-        };
-        let result = context.SetSelection(ec, std::slice::from_ref(&selected));
-        ManuallyDrop::drop(&mut selected.range);
-        result?;
+        guarded_selection(shared, context, ec, &caret, write_guard.clone())?;
         let current = selection(context, ec)?;
         permitted()?;
         shared.borrow_mut().selection = Some(current);
@@ -2455,6 +2593,11 @@ impl KeySink {
             return None;
         }
         let shared = self.state.upgrade()?;
+        let manager = shared.borrow().manager.clone()?;
+        let native = unsafe { edit_context::Binding::focused(&manager) }.ok()?;
+        if !native.owns_context(context.as_ref()?) {
+            return None;
+        }
         let owns = {
             let s = shared.borrow();
             #[cfg(feature = "acceptance")]
@@ -2470,10 +2613,10 @@ impl KeySink {
             }
             s.active
                 && !s.cleanup
-                && ((s.version.owned && s.context.as_ref() == context.as_ref())
+                && ((s.version.owned && s.context.as_ref() == Some(&native.context))
                     || s.block
                         .as_ref()
-                        .is_some_and(|b| Some(&b.context) == context.as_ref()))
+                        .is_some_and(|b| b.context == native.context))
         };
         owns.then_some(shared)
     }
@@ -2583,15 +2726,15 @@ struct EndOwned {
 impl ITfEditSession_Impl for EndOwned_Impl {
     fn DoEditSession(&self, ec: u32) -> windows::core::Result<()> {
         let _callback = Callback::enter();
-        let guard = || {
-            cleanup_identity(
-                &self.state,
-                &self.context,
-                &self.composition,
-                self.epoch,
-                self.cleanup_id,
-            )
-        };
+        let (state, context, composition, epoch, cleanup_id) = (
+            self.state.clone(),
+            self.context.clone(),
+            self.composition.clone(),
+            self.epoch,
+            self.cleanup_id,
+        );
+        let guard: MutationGuard =
+            Rc::new(move || cleanup_identity(&state, &context, &composition, epoch, cleanup_id));
         guard()?;
         let mut mutation = Mutation::NotAttempted;
         let semantic = if let Some(context) = &self.context {
@@ -2673,18 +2816,24 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
             unsafe { protected.as_ref().map_or(Ok(()), |guard| guard.check(ec)) };
         let mut semantic = Ok(());
         if let Some(context) = context {
-            let guard = || {
-                let s = self.state.borrow();
-                if s.epoch != self.epoch
+            let (state, guarded_context, guarded_composition, epoch) = (
+                self.state.clone(),
+                context.clone(),
+                composition.clone(),
+                self.epoch,
+            );
+            let guard: MutationGuard = Rc::new(move || {
+                let s = state.borrow();
+                if s.epoch != epoch
                     || s.generation != generation
-                    || s.context.as_ref() != Some(&context)
-                    || s.composition.as_ref() != Some(composition)
+                    || s.context.as_ref() != Some(&guarded_context)
+                    || s.composition.as_ref() != Some(&guarded_composition)
                 {
                     Err(failure(TF_E_DISCONNECTED))
                 } else {
                     Ok(())
                 }
-            };
+            });
             semantic = materialize(
                 &self.state,
                 &context,
@@ -3351,15 +3500,19 @@ fn settle_prefix(
         let committed = CompositionText::new(&prefix.text).commit_text();
         let tail = CompositionText::new(&r.text);
         let combined = format!("{committed}{}", tail.marked);
+        let write_combined = combined.encode_utf16().collect::<Vec<_>>();
         *phase = "settleText";
-        *mutation = Mutation::Uncertain;
-        start_effect(shared, r)?;
-        range.SetText(
-            ec,
-            TF_ST_CORRECTION,
-            &combined.encode_utf16().collect::<Vec<_>>(),
+        let (write_shared, write_request, write_range) = (shared.clone(), r.clone(), range.clone());
+        guarded_mutation(
+            shared,
+            context,
+            mutation,
+            mutation_guard(shared, r, generation, epoch, context),
+            move || {
+                start_effect(&write_shared, &write_request)?;
+                write_range.SetText(ec, TF_ST_CORRECTION, &write_combined)
+            },
         )?;
-        *mutation = Mutation::Changed;
         edit_identity(shared, r, generation, epoch)?;
         preserve_attributes(shared, context, range, r, generation, epoch, ec)?;
         *phase = "settleReadback";
@@ -3499,16 +3652,13 @@ fn settle_prefix(
         let caret = remaining.Clone()?;
         caret.Collapse(ec, TF_ANCHOR_END)?;
         edit_identity(shared, r, generation, epoch)?;
-        let mut selected = TF_SELECTION {
-            range: ManuallyDrop::new(Some(caret)),
-            style: TF_SELECTIONSTYLE {
-                ase: TF_AE_NONE,
-                fInterimChar: false.into(),
-            },
-        };
-        let result = context.SetSelection(ec, std::slice::from_ref(&selected));
-        ManuallyDrop::drop(&mut selected.range);
-        result?;
+        guarded_selection(
+            shared,
+            context,
+            ec,
+            &caret,
+            mutation_guard(shared, r, generation, epoch, context),
+        )?;
         edit_identity(shared, r, generation, epoch)?;
         let selected = selection(context, ec)?;
         edit_identity(shared, r, generation, epoch)?;
@@ -3737,21 +3887,34 @@ fn write_composing(
         *phase = "selectionMapping";
         let mapped_selection =
             block_tracking::selection_for_write(shared, context, range, ec, text)?;
-        let tracking = block_tracking::owned_update(shared, context, range, ec)?;
+        let tracking = block_tracking::owned_update(shared, context, range, ec)?.map(Rc::new);
         lease(shared, r, generation, context)?;
-        *mutation = Mutation::Uncertain;
         *phase = "updateText";
         let text = CompositionText::new(text);
-        if tracking.as_ref().is_some_and(|t| !t.arm()) {
-            return Err(failure(TF_E_DISCONNECTED));
-        }
-        start_effect(shared, r)?;
-        range.SetText(
-            ec,
-            TF_ST_CORRECTION,
-            &text.marked.encode_utf16().collect::<Vec<_>>(),
+        let (write_shared, write_request, write_range, write_tracking, marked) = (
+            shared.clone(),
+            r.clone(),
+            range.clone(),
+            tracking.clone(),
+            text.marked.clone(),
+        );
+        guarded_mutation(
+            shared,
+            context,
+            mutation,
+            mutation_guard(shared, r, generation, epoch, context),
+            move || {
+                if write_tracking.as_ref().is_some_and(|t| !t.arm()) {
+                    return Err(failure(TF_E_DISCONNECTED));
+                }
+                start_effect(&write_shared, &write_request)?;
+                write_range.SetText(
+                    ec,
+                    TF_ST_CORRECTION,
+                    &marked.encode_utf16().collect::<Vec<_>>(),
+                )
+            },
         )?;
-        *mutation = Mutation::Changed;
         *phase = "updateAttributes";
         preserve_attributes(shared, context, range, r, generation, epoch, ec)?;
         *phase = "updateReadback";
@@ -3808,17 +3971,14 @@ fn write_composing(
                 return Err(failure(TF_E_DISCONNECTED));
             }
         }
-        let mut selected = TF_SELECTION {
-            range: ManuallyDrop::new(Some(caret)),
-            style: TF_SELECTIONSTYLE {
-                ase: TF_AE_NONE,
-                fInterimChar: false.into(),
-            },
-        };
         *phase = "updateSelection";
-        let result = context.SetSelection(ec, std::slice::from_ref(&selected));
-        ManuallyDrop::drop(&mut selected.range);
-        result?;
+        guarded_selection(
+            shared,
+            context,
+            ec,
+            &caret,
+            mutation_guard(shared, r, generation, epoch, context),
+        )?;
         let next_selection = selection(context, ec)?;
         edit_identity(shared, r, generation, epoch)?;
         let mut s = shared.borrow_mut();
@@ -3954,7 +4114,13 @@ fn apply_prepared(
             if fault == 1 {
                 return Err(failure(E_FAIL));
             }
-            owner.StartComposition(ec, &prepared.range, &sink)
+            let (owner, range, sink) = (owner.clone(), prepared.range.clone(), sink.clone());
+            with_authority(
+                shared,
+                context,
+                mutation_guard(shared, r, generation, epoch, context),
+                move || owner.StartComposition(ec, &range, &sink),
+            )
         };
         let next = match start() {
             Ok(next) => next,
@@ -3985,16 +4151,19 @@ fn apply_prepared(
                         return Err(failure(TF_E_LOCKED));
                     }
                     edit_identity(shared, r, generation, epoch)?;
-                    *mutation = Mutation::Uncertain;
-                    restore_original_selection(
-                        context,
-                        &prepared.range,
-                        &backup,
-                        semantic.as_ref(),
-                        ec,
-                        || edit_identity(shared, r, generation, epoch),
-                    )?;
-                    *mutation = Mutation::Changed;
+                    let guard = mutation_guard(shared, r, generation, epoch, context);
+                    let (write_context, write_range, write_guard) =
+                        (context.clone(), prepared.range.clone(), guard.clone());
+                    guarded_mutation(shared, context, mutation, guard, move || {
+                        restore_original_selection(
+                            &write_context,
+                            &write_range,
+                            &backup,
+                            semantic.as_ref(),
+                            ec,
+                            || write_guard(),
+                        )
+                    })?;
                     Ok(())
                 })();
                 *phase = if rollback.is_ok() {
@@ -4083,6 +4252,19 @@ fn apply(
     shared.borrow_mut().own_change = None;
     unsafe {
         if r.action == Action::Begin {
+            *phase = "beginContext";
+            let manager = shared
+                .borrow()
+                .manager
+                .clone()
+                .ok_or_else(|| failure(E_FAIL))?;
+            let native = edit_context::Binding::focused(&manager)?;
+            if native.context != *context {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            *phase = "beginCarrier";
+            let client = shared.borrow().client;
+            native.check_carrier(client)?;
             shared.borrow_mut().ownership_loss = None;
             shared.borrow_mut().ownership_detail = None;
             shared.borrow_mut().key_handoff = false;
@@ -4160,16 +4342,27 @@ fn apply(
                                 return Err(failure(TF_E_DISCONNECTED));
                             }
                         }
-                        let mut next = TF_SELECTION {
-                            range: ManuallyDrop::new(Some(candidate.clone())),
-                            style: TF_SELECTIONSTYLE {
-                                ase: TF_AE_NONE,
-                                fInterimChar: false.into(),
-                            },
-                        };
-                        let result = context.SetSelection(ec, std::slice::from_ref(&next));
-                        ManuallyDrop::drop(&mut next.range);
-                        result?;
+                        let (
+                            guard_shared,
+                            guard_request,
+                            guard_context,
+                            guard_native,
+                            guard_manager,
+                        ) = (
+                            shared.clone(),
+                            r.clone(),
+                            context.clone(),
+                            native.clone(),
+                            manager.clone(),
+                        );
+                        let guard: MutationGuard = Rc::new(move || {
+                            if !guard_native.same(&edit_context::Binding::focused(&guard_manager)?)
+                            {
+                                return Err(failure(TF_E_DISCONNECTED));
+                            }
+                            lease(&guard_shared, &guard_request, generation, &guard_context)
+                        });
+                        guarded_selection(shared, context, ec, &candidate, guard)?;
                         range = candidate;
                         #[cfg(feature = "acceptance")]
                         if let Some(value) = shared.borrow_mut().selection_probe.as_mut() {
@@ -4230,6 +4423,24 @@ fn apply(
                 let _ = source.UnadviseSink(cookie);
                 return Err(failure(TF_E_DISCONNECTED));
             }
+            let still_focused = edit_context::Binding::focused(&manager);
+            let current = {
+                let state = shared.borrow();
+                state.active
+                    && state.generation == generation
+                    && state.version.accepts(r)
+                    && !state.cleanup
+                    && r.live(GetTickCount64())
+                    && state.capability.as_ref() == Some(&r.capability)
+            };
+            if !current
+                || !still_focused
+                    .as_ref()
+                    .is_ok_and(|current| native.same(current))
+            {
+                let _ = source.UnadviseSink(cookie);
+                return Err(failure(TF_E_DISCONNECTED));
+            }
             let mut s = shared.borrow_mut();
             s.epoch = epoch;
             s.observation_original = original_semantic
@@ -4242,6 +4453,7 @@ fn apply(
             s.preserved_attributes.clear();
             s.backup = Some(Rollback::OriginalSelection(backup, original_semantic));
             s.context = Some(context.clone());
+            s.native_context = Some(native);
             s.expected = expected;
             s.text = None;
             s.materialize_allowed = true;
@@ -4344,7 +4556,13 @@ fn apply(
                 _lease: Lease::new(),
             }
             .into();
-            let next = owner.StartComposition(ec, &range, &sink)?;
+            let start_range = range.clone();
+            let next = with_authority(
+                shared,
+                context,
+                mutation_guard(shared, r, generation, epoch, context),
+                move || owner.StartComposition(ec, &start_range, &sink),
+            )?;
             if let Err(error) = edit_identity(shared, r, generation, epoch) {
                 let _ = next.EndComposition(ec);
                 return Err(error);
@@ -4395,7 +4613,7 @@ fn apply(
                         &composition,
                         epoch,
                         ec,
-                        &|| edit_identity(shared, r, generation, epoch),
+                        &mutation_guard(shared, r, generation, epoch, context),
                         true,
                         mutation,
                     )?;
@@ -4403,19 +4621,23 @@ fn apply(
                     release_composition(shared, epoch, Some(&composition));
                     return Err(failure(TF_E_DISCONNECTED));
                 };
-                *mutation = Mutation::Uncertain;
                 lease(shared, r, generation, context)?;
                 *phase = "abortRestore";
                 match backup {
                     Rollback::OriginalSelection(backup, semantic) => {
-                        restore_original_selection(
-                            context,
-                            &range,
-                            &backup,
-                            semantic.as_ref(),
-                            ec,
-                            || edit_identity(shared, r, generation, epoch),
-                        )?;
+                        let guard = mutation_guard(shared, r, generation, epoch, context);
+                        let (write_context, write_range, write_guard) =
+                            (context.clone(), range.clone(), guard.clone());
+                        guarded_mutation(shared, context, mutation, guard, move || {
+                            restore_original_selection(
+                                &write_context,
+                                &write_range,
+                                &backup,
+                                semantic.as_ref(),
+                                ec,
+                                || write_guard(),
+                            )
+                        })?;
                         // Restore the selected content; let the host retain its
                         // normal caret after cancellation. Do not reselect text
                         // asynchronously after the user may have resumed editing.
@@ -4433,7 +4655,16 @@ fn apply(
                                 Some((r.task.clone(), r.turn, r.operation, evidence));
                         }
                     }
-                    Rollback::GeneratedTail => range.SetText(ec, TF_ST_CORRECTION, &[])?,
+                    Rollback::GeneratedTail => {
+                        let write_range = range.clone();
+                        guarded_mutation(
+                            shared,
+                            context,
+                            mutation,
+                            mutation_guard(shared, r, generation, epoch, context),
+                            move || write_range.SetText(ec, TF_ST_CORRECTION, &[]),
+                        )?;
+                    }
                 }
                 *mutation = Mutation::Changed;
                 if shared.borrow().generation == generation {
@@ -4452,7 +4683,7 @@ fn apply(
                     &composition,
                     epoch,
                     ec,
-                    &|| edit_identity(shared, r, generation, epoch),
+                    &mutation_guard(shared, r, generation, epoch, context),
                     r.action == Action::Handoff,
                     mutation,
                 )?;
@@ -4572,7 +4803,7 @@ fn settle_checkpoint(
                 composition,
                 epoch,
                 ec,
-                &|| edit_identity(shared, request, generation, epoch),
+                &mutation_guard(shared, request, generation, epoch, context),
                 true,
                 mutation,
             )?;

@@ -72,7 +72,7 @@ try{
  const pid=(await session.send('SystemInfo.getProcessInfo')).processInfo.find(item=>item.type==='browser').id;await session.detach();
  const page=await browser.newPage();
  await page.setContent('<input id="input"><textarea id="area"></textarea><div id="editable" contenteditable="true"></div>');
- const bundle=await build({configFile:false,logLevel:'error',build:{write:false,lib:{entry:path.join(root,'tests/fixtures/input-target.ts'),name:'InputFixture',formats:['iife']}}});
+ const bundle=await build({configFile:false,logLevel:'error',define:{'process.env.NODE_ENV':JSON.stringify('production')},build:{write:false,lib:{entry:path.join(root,'tests/fixtures/input-target.ts'),name:'InputFixture',formats:['iife']}}});
  await page.addScriptTag({content:(Array.isArray(bundle)?bundle[0]:bundle).output[0].code});
  if(process.env.SAYWEAVE_BLOCK_IME==='1'){
   const {runPostDictationIme}=await import('./test-richtext-block.mjs');

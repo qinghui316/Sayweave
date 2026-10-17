@@ -1,6 +1,9 @@
 import {Schema} from 'prosemirror-model';
 import {EditorState, Plugin, PluginKey, TextSelection} from 'prosemirror-state';
 import {Decoration, DecorationSet, EditorView} from 'prosemirror-view';
+import {createElement, useState} from 'react';
+import {createRoot} from 'react-dom/client';
+import {flushSync} from 'react-dom';
 
 function semanticSelection(editor:EditorView){const offset=(position:number)=>{let blocks=0;editor.state.doc.forEach((_node,start,index)=>{if(start<position)blocks=index;});return position-1-blocks;};return {start:offset(editor.state.selection.from),end:offset(editor.state.selection.to)};}
 
@@ -35,6 +38,38 @@ window.fixtureEditor={
  select(position,end=position){view.dispatch(view.state.tr.setSelection(TextSelection.create(view.state.doc,position+1,end+1)));},
  read(){return view.state.doc.textBetween(0,view.state.doc.content.size,'\n');},
  inspect(){const selection=getSelection();return {composing:view.composing,html:view.dom.innerHTML,selection:{from:view.state.selection.from,to:view.state.selection.to},semanticSelection:semanticSelection(view),domSelection:selection?{anchor:{parent:selection.anchorNode?.parentElement?.tagName,offset:selection.anchorOffset,text:selection.anchorNode?.textContent},focus:{parent:selection.focusNode?.parentElement?.tagName,offset:selection.focusOffset,text:selection.focusNode?.textContent}}:null,document:view.state.doc.toJSON()};},
+};
+
+// The same native/actor acceptance can exercise an ordinary controlled field.
+// Read the browser value and React state separately after native events settle.
+declare global {interface Window {fixtureControlledInput():void}}
+window.fixtureControlledInput=()=>{
+ host.id='prosemirror-richtext';
+ const container=document.createElement('div');document.body.prepend(container);
+ let rendered='',composing=false,setValue:(text:string)=>void=()=>{throw Error('Owned input not mounted');};
+ function ControlledInput(){
+  const [value,update]=useState('');setValue=update;rendered=value;
+  return createElement('input',{id:'prosemirror',value,'aria-label':'Owned controlled input',
+   onChange:(event:React.ChangeEvent<HTMLInputElement>)=>update(event.target.value),
+   onCompositionStart:()=>{composing=true;},onCompositionEnd:()=>{composing=false;}});
+ }
+ const root=createRoot(container);flushSync(()=>root.render(createElement(ControlledInput)));
+ const input=container.querySelector('input')!;
+ window.fixtureEditor={
+  set(text,start,end){flushSync(()=>setValue(text));input.focus();input.setSelectionRange(start,end);},
+  edit(from,to,text){
+   const next=input.value.slice(0,from)+text+input.value.slice(to);
+   // Native value setter bypasses React's value tracker, like a browser edit.
+   Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value')!.set!.call(input,next);
+   input.setSelectionRange(from+text.length,from+text.length);
+   input.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertReplacementText',data:text}));
+  },
+  appendParagraph(){throw Error('Single-line owned field cannot append a paragraph');},
+  select(start,end=start){input.focus();input.setSelectionRange(start,end);},
+  read(){return input.value;},
+  inspect(){return {composing,html:input.outerHTML,controlledValue:rendered,
+   semanticSelection:{start:input.selectionStart,end:input.selectionEnd}};},
+ };
 };
 
 // A second real view permits inline hard breaks, as full rich editors commonly

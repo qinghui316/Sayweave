@@ -5,7 +5,7 @@ use super::*;
 #[derive(Clone)]
 pub(super) struct BlockScope {
     manager: ITfThreadMgr,
-    document: ITfDocumentMgr,
+    native: edit_context::Binding,
     context: ITfContext,
     view: ITfContextView,
     window: HWND,
@@ -28,10 +28,11 @@ impl BlockScope {
         context: &ITfContext,
     ) -> windows::core::Result<Self> {
         unsafe {
-            let document = manager.GetFocus()?;
-            if document.GetTop()? != *context || context.GetDocumentMgr()? != document {
+            let native = edit_context::Binding::focused(manager)?;
+            if native.context != *context {
                 return Err(failure(TF_E_DISCONNECTED));
             }
+            native.permits()?;
             let window = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus();
             let mut process = 0;
             if window.0.is_null()
@@ -65,7 +66,7 @@ impl BlockScope {
             };
             let scope = Self {
                 manager: manager.clone(),
-                document,
+                native,
                 context: context.clone(),
                 view,
                 window,
@@ -85,9 +86,9 @@ impl BlockScope {
                 || windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() != self.window
                 || GetAncestor(self.window, GA_ROOT) != self.root
                 || GetForegroundWindow() != self.root
-                || self.manager.GetFocus()?.cast::<IUnknown>()?
-                    != self.document.cast::<IUnknown>()?
-                || self.document.GetTop()?.cast::<IUnknown>()? != self.context.cast::<IUnknown>()?
+                || !self
+                    .native
+                    .same(&edit_context::Binding::focused(&self.manager)?)
                 || self.context.GetActiveView()?.cast::<IUnknown>()?
                     != self.view.cast::<IUnknown>()?
             {
@@ -97,6 +98,7 @@ impl BlockScope {
             if !window.0.is_null() && GetAncestor(window, GA_ROOT) != self.root {
                 return Ok(false);
             }
+            self.native.permits()?;
             match &self.field {
                 FieldProof::Accessible(field) => field.matches(),
                 FieldProof::NativeOwned => Ok(true),
@@ -109,5 +111,11 @@ impl BlockScope {
     }
     pub(super) fn has_native_origin(&self) -> bool {
         matches!(self.field, FieldProof::NativeOwned)
+    }
+    pub(super) fn binding(&self) -> edit_context::Binding {
+        self.native.clone()
+    }
+    pub(super) fn check_carrier(&self, client: u32) -> windows::core::Result<()> {
+        self.native.check_carrier(client)
     }
 }

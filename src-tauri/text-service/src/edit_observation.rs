@@ -1,6 +1,6 @@
 //! Optional read-only output observation, independent of composition ownership.
 //! COM ranges and sinks never leave their target apartment.
-use super::{Callback, Lease, range_text};
+use super::{Callback, Lease, edit_context, range_text};
 #[path = "native_observation.rs"]
 mod native_observation;
 #[cfg(feature = "acceptance")]
@@ -256,8 +256,7 @@ impl Watch {
     ) -> Option<ObservedEdit> {
         unsafe {
             let focused = manager
-                .and_then(|m| m.GetFocus().ok())
-                .and_then(|m| m.GetTop().ok())
+                .and_then(|m| edit_context::focused(m).ok())
                 .is_some_and(|c| c == self.context);
             let now = GetTickCount64();
             let field = self.field.matches();
