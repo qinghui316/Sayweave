@@ -398,7 +398,7 @@ async fn richtext_actor() {
         draft,
         control.clone(),
         cancel.clone(),
-        Some(context),
+        (std::env::var("SAYWEAVE_ACTOR_RAW_ONLY").as_deref() != Ok("1")).then_some(context),
         None,
     );
     HOLD_FIRST_UPDATE.store(
