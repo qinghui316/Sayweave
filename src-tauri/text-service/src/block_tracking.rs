@@ -1900,7 +1900,7 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                     &self.request,
                     self.connection,
                     false,
-                    &format!("{phase}:{:08x}{detail}", error.code().0 as u32),
+                    &refusal_code(&phase, error.code(), mutation, &detail),
                     mutation,
                     None,
                 );
@@ -1913,9 +1913,72 @@ impl ITfEditSession_Impl for EditBlock_Impl {
     }
 }
 
+// Classification describes only the retired range. Fresh input still requires
+// a fully authenticated Begin at the session's original editing endpoint.
+fn refusal_code(phase: &str, error: HRESULT, mutation: Mutation, detail: &str) -> String {
+    let unavailable = mutation == Mutation::NotAttempted
+        && error == TF_E_DISCONNECTED
+        && matches!(
+            phase,
+            "blockEditEmpty"
+                | "blockProtectedAnchor"
+                | "blockEditRangeDrift"
+                | "blockDocumentFocus"
+                | "blockEditSelection"
+        );
+    format!(
+        "{}{phase}:{:08x}{detail}",
+        if unavailable { "blockUnavailable:" } else { "" },
+        error.0 as u32
+    )
+}
+
 #[cfg(test)]
 mod native_lifetime_tests {
     use super::*;
+
+    #[test]
+    fn lost_range_classification_cannot_promote_security_or_uncertain_effects() {
+        assert!(
+            refusal_code(
+                "blockEditEmpty",
+                TF_E_DISCONNECTED,
+                Mutation::NotAttempted,
+                ""
+            )
+            .starts_with("blockUnavailable:blockEditEmpty:")
+        );
+        for phase in [
+            "blockSnapshotAccess",
+            "blockGuardProtected",
+            "blockScopeInvalid",
+            "blockInputMethodBusy",
+        ] {
+            assert!(
+                !refusal_code(phase, E_ACCESSDENIED, Mutation::NotAttempted, "")
+                    .starts_with("blockUnavailable:")
+            );
+        }
+        for effect in [Mutation::Changed, Mutation::Uncertain] {
+            assert!(
+                !refusal_code("blockEditEmpty", TF_E_DISCONNECTED, effect, "")
+                    .starts_with("blockUnavailable:")
+            );
+        }
+        assert!(
+            !refusal_code("blockEditEmpty", E_ACCESSDENIED, Mutation::NotAttempted, "")
+                .starts_with("blockUnavailable:")
+        );
+        assert!(
+            !refusal_code(
+                "blockDocumentRetired",
+                TF_E_DISCONNECTED,
+                Mutation::NotAttempted,
+                ""
+            )
+            .starts_with("blockUnavailable:")
+        );
+    }
 
     #[test]
     fn popped_context_cannot_revive_even_when_the_same_object_is_pushed_again() {

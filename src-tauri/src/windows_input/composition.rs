@@ -161,6 +161,8 @@ pub(crate) struct WriteFailure {
     pub mutation: Mutation,
     /// The body write completed; only its independent tracking failed.
     pub tracking_failed: bool,
+    /// A settled refusal of the old range, not permission for a fresh target.
+    pub scope_unavailable: bool,
 }
 impl WriteFailure {
     fn not_attempted(code: &str) -> Self {
@@ -168,6 +170,7 @@ impl WriteFailure {
             error: Error::new(code),
             mutation: Mutation::NotAttempted,
             tracking_failed: false,
+            scope_unavailable: false,
         }
     }
     fn uncertain(error: Error) -> Self {
@@ -175,6 +178,7 @@ impl WriteFailure {
             error,
             mutation: Mutation::Uncertain,
             tracking_failed: false,
+            scope_unavailable: false,
         }
     }
 }
@@ -194,6 +198,7 @@ fn update_receipt(
                 error: Error::new("compositionPartial"),
                 mutation: reply.mutation,
                 tracking_failed: true,
+                scope_unavailable: true,
             });
         }
         return Ok(reply.block);
@@ -209,6 +214,9 @@ fn update_receipt(
         error: Error::new(error),
         mutation: reply.mutation,
         tracking_failed,
+        scope_unavailable: (reply.mutation == Mutation::NotAttempted
+            && reply.code.starts_with("draftOwnershipTerminated:"))
+            || (reply.mutation == Mutation::Changed && tracking_failed),
     })
 }
 pub(crate) struct FinishOutcome {
@@ -254,12 +262,14 @@ pub(crate) enum ReacquireOutcome {
         snapshot: BlockSnapshot,
     },
     AwaitingProof,
+    Unavailable,
     Invalidated,
     Uncertain,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlockRefusal {
     AwaitingProof,
+    Unavailable,
     Invalidated,
     Uncertain,
 }
@@ -272,6 +282,8 @@ pub(crate) fn block_refusal(reply: &Reply) -> BlockRefusal {
         || reply.code.ends_with(":80040500")
     {
         BlockRefusal::AwaitingProof
+    } else if reply.code.starts_with("blockUnavailable:") {
+        BlockRefusal::Unavailable
     } else {
         BlockRefusal::Invalidated
     }
@@ -312,6 +324,7 @@ impl Connection {
         if !reply.applied {
             return Ok(match block_refusal(&reply) {
                 BlockRefusal::AwaitingProof => ReacquireOutcome::AwaitingProof,
+                BlockRefusal::Unavailable => ReacquireOutcome::Unavailable,
                 BlockRefusal::Invalidated => ReacquireOutcome::Invalidated,
                 BlockRefusal::Uncertain => ReacquireOutcome::Uncertain,
             });
@@ -697,10 +710,10 @@ impl Drop for Apartment {
     }
 }
 struct Host {
-    revoking_primary: Option<(u64, u64)>,
+    revoking_primary: Option<(u64, u64, u64)>,
     block: Option<BlockSnapshot>,
     supports_observation: bool,
-    abandoned_optional: Vec<(u64, u64)>,
+    abandoned_optional: Vec<(u64, u64, u64)>,
     optional_disabled: bool,
     observer_reversal: u64,
     sink: Option<Arc<ObservationSink>>,
@@ -1301,7 +1314,8 @@ impl Host {
                         self.turn,
                         (self.operation, self.revision),
                         &self.abandoned_optional,
-                    ) && self.revoking_primary != Some((reply.operation, reply.revision))
+                    ) && self.revoking_primary
+                        != Some((reply.turn, reply.operation, reply.revision))
                         || self.receipt_inbox.len() >= 4
                     {
                         return Err(Error::new("compositionProtocol"));
@@ -1448,8 +1462,7 @@ impl Host {
             if let Some(frame) = frame {
                 let reply: Reply = serde_json::from_slice(&frame)
                     .map_err(|_| Error::new("compositionProtocol"))?;
-                if reply.engine != self.engine || reply.task != self.task || reply.turn != self.turn
-                {
+                if reply.engine != self.engine || reply.task != self.task {
                     return Err(Error::new("compositionProtocol"));
                 }
                 // Only a timed-out optional read may finish after its caller
@@ -1457,12 +1470,16 @@ impl Host {
                 // write. Unknown/core mismatches remain protocol failures.
                 if discard_optional_reply(
                     &mut self.abandoned_optional,
+                    reply.turn,
                     reply.operation,
                     reply.revision,
                 ) {
                     self.retained_ack = ReceiptKey::from_frame(&frame);
                     self.acknowledge_receipt()?;
                     continue;
+                }
+                if reply.turn != self.turn {
+                    return Err(Error::new("compositionProtocol"));
                 }
                 if revocation
                     .as_ref()
@@ -1530,7 +1547,7 @@ impl Host {
                     text: String::new(),
                     prefix: None,
                 };
-                self.revoking_primary = Some((request.operation, request.revision));
+                self.revoking_primary = Some((request.turn, request.operation, request.revision));
                 self.pipe
                     .send(
                         &serde_json::to_vec(&revoke)
@@ -1545,15 +1562,21 @@ impl Host {
                         if self.abandoned_optional.len() >= 16 {
                             return Err(Error::new("compositionProtocol"));
                         }
-                        self.abandoned_optional
-                            .push((revoke.operation, revoke.revision));
+                        self.abandoned_optional.push((
+                            revoke.turn,
+                            revoke.operation,
+                            revoke.revision,
+                        ));
                     }
                     self.revoking_primary = None;
                     return Ok(reply);
                 }
                 if optional {
-                    self.abandoned_optional
-                        .push((request.operation, request.revision));
+                    self.abandoned_optional.push((
+                        request.turn,
+                        request.operation,
+                        request.revision,
+                    ));
                     // Never evict an outstanding identity to make room for
                     // another read. Stop optional work at the fixed bound.
                     self.optional_disabled = self.abandoned_optional.len() >= 16;
@@ -1678,6 +1701,7 @@ impl Host {
                         error,
                         mutation: Mutation::NotAttempted,
                         tracking_failed: false,
+                        scope_unavailable: false,
                     }
                 }
             })
@@ -1694,10 +1718,11 @@ impl Host {
             }
         }
         if result.as_ref().err().is_some_and(|e| {
-            !matches!(
-                e.error.code.as_str(),
-                "staleSnapshot" | "editing" | "inputComposition" | "selectionMapping"
-            )
+            !e.scope_unavailable
+                && !matches!(
+                    e.error.code.as_str(),
+                    "staleSnapshot" | "editing" | "inputComposition" | "selectionMapping"
+                )
         }) {
             self.failure = result.as_ref().err().map(|e| e.error.code.clone());
         }
@@ -1866,18 +1891,22 @@ fn pending_business_receipt(
     task: &str,
     turn: u64,
     current: (u64, u64),
-    abandoned: &[(u64, u64)],
+    abandoned: &[(u64, u64, u64)],
 ) -> bool {
     reply.engine == *engine
         && reply.task == task
-        && reply.turn == turn
-        && ((reply.operation, reply.revision) == current
-            || abandoned.contains(&(reply.operation, reply.revision)))
+        && (reply.turn == turn && (reply.operation, reply.revision) == current
+            || abandoned.contains(&(reply.turn, reply.operation, reply.revision)))
 }
-fn discard_optional_reply(abandoned: &mut Vec<(u64, u64)>, operation: u64, revision: u64) -> bool {
+fn discard_optional_reply(
+    abandoned: &mut Vec<(u64, u64, u64)>,
+    turn: u64,
+    operation: u64,
+    revision: u64,
+) -> bool {
     if let Some(index) = abandoned
         .iter()
-        .position(|value| *value == (operation, revision))
+        .position(|value| *value == (turn, operation, revision))
     {
         abandoned.swap_remove(index);
         true
@@ -2035,6 +2064,34 @@ mod tests {
         reply.mutation = Mutation::Uncertain;
         assert_eq!(block_refusal(&reply), BlockRefusal::Uncertain);
     }
+
+    #[test]
+    fn unavailable_old_range_is_distinct_from_a_changed_target() {
+        let mut reply: Reply = serde_json::from_value(serde_json::json!({
+            "engine":{"proxy_instance":uuid::Uuid::new_v4().to_string(),"engine_generation":1},
+            "task":"scope","turn":1,"operation":1,"revision":1,
+            "applied":false,"code":"blockEditEmpty:80040200","mutation":"notAttempted"
+        }))
+        .unwrap();
+        for code in [
+            "blockUnavailable:blockEditEmpty:80040200",
+            "blockUnavailable:blockDocumentFocus:80040200",
+            "blockUnavailable:blockProtectedAnchor:80040200",
+        ] {
+            reply.code = code.into();
+            assert_ne!(block_refusal(&reply), BlockRefusal::Invalidated, "{code}");
+        }
+        reply.code = "draftOwnershipTerminated:80070057".into();
+        let failure = update_receipt(reply.clone(), "周三", None).unwrap_err();
+        assert!(failure.scope_unavailable);
+        assert_eq!(failure.mutation, Mutation::NotAttempted);
+        reply.mutation = Mutation::Uncertain;
+        assert!(
+            !update_receipt(reply, "周三", None)
+                .unwrap_err()
+                .scope_unavailable
+        );
+    }
     #[test]
     fn ack_wait_preserves_current_write_and_late_optional_identity() {
         let engine = EngineBinding {
@@ -2052,7 +2109,7 @@ mod tests {
             &task,
             1,
             (11, 3),
-            &[(10, 2)]
+            &[(1, 10, 2)]
         ));
         reply.operation = 10;
         reply.revision = 2;
@@ -2062,7 +2119,7 @@ mod tests {
             &task,
             1,
             (11, 3),
-            &[(10, 2)]
+            &[(1, 10, 2)]
         ));
         reply.operation = 12;
         assert!(!pending_business_receipt(
@@ -2071,7 +2128,7 @@ mod tests {
             &task,
             1,
             (11, 3),
-            &[(10, 2)]
+            &[(1, 10, 2)]
         ));
         reply.operation = 11;
         reply.revision = 3;
@@ -2082,7 +2139,7 @@ mod tests {
             &task,
             1,
             (11, 3),
-            &[(10, 2)]
+            &[(1, 10, 2)]
         ));
     }
 
@@ -2220,11 +2277,11 @@ mod tests {
     #[test]
     fn late_optional_receipt_is_discarded_without_accepting_unknown_write_receipts() {
         // ObserveStart(2,0) exceeded its budget; Update(3,1) is now waiting.
-        let mut abandoned = vec![(2, 0)];
+        let mut abandoned = vec![(1, 2, 0)];
         let frames = [(2, 0), (3, 1)];
         let mut accepted = vec![];
         for (operation, revision) in frames {
-            if !discard_optional_reply(&mut abandoned, operation, revision) {
+            if !discard_optional_reply(&mut abandoned, 1, operation, revision) {
                 assert_eq!((operation, revision), (3, 1));
                 accepted.push((operation, revision));
             }
@@ -2232,9 +2289,10 @@ mod tests {
         assert_eq!(accepted, vec![(3, 1)]);
         assert!(abandoned.is_empty());
         // A duplicate or a wrong revision is not silently swallowed.
-        assert!(!discard_optional_reply(&mut abandoned, 2, 0));
-        abandoned.push((4, 1));
-        assert!(!discard_optional_reply(&mut abandoned, 4, 2));
-        assert_eq!(abandoned, vec![(4, 1)]);
+        assert!(!discard_optional_reply(&mut abandoned, 1, 2, 0));
+        abandoned.push((1, 4, 1));
+        assert!(!discard_optional_reply(&mut abandoned, 2, 4, 1));
+        assert!(!discard_optional_reply(&mut abandoned, 1, 4, 2));
+        assert_eq!(abandoned, vec![(1, 4, 1)]);
     }
 }

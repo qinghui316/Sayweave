@@ -317,6 +317,7 @@ async fn tracking_failure_preserves_the_completed_body_and_never_rebinds_or_repl
             error: Error::new("compositionPartial"),
             mutation: Mutation::Changed,
             tracking_failed: true,
+            scope_unavailable: false,
         }))
         .unwrap();
     acknowledge(&actor, &mut state).await;

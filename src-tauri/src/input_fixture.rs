@@ -1027,6 +1027,7 @@ fn main() {
                         Some("ArrowLeft") => Some(VK_LEFT),
                         Some("End") => Some(VK_END),
                         Some("ShiftLeft") => Some(VK_LSHIFT),
+                        Some("ControlLeft") => Some(VK_LCONTROL),
                         Some("ShiftRight") => Some(VK_RSHIFT),
                         Some("Escape") => Some(VK_ESCAPE),
                         Some("Enter") => Some(VK_RETURN),

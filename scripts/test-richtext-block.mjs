@@ -361,6 +361,52 @@ async function runActor({page,pid,focus,start,read:readWhole,settled:settledWhol
  };
  try{
   report.actorIdentity=await receive();
+  const continuity=process.env.SAYWEAVE_BLOCK_CONTINUITY;
+  if(continuity){
+   if(!['prediction','delete-empty'].includes(continuity)||sentinels)throw Error('Explicit empty-field continuity scenario required');
+   report.continuityScenario=continuity;
+   for(const [revision,text]of [[1,'周'],[2,'周三'],[3,'周三开会']]){
+    segments[0]={id:1,revision,text,confirmed:false};
+    await command({action:'asr',segments});await expectBody('continuity stream '+revision,text);
+   }
+   if(continuity==='delete-empty'){
+    await command({action:'edited'});
+    const repeated=process.env.SAYWEAVE_BLOCK_DELETE_KEYS==='repeat';
+    const keys=repeated?Array.from({length:4},()=>['Backspace',true]).concat([['Backspace',false]]):[['ControlLeft',true],['KeyA',true],['KeyA',false],['ControlLeft',false],['Backspace',true],['Backspace',false]];
+    report.continuityDeletion=repeated?'held-repeated-backspace':'selected-backspace';
+    let remaining='周三开会';
+    for(const [key,down]of keys){
+     const result=await focus({action:'fixture-key',process:pid,key,down});
+     if(!result.keyResult?.accepted)throw Error('Guarded empty-field deletion failed');
+     if(repeated&&down){remaining=remaining.slice(0,-1);await expectBody('continuity held deletion '+remaining.length,remaining);}
+    }
+    await expectBody('continuity actual deletion','');
+    segments[0].confirmed=true;
+    segments.push({id:2,revision:1,text:'新的安排',confirmed:true});
+    await command({action:'asr',segments});await expectBody('continuity after delete','新的安排。');
+   }else{
+    await command({action:'edited'});
+    for(const key of ['ArrowLeft','ArrowLeft','Backspace'])for(const down of [true,false]){
+     const result=await focus({action:'fixture-key',process:pid,key,down});
+     if(!result.keyResult?.accepted)throw Error('Guarded new-block editing failed');
+    }
+    await expectBody('continuity new-block deletion','周开会');
+    const typed=await focus({action:'fixture-text',process:pid,text:'五'});
+    if(!typed.keyResult?.accepted)throw Error('Guarded new-block text edit failed');
+    await expectBody('continuity new-block edit','周五开会');
+    segments[0].confirmed=true;
+    segments.push({id:2,revision:1,text:'地点在上海',confirmed:true});
+    await command({action:'asr',segments});await expectBody('continuity new-block polish','周五开会，地点在上海。');
+   }
+   report.actorDelivery=await command({action:'finish'});
+   const final=continuity==='prediction'?'周五开会，地点在上海。':'新的安排。';
+   await expectBody('continuity final settled',final);
+   if(report.actorDelivery.error||report.actorDelivery.resultOnly||report.actorDelivery.delivery?.restoreError)throw Error('Continuity finished without safe direct input');
+   actor.stdin.end();
+   if(!exited)await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Continuity cleanup timeout')),5000);actor.once('exit',code=>{clearTimeout(timer);if(code===0)resolve();else reject(Error('Continuity actor failed: '+diagnostics));});});
+   report.actorPassed=true;
+   return;
+  }
   const earlyEdit=process.env.SAYWEAVE_BLOCK_EARLY_EDIT==='1';
   const firstOnly=process.env.SAYWEAVE_BLOCK_FIRST_ONLY==='1';
   const commitEarly=process.env.SAYWEAVE_BLOCK_COMMIT_EARLY==='1';

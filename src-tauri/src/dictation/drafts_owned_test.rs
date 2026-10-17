@@ -9,6 +9,7 @@ struct ActualBodyReader {
     automation: windows::Win32::UI::Accessibility::IUIAutomation,
     field: windows::Win32::UI::Accessibility::IUIAutomationElement,
     anchor: windows_input::Anchor,
+    unprefixed: bool,
     _apartment: ActualBodyApartment,
 }
 struct ActualBodyApartment;
@@ -34,9 +35,16 @@ impl ActualBodyReader {
                 automation,
                 field,
                 anchor: anchor.clone(),
+                unprefixed: std::env::var("SAYWEAVE_ACTOR_EMPTY_FIELD").as_deref() == Ok("1"),
                 _apartment: apartment,
             };
-            reader.read()?;
+            let initial = reader.read()?;
+            if reader.unprefixed && !initial.chars().all(|c| matches!(c, '\r' | '\n')) {
+                return Err(windows::core::Error::new(
+                    windows::Win32::Foundation::E_ACCESSDENIED,
+                    "explicit empty test field was not empty at admission",
+                ));
+            }
             Ok(reader)
         }
     }
@@ -130,7 +138,8 @@ impl ActualBodyReader {
                 .GetText(1025)
                 .map_err(|e| diagnostic("range text", e))?
                 .to_string();
-            if text.encode_utf16().count() > 1024 || !text.starts_with("测试：") {
+            if text.encode_utf16().count() > 1024 || !self.unprefixed && !text.starts_with("测试：")
+            {
                 return Err(reject(&format!(
                     "actual-body prefix/size: units={}",
                     text.encode_utf16().count()
@@ -354,11 +363,25 @@ async fn richtext_actor() {
     let draft = Draft::begin(task.clone(), 1, anchor.clone(), gate)
         .await
         .unwrap();
-    let provider = Fixture::start(vec![
-        response("下周一上午开会"),
-        response("下周一下午三点开会"),
-        response("下周一下午四点线上开会"),
-    ]);
+    let replies = std::env::var("SAYWEAVE_ACTOR_MODEL_REPLIES")
+        .ok()
+        .map(|raw| {
+            let replies: Vec<String> = serde_json::from_str(&raw).expect("owned model reply list");
+            assert!(
+                !replies.is_empty()
+                    && replies.len() <= 4
+                    && replies.iter().all(|text| text.len() <= 1024)
+            );
+            replies.into_iter().map(|text| response(&text)).collect()
+        })
+        .unwrap_or_else(|| {
+            vec![
+                response("下周一上午开会"),
+                response("下周一下午三点开会"),
+                response("下周一下午四点线上开会"),
+            ]
+        });
+    let provider = Fixture::start(replies);
     let root = tempfile::tempdir().unwrap();
     let data = crate::data::DataWorker::start(root.path().to_owned()).unwrap();
     let mut context = Context::fixture(provider.provider.clone(), provider.input(), data.clone());
