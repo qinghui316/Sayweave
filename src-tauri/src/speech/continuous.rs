@@ -59,6 +59,7 @@ pub struct Control {
     ready: watch::Sender<u64>,
     stopping: Arc<AtomicBool>,
     input_held: Arc<AtomicBool>,
+    input_detached: Arc<AtomicBool>,
     transition: Arc<Mutex<()>>,
     draft_activity: Arc<AtomicU64>,
     draft_armed: Arc<AtomicBool>,
@@ -77,6 +78,7 @@ impl Control {
             ready,
             stopping: Arc::new(AtomicBool::new(false)),
             input_held: Arc::new(AtomicBool::new(false)),
+            input_detached: Arc::new(AtomicBool::new(false)),
             transition: Arc::new(Mutex::new(())),
             draft_activity: Arc::new(AtomicU64::new(0)),
             draft_armed: Arc::new(AtomicBool::new(false)),
@@ -97,6 +99,9 @@ impl Control {
         let Ok(_transition) = self.transition.lock() else {
             return;
         };
+        if self.input_detached.load(Ordering::Acquire) {
+            return;
+        }
         self.input_held.store(true, Ordering::Release);
         self.audio.set(Route::default());
     }
@@ -104,7 +109,7 @@ impl Control {
         let Ok(_transition) = self.transition.lock() else {
             return;
         };
-        if self.stopping() {
+        if self.stopping() || self.input_detached.load(Ordering::Acquire) {
             return;
         }
         self.input_held.store(false, Ordering::Release);
@@ -121,7 +126,7 @@ impl Control {
         let Ok(_transition) = self.transition.lock() else {
             return;
         };
-        if self.stopping() {
+        if self.stopping() || self.input_detached.load(Ordering::Acquire) {
             return;
         }
         self.input_held.store(false, Ordering::Release);
@@ -139,9 +144,31 @@ impl Control {
         self.stopping.load(Ordering::Acquire)
     }
     pub fn draft_started(&self, activity: u64) {
+        let Ok(_transition) = self.transition.lock() else {
+            return;
+        };
+        if self.stopping() || self.input_detached.load(Ordering::Acquire) {
+            return;
+        }
         self.draft_activity.store(activity, Ordering::Release);
         self.draft_armed.store(true, Ordering::Release);
         self.audio.editing_gate.store(true, Ordering::Release);
+    }
+    /// Retire external input permission without retiring the recognition turn.
+    /// Late editing callbacks cannot gate PCM or replace its source afterwards.
+    pub(crate) fn detach_input(&self) {
+        let Ok(_transition) = self.transition.lock() else {
+            return;
+        };
+        self.input_detached.store(true, Ordering::Release);
+        self.input_held.store(false, Ordering::Release);
+        self.audio.editing_gate.store(false, Ordering::Release);
+        if !self.stopping() {
+            let route = *self.requested.borrow();
+            if route.turn != 0 && *self.ready.borrow() == route.turn {
+                self.audio.set(route);
+            }
+        }
     }
     pub fn handoff_started(&self) {
         self.handed_off.store(true, Ordering::Release);
@@ -604,6 +631,79 @@ impl Drop for Continuous {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn detached_delivery_keeps_pcm_on_the_same_socket_through_focus_changes() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let evidence = Arc::new(AtomicU64::new(3));
+            let control = Control::new(evidence.clone());
+            let route = Route {
+                turn: 1,
+                activity: 3,
+            };
+            control.resume(1, 3);
+            control.enabled(route);
+            control.draft_started(3);
+            let mut readiness = control.readiness();
+            let _ = readiness.borrow_and_update();
+            let (first, mut peer) = RecognitionSession::controlled();
+            let mut stream = Continuous::run(first, control.clone(), route, |_| async {
+                panic!("delivery retirement must retain the recognition socket")
+            });
+            stream
+                .send_pcm(control.audio.current(), &[100, -100])
+                .await
+                .unwrap();
+            assert_eq!(peer.audio().await, [100, -100]);
+            evidence.store(4, Ordering::Release);
+            assert_eq!(control.audio.current(), 0);
+            control.hold_input();
+            control.detach_input();
+            assert!(!control.stopping());
+            // Old input callbacks and later typing cannot create a new source
+            // or silence a session which now has no external writing owner.
+            control.hold_input();
+            control.resume(2, 4);
+            control.resume_retained(2, 4);
+            control.draft_started(4);
+            evidence.store(5, Ordering::Release);
+            assert_eq!(control.audio.current(), 1);
+            assert_eq!(*control.requested.borrow(), route);
+            assert!(!readiness.has_changed().unwrap());
+            stream
+                .send_pcm(control.audio.current(), &[200, -200])
+                .await
+                .unwrap();
+            assert_eq!(peer.audio().await, [200, -200]);
+            let (finished, ()) = tokio::join!(stream.finish(), peer.finished_audio());
+            finished.unwrap();
+            peer.events.send(Ok(Event::Finished)).await.unwrap();
+            while !matches!(
+                stream.events.recv().await.unwrap().unwrap(),
+                StreamEvent::Finished
+            ) {}
+        })
+        .await
+        .unwrap();
+    }
+    #[test]
+    fn detaching_after_finish_cannot_reopen_audio() {
+        let control = Control::new(Arc::new(AtomicU64::new(0)));
+        control.resume(1, 0);
+        control.enabled(Route {
+            turn: 1,
+            activity: 0,
+        });
+        control.hold_input();
+        control.request_finish();
+        control.detach_input();
+        control.enabled(Route {
+            turn: 2,
+            activity: 0,
+        });
+        control.resume_retained(1, 0);
+        assert!(control.stopping());
+        assert_eq!(control.audio.current(), 0);
+    }
     #[test]
     fn retained_connection_ready_cannot_reopen_audio_during_proof() {
         let control = Control::new(Arc::new(AtomicU64::new(0)));

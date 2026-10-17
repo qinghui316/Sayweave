@@ -81,7 +81,7 @@ impl ProviderSummary {
 pub(super) unsafe fn capture(
     context: &ITfContext,
     range: &ITfRange,
-    field: &initial_selection::FocusIdentity,
+    field: &BlockScope,
     data: &Rc<RefCell<Data>>,
     ec: u32,
     cause: (&'static str, &str, Option<HRESULT>),

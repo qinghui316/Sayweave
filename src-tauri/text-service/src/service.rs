@@ -1822,15 +1822,21 @@ fn lease(
         if manager.GetFocus()?.GetTop()? != *context {
             return Err(failure(TF_E_DISCONNECTED));
         }
-        let mut pid = 0;
-        GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
-        if pid != std::process::id() {
-            return Err(failure(TF_E_DISCONNECTED));
-        }
         let view = context.GetActiveView()?.GetWnd()?;
-        if !view.0.is_null() && GetAncestor(view, GA_ROOT) != GetForegroundWindow() {
+        let focus = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus();
+        let mut pid = 0;
+        let thread = GetWindowThreadProcessId(focus, Some(&mut pid));
+        if focus.0.is_null()
+            || pid != std::process::id()
+            || thread != windows::Win32::System::Threading::GetCurrentThreadId()
+            || GetAncestor(focus, GA_ROOT) != GetForegroundWindow()
+            || (!view.0.is_null() && GetAncestor(view, GA_ROOT) != GetForegroundWindow())
+        {
             return Err(failure(TF_E_DISCONNECTED));
         }
+        // The focused TSF document and local editing HWND establish the
+        // endpoint. GetWnd may omit an HWND; a returned contradictory view
+        // is still rejected. The enclosing app need not share this process.
         if context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0 {
             return Err(failure(TF_E_READONLY));
         }

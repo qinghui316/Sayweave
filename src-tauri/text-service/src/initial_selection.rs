@@ -102,7 +102,12 @@ impl FocusIdentity {
                     return Err(error);
                 }
                 let root = GetAncestor(window, GA_ROOT);
-                if root == window || GetWindowThreadProcessId(root, None) != GetCurrentThreadId() {
+                if root == window {
+                    // A generic CLIENT without an editable provider is still
+                    // unavailable evidence, not a protected-field verdict.
+                    return Err(error);
+                }
+                if !Self::focused_root(root) {
                     return Err(E_ACCESSDENIED.into());
                 }
                 Self::focused_object(root)
@@ -112,6 +117,17 @@ impl FocusIdentity {
                 class,
                 object: Some(object),
             })
+        }
+    }
+    unsafe fn focused_root(root: HWND) -> bool {
+        unsafe {
+            let focus = GetFocus();
+            let mut process = 0;
+            !focus.0.is_null()
+                && GetWindowThreadProcessId(focus, Some(&mut process)) == GetCurrentThreadId()
+                && process == GetCurrentProcessId()
+                && GetAncestor(focus, GA_ROOT) == root
+                && GetForegroundWindow() == root
         }
     }
     unsafe fn focused_object(window: HWND) -> Result<FieldIdentity> {
@@ -239,14 +255,14 @@ unsafe fn field_identity(
             FragmentIdentity::Runtime(id)
         } else {
             // A window-hosted top-level provider has no runtime ID. Bind the
-            // fragment to its proven same-thread native root, never to text.
+            // fragment to the proven root of this thread's actual focus, never to text.
             let raw: IRawElementProviderSimple = root.cast()?;
             let handle = i32::try_from(&raw.GetPropertyValue(UIA_NativeWindowHandlePropertyId)?)?
                 as u32 as usize;
             let native = HWND(handle as *mut _);
             if handle == 0
                 || native != GetAncestor(window, GA_ROOT)
-                || GetWindowThreadProcessId(native, None) != GetCurrentThreadId()
+                || !FocusIdentity::focused_root(native)
             {
                 return Err(E_ACCESSDENIED.into());
             }

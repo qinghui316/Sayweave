@@ -772,6 +772,7 @@ impl DictationCoordinator {
                 // Every admitted range has a cleanup owner, including the
                 // cancelled/failed-journal path which may never write text.
                 let manager = draft.clone();
+                let projection = draft.clone();
                 let handle = app.clone();
                 let task_id = id.clone();
                 tauri::async_runtime::spawn(async move {
@@ -779,7 +780,12 @@ impl DictationCoordinator {
                         .maintain(move |presentation| {
                             handle
                                 .state::<DictationCoordinator>()
-                                .update(&handle, &task_id, |s| s.presentation = presentation);
+                                .update(&handle, &task_id, |s| {
+                                    s.presentation = presentation;
+                                    if projection.result_only() {
+                                        s.input_route = InputRoute::ResultOnly;
+                                    }
+                                });
                         })
                         .await;
                 });
@@ -908,10 +914,25 @@ impl DictationCoordinator {
                     s.presentation = Presentation::Recognizing;
                 });
             }
+            let mut automatic_result_copy = false;
             #[cfg(windows)]
             if let Some(report) = draft.as_ref().and_then(|d| d.report()) {
+                automatic_result_copy = report.result_only
+                    && !report.cancelled
+                    && !report.result_raw.trim().is_empty()
+                    && !gate.cancelled()
+                    && coordinator.active.lock().is_ok_and(|a| {
+                        a.as_ref()
+                            .is_some_and(|a| a.id == id && a.explicit_end.load(Ordering::Acquire))
+                    })
+                    && recognized_snapshot
+                        .as_ref()
+                        .is_some_and(|s| s.phase == Phase::Completed);
                 coordinator.update(&app, &id, |s| {
-                    if !report.text.is_empty() || report.cancelled {
+                    if report.result_only && !report.cancelled {
+                        s.text = report.result_raw;
+                        s.input_route = InputRoute::ResultOnly;
+                    } else if !report.text.is_empty() || report.cancelled {
                         s.text = report.text;
                     }
                 });
@@ -1064,6 +1085,30 @@ impl DictationCoordinator {
             });
             app.state::<WindowsInputService>().forget(id.clone());
             coordinator.release(&app, &id).await;
+            if automatic_result_copy
+                && let Ok(snapshot) = coordinator.snapshot()
+                && snapshot.task_id.as_deref() == Some(&id)
+                && let Some(presentation) = snapshot.presentation_id
+                && let Ok((text, copy_gate)) = coordinator.begin_copy(&id, &presentation)
+            {
+                // The same bound gate as explicit Copy: dismissal or a newer
+                // task can still cancel the queued clipboard write.
+                let result = app
+                    .state::<WindowsInputService>()
+                    .copy_bound(text, copy_gate)
+                    .await;
+                log::info!(target:"sayweave", "operation=dictation_result_copy task_id={id} result={} error={}", if result.is_ok(){"copied"}else{"failed"}, result.as_ref().err().map_or("none",|e|e.code.as_str()));
+                if result
+                    .as_ref()
+                    .is_err_and(|e| e.code != "cancelled" && e.code != "staleSession")
+                {
+                    coordinator.update(&app, &id, |s| {
+                        if s.presentation_id.as_deref() == Some(&presentation) {
+                            s.error.get_or_insert_with(|| "copyFailed".into());
+                        }
+                    });
+                }
+            }
         });
         result
     }
@@ -1481,6 +1526,13 @@ pub async fn dictation_copy(
     app.state::<WindowsInputService>()
         .copy_bound(text, gate)
         .await?;
+    service.update(&app, &task_id, |s| {
+        if s.presentation_id.as_deref() == Some(&presentation_id)
+            && s.error.as_deref() == Some("copyFailed")
+        {
+            s.error = None;
+        }
+    });
     let visibility = crate::OVERLAY_VISIBILITY.load(Ordering::Acquire);
     service.schedule_hide(&app, &task_id, presentation_id, visibility, 600);
     Ok(())

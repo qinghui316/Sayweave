@@ -1232,3 +1232,35 @@ pub(super) fn observation_run(process: u32) -> Result<(), String> {
     input.shutdown();
     result
 }
+
+// Read-only assertion against the foreground fixture explicitly named by its
+// controller. Exercises production capture/endpoint identity without writing.
+pub(super) fn endpoint(root: u32, editor: u32) -> Result<(), String> {
+    let captured = anchor().map_err(|e| e.code)?;
+    if captured.process != root || captured.editor.process != editor || root == editor {
+        return Err("root/editor capture mismatch".into());
+    }
+    if editor_endpoint(&captured).map_err(|e| e.code)? != (editor, captured.editor.thread) {
+        return Err("actual editor endpoint was not selected".into());
+    }
+    let mut stale = captured.clone();
+    stale.editor.lifetime ^= 1;
+    if editor_endpoint(&stale).is_ok() {
+        return Err("stale editor lifetime accepted".into());
+    }
+    let mut unrelated = captured.clone();
+    unrelated.editor.window = unrelated.window;
+    if editor_endpoint(&unrelated).is_ok() {
+        return Err("root substituted for editor".into());
+    }
+    let mut stale_root = captured.clone();
+    stale_root.lifetime ^= 1;
+    if editor_endpoint(&stale_root).is_ok() {
+        return Err("stale root lifetime accepted".into());
+    }
+    println!(
+        "endpoint capture root={root} editor={editor} thread={} lifetimes/relation=true stale/substitution=rejected",
+        captured.editor.thread
+    );
+    Ok(())
+}

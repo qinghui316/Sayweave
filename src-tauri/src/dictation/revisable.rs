@@ -74,6 +74,9 @@ impl State {
         self.block.stop();
         self.stopped = true;
     }
+    pub(super) fn uncertain(&self) -> bool {
+        self.uncertain
+    }
     pub fn expire(&mut self) {
         self.stop();
         // A read raced by continued user edits cannot extend the end budget.
@@ -485,6 +488,10 @@ fn archive_block(
     log::info!(target:"sayweave", "operation=draft_delivery task_id={} block={} certain={} visible_revision={}",actor.task,r.block.id(),certain,r.block.confirmed().0);
     s.report.units.push(record);
 }
+pub(super) fn archive_detached(actor: &SessionDraft, s: &mut super::State, r: &mut State) {
+    let text = r.block.confirmed().1.to_owned();
+    archive_block(actor, s, r, &text, !r.uncertain && !r.cleanup_failed);
+}
 fn checkpoint(actor: &SessionDraft, r: &State, state: &str) {
     if let Some(context) = &actor.context {
         let (visible_revision, visible_text) = r.block.confirmed();
@@ -709,7 +716,7 @@ pub(super) fn schedule(
                                 .await,
                         );
                     }
-                    NativeValue::Replaced(
+                    NativeValue::GuardedReplaced(
                         draft
                             .replace_guarded(sequence, body, Some(source), Some(permit))
                             .await,
@@ -853,19 +860,35 @@ pub(super) fn native_done(
             }),
             value,
         ) => {
+            let mut mutation = Mutation::Uncertain;
             let result = match value {
-                NativeValue::TrackedReplaced(result) => result.and_then(|snapshot| {
-                    if snapshot.id != r.block.id() {
-                        return Err(Error::new("compositionProtocol"));
+                NativeValue::TrackedReplaced(Err(failure))
+                | NativeValue::GuardedReplaced(Err(failure)) => {
+                    if failure.mutation == Mutation::Changed && failure.tracking_failed {
+                        // SetText completed before tracking failed. Preserve
+                        // that submission without granting a range or replay.
+                        let _ = r.block.acknowledge(*revision, text.clone());
+                        s.written_raw = raw.clone();
+                        s.report.recovery_raw = s.latest.text.clone();
+                        s.record_failure(&actor.task, failure.error.code);
+                        return None;
                     }
-                    // The native tracker already observed any edits made while
-                    // this receipt was in flight. Keep its identity even when
-                    // the old write permit has since been revoked.
-                    r.bound = true;
-                    r.snapshot = Some(snapshot);
-                    Ok(())
-                }),
+                    mutation = failure.mutation;
+                    Err(failure.error)
+                }
+                NativeValue::TrackedReplaced(Ok(snapshot)) => {
+                    if snapshot.id != r.block.id() {
+                        Err(Error::new("compositionProtocol"))
+                    } else {
+                        // Retain the native identity even if physical editing
+                        // revoked the write permit while this receipt travelled.
+                        r.bound = true;
+                        r.snapshot = Some(snapshot);
+                        Ok(())
+                    }
+                }
                 NativeValue::Replaced(result) => result,
+                NativeValue::GuardedReplaced(Ok(())) => Ok(()),
                 _ => Err(Error::new("compositionProtocol")),
             };
             match result {
@@ -923,7 +946,7 @@ pub(super) fn native_done(
                     s.paused_at = Some(Instant::now());
                 }
                 Err(error) => {
-                    r.uncertain = true;
+                    r.uncertain |= mutation != Mutation::NotAttempted;
                     s.report.recovery_raw = s.latest.text.clone();
                     s.record_failure(&actor.task, error.code);
                 }
@@ -1085,19 +1108,10 @@ pub(super) fn native_done(
                         s.latest.sequence = 0;
                         observe(actor, s, r, latest);
                     } else if *abandon {
-                        let text = r.block.confirmed().1.to_owned();
-                        archive_block(actor, s, r, &text, false);
-                        r.reset_block();
-                        r.offset = 0;
-                        r.sealed_source.clear();
-                        r.absorbed_coverage = None;
-                        r.visible_coverage = None;
-                        r.pending_coverage = None;
-                        r.pending_source = None;
-                        s.turn += 1;
-                        s.latest = NativeTranscript::default();
-                        s.written_raw.clear();
-                        actor.control.pause();
+                        // Original scope is retired. Keep this recognition
+                        // source for ResultOnly; never begin at a new focus.
+                        r.stop();
+                        s.record_failure(&actor.task, "targetChanged".into());
                     }
                 }
                 _ => {
@@ -1165,6 +1179,33 @@ mod tests {
     use super::super::tests::{actor, block_reply, command};
     use super::*;
     use crate::windows_input::composition::Command;
+    #[test]
+    fn invalid_scope_release_does_not_start_an_asr_turn_at_the_new_focus() {
+        let (actor, mut s, _) = actor(None);
+        let mut r = State::new();
+        let body = "原块正文";
+        let snapshot = baseline(&mut r, body);
+        r.snapshot = Some(snapshot);
+        s.latest.text = body.into();
+        s.written_raw = body.into();
+        actor.control.resume(s.turn, s.activity);
+        actor.control.fixture_ready(s.turn, s.activity);
+        let turn = s.turn;
+        native_done(
+            &actor,
+            &mut s,
+            &mut r,
+            &NativeKind::Revisable(Effect::Release { abandon: true }),
+            NativeValue::block(Ok(block_reply(&actor.task, None, true))),
+        );
+        assert_eq!(s.turn, turn);
+        assert_eq!(s.latest.text, body);
+        assert_eq!(s.written_raw, body);
+        assert_eq!(actor.control.audio.current(), turn);
+        assert_eq!(s.stop_error.as_deref(), Some("targetChanged"));
+        assert!(r.stopped);
+        assert!(r.snapshot.is_none());
+    }
     #[test]
     fn resumed_ime_composition_waits_without_failing_and_can_recover_same_turn() {
         let (actor, mut s, _) = actor(None);

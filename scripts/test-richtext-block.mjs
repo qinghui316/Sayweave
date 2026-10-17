@@ -168,19 +168,23 @@ export async function runOwnedTermination({focus,start,report,pid}){
   if(!terminated.terminated)throw Error('Host termination failed '+JSON.stringify(terminated));
   await expectBody('after host events','周三开会');
   source.revision++;source.text='周三开会，不对，改成下周一上午开会';source.confirmed=true;
-  let stopped;
-  try{
-   await command({action:'asr',segments:[source]});
-   const deadline=Date.now()+5000;
-   while(Date.now()<deadline){await new Promise(resolve=>setTimeout(resolve,30));await command({action:'status'});}
-  }catch(error){stopped=String(error);}
-  // v0.1.13 stops on this injected host termination. This verifies the
-  // rollback boundary, not the cause of the historical spontaneous callback.
-  if(!stopped?.includes('actor stopped:'))throw Error('Baseline termination did not stop the actor: '+stopped);
+  await command({action:'asr',segments:[source]});
+  let state;const detachedDeadline=Date.now()+5000;
+  do{
+   await new Promise(resolve=>setTimeout(resolve,30));state=await command({action:'status'});
+  }while(!state.resultOnly&&Date.now()<detachedDeadline);
+  trace.push({label:'delivery detached',...state});
+  if(!state.resultOnly||state.presentation!=='recording'||state.audioRoute!==1)throw Error('Input refusal did not retain the recording route');
   if(!/code=draftOwnershipTerminated:[^\n]+mutation=NotAttempted/.test(diagnostics))throw Error('Exact no-write termination receipt not observed');
   if(diagnostics.includes('operation=draft_reacquire')||diagnostics.includes('operation=draft_reanchor'))throw Error('Unexpected automatic recovery after host termination');
-  await expectBody('after baseline stop and host events','周三开会');
-  report.terminationBaseline={injected:true,stopped:true,retained:'周三开会',naturalCauseProven:false};
+  await expectBody('after delivery detach and host events','周三开会');
+  source.revision++;source.text+='，再补充一个测试';
+  await command({action:'asr',segments:[source]});
+  await expectBody('later recognition cannot replay into the old field','周三开会');
+  const result=await command({action:'finish'});trace.push({label:'explicit finish',...result});
+  if(!result.finished||!result.resultOnly||result.resultRaw!==source.text)throw Error('Explicit finish lost the complete recording result');
+  await expectBody('after finish and host events','周三开会');
+  report.terminationDelivery={injected:true,recordingRetained:true,retained:'周三开会',result:result.resultRaw,native:result.delivery,naturalCauseProven:false};
  }finally{
   if(!ended){actor.stdin.end();await new Promise(resolve=>{const timer=setTimeout(resolve,5500);actor.once('exit',()=>{clearTimeout(timer);resolve();});});}
   report.actorDiagnostics=diagnostics;

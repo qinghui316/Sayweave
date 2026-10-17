@@ -61,6 +61,10 @@ pub fn observation_acceptance(process: u32) -> Result<(), String> {
     windows_input::observation_checks(process)
 }
 #[cfg(feature = "desktop-acceptance")]
+pub fn endpoint_acceptance(root: u32, editor: u32) -> Result<(), String> {
+    windows_input::endpoint_checks(root, editor)
+}
+#[cfg(feature = "desktop-acceptance")]
 #[tauri::command]
 fn acceptance_exit(app: tauri::AppHandle, window: WebviewWindow) -> Result<(), RuntimeError> {
     if window.label() != "main"

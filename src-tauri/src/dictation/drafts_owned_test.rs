@@ -249,9 +249,9 @@ async fn richtext_actor() {
                     cancel.send_replace(if stopped { 2 } else { 1 });
                     let delivery = manager.finish(&latest, if stopped { Finish::Abort } else { Finish::Commit }).await;
                     let report = manager.report().ok_or("missing actor report")?;
-                    emit(serde_json::json!({"finished":true,"delivery":delivery,"text":report.text,"error":report.error,"requests":provider.seen.lock().unwrap().len()}));
+                    emit(serde_json::json!({"finished":true,"delivery":delivery,"text":report.text,"error":report.error,"resultOnly":report.result_only,"resultRaw":report.result_raw,"requests":provider.seen.lock().unwrap().len()}));
                     finished = true;
-                    if report.error.as_deref().is_some_and(|error| !stopped || error != "cancelled") || delivery.restore_error || delivery.submission == Submission::Uncertain {
+                    if !report.result_only && (report.error.as_deref().is_some_and(|error| !stopped || error != "cancelled") || delivery.restore_error || delivery.submission == Submission::Uncertain) {
                         return Err("actor delivery was not safely settled".into());
                     }
                     return Ok(());
@@ -261,7 +261,7 @@ async fn richtext_actor() {
             if *cancel.borrow() > 0 || control.stopping() {
                 return Err(format!("actor stopped: {:?}", manager.report().and_then(|r|r.error)));
             }
-            emit(serde_json::json!({"accepted":true,"sequence":latest.sequence,"presentation":manager.presentation(),"published":publications.lock().unwrap().last().copied(),"audioRoute":control.audio.current(),"requests":provider.seen.lock().unwrap().len()}));
+            emit(serde_json::json!({"accepted":true,"sequence":latest.sequence,"resultOnly":manager.result_only(),"presentation":manager.presentation(),"published":publications.lock().unwrap().last().copied(),"audioRoute":control.audio.current(),"requests":provider.seen.lock().unwrap().len()}));
         }
         Err("owned actor command limit".into())
     }.await;

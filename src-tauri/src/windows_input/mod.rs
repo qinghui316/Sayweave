@@ -125,9 +125,18 @@ pub struct Anchor {
     pub focus: usize,
     pub process: u32,
     pub lifetime: u64,
+    pub editor: EditorEndpoint,
     pub generation: u64,
     pub captured_tick: u32,
     pub activity: u64,
+}
+/// The focused editing apartment can belong to a child process of the app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditorEndpoint {
+    pub window: usize,
+    pub process: u32,
+    pub thread: u32,
+    pub lifetime: u64,
 }
 #[derive(Default)]
 pub struct DeliveryGate {
@@ -367,6 +376,11 @@ impl Default for WindowsInputService {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(feature = "desktop-acceptance")]
+pub(crate) fn endpoint_checks(root: u32, editor: u32) -> Result<(), String> {
+    acceptance::endpoint(root, editor)
 }
 
 #[cfg(test)]

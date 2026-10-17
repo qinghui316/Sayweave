@@ -67,6 +67,9 @@ pub(super) fn run(
     capability: &str,
     module: windows::Win32::Foundation::HMODULE,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("SAYWEAVE_BLOCK_FIXTURE").as_deref() == Ok("native-scope") {
+        return native_scope_cases(editor, manager, pipe, capability, module);
+    }
     if std::env::var("SAYWEAVE_BLOCK_FIXTURE").as_deref() == Ok("unified") {
         return unified(editor, pipe, capability, module);
     }
@@ -344,6 +347,333 @@ pub(super) fn run(
         "block manual-edit/read/stale-refusal/lease-rotation/reacquire/actual-write/focus-retirement/release=true"
     );
     boundary_cases(editor, pipe, capability, module)?;
+    Ok(())
+}
+
+fn native_scope_cases(
+    editor: HWND,
+    manager: &ITfThreadMgr,
+    pipe: &Pipe,
+    capability: &str,
+    module: windows::Win32::Foundation::HMODULE,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use windows::{
+        Win32::UI::{Input::KeyboardAndMouse::SetFocus, WindowsAndMessaging::*},
+        core::w,
+    };
+    let fault: unsafe extern "system" fn(u32) = unsafe {
+        std::mem::transmute(
+            windows::Win32::System::LibraryLoader::GetProcAddress(
+                module,
+                windows::core::s!("SayweaveBlockFixtureFault"),
+            )
+            .ok_or("missing native scope fixture hook")?,
+        )
+    };
+    unsafe {
+        fault(11);
+    }
+    let mut operation = 0;
+    let task = uuid::Uuid::new_v4().to_string();
+    let mut send = |action: Action, block: Option<BlockCommand>, text: &str| {
+        operation += 1;
+        let request = frame(capability, &task, operation, block, action, text, None);
+        pipe.send(&serde_json::to_vec(&request)?)?;
+        let started = Instant::now();
+        loop {
+            pump(Duration::from_millis(10));
+            if let Some(data) = pipe.receive()? {
+                let reply: Reply = serde_json::from_slice(&data)?;
+                if reply.operation != operation {
+                    return Err("native scope operation mismatch".into());
+                }
+                return Ok::<Reply, Box<dyn std::error::Error>>(reply);
+            }
+            if started.elapsed() >= Duration::from_secs(2) {
+                return Err("native scope fixture timeout".into());
+            }
+        }
+    };
+    unsafe {
+        SendMessageW(
+            editor,
+            WM_SETTEXT,
+            Some(WPARAM(0)),
+            Some(LPARAM(w!("左｜｜右").as_ptr() as isize)),
+        );
+        SendMessageW(editor, 0xB1, Some(WPARAM(2)), Some(LPARAM(2)));
+    }
+    pump(Duration::from_millis(40));
+    if !send(Action::Begin, None, "")?.applied {
+        return Err("native scope begin failed".into());
+    }
+    let bind = BlockCommand {
+        id: uuid::Uuid::new_v4().to_string(),
+        action: BlockAction::Bind,
+        epoch: 0,
+        version: 0,
+        lease: 0,
+        expected: String::new(),
+        selection_start: 0,
+        selection_end: 0,
+    };
+    let mut current = snapshot(send(Action::Update, Some(bind), "周三开会")?)?;
+    if editor_text(editor)? != "左｜周三开会｜右" {
+        return Err("native scope first body differs".into());
+    }
+    println!(
+        "native-scope first actual={:?} provider=unavailable",
+        editor_text(editor)?
+    );
+    let edits = [
+        (1, 2, "五", "周五开会", "下周一上午开会"),
+        (3, 5, "", "下周一开会", "下周一下午三点开会"),
+        (5, 6, "两", "下周一下午两点开会", "下周一线上四点开会"),
+        (2, 3, "二", "下周二线上四点开会", "下周二线上五点开会"),
+        (0, 9, "明天开会", "明天开会", "明天下午开会"),
+    ];
+    for (start, end, replacement, edited, target) in edits {
+        if !send(Action::Handoff, None, "")?.applied {
+            return Err("native scope handoff failed".into());
+        }
+        pump(Duration::from_millis(40));
+        let replacement: Vec<u16> = replacement.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            SendMessageW(
+                editor,
+                0xB1,
+                Some(WPARAM(start + 2)),
+                Some(LPARAM((end + 2) as isize)),
+            );
+            SendMessageW(
+                editor,
+                0xC2,
+                Some(WPARAM(1)),
+                Some(LPARAM(replacement.as_ptr() as isize)),
+            );
+        }
+        pump(Duration::from_millis(40));
+        if editor_text(editor)? != format!("左｜{edited}｜右") {
+            return Err("native scope edit body differs".into());
+        }
+        unsafe {
+            let end = 2 + edited.encode_utf16().count();
+            SendMessageW(editor, 0xB1, Some(WPARAM(end)), Some(LPARAM(end as isize)));
+        }
+        pump(Duration::from_millis(30));
+        let read = snapshot(send(
+            Action::Inspect,
+            Some(command(&current, BlockAction::Read)),
+            "",
+        )?)?;
+        if read.text != edited {
+            return Err(format!("native scope edited snapshot differs: {:?}", read.text).into());
+        }
+        let acquired = snapshot(send(
+            Action::Inspect,
+            Some(command(&read, BlockAction::Acquire)),
+            "",
+        )?)?;
+        current = snapshot(send(
+            Action::Inspect,
+            Some(command(&acquired, BlockAction::Apply)),
+            target,
+        )?)?;
+        pump(Duration::from_millis(40));
+        if editor_text(editor)? != format!("左｜{target}｜右") || current.text != target {
+            return Err("native scope reacquisition body differs".into());
+        }
+        println!(
+            "native-scope reacquired actual={:?} provider=unavailable",
+            editor_text(editor)?
+        );
+    }
+    if !send(Action::Handoff, None, "")?.applied {
+        return Err("native scope final handoff failed".into());
+    }
+    pump(Duration::from_millis(30));
+    let original_body = editor_text(editor)?;
+    let other_body: Vec<u16> = original_body.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let other = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("RICHEDIT50W"),
+            windows::core::PCWSTR(other_body.as_ptr()),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_MULTILINE as u32),
+            10,
+            185,
+            480,
+            35,
+            Some(GetAncestor(editor, GA_ROOT)),
+            None,
+            None,
+            None,
+        )?;
+        SendMessageW(
+            other,
+            WM_USER + 204,
+            Some(WPARAM(0x10000)),
+            Some(LPARAM(0x10000)),
+        );
+        let _ = SetFocus(Some(other));
+        pump(Duration::from_millis(40));
+        let _ = SetFocus(Some(editor));
+        pump(Duration::from_millis(40));
+        DestroyWindow(other)?;
+    }
+    let denied = send(
+        Action::Inspect,
+        Some(command(&current, BlockAction::Acquire)),
+        "",
+    )?;
+    if denied.applied
+        || denied.mutation != Mutation::NotAttempted
+        || editor_text(editor)? != original_body
+    {
+        return Err("native scope field switch revived old block".into());
+    }
+    if !send(
+        Action::Inspect,
+        Some(command(&current, BlockAction::Release)),
+        "",
+    )?
+    .applied
+    {
+        return Err("native scope release failed".into());
+    }
+    println!("native-scope field-switch/return refused actual={original_body:?}");
+    // A text reset alone is an observation, not a simulated TSF document
+    // teardown. Pop/Push lifetime events are tested on a document owned by
+    // the TSF test, not by removing RichEdit's private primary context.
+    for outside in [true, false] {
+        native_scope_reset_case(editor, manager, pipe, capability, outside)?;
+    }
+    Ok(())
+}
+
+fn native_scope_reset_case(
+    editor: HWND,
+    manager: &ITfThreadMgr,
+    pipe: &Pipe,
+    capability: &str,
+    outside: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    let task = uuid::Uuid::new_v4().to_string();
+    let mut operation = 0;
+    let mut send = |action: Action, block: Option<BlockCommand>, text: &str| {
+        operation += 1;
+        pipe.send(&serde_json::to_vec(&frame(
+            capability, &task, operation, block, action, text, None,
+        ))?)?;
+        let started = Instant::now();
+        loop {
+            pump(Duration::from_millis(10));
+            if let Some(data) = pipe.receive()? {
+                let reply: Reply = serde_json::from_slice(&data)?;
+                if reply.operation != operation {
+                    return Err("scope reset operation mismatch".into());
+                }
+                return Ok::<Reply, Box<dyn std::error::Error>>(reply);
+            }
+            if started.elapsed() >= Duration::from_secs(2) {
+                return Err("scope reset timeout".into());
+            }
+        }
+    };
+    let initial = if outside { "左｜｜右" } else { "" };
+    let body = if outside {
+        "左｜周三开会｜右"
+    } else {
+        "周三开会"
+    };
+    let initial: Vec<u16> = initial.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        SendMessageW(
+            editor,
+            WM_SETTEXT,
+            Some(WPARAM(0)),
+            Some(LPARAM(initial.as_ptr() as isize)),
+        );
+        let at = if outside { 2 } else { 0 };
+        SendMessageW(editor, 0xB1, Some(WPARAM(at)), Some(LPARAM(at as isize)));
+    }
+    pump(Duration::from_millis(30));
+    if !send(Action::Begin, None, "")?.applied {
+        return Err("scope reset begin failed".into());
+    }
+    let bind = BlockCommand {
+        id: uuid::Uuid::new_v4().to_string(),
+        action: BlockAction::Bind,
+        epoch: 0,
+        version: 0,
+        lease: 0,
+        expected: String::new(),
+        selection_start: 0,
+        selection_end: 0,
+    };
+    let current = snapshot(send(Action::Update, Some(bind), "周三开会")?)?;
+    if !send(Action::Handoff, None, "")?.applied {
+        return Err("scope reset handoff failed".into());
+    }
+    pump(Duration::from_millis(30));
+    let document = unsafe { manager.GetFocus()? };
+    let before = unsafe { document.GetTop()? };
+    let before_read = send(
+        Action::Inspect,
+        Some(command(&current, BlockAction::Read)),
+        "",
+    )?;
+    if !before_read.applied {
+        return Err(format!(
+            "native scope intact whole-field read failed outside={outside}: {}",
+            before_read.code
+        )
+        .into());
+    }
+    let replacement: Vec<u16> = body.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        SendMessageW(
+            editor,
+            WM_SETTEXT,
+            Some(WPARAM(0)),
+            Some(LPARAM(replacement.as_ptr() as isize)),
+        );
+    }
+    pump(Duration::from_millis(40));
+    let same_context = unsafe { manager.GetFocus()?.GetTop()? == before };
+    let read = send(
+        Action::Inspect,
+        Some(command(&current, BlockAction::Read)),
+        "",
+    )?;
+    let acquire = send(
+        Action::Inspect,
+        Some(command(&current, BlockAction::Acquire)),
+        "",
+    )?;
+    println!(
+        "native-scope text-reset outside={outside} same_context={same_context} read={} read_code={} acquire={} actual={:?}",
+        read.applied,
+        read.code,
+        acquire.applied,
+        editor_text(editor)?
+    );
+    if editor_text(editor)? != body {
+        return Err("native scope reset changed the host body".into());
+    }
+    if acquire.applied && !send(Action::Handoff, None, "")?.applied {
+        return Err("text-reset observation failed to hand off acquired composition".into());
+    }
+    if !send(
+        Action::Inspect,
+        Some(command(&current, BlockAction::Release)),
+        "",
+    )?
+    .applied
+    {
+        return Err("scope reset release failed".into());
+    }
     Ok(())
 }
 fn boundary_cases(

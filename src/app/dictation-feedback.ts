@@ -5,6 +5,7 @@ import {speechMessages} from '../locales/speech';
 
 /** Only the native owner of this presentation can supply its terminal error. */
 export function dictationFeedback(value:DictationSnapshot,speech:SpeechSnapshot):string|undefined {
+ if(value.source==='external'&&value.presentation==='result')return value.error==='copyFailed'?speechMessages.copyFailed:undefined;
  if(value.source!=='external'||value.presentation!=='error')return undefined;
  const delivery=value.delivery;
  if(value.error==='saveFailed'||delivery?.restoreError||delivery?.submission==='uncertain'||delivery?.error&&['compositionCleanup','compositionRollback','compositionHandoffFailed','targetReadonlyContext'].includes(delivery.error)||value.error==='targetReadonlyContext')return undefined;

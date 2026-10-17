@@ -70,7 +70,7 @@ pub(super) struct VerifiedBlockContent {
 pub(super) unsafe fn capture(
     context: &ITfContext,
     range: &ITfRange,
-    field: &initial_selection::FocusIdentity,
+    field: &BlockScope,
     original: Option<&initial_selection::SemanticBoundary>,
     ec: u32,
     version: u64,

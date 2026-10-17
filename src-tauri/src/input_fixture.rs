@@ -51,11 +51,14 @@ fn context_status() -> serde_json::Value {
 // Metadata-only diagnostic for an explicitly owned foreground fixture. Never
 // reads a field name/value/body and never supplies production range authority.
 fn focus_metadata(process: u32) -> serde_json::Value {
+    focus_metadata_at(process, None)
+}
+fn focus_metadata_at(process: u32, expected: Option<usize>) -> serde_json::Value {
     std::thread::spawn(move || unsafe {
         use windows::{core::Interface, Win32::{System::{Com::*, Ole::*, Variant::*}, UI::Accessibility::*}};
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let result = (|| {
-            let window=GetForegroundWindow();let mut actual=0;
+            let window=expected.map(|v|HWND(v as *mut _)).unwrap_or_else(||GetForegroundWindow());let mut actual=0;
             let thread=GetWindowThreadProcessId(window,Some(&mut actual));
             if actual!=process { return Err(windows::core::Error::from_hresult(E_ACCESSDENIED)); }
             let mut info=GUITHREADINFO { cbSize:std::mem::size_of::<GUITHREADINFO>() as u32,..Default::default() };
@@ -70,17 +73,33 @@ fn focus_metadata(process: u32) -> serde_json::Value {
                     for _ in 0..16 {
                         let child=VARIANT::from(0i32);
                         let focus=current.accFocus();
-                        route["chain"].as_array_mut().unwrap().push(serde_json::json!({"focusVt":focus.as_ref().ok().map(|f|f.vt().0),"focusChild":focus.as_ref().ok().and_then(|f|i32::try_from(f).ok()),"role":current.get_accRole(&child).ok().and_then(|r|i32::try_from(&r).ok()),"state":current.get_accState(&child).ok().and_then(|r|i32::try_from(&r).ok()),"focusError":focus.as_ref().err().map(|e|format!("{:08x}",e.code().0 as u32))}));
+                        route["chain"].as_array_mut().unwrap().push(serde_json::json!({"focusVt":focus.as_ref().ok().map(|f|f.vt().0),"focusChild":focus.as_ref().ok().and_then(|f|i32::try_from(f).ok()),"children":current.accChildCount().ok(),"role":current.get_accRole(&child).ok().and_then(|r|i32::try_from(&r).ok()),"state":current.get_accState(&child).ok().and_then(|r|i32::try_from(&r).ok()),"focusError":focus.as_ref().err().map(|e|format!("{:08x}",e.code().0 as u32))}));
                         let Ok(focus)=focus else { break; };
                         let next=if focus.vt()==VT_DISPATCH { IDispatch::try_from(&focus).and_then(|v|v.cast()) } else if focus.vt()==VT_I4 && i32::try_from(&focus).unwrap_or(0)!=0 { current.get_accChild(&focus).and_then(|v|v.cast()) } else { break; };
                         let Ok(next)=next else { break; };current=next;
                     }
+                    let mut tree=vec![];let mut queue=vec![(current.clone(),0u32)];
+                    while let Some((node,depth))=queue.pop() {
+                        if depth>=4 || tree.len()>=64 {continue;}
+                        for index in 1..=node.accChildCount().unwrap_or(0).clamp(0,32) {
+                            if tree.len()>=64 {break;}
+                            let child=VARIANT::from(index);let next=node.get_accChild(&child).and_then(|v|v.cast::<IAccessible>());
+                            tree.push(serde_json::json!({"depth":depth,"child":index,
+                                "role":node.get_accRole(&child).ok().and_then(|v|i32::try_from(&v).ok()),
+                                "state":node.get_accState(&child).ok().and_then(|v|i32::try_from(&v).ok()),
+                                "object":next.is_ok(),"error":next.as_ref().err().map(|e|format!("{:08x}",e.code().0 as u32))}));
+                            if let Ok(next)=next {queue.push((next,depth+1));}
+                        }
+                    }
+                    route["descendants"]=serde_json::json!(tree);
                     let mut opaque=std::ptr::null_mut();let mut length=0;
                     let bytes=if let Ok(identity)=current.cast::<IAccIdentity>() {
                         let result=identity.GetIdentityString(0,&mut opaque,&mut length);
+                        route["opaqueIdentityHresult"]=serde_json::json!(result.as_ref().err().map(|e|format!("{:08x}",e.code().0 as u32)));
                         let bytes=if result.is_ok()&&!opaque.is_null()&&length>0&&length<=1024 {Some(std::slice::from_raw_parts(opaque,length as usize).to_vec())}else{None};
                         if !opaque.is_null(){CoTaskMemFree(Some(opaque.cast()));}bytes
-                    }else{None};
+                    }else{route["opaqueIdentityInterface"]=serde_json::json!(false);None};
+                    route["accessibleEx"]=serde_json::json!(current.cast::<IAccessibleEx>().is_ok());
                     stable.push(bytes);
                     let runtime_id=(|| {
                         let raw=current.cast::<IRawElementProviderSimple>().or_else(|_|current.cast::<IServiceProvider>()?.QueryService(&IAccessible::IID))?;
@@ -258,6 +277,39 @@ unsafe extern "system" fn process_window(window: HWND, parameter: LPARAM) -> BOO
 }
 fn main() {
     if std::env::var("SAYWEAVE_INPUT_ACCEPTANCE").as_deref() != Ok("1") {
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("inspect-focus-window") {
+        let process = std::env::args()
+            .nth(2)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let window = std::env::args().nth(3).and_then(|v| v.parse().ok());
+        if process != 0 && window.is_some() {
+            println!("{}", focus_metadata_at(process, window));
+        }
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("inspect-focus-watch") {
+        let process = std::env::args()
+            .nth(2)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if process == 0 {
+            return;
+        }
+        // Opt-in, metadata-only observation. Do not move foreground or read text.
+        for _ in 0..60 {
+            let mut foreground = 0;
+            unsafe {
+                GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut foreground));
+            }
+            if foreground == process {
+                println!("{}", focus_metadata(process));
+                let _ = io::stdout().flush();
+            }
+            thread::sleep(std::time::Duration::from_millis(500));
+        }
         return;
     }
     if std::env::args().nth(1).as_deref() == Some("inspect-product") {

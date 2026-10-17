@@ -36,7 +36,7 @@ pub(crate) enum Command {
         Option<String>,
         String,
         Arc<AtomicBool>,
-        oneshot::Sender<Result<BlockSnapshot, Error>>,
+        oneshot::Sender<Result<BlockSnapshot, WriteFailure>>,
     ),
     Acquire(
         u64,
@@ -68,7 +68,7 @@ pub(crate) enum Command {
         String,
         Option<String>,
         Option<Arc<AtomicBool>>,
-        oneshot::Sender<Result<(), Error>>,
+        oneshot::Sender<Result<(), WriteFailure>>,
     ),
     Settle(
         u64,
@@ -154,6 +154,62 @@ pub(crate) struct PrefixOutcome {
     pub prefix: Mutation,
     pub tail_owned: bool,
     pub error: Option<String>,
+}
+#[derive(Debug)]
+pub(crate) struct WriteFailure {
+    pub error: Error,
+    pub mutation: Mutation,
+    /// The body write completed; only its independent tracking failed.
+    pub tracking_failed: bool,
+}
+impl WriteFailure {
+    fn not_attempted(code: &str) -> Self {
+        Self {
+            error: Error::new(code),
+            mutation: Mutation::NotAttempted,
+            tracking_failed: false,
+        }
+    }
+    fn uncertain(error: Error) -> Self {
+        Self {
+            error,
+            mutation: Mutation::Uncertain,
+            tracking_failed: false,
+        }
+    }
+}
+fn update_receipt(
+    reply: Reply,
+    text: &str,
+    block_id: Option<&str>,
+) -> Result<Option<BlockSnapshot>, WriteFailure> {
+    if reply.applied {
+        if let Some(id) = block_id
+            && reply
+                .block
+                .as_ref()
+                .is_none_or(|b| b.id != id || b.epoch == 0 || b.text != text || b.writable)
+        {
+            return Err(WriteFailure {
+                error: Error::new("compositionPartial"),
+                mutation: reply.mutation,
+                tracking_failed: true,
+            });
+        }
+        return Ok(reply.block);
+    }
+    let tracking_failed = block_id.is_some() && reply.code.starts_with("edit:writeTracking:");
+    let error = if reply.mutation != Mutation::NotAttempted {
+        "compositionPartial"
+    } else {
+        reply_error(&reply.code)
+    };
+    log::info!(target:"sayweave", "operation=composition_update_refused task_id={} turn={} mutation={:?} tracking_failed={tracking_failed} native_code={}",reply.task,reply.turn,reply.mutation,reply.code);
+    Err(WriteFailure {
+        error: Error::new(error),
+        mutation: reply.mutation,
+        tracking_failed,
+    })
 }
 pub(crate) struct FinishOutcome {
     pub delivery: Delivery,
@@ -390,16 +446,16 @@ impl Draft {
                         },
                         Ok(Command::Observe(sink,reply))=>{let ready=host.observe(sink);let _=reply.send(ready);},
                         Ok(Command::Replace(turn,text,raw,permit,reply))=>{
-                            let result=if turn==host.turn {host.update_guarded(&text,permit.as_deref())}else{Err(Error::new("staleSession"))};
+                            let result=if turn==host.turn {host.update_guarded(&text,permit.as_deref())}else{Err(WriteFailure::not_attempted("staleSession"))};
                             if result.is_ok(){host.remember_tail(raw);}
                             let _=reply.send(result);
                         },
                         Ok(Command::ReplaceTracked(turn,text,raw,id,permit,reply))=>{
                             let result=if turn==host.turn {
                                 host.update_scoped(&text,Some(&permit),Some(id))
-                                    .and_then(|snapshot|snapshot.ok_or_else(||Error::new("compositionPartial")))
-                            }else{Err(Error::new("staleSession"))};
-                            if result.is_ok(){host.remember_tail(raw);}
+                                    .and_then(|snapshot|snapshot.ok_or_else(||WriteFailure::uncertain(Error::new("compositionPartial"))))
+                            }else{Err(WriteFailure::not_attempted("staleSession"))};
+                            if result.is_ok() || result.as_ref().err().is_some_and(|e|e.mutation==Mutation::Changed&&e.tracking_failed){host.remember_tail(raw);}
                             let _=reply.send(result);
                         },
                         Ok(Command::Settle(turn,prefix,tail,source,permit,reply))=>{
@@ -469,7 +525,9 @@ impl Draft {
         text: String,
         raw: Option<String>,
     ) -> Result<(), Error> {
-        self.replace_guarded(sequence, text, raw, None).await
+        self.replace_guarded(sequence, text, raw, None)
+            .await
+            .map_err(|e| e.error)
     }
     pub(crate) async fn replace_guarded(
         &self,
@@ -477,19 +535,21 @@ impl Draft {
         text: String,
         raw: Option<String>,
         permit: Option<Arc<AtomicBool>>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), WriteFailure> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(Error::new("staleSession"));
+            return Err(WriteFailure::not_attempted("staleSession"));
         }
         if sequence == 0 || sequence <= self.source_sequence.fetch_max(sequence, Ordering::AcqRel) {
-            return Err(Error::new("staleSnapshot"));
+            return Err(WriteFailure::not_attempted("staleSnapshot"));
         }
         let (reply, result) = oneshot::channel();
         self.connection
             .sender
             .try_send(Command::Replace(self.turn, text, raw, permit, reply))
-            .map_err(|_| Error::new("compositionWorker"))?;
-        result.await.map_err(|_| Error::new("compositionWorker"))?
+            .map_err(|_| WriteFailure::not_attempted("compositionWorker"))?;
+        result
+            .await
+            .map_err(|_| WriteFailure::uncertain(Error::new("compositionWorker")))?
     }
     pub(crate) async fn replace_tracked(
         &self,
@@ -498,12 +558,12 @@ impl Draft {
         raw: Option<String>,
         id: String,
         permit: Arc<AtomicBool>,
-    ) -> Result<BlockSnapshot, Error> {
+    ) -> Result<BlockSnapshot, WriteFailure> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(Error::new("staleSession"));
+            return Err(WriteFailure::not_attempted("staleSession"));
         }
         if sequence == 0 || sequence <= self.source_sequence.fetch_max(sequence, Ordering::AcqRel) {
-            return Err(Error::new("staleSnapshot"));
+            return Err(WriteFailure::not_attempted("staleSnapshot"));
         }
         let (reply, result) = oneshot::channel();
         self.connection
@@ -511,8 +571,10 @@ impl Draft {
             .try_send(Command::ReplaceTracked(
                 self.turn, text, raw, id, permit, reply,
             ))
-            .map_err(|_| Error::new("compositionWorker"))?;
-        result.await.map_err(|_| Error::new("compositionWorker"))?
+            .map_err(|_| WriteFailure::not_attempted("compositionWorker"))?;
+        result
+            .await
+            .map_err(|_| WriteFailure::uncertain(Error::new("compositionWorker")))?
     }
     #[cfg(feature = "desktop-acceptance")]
     pub async fn settle(
@@ -687,6 +749,7 @@ impl Host {
                 || command.action != BlockAction::Read
                 || anchor.process != self.anchor.process
                 || anchor.lifetime != self.anchor.lifetime
+                || anchor.editor != self.anchor.editor
                 || anchor.window != self.anchor.window
                 || anchor.capture_id != self.anchor.capture_id
             {
@@ -912,12 +975,7 @@ impl Host {
         if gate.cancelled() {
             return Err(Error::new("cancelled"));
         }
-        let mut pid = 0;
-        let thread =
-            unsafe { GetWindowThreadProcessId(HWND(anchor.window as *mut _), Some(&mut pid)) };
-        if pid != anchor.process {
-            return Err(Error::new("targetChanged"));
-        }
+        let (pid, thread) = editor_endpoint(&anchor)?;
         let started = Instant::now();
         let pipe = loop {
             target_ready(&task, &anchor, &gate)?;
@@ -1001,6 +1059,7 @@ impl Host {
             || anchor.window != self.anchor.window
             || anchor.process != self.anchor.process
             || anchor.lifetime != self.anchor.lifetime
+            || anchor.editor != self.anchor.editor
             || anchor.capture_id != self.anchor.capture_id
         {
             return Err(Error::new("staleSession"));
@@ -1092,22 +1151,18 @@ impl Host {
             let runtime = reply
                 .runtime
                 .ok_or_else(|| Error::new("compositionProtocol"))?;
-            let mut process = 0;
-            let thread = unsafe {
-                GetWindowThreadProcessId(HWND(self.anchor.window as *mut _), Some(&mut process))
-            };
+            let (process, thread) = editor_endpoint(&self.anchor)?;
             if !binding.valid()
                 || runtime.engine != binding
                 || runtime.protocol != sayweave_text_service::wire::PROTOCOL
-                || runtime.process != self.anchor.process
-                || process != self.anchor.process
+                || runtime.process != self.anchor.editor.process
                 || runtime.thread != thread
             {
                 return Err(Error::new("compositionTargetVersion"));
             }
             super::runtime_module::verify(process, &runtime)?;
             self.engine = binding;
-            log::info!(target:"sayweave","operation=engine_prepare task_id={} result=ready process={} lifetime={} thread={} proxy_instance={} engine_generation={} core_hash={}",self.task,process,self.anchor.lifetime,thread,self.engine.proxy_instance,self.engine.engine_generation,expected);
+            log::info!(target:"sayweave","operation=engine_prepare task_id={} result=ready process={} lifetime={} thread={} proxy_instance={} engine_generation={} core_hash={}",self.task,process,self.anchor.editor.lifetime,thread,self.engine.proxy_instance,self.engine.engine_generation,expected);
             return Ok(());
         }
     }
@@ -1142,12 +1197,8 @@ impl Host {
         };
         let control = self.receipt_request(ControlAction::ReadRetired, key.clone(), deadline);
         self.pipe = Pipe(HANDLE::default());
-        let mut pid = 0;
-        let thread =
-            unsafe { GetWindowThreadProcessId(HWND(self.anchor.window as *mut _), Some(&mut pid)) };
-        if pid != self.anchor.process {
-            return Err(Error::new("compositionDisconnected"));
-        }
+        let (pid, thread) =
+            editor_endpoint(&self.anchor).map_err(|_| Error::new("compositionDisconnected"))?;
         loop {
             if unsafe { GetTickCount64() } >= deadline {
                 return Err(Error::new("compositionDisconnected"));
@@ -1440,11 +1491,8 @@ impl Host {
                         .edit_observation
                         .as_ref()
                         .is_some_and(|v| v.capability == 2);
-                    let mut pid = 0;
-                    let thread = unsafe {
-                        GetWindowThreadProcessId(HWND(self.anchor.window as *mut _), Some(&mut pid))
-                    };
-                    if pid != self.anchor.process || !reply.compatible_runtime(pid, thread) {
+                    let (pid, thread) = editor_endpoint(&self.anchor)?;
+                    if !reply.compatible_runtime(pid, thread) {
                         return Err(Error::new("compositionTargetVersion"));
                     }
                     log::info!(target:"sayweave", "operation=draft_runtime task_id={} turn={} result=ready protocol={} process={} thread={}", self.task,self.turn,sayweave_text_service::wire::PROTOCOL,pid,thread);
@@ -1583,9 +1631,13 @@ impl Host {
         outcome
     }
     fn update(&mut self, text: &str) -> Result<(), Error> {
-        self.update_guarded(text, None)
+        self.update_guarded(text, None).map_err(|e| e.error)
     }
-    fn update_guarded(&mut self, text: &str, permit: Option<&AtomicBool>) -> Result<(), Error> {
+    fn update_guarded(
+        &mut self,
+        text: &str,
+        permit: Option<&AtomicBool>,
+    ) -> Result<(), WriteFailure> {
         self.update_scoped(text, permit, None).map(|_| ())
     }
     fn update_scoped(
@@ -1593,9 +1645,9 @@ impl Host {
         text: &str,
         permit: Option<&AtomicBool>,
         block_id: Option<String>,
-    ) -> Result<Option<BlockSnapshot>, Error> {
+    ) -> Result<Option<BlockSnapshot>, WriteFailure> {
         if permit.is_some_and(|p| !p.load(Ordering::Acquire)) {
-            return Err(Error::new("staleSnapshot"));
+            return Err(WriteFailure::not_attempted("staleSnapshot"));
         }
         if text == self.text && block_id.is_none() {
             return Ok(None);
@@ -1618,34 +1670,26 @@ impl Host {
         });
         let result = self
             .exchange_block_reply(Action::Update, text, None, false, permit, block)
-            .and_then(|r| {
-                if r.applied {
-                    if let Some(id) = &block_id
-                        && r.block.as_ref().is_none_or(|b| {
-                            b.id != *id || b.epoch == 0 || b.text != text || b.writable
-                        })
-                    {
-                        return Err(Error::new("compositionPartial"));
-                    }
-                    Ok(r.block)
-                } else if r.mutation != Mutation::NotAttempted {
-                    Err(Error::new("compositionPartial"))
-                } else {
-                    Err(Error::new(reply_error(&r.code)))
-                }
-            });
-        if result.is_ok() {
+            .map_err(WriteFailure::uncertain)
+            .and_then(|r| update_receipt(r, text, block_id.as_deref()));
+        if result.is_ok()
+            || result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.mutation == Mutation::Changed && e.tracking_failed)
+        {
             self.text = text.into();
             if let Ok(Some(snapshot)) = &result {
                 log::info!(target:"sayweave", "operation=draft_block_bound task_id={} turn={} block={} epoch={}", self.task,self.turn,snapshot.id,snapshot.epoch);
             }
-        } else if result.as_ref().err().is_some_and(|e| {
+        }
+        if result.as_ref().err().is_some_and(|e| {
             !matches!(
-                e.code.as_str(),
+                e.error.code.as_str(),
                 "staleSnapshot" | "editing" | "inputComposition" | "selectionMapping"
             )
         }) {
-            self.failure = result.as_ref().err().map(|e| e.code.clone());
+            self.failure = result.as_ref().err().map(|e| e.error.code.clone());
         }
         result
     }
@@ -1905,6 +1949,9 @@ fn target_ready(task: &str, anchor: &Anchor, gate: &DeliveryGate) -> Result<(), 
         std::thread::sleep(Duration::from_millis(5));
     }
 }
+fn editor_endpoint(anchor: &Anchor) -> Result<(u32, u32), Error> {
+    super::native::editor_endpoint(anchor)
+}
 fn pump() {
     unsafe {
         let mut message = MSG::default();
@@ -1918,6 +1965,42 @@ fn pump() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn write_effect_and_tracking_refusal_are_independent_receipt_facts() {
+        let reply = |phase: &str, mutation: Mutation| -> Reply {
+            serde_json::from_value(serde_json::json!({
+                "engine":EngineBinding { proxy_instance: uuid::Uuid::new_v4().to_string(), engine_generation: 1 },
+                "task":"receipt-test","turn":1,"operation":1,"revision":1,
+                "applied":false,"code":phase,"mutation":mutation
+            }))
+            .unwrap()
+        };
+        let written = update_receipt(
+            reply("edit:writeTracking:80070005", Mutation::Changed),
+            "正文",
+            Some("block"),
+        )
+        .unwrap_err();
+        assert_eq!(written.mutation, Mutation::Changed);
+        assert!(written.tracking_failed);
+        let rejected = update_receipt(
+            reply("edit:updateLease:80070057", Mutation::NotAttempted),
+            "正文",
+            Some("block"),
+        )
+        .unwrap_err();
+        assert_eq!(rejected.mutation, Mutation::NotAttempted);
+        assert!(!rejected.tracking_failed);
+        assert_eq!(rejected.error.code, "editing");
+        let uncertain = update_receipt(
+            reply("edit:updateText:80070057", Mutation::Uncertain),
+            "正文",
+            Some("block"),
+        )
+        .unwrap_err();
+        assert_eq!(uncertain.mutation, Mutation::Uncertain);
+        assert!(!uncertain.tracking_failed);
+    }
     #[test]
     fn block_refusals_keep_wait_boundary_and_uncertain_effect_separate() {
         let mut reply: Reply = serde_json::from_value(serde_json::json!({

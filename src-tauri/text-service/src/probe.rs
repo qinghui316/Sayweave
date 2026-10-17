@@ -90,6 +90,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(feature = "acceptance")]
             Some("fixture") => fixture()?,
             #[cfg(feature = "acceptance")]
+            Some("cross-process-fixture") => cross_process_fixture()?,
+            #[cfg(feature = "acceptance")]
             Some("installed-fixture") => fixture()?,
             #[cfg(feature = "acceptance")]
             Some("capabilities") => println!(
@@ -801,6 +803,57 @@ fn keyboard() -> windows::core::Result<(u32, u16, windows::core::GUID, windows::
     }
 }
 #[cfg(feature = "acceptance")]
+fn cross_process_fixture() -> Result<(), Box<dyn std::error::Error>> {
+    use windows::{Win32::UI::WindowsAndMessaging::*, core::w};
+    unsafe {
+        let top = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            w!("Sayweave owned cross-process editor"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            20,
+            20,
+            520,
+            240,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        let outcome = (|| {
+            let _ = SetForegroundWindow(top);
+            let dll = std::env::args().nth(2).ok_or("candidate DLL required")?;
+            let mut child = std::process::Command::new(std::env::current_exe()?)
+                .arg("fixture")
+                .arg(dll)
+                .env("SAYWEAVE_OWNED_PARENT_WINDOW", (top.0 as usize).to_string())
+                .env(
+                    "SAYWEAVE_OWNED_PARENT_PROCESS",
+                    std::process::id().to_string(),
+                )
+                .spawn()?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                pump(Duration::from_millis(10));
+                if let Some(status) = child.try_wait()? {
+                    return if status.success() {
+                        Ok(())
+                    } else {
+                        Err(format!("cross-process editor failed: {status}").into())
+                    };
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("owned cross-process fixture deadline".into());
+                }
+            }
+        })();
+        let _ = DestroyWindow(top);
+        outcome
+    }
+}
+#[cfg(feature = "acceptance")]
 fn fixture() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
         use windows::{
@@ -820,20 +873,46 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         println!("owned fixture stage=library");
         let library = LoadLibraryExW(w!("Msftedit.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)?;
         println!("owned fixture stage=window");
-        let top = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("STATIC"),
-            w!("Sayweave TSF isolated fixture"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            20,
-            20,
-            520,
-            240,
-            None,
-            None,
-            None,
-            None,
-        )?;
+        let external_parent = std::env::var("SAYWEAVE_OWNED_PARENT_WINDOW")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .zip(
+                std::env::var("SAYWEAVE_OWNED_PARENT_PROCESS")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok()),
+            );
+        let top = if let Some((window, expected)) = external_parent {
+            let window = HWND(window as *mut _);
+            let mut actual = 0;
+            GetWindowThreadProcessId(window, Some(&mut actual));
+            if actual != expected
+                || actual == std::process::id()
+                || !IsWindow(Some(window)).as_bool()
+                || GetAncestor(window, GA_ROOT) != window
+            {
+                return Err("owned parent identity mismatch".into());
+            }
+            println!(
+                "owned fixture separate root/editor processes=true root={actual} editor={}",
+                std::process::id()
+            );
+            window
+        } else {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Sayweave TSF isolated fixture"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                20,
+                20,
+                520,
+                240,
+                None,
+                None,
+                None,
+                None,
+            )?
+        };
         println!("owned fixture stage=editor");
         let editor = CreateWindowExW(
             WINDOW_EX_STYLE(0),
@@ -929,6 +1008,19 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         }
         if GetForegroundWindow() != top {
             return Err("owned fixture is not the actual foreground window".into());
+        }
+        if let (Some((_, root_process)), Ok(checker)) =
+            (external_parent, std::env::var("SAYWEAVE_ENDPOINT_CHECKER"))
+        {
+            let status = std::process::Command::new(checker)
+                .arg("endpoint")
+                .arg(root_process.to_string())
+                .arg(std::process::id().to_string())
+                .env("SAYWEAVE_INPUT_ACCEPTANCE", "1")
+                .status()?;
+            if !status.success() {
+                return Err("desktop endpoint verification failed".into());
+            }
         }
         let module_path = std::env::args()
             .nth(2)
@@ -1619,7 +1711,11 @@ fn fixture() -> Result<(), Box<dyn std::error::Error>> {
         };
         drop(processor);
         let manager_stopped = manager.Deactivate();
-        let _ = DestroyWindow(top);
+        let _ = DestroyWindow(if external_parent.is_some() {
+            editor
+        } else {
+            top
+        });
         let _ = FreeLibrary(library);
         pump(Duration::from_millis(100));
         let entry = GetProcAddress(component, windows::core::s!("DllCanUnloadNow"))

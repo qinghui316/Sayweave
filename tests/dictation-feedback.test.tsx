@@ -6,6 +6,17 @@ import {initialSpeech} from '../src/contracts/speech';
 import {VoiceSurface} from '../src/features/voice';
 import {Home} from '../src/features/home';
 
+it('clipboard failure keeps the result and original input facts visible',()=>{
+ const value={...initialDictation(),source:'external' as const,taskId:'current',presentationId:'view',presentation:'result' as const,error:'copyFailed',text:'完整口述',delivery:{state:'unconfirmed' as const,submission:'uncertain' as const,verification:'unavailable' as const,stage:'composition',submittedEvents:0,error:'compositionPartial',restoreError:false,elapsedMs:1}};
+ const message=dictationFeedback(value,initialSpeech());
+ expect(message).toBe('复制失败，请重试。');
+ render(<VoiceSurface presentation="result" phase="completed" text={value.text} delivery={value.delivery} error={message} copy={async()=>{}} start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
+ expect(screen.getByRole('alert')).toHaveTextContent('复制失败，请重试。');
+ expect(screen.getByText('完整口述')).toBeVisible();
+ expect(screen.getByRole('button',{name:'复制'})).toBeEnabled();
+ expect(value.delivery.submission).toBe('uncertain');
+});
+
 it('quiet native terminal cannot show an older source error during its pending hide',()=>{
  const value={...initialDictation(),source:'external' as const,taskId:'current',presentationId:'pending-hide',stage:'result' as const,error:'emptyText'};
  const speech={...initialSpeech(),taskId:'old',source:'history' as const,error:'network' as const};

@@ -50,6 +50,13 @@ pub fn final_presentation(
     error: Option<&str>,
     explicit_end: bool,
 ) -> Presentation {
+    let cancelled = error == Some("cancelled")
+        || delivery.is_some_and(|d| d.error.as_deref() == Some("cancelled"));
+    // ResultOnly owns a recording result, not permission to replay a native
+    // write. Keep the original submission/cleanup facts on Delivery.
+    if absent_target && !text.trim().is_empty() && !cancelled {
+        return Presentation::Result;
+    }
     // Terminal input/storage facts remain available in their owners. They do
     // not create a blocking external bubble or grant permission to retry input.
     let silent = |code: &str| {
@@ -115,8 +122,6 @@ pub fn final_presentation(
     if quiet_empty {
         return Presentation::Idle;
     }
-    let cancelled = error == Some("cancelled")
-        || delivery.is_some_and(|d| d.error.as_deref() == Some("cancelled"));
     if cancelled
         && error != Some("saveFailed")
         && delivery.is_none_or(|d| {
@@ -230,7 +235,7 @@ mod tests {
         let failure = Delivery::not_submitted("compositionRejected");
         assert_eq!(
             final_presentation(true, "文字", Some(&failure), None, true),
-            Presentation::Error
+            Presentation::Result
         );
     }
     #[test]
@@ -326,7 +331,7 @@ mod tests {
         );
     }
     #[test]
-    fn unsubmitted_text_is_recoverable_and_submitted_text_is_never_repeated() {
+    fn result_route_keeps_full_recording_while_live_delivery_does_not_replay() {
         let mut delivery = Delivery::not_submitted("targetChanged");
         assert_eq!(
             final_presentation(false, "文字", Some(&delivery), None, false),
@@ -340,7 +345,7 @@ mod tests {
         delivery.submission = Submission::Submitted;
         assert_eq!(
             final_presentation(true, "文字", Some(&delivery), None, false),
-            Presentation::Idle
+            Presentation::Result
         );
         delivery.state = "confirmed".into();
         delivery.error = None;

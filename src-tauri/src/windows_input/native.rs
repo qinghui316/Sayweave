@@ -91,6 +91,7 @@ pub(crate) fn composition_target(id: &str, anchor: &Anchor) -> Result<bool, Erro
         .ok_or_else(|| err("targetChanged"))?;
     if watch.identity_changed
         || lifetime(anchor.process)? != anchor.lifetime
+        || !editor_matches(anchor)?
         || !unsafe { IsWindow(Some(hwnd(anchor.window))) }.as_bool()
     {
         return Err(err("targetChanged"));
@@ -117,6 +118,9 @@ pub(super) fn composition_begin_target(id: &str, expected: &Anchor) -> Result<()
         log::info!(target:"sayweave", "operation=draft_begin_guard task_id={id} reason=targetChanged focus_same=false");
         return Err(err("targetChanged"));
     }
+    if current.editor != expected.editor {
+        return Err(err("targetChanged"));
+    }
     if current.activity != expected.activity {
         log::info!(target:"sayweave", "operation=draft_begin_guard task_id={id} reason=editing focus_same={} generation_same={}", current.focus == expected.focus, current.generation == expected.generation);
         return Err(err("editing"));
@@ -137,6 +141,7 @@ pub(crate) fn reanchor_turn(id: &str, original: &Anchor) -> Result<Anchor, Error
     if next.window != original.window
         || next.process != original.process
         || next.lifetime != original.lifetime
+        || next.editor != original.editor
     {
         return Err(err("targetChanged"));
     }
@@ -455,12 +460,29 @@ fn read_anchor() -> Result<Option<Anchor>, Error> {
             ..Default::default()
         };
         GetGUIThreadInfo(tid, &mut gui).map_err(|_| err("targetProbeFailed"))?;
+        if gui.hwndFocus.0.is_null() {
+            return Ok(None);
+        }
+        let mut editor_process = 0;
+        let editor_thread = GetWindowThreadProcessId(gui.hwndFocus, Some(&mut editor_process));
+        if editor_thread == 0
+            || editor_process == 0
+            || GetAncestor(gui.hwndFocus, GA_ROOT) != window
+        {
+            return Err(err("targetChanged"));
+        }
         Ok(Some(Anchor {
             capture_id: 0,
             window: window.0 as usize,
             focus: gui.hwndFocus.0 as usize,
             process,
             lifetime: lifetime(process)?,
+            editor: EditorEndpoint {
+                window: gui.hwndFocus.0 as usize,
+                process: editor_process,
+                thread: editor_thread,
+                lifetime: lifetime(editor_process)?,
+            },
             generation: CHANGES.load(Ordering::Acquire),
             captured_tick,
             activity: crate::input_state::activity(),
@@ -473,6 +495,7 @@ fn same(a: &Anchor) -> bool {
             && now.focus == a.focus
             && now.process == a.process
             && now.lifetime == a.lifetime
+            && now.editor == a.editor
             && now.generation == a.generation;
         if !unchanged {
             let task = WATCH.lock().ok().and_then(|w| w.as_ref().filter(|w| w.anchor.capture_id == a.capture_id).and_then(|w| w.task.clone())).unwrap_or_else(|| "pending".into());
@@ -480,6 +503,33 @@ fn same(a: &Anchor) -> bool {
         }
         unchanged
     })
+}
+fn editor_matches(anchor: &Anchor) -> Result<bool, Error> {
+    unsafe {
+        let editor = &anchor.editor;
+        if !IsWindow(Some(hwnd(editor.window))).as_bool()
+            || GetAncestor(hwnd(editor.window), GA_ROOT).0 as usize != anchor.window
+            || lifetime(editor.process)? != editor.lifetime
+        {
+            return Ok(false);
+        }
+        let mut process = 0;
+        let thread = GetWindowThreadProcessId(hwnd(editor.window), Some(&mut process));
+        Ok(process == editor.process && thread == editor.thread)
+    }
+}
+pub(super) fn editor_endpoint(anchor: &Anchor) -> Result<(u32, u32), Error> {
+    if lifetime(anchor.process)? != anchor.lifetime || !editor_matches(anchor)? {
+        return Err(err("targetChanged"));
+    }
+    let mut process = 0;
+    unsafe {
+        GetWindowThreadProcessId(hwnd(anchor.window), Some(&mut process));
+    }
+    if process != anchor.process {
+        return Err(err("targetChanged"));
+    }
+    Ok((anchor.editor.process, anchor.editor.thread))
 }
 thread_local! { static DEADLINE:std::cell::Cell<Option<Instant>>=const{std::cell::Cell::new(None)}; }
 fn deadline(ms: u64) {
@@ -524,7 +574,11 @@ fn integrity(pid: u32) -> Result<u32, Error> {
 }
 fn permitted(a: &Anchor) -> bool {
     integrity(a.process)
-        .and_then(|target| integrity(std::process::id()).map(|own| target <= own))
+        .and_then(|root| {
+            integrity(a.editor.process).and_then(|editor| {
+                integrity(std::process::id()).map(|own| root <= own && editor <= own)
+            })
+        })
         .unwrap_or(false)
 }
 fn composing(a: &Anchor) -> bool {
@@ -642,7 +696,7 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<(), Error> {
                 .ok_or_else(|| err("targetProbeFailed"))?;
             let element = probe!(auto.GetFocusedElement()).map_err(|_| err("targetProbeFailed"))?;
             if probe!(element.CurrentProcessId()).map_err(|_| err("targetProbeFailed"))?
-                != a.process as i32
+                != a.editor.process as i32
             {
                 return Err(err("targetChanged"));
             }

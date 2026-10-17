@@ -1,4 +1,6 @@
 //! One serial owner. Network/native effects complete back into this loop.
+#[path = "draft_delivery.rs"]
+mod delivery;
 #[path = "revisable.rs"]
 mod revisable;
 #[cfg(test)]
@@ -212,6 +214,8 @@ pub(crate) struct Report {
     pub error: Option<String>,
     pub cancelled: bool,
     pub rollback_failed: bool,
+    pub result_only: bool,
+    pub result_raw: String,
 }
 impl Report {
     pub(crate) fn cancellation_raw(&self) -> &str {
@@ -244,6 +248,8 @@ impl UnitSlot {
     }
 }
 enum NativeKind {
+    RetireHandoff,
+    RetireClose,
     Revisable(revisable::Effect),
     Replace {
         sequence: u64,
@@ -270,7 +276,13 @@ enum NativeKind {
     Close,
 }
 enum NativeValue {
-    TrackedReplaced(Result<sayweave_text_service::wire::BlockSnapshot, Error>),
+    GuardedReplaced(Result<(), windows_input::composition::WriteFailure>),
+    TrackedReplaced(
+        Result<
+            sayweave_text_service::wire::BlockSnapshot,
+            windows_input::composition::WriteFailure,
+        >,
+    ),
     Reacquired(Result<windows_input::composition::ReacquireOutcome, Error>),
     Block(Result<Box<sayweave_text_service::wire::Reply>, Error>),
     Replaced(Result<(), Error>),
@@ -306,6 +318,7 @@ struct Ending {
     expired: bool,
 }
 struct State {
+    input_delivery: delivery::InputDelivery,
     revisable: Option<revisable::State>,
     draft: Option<Arc<Draft>>,
     turn: u64,
@@ -371,6 +384,7 @@ struct View {
     turn: u64,
     paused: bool,
     report: Option<Report>,
+    result_only: bool,
 }
 pub(crate) struct SessionDraft {
     connection: Arc<Connection>,
@@ -408,6 +422,7 @@ impl SessionDraft {
             ends,
             initial: Mutex::new(Some((
                 State {
+                    input_delivery: delivery::InputDelivery::Live,
                     revisable: revisable::State::configured(),
                     draft: Some(draft),
                     turn: 1,
@@ -468,6 +483,9 @@ impl SessionDraft {
     pub fn report(&self) -> Option<Report> {
         self.view.lock().ok().and_then(|v| v.report.clone())
     }
+    pub fn result_only(&self) -> bool {
+        self.view.lock().is_ok_and(|v| v.result_only)
+    }
     pub async fn archive(&self) -> Result<Option<(Report, bool)>, Error> {
         let report = self.report();
         let mut persisted = false;
@@ -490,13 +508,14 @@ impl SessionDraft {
     fn project(&self, s: &State) {
         if let Ok(mut v) = self.view.lock() {
             v.turn = s.turn;
-            v.paused = s.paused_at.is_some() || s.handoff;
+            v.paused = s.input_delivery.live() && (s.paused_at.is_some() || s.handoff);
+            v.result_only = !s.input_delivery.live();
         }
     }
     fn publish_projected(
         &self,
         s: &State,
-        published: &mut Option<Presentation>,
+        published: &mut Option<(Presentation, bool)>,
         publish: &impl Fn(Presentation),
     ) {
         self.project(s);
@@ -506,13 +525,23 @@ impl SessionDraft {
             return;
         }
         let next = self.presentation();
-        if *published != Some(next) {
+        let projection = (next, !s.input_delivery.live());
+        if *published != Some(projection) {
             log::info!(target: "sayweave", "operation=draft_presentation task_id={} turn={} previous={:?} next={:?} audio_route={}", self.task, s.turn, published, next, self.control.audio.current());
-            *published = Some(next);
+            *published = Some(projection);
             publish(next);
         }
     }
     fn observe(&self, s: &mut State, value: NativeTranscript) {
+        if !s.input_delivery.live() {
+            if value.task_id == self.task
+                && value.turn == s.turn
+                && value.sequence > s.latest.sequence
+            {
+                s.latest = value;
+            }
+            return;
+        }
         if let Some(mut revised) = s.revisable.take() {
             revisable::observe(self, s, &mut revised, value);
             s.revisable = Some(revised);
@@ -591,7 +620,7 @@ impl SessionDraft {
         }
     }
     fn request_handoff(&self, s: &mut State) {
-        if s.activity == input_state::activity() {
+        if !s.input_delivery.live() || s.activity == input_state::activity() {
             return;
         }
         self.control.handoff_started();
@@ -643,6 +672,9 @@ impl SessionDraft {
         s.handoff = false;
     }
     fn start_generation(&self, s: &mut State) -> Result<(), Error> {
+        if !s.input_delivery.live() {
+            return Ok(());
+        }
         if let Some(mut revised) = s.revisable.take() {
             let result = revisable::start_generation(self, s, &mut revised);
             s.revisable = Some(revised);
@@ -901,6 +933,10 @@ impl SessionDraft {
         Ok(())
     }
     fn schedule(&self, s: &mut State) -> Result<(), Error> {
+        if !s.input_delivery.live() {
+            self.schedule_delivery_retirement(s);
+            return Ok(());
+        }
         if let Some(mut revised) = s.revisable.take() {
             let result = revisable::schedule(self, s, &mut revised);
             s.revisable = Some(revised);
@@ -1079,8 +1115,26 @@ impl SessionDraft {
         kind: &NativeKind,
         value: NativeValue,
     ) -> Option<Delivery> {
+        if matches!(kind, NativeKind::RetireHandoff | NativeKind::RetireClose) {
+            self.delivery_retired(s, kind, value);
+            return None;
+        }
+        if !s.input_delivery.live() && matches!(kind, NativeKind::Handoff) {
+            self.delivery_retired(s, &NativeKind::RetireHandoff, value);
+            return None;
+        }
         if let Some(mut revised) = s.revisable.take() {
+            let detached_source = (!s.input_delivery.live()).then(|| (s.turn, s.latest.clone()));
             let result = revisable::native_done(self, s, &mut revised, kind, value);
+            if let Some((turn, latest)) = detached_source {
+                // A pre-retirement receipt may settle its effect, but cannot
+                // allocate a replacement ASR source or reopen input permission.
+                s.turn = turn;
+                s.latest = latest;
+                s.handoff = false;
+                s.paused_at = None;
+                revised.stop();
+            }
             s.revisable = Some(revised);
             return result;
         }
@@ -1339,7 +1393,7 @@ impl SessionDraft {
                 _=readiness.changed()=>{let _=readiness.borrow_and_update();},
                 _=tick.tick()=>{
                     self.request_handoff(&mut s);
-                    if !s.stopping&&let Err(error)=windows_input::composition_target(&self.task,&self.anchor){s.record_failure(&self.task, error.code);}
+                    if !s.stopping&&s.input_delivery.live()&&let Err(error)=windows_input::composition_target(&self.task,&self.anchor){s.record_failure(&self.task, error.code);}
                 },
             }
             if s.ending
@@ -1364,6 +1418,7 @@ impl SessionDraft {
                     revised.expire();
                 }
             }
+            self.detach_failed_input(&mut s);
             if !s.stopping || s.ending.is_some() {
                 if let Err(error) = self.start_generation(&mut s) {
                     s.record_failure(&self.task, error.code);
@@ -1372,14 +1427,16 @@ impl SessionDraft {
                     s.record_failure(&self.task, error.code);
                 }
             }
-            if s.stop_error.is_some() && !s.stopping {
-                s.stopping = true;
-                self.control.request_finish();
-                self.control.pause();
-                let _ = crate::task_stop::request(
-                    &self.cancel,
-                    crate::contracts::speech::StopReason::Finish,
-                );
+            self.detach_failed_input(&mut s);
+            if let Some(mut delivery) = self.result_delivery(&mut s) {
+                s.terminal_failure(&self.task, &mut delivery);
+                if let Ok(mut view) = self.view.lock() {
+                    view.report = Some(s.report.clone());
+                }
+                if let Some(ending) = s.ending.take() {
+                    let _ = ending.reply.send(delivery);
+                }
+                return;
             }
             self.trace_dispatch(&mut s);
             self.publish_projected(&s, &mut published, &publish);

@@ -2,6 +2,7 @@
 .result { width: min(360px,100%); min-width: 0; border-radius: var(--radius-card); background: var(--surface-content); padding: 12px; box-shadow: var(--shadow-voice); }
 .result header { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: var(--text-small); line-height: var(--line-small); }
 .result header button { flex: none; }
+.resultHint { margin: 8px 0 0; font-size: var(--text-small); line-height: var(--line-small); color: var(--text-secondary); }
 .resultText { margin-top: 8px; max-height: 96px; overflow-y: auto; overflow-wrap: anywhere; user-select: text; font-size: var(--text-body); line-height: var(--line-body); }
 .actions { margin-top: 12px; display: flex; gap: 8px; }
 

@@ -21,6 +21,16 @@ fn main() {
         .unwrap()
         .with_file_name("input-fixture.exe");
     let result = match std::env::args().nth(1).as_deref() {
+        Some("endpoint") => {
+            let mut args = std::env::args().skip(2);
+            match (
+                args.next().and_then(|v| v.parse().ok()),
+                args.next().and_then(|v| v.parse().ok()),
+            ) {
+                (Some(root), Some(editor)) => sayweave_lib::endpoint_acceptance(root, editor),
+                _ => Err("explicit root and editor PID required".into()),
+            }
+        }
         Some("observation") => std::env::args()
             .nth(2)
             .and_then(|p| p.parse().ok())

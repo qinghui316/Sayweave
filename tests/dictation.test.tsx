@@ -111,6 +111,16 @@ it('terminal input notices render no explanatory banner or actions',()=>{
  expect(screen.queryByText('草稿更新已停止，请检查输入框。')).not.toBeInTheDocument();
  expect(screen.queryByRole('button')).not.toBeInTheDocument();
 });
+it('retired external input keeps the full recording copyable with its submission warning',async()=>{
+ const copy=vi.fn(async()=>{throw Error('clipboard busy');});
+ render(<VoiceSurface presentation="result" phase="completed" text="已经填入继续口述的完整原文" delivery={{state:'unconfirmed',submission:'uncertain',verification:'unavailable',stage:'composition',submittedEvents:0,error:'compositionPartial',restoreError:false,elapsedMs:100}} start={()=>{}} finish={()=>{}} cancel={()=>{}} copy={copy}/>);
+ expect(screen.getByText('已经填入继续口述的完整原文')).toBeVisible();
+ expect(screen.getByText('以下是本轮完整口述，前面的部分文字可能已填入。')).toBeVisible();
+ fireEvent.click(screen.getByRole('button',{name:'复制'}));
+ await screen.findByRole('button',{name:'复制失败，重试'});
+ expect(screen.getByText('已经填入继续口述的完整原文')).toBeVisible();
+ expect(copy).toHaveBeenCalledTimes(1);
+});
 it('no-target result retains its content and close action after copy failure',async()=>{
  const dismiss=vi.fn(),copy=vi.fn().mockRejectedValue(Error('clipboard busy')),user=userEvent.setup();
  render(<VoiceSurface presentation="result" phase="completed" text="完整结果" start={()=>{}} finish={()=>{}} cancel={()=>{}} dismiss={dismiss} copy={copy}/>);

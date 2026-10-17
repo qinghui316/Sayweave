@@ -5,6 +5,9 @@ use unicode_segmentation::UnicodeSegmentation;
 #[path = "block_boundary.rs"]
 mod boundary;
 use boundary::BoundaryProof;
+#[path = "block_scope.rs"]
+mod scope;
+use scope::BlockScope;
 #[path = "block_content.rs"]
 mod content;
 #[path = "block_evidence.rs"]
@@ -13,7 +16,7 @@ mod evidence;
 pub(super) struct Track {
     pub context: ITfContext,
     range: ITfRange,
-    field: initial_selection::FocusIdentity,
+    field: BlockScope,
     task: String,
     data: Rc<RefCell<Data>>,
     cookie: u32,
@@ -459,12 +462,26 @@ impl Track {
             if range_text(&range, ec)? != expected || expected.is_empty() {
                 return Err(failure(TF_E_DISCONNECTED));
             }
-            let field = initial_selection::FocusIdentity::capture()?;
+            let manager = shared
+                .borrow()
+                .manager
+                .clone()
+                .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
+            let field = BlockScope::capture(&manager, context)?;
             range.SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_FORWARD)?;
             // Unavailable/oversized outside evidence keeps the original strict
             // notification rule. It does not block ordinary composition input.
             let mut boundary_reason = "blockBoundaryUnavailable".into();
             let boundary = BoundaryProof::capture(context, &range, ec, &mut boundary_reason)
+                .inspect_err(|error| {
+                    #[cfg(feature = "acceptance")]
+                    eprintln!(
+                        "block boundary capture phase={boundary_reason} hr={:08x}",
+                        error.code().0 as u32
+                    );
+                    #[cfg(not(feature = "acceptance"))]
+                    let _ = error;
+                })
                 .ok()
                 .map(Rc::new);
             let data = Rc::new(RefCell::new(Data {
@@ -586,9 +603,11 @@ impl Track {
                 return Err(failure(TF_E_LOCKED));
             }
             if content::inline_identity(&native)
-                && let Some(boundary) = &self.boundary
+                && (self.boundary.is_some() || self.field.has_native_origin())
             {
-                if !boundary.matches(&self.context, &self.range, ec, phase)? {
+                if let Some(boundary) = &self.boundary
+                    && !boundary.matches(&self.context, &self.range, ec, phase)?
+                {
                     return Err(failure(TF_E_LOCKED));
                 }
                 let (selection_start, selection_end) =
@@ -784,13 +803,11 @@ impl Track {
             }
             *phase = "blockSnapshotForeground".into();
             let foreground = GetForegroundWindow();
-            let mut process = 0;
-            GetWindowThreadProcessId(foreground, Some(&mut process));
-            if process != std::process::id() {
-                return Err(failure(TF_E_DISCONNECTED));
-            }
             *phase = "blockSnapshotView".into();
             let view = self.context.GetActiveView()?.GetWnd()?;
+            // BlockScope already checks the local focus HWND and retained
+            // native view. A missing optional view HWND does not turn the
+            // outer application process into the editing process.
             if !view.0.is_null() && GetAncestor(view, GA_ROOT) != foreground {
                 return Err(failure(TF_E_DISCONNECTED));
             }
@@ -856,7 +873,7 @@ impl Track {
 
 #[implement(ITfTextEditSink)]
 struct Sink {
-    field: initial_selection::FocusIdentity,
+    field: BlockScope,
     range: ITfRange,
     client: u32,
     data: Rc<RefCell<Data>>,
@@ -893,6 +910,41 @@ impl ITfTextEditSink_Impl for Sink_Impl {
             // Own composition updates remain subject to native text proof; they
             // update tracking but must never become user-edit learning evidence.
             let own = context.InWriteSession(self.client)?.as_bool();
+            #[cfg(feature = "acceptance")]
+            if block_faults::native_scope_only()
+                && let Some(record) = record.as_ref()
+            {
+                let ranges = (|| {
+                    let updates = record.GetTextAndPropertyUpdates(TF_GTP_INCL_TEXT, &[])?;
+                    let mut values = Vec::new();
+                    for _ in 0..64 {
+                        let mut item = [None];
+                        let mut count = 0;
+                        updates.Next(&mut item, &mut count)?;
+                        if count == 0 {
+                            break;
+                        }
+                        let item = item[0].as_ref().ok_or_else(|| failure(E_FAIL))?;
+                        values.push(serde_json::json!({
+                            "start": item.CompareStart(ec,&self.range,TF_ANCHOR_START)?,
+                            "end": item.CompareEnd(ec,&self.range,TF_ANCHOR_END)?,
+                            "units": range_text(item,ec).ok().map(|v|v.encode_utf16().count()),
+                            "position": range_position(context,item,ec).ok().map(|v|[v.start,v.end]),
+                        }));
+                    }
+                    Ok::<_, windows::core::Error>(values)
+                })();
+                eprintln!(
+                    "native-scope edit-record {}",
+                    serde_json::json!({
+                        "within":updates_within(record,&self.range,ec).ok(),
+                        "selectionChanged":record.GetSelectionStatus().ok().map(|v|v.as_bool()),
+                        "selection":relative_selection(context,&self.range,ec).ok(),
+                        "scope":self.field.matches().ok(),
+                        "updates":ranges.ok(),
+                    })
+                );
+            }
             phase = "blockEditField".into();
             if !self.field.matches()? {
                 return Err(failure(TF_E_DISCONNECTED));
@@ -1868,4 +1920,75 @@ fn map_endpoint(before: &str, after: &str, at: u32) -> Option<u32> {
         return None;
     };
     boundary(after, mapped).then_some(mapped)
+}
+
+#[cfg(test)]
+mod native_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn popped_context_cannot_revive_even_when_the_same_object_is_pushed_again() {
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+            let result = (|| -> windows::core::Result<()> {
+                let manager: ITfThreadMgr =
+                    CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
+                let client = manager.Activate()?;
+                let result = (|| -> windows::core::Result<()> {
+                    let document = manager.CreateDocumentMgr()?;
+                    let mut context = None;
+                    let mut cookie = 0;
+                    document.CreateContext(client, 0, None, &mut context, &mut cookie)?;
+                    let context = context.ok_or_else(|| failure(E_FAIL))?;
+                    document.Push(&context)?;
+                    let data = Rc::new(RefCell::new(Data {
+                        id: "owned-lifetime".into(),
+                        epoch: 1,
+                        version: 1,
+                        operation: 1,
+                        text: "周三开会".into(),
+                        position: RangePosition { start: 0, end: 4 },
+                        valid: true,
+                        invalid_reason: String::new(),
+                        writable: true,
+                        lease: 1,
+                        writing: false,
+                        evidence: evidence::Record::default(),
+                        semantic_boundary: None,
+                        pending_proof: false,
+                        reacquired: false,
+                        notification: 0,
+                        notification_depth: 0,
+                    }));
+                    let sink: ITfThreadMgrEventSink = FocusSink {
+                        context: context.clone(),
+                        data: data.clone(),
+                        notifications: Rc::new(TextNotifications::default()),
+                        _lease: Lease::new(),
+                    }
+                    .into();
+                    let source: ITfSource = manager.cast()?;
+                    let subscription = source.AdviseSink(&ITfThreadMgrEventSink::IID, &sink)?;
+                    let result = (|| -> windows::core::Result<()> {
+                        assert!(data.borrow().valid && data.borrow().writable);
+                        document.Pop(TF_POPF_ALL)?;
+                        assert!(!data.borrow().valid && !data.borrow().writable);
+                        assert_eq!(data.borrow().invalid_reason, "blockContextPopped");
+                        document.Push(&context)?;
+                        assert_eq!(document.GetTop()?, context);
+                        assert!(!data.borrow().valid && !data.borrow().writable);
+                        assert_eq!(data.borrow().text, "周三开会");
+                        document.Pop(TF_POPF_ALL)?;
+                        Ok(())
+                    })();
+                    source.UnadviseSink(subscription)?;
+                    result
+                })();
+                manager.Deactivate()?;
+                result
+            })();
+            CoUninitialize();
+            result.unwrap();
+        }
+    }
 }

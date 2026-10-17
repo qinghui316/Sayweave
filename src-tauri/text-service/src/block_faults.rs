@@ -2,10 +2,18 @@
 use super::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 static FAULT: AtomicU32 = AtomicU32::new(0);
+static NATIVE_SCOPE_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 thread_local! {static DEFERRED:RefCell<Vec<(ITfContext,u32,ITfEditSession,TF_CONTEXT_EDIT_CONTEXT_FLAGS)>>=const{RefCell::new(Vec::new())};}
 #[unsafe(no_mangle)]
 pub extern "system" fn SayweaveBlockFixtureFault(value: u32) {
+    if value == 11 {
+        NATIVE_SCOPE_ONLY.store(true, Ordering::Release);
+        return;
+    }
     FAULT.store(value, Ordering::Release);
+}
+pub fn native_scope_only() -> bool {
+    NATIVE_SCOPE_ONLY.load(Ordering::Acquire)
 }
 pub fn coarse_notification(text_changed: bool) -> bool {
     text_changed

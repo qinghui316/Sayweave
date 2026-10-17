@@ -159,6 +159,186 @@ fn segment(id: u64, text: &str, confirmed: bool) -> SourceSegment {
 }
 
 #[tokio::test]
+async fn input_failure_retires_writing_while_the_original_source_continues_until_finish() {
+    let (actor, mut state, native) = actor(None);
+    bound_preview(&actor, &mut state, &native, "周三开会").await;
+    actor.control.resume(state.turn, state.activity);
+    actor.control.fixture_ready(state.turn, state.activity);
+    let turn = state.turn;
+    state.record_failure(&actor.task, "targetLost".into());
+    actor.detach_failed_input(&mut state);
+    assert!(!state.stopping);
+    assert!(!actor.control.stopping());
+    assert_eq!(*actor.cancel.borrow(), 0);
+    assert_eq!(actor.control.audio.current(), turn);
+    actor.schedule(&mut state).unwrap();
+    let Command::Finish(_, text, mode, _, _, reply) = command(&native).await else {
+        panic!("retire original composition without another body write")
+    };
+    assert!(text.is_empty());
+    assert!(matches!(mode, Finish::Handoff(_)));
+    reply
+        .send(FinishOutcome {
+            delivery: Delivery {
+                submission: Submission::Submitted,
+                state: "unconfirmed".into(),
+                stage: "composition".into(),
+                ..Delivery::not_submitted("inputUnconfirmed")
+            },
+            committed: false,
+            handed_off: true,
+            cancelled: false,
+            rollback_failed: false,
+        })
+        .ok()
+        .unwrap();
+    acknowledge(&actor, &mut state).await;
+    // Close completion is independent of recording. Drive its real actor
+    // receipt here; the connection worker has separate retirement tests.
+    actor.native_done(
+        &mut state,
+        &NativeKind::RetireClose,
+        NativeValue::Closed(Ok(())),
+    );
+    actor.observe(
+        &mut state,
+        snapshot(2, vec![segment(1, "周三开会下周一上午开会", false)]),
+    );
+    actor.start_generation(&mut state).unwrap();
+    actor.schedule(&mut state).unwrap();
+    assert!(state.native.is_none());
+    assert!(native.try_recv().is_err());
+    assert_eq!(state.turn, turn);
+    assert_eq!(actor.control.audio.current(), turn);
+    assert!(
+        actor.result_delivery(&mut state).is_none(),
+        "input cleanup cannot finish recording"
+    );
+    let (reply, _) = oneshot::channel();
+    state.ending = Some(Ending {
+        mode: Finish::Commit,
+        reply,
+        deadline: Instant::now() + Duration::from_secs(15),
+        expired: false,
+    });
+    let delivery = actor.result_delivery(&mut state).unwrap();
+    assert_eq!(delivery.submission, Submission::Submitted);
+    assert_eq!(state.report.text, "周三开会");
+    assert_eq!(state.report.result_raw, "周三开会下周一上午开会");
+    assert!(state.report.result_only);
+    assert_eq!(state.stop_error.as_deref(), Some("targetLost"));
+}
+
+#[tokio::test]
+async fn in_flight_write_must_settle_before_retirement_without_replay_or_new_source() {
+    let (actor, mut state, native) = actor(None);
+    state.revisable = Some(revisable::State::new());
+    actor.observe(&mut state, snapshot(1, vec![segment(1, "首批文字", false)]));
+    actor.schedule(&mut state).unwrap();
+    let Command::ReplaceTracked(_, text, _, id, _, reply) = command(&native).await else {
+        panic!("tracked write")
+    };
+    state.record_failure(&actor.task, "targetChanged".into());
+    actor.detach_failed_input(&mut state);
+    actor.schedule(&mut state).unwrap();
+    assert!(
+        native.try_recv().is_err(),
+        "in-flight write must settle before cleanup"
+    );
+    reply.send(Ok(tracked_snapshot(&id, &text))).unwrap();
+    acknowledge(&actor, &mut state).await;
+    actor.observe(
+        &mut state,
+        snapshot(2, vec![segment(1, "首批文字后续文字", false)]),
+    );
+    actor.schedule(&mut state).unwrap();
+    let Command::Finish(_, text, mode, _, _, _) = command(&native).await else {
+        panic!("only handoff may follow")
+    };
+    assert!(text.is_empty());
+    assert!(matches!(mode, Finish::Handoff(_)));
+    assert_eq!(state.turn, 1);
+    assert_eq!(state.written_raw, "首批文字");
+    assert_eq!(state.latest.text, "首批文字后续文字");
+}
+
+#[test]
+fn cancelled_result_keeps_uncertain_input_facts_and_has_no_copy_text() {
+    let (actor, mut state, _native) = actor(None);
+    state.input_delivery = delivery::InputDelivery::Result(Delivery {
+        submission: Submission::Uncertain,
+        ..Delivery::not_submitted("compositionPartial")
+    });
+    let (reply, _) = oneshot::channel();
+    state.ending = Some(Ending {
+        mode: Finish::Abort,
+        reply,
+        deadline: Instant::now() + Duration::from_secs(15),
+        expired: false,
+    });
+    state.latest = snapshot(3, vec![segment(1, "保留识别原文", false)]);
+    let delivery = actor.result_delivery(&mut state).unwrap();
+    assert_eq!(delivery.submission, Submission::Uncertain);
+    assert_eq!(delivery.error.as_deref(), Some("cancelled"));
+    assert!(state.report.result_raw.is_empty());
+    assert!(state.report.cancelled);
+}
+#[test]
+fn input_failure_during_final_drain_keeps_result_but_cancel_retains_its_own_policy() {
+    for mode in [Finish::Commit, Finish::Abort] {
+        let (actor, mut state, _) = actor(None);
+        state.stopping = true;
+        actor.control.request_finish();
+        let (reply, _) = oneshot::channel();
+        state.ending = Some(Ending {
+            mode: mode.clone(),
+            reply,
+            deadline: Instant::now() + Duration::from_secs(15),
+            expired: false,
+        });
+        state.record_failure(&actor.task, "compositionPartial".into());
+        actor.detach_failed_input(&mut state);
+        assert_eq!(state.report.result_only, mode == Finish::Commit);
+        assert!(actor.control.stopping());
+    }
+}
+
+#[tokio::test]
+async fn tracking_failure_preserves_the_completed_body_and_never_rebinds_or_replays() {
+    let (actor, mut state, native) = actor(None);
+    state.revisable = Some(revisable::State::new());
+    actor.observe(&mut state, snapshot(1, vec![segment(1, "已经写入", false)]));
+    actor.schedule(&mut state).unwrap();
+    let Command::ReplaceTracked(_, text, _, _, _, reply) = command(&native).await else {
+        panic!("tracked write")
+    };
+    reply
+        .send(Err(windows_input::composition::WriteFailure {
+            error: Error::new("compositionPartial"),
+            mutation: Mutation::Changed,
+            tracking_failed: true,
+        }))
+        .unwrap();
+    acknowledge(&actor, &mut state).await;
+    assert_eq!(text, "已经写入");
+    assert_eq!(state.written_raw, "已经写入");
+    assert!(!state.revisable.as_ref().unwrap().uncertain());
+    actor.detach_failed_input(&mut state);
+    actor.observe(
+        &mut state,
+        snapshot(2, vec![segment(1, "已经写入继续口述", false)]),
+    );
+    actor.schedule(&mut state).unwrap();
+    let Command::Finish(_, text, mode, _, _, _) = command(&native).await else {
+        panic!("only cleanup follows")
+    };
+    assert!(text.is_empty());
+    assert!(matches!(mode, Finish::Handoff(_)));
+    assert!(!actor.control.stopping());
+    assert_eq!(state.latest.text, "已经写入继续口述");
+}
+
+#[tokio::test]
 async fn revisable_preview_does_not_commit_and_next_request_rewrites_full_block() {
     let fixture = Fixture::start(vec![response("周三开会。"), response("周四开会。")]);
     let root = tempfile::tempdir().unwrap();
@@ -330,6 +510,12 @@ pub(super) fn actor(
         focus: 1,
         process: 1,
         lifetime: 1,
+        editor: crate::windows_input::EditorEndpoint {
+            window: 1,
+            process: 1,
+            thread: 1,
+            lifetime: 1,
+        },
         generation: 1,
         captured_tick: 0,
         activity,
@@ -1128,5 +1314,26 @@ fn retained_audio_resume_publishes_settled_view_without_readiness_event() {
         values.lock().unwrap().len(),
         3,
         "late transitions cannot reopen a finishing task"
+    );
+}
+#[test]
+fn result_route_change_is_published_even_when_recording_presentation_is_unchanged() {
+    let (actor, mut state, _) = actor(None);
+    actor.control.resume(state.turn, state.activity);
+    actor.control.fixture_ready(state.turn, state.activity);
+    let values = Mutex::new(Vec::new());
+    let publish = |value| values.lock().unwrap().push((value, actor.result_only()));
+    let mut published = None;
+    actor.publish_projected(&state, &mut published, &publish);
+    state.record_failure(&actor.task, "targetChanged".into());
+    actor.detach_failed_input(&mut state);
+    actor.publish_projected(&state, &mut published, &publish);
+    actor.publish_projected(&state, &mut published, &publish);
+    assert_eq!(
+        *values.lock().unwrap(),
+        vec![
+            (Presentation::Recording, false),
+            (Presentation::Recording, true)
+        ]
     );
 }
