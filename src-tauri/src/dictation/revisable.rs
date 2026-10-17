@@ -540,10 +540,11 @@ fn continue_at_caret(
         .visible_coverage
         .clone()
         .ok_or_else(|| Error::new("sourceChanged"))?;
-    let latest = r.pending_source.take().unwrap_or_else(|| s.latest.clone());
+    let latest = r.pending_source.clone().unwrap_or_else(|| s.latest.clone());
     let offset = coverage
         .offset(&latest.segments)
         .ok_or_else(|| Error::new("sourceChanged"))?;
+    r.pending_source = None;
     let text = r.block.confirmed().1.to_owned();
     archive_block(actor, s, r, &text, false);
     cancel(actor, s, r);
@@ -559,7 +560,6 @@ fn continue_at_caret(
     s.handoff = false;
     s.merge_at = None;
     s.paused_at = Some(Instant::now());
-    r.proof_deadline = Some(Instant::now() + Duration::from_secs(15));
     observe(actor, s, r, latest);
     log::info!(target:"sayweave", "operation=draft_input_mode task_id={} turn={} mode=caret source_end={offset}",actor.task,s.turn);
     Ok(())
@@ -726,6 +726,12 @@ pub(super) fn schedule(
             .is_none_or(|a| a.elapsed() >= Duration::from_millis(300))
             && !input_state::editing_key_held()
         {
+            if r.mode == InputMode::Caret {
+                // The old block is already retired. Preparation starts after
+                // editing releases the caret, not while the user still types.
+                r.proof_deadline
+                    .get_or_insert_with(|| Instant::now() + Duration::from_secs(15));
+            }
             let anchor = windows_input::reanchor_turn(&actor.task, &actor.anchor)?;
             if anchor.activity != s.activity {
                 actor.control.hold_input();
@@ -1235,14 +1241,17 @@ pub(super) fn native_done(
         }
         (NativeKind::Revisable(Effect::Close), NativeValue::Closed(result)) => {
             s.report.cancelled = s.ending.as_ref().is_some_and(|e| e.mode == Finish::Abort);
+            // An acknowledged native write remains submitted even when a
+            // released carrier cannot expose the user's final edited body.
+            let submitted = !s.written_raw.is_empty() || !s.report.text.is_empty();
             let mut delivery = Delivery::not_submitted(if s.report.cancelled {
                 "cancelled"
-            } else if s.report.text.trim().is_empty() {
+            } else if !submitted {
                 "emptyText"
             } else {
                 "inputUnconfirmed"
             });
-            if !s.report.text.is_empty() {
+            if submitted {
                 delivery.submission = Submission::Submitted;
                 delivery.verification = crate::windows_input::Verification::Unavailable;
                 delivery.stage = "composition".into();
@@ -1312,6 +1321,10 @@ mod tests {
         assert!(!Arc::ptr_eq(&old_permit, &r.permit));
         assert_eq!(r.block.visible(), "地点在上海");
         assert!(
+            r.proof_deadline.is_none(),
+            "editing has not released a new position yet"
+        );
+        assert!(
             s.report.text.is_empty(),
             "host user edits are not fabricated"
         );
@@ -1360,7 +1373,8 @@ mod tests {
         prior.segments[0].confirmed = false;
         r.visible_coverage =
             crate::processing::draft_source::Watermark::capture(&prior.segments, 2);
-        s.latest = source(&actor.task, 2, "会议", "在周一");
+        s.latest = prior;
+        r.pending_source = Some(source(&actor.task, 2, "会议", "在周一"));
         let id = r.block.id().to_owned();
         assert_eq!(
             continue_at_caret(&actor, &mut s, &mut r).unwrap_err().code,
@@ -1368,6 +1382,7 @@ mod tests {
         );
         assert_eq!(r.block.id(), id);
         assert_eq!(r.mode, InputMode::Revisable);
+        assert_eq!(r.pending_source.as_ref().unwrap().text, "会议在周一");
     }
     #[tokio::test]
     async fn unavailable_scope_needs_a_successful_release_before_caret_mode() {
@@ -1450,6 +1465,36 @@ mod tests {
         native_done(&actor, &mut s, &mut r, &kind, NativeValue::Begun(Ok(draft)));
         assert_eq!(actor.control.audio.current(), 0);
         assert!(s.stop_error.is_none());
+    }
+    #[test]
+    fn caret_without_a_new_tail_keeps_the_prior_submission_fact_at_finish_or_cancel() {
+        for mode in [Finish::Commit, Finish::Abort] {
+            let (actor, mut s, _) = actor(None);
+            let mut r = State::new();
+            r.mode = InputMode::Caret;
+            s.written_raw = "周三开会".into();
+            ending(&mut s, false);
+            s.ending.as_mut().unwrap().mode = mode.clone();
+            let delivery = native_done(
+                &actor,
+                &mut s,
+                &mut r,
+                &NativeKind::Revisable(Effect::Close),
+                NativeValue::Closed(Ok(())),
+            )
+            .unwrap();
+            assert_eq!(delivery.submission, Submission::Submitted);
+            assert_eq!(
+                delivery.verification,
+                crate::windows_input::Verification::Unavailable
+            );
+            assert_eq!(s.report.cancelled, mode == Finish::Abort);
+            assert_ne!(delivery.error.as_deref(), Some("emptyText"));
+            assert!(
+                s.report.text.is_empty(),
+                "committed user edits remain unknown"
+            );
+        }
     }
     #[test]
     fn caret_finish_never_opens_a_new_range_for_an_unwritten_tail() {

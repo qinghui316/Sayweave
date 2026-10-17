@@ -431,6 +431,8 @@ async fn richtext_actor() {
                     manager.update(&latest);
                 }
                 Some("edited") => { input_state::edited(); }
+                Some("edit-start") => { input_state::edit_key_pressed(0xff); }
+                Some("edit-end") => { input_state::key_released(0xff); }
                 Some("release-bind") => {
                     let (lock, ready) = &RELEASE_UPDATE;
                     *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
@@ -476,6 +478,7 @@ async fn richtext_actor() {
         }
         Err("owned actor command limit".into())
     }.await;
+    input_state::key_released(0xff);
     // Also unblock native retirement if the driver exits during the edit.
     *RELEASE_UPDATE.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
     RELEASE_UPDATE.1.notify_one();

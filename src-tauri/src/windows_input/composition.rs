@@ -715,6 +715,8 @@ struct Host {
     poll_at: Instant,
     task: String,
     turn: u64,
+    // Native range lifetimes can advance while recognition keeps its source turn.
+    native_turn: u64,
     anchor: Anchor,
     gate: Arc<DeliveryGate>,
     pipe: Pipe,
@@ -825,7 +827,7 @@ impl Host {
             return;
         }
         self.receipts.insert(
-            (self.turn, self.operation, region),
+            (self.native_turn, self.operation, region),
             SourceReceipt {
                 operation: self.operation,
                 revision: self.revision,
@@ -879,7 +881,7 @@ impl Host {
                 .or_else(|| {
                     self.raw_tail.as_ref().filter(|r| {
                         value.region == OutputRegion::Tail
-                            && value.turn == self.turn
+                            && value.turn == self.native_turn
                             && r.operation == value.operation
                     })
                 });
@@ -899,7 +901,7 @@ impl Host {
                     value.task, value.turn, value.operation, value.region, value.sequence
                 ),
                 task: value.task,
-                turn: value.turn,
+                turn: self.turn,
                 operation: value.operation,
                 sequence: value.sequence,
                 region: if value.region == OutputRegion::Prefix {
@@ -1005,6 +1007,7 @@ impl Host {
             poll_at: Instant::now(),
             task,
             turn,
+            native_turn: turn,
             anchor,
             gate,
             pipe,
@@ -1059,6 +1062,7 @@ impl Host {
     }
     fn begin_turn(&mut self, turn: u64, anchor: Anchor) -> Result<(), Error> {
         if self.range_open
+            || self.block.is_some()
             || turn < self.turn
             || self.failure.is_some()
             || anchor.window != self.anchor.window
@@ -1070,6 +1074,8 @@ impl Host {
             return Err(Error::new("staleSession"));
         }
         self.stop_observation();
+        self.acknowledge_receipt()?;
+        self.native_turn = next_native_turn(self.native_turn, turn)?;
         self.anchor = anchor;
         self.turn = turn;
         self.revision = 0;
@@ -1108,7 +1114,7 @@ impl Host {
                 control_protocol: 1,
                 capability: self.capability.clone(),
                 task: self.task.clone(),
-                turn: self.turn,
+                turn: self.native_turn,
                 operation,
                 deadline_tick: deadline.min(now + 15_000),
                 action: ControlAction::PrepareEngine,
@@ -1130,7 +1136,7 @@ impl Host {
                         .map_err(|_| Error::new("compositionTargetVersion"))?;
                     if reply.control_protocol != 1
                         || reply.task != self.task
-                        || reply.turn != self.turn
+                        || reply.turn != self.native_turn
                         || reply.operation != operation
                     {
                         return Err(Error::new("compositionProtocol"));
@@ -1303,7 +1309,7 @@ impl Host {
                         &reply,
                         &self.engine,
                         &self.task,
-                        self.turn,
+                        self.native_turn,
                         (self.operation, self.revision),
                         &self.abandoned_optional,
                     ) && self.revoking_primary != Some((reply.operation, reply.revision))
@@ -1404,7 +1410,7 @@ impl Host {
             protocol: sayweave_text_service::wire::PROTOCOL,
             capability: self.capability.clone(),
             task: self.task.clone(),
-            turn: self.turn,
+            turn: self.native_turn,
             operation: self.operation,
             revision: self.revision,
             deadline_tick: deadline
@@ -1453,7 +1459,9 @@ impl Host {
             if let Some(frame) = frame {
                 let reply: Reply = serde_json::from_slice(&frame)
                     .map_err(|_| Error::new("compositionProtocol"))?;
-                if reply.engine != self.engine || reply.task != self.task || reply.turn != self.turn
+                if reply.engine != self.engine
+                    || reply.task != self.task
+                    || reply.turn != request.turn
                 {
                     return Err(Error::new("compositionProtocol"));
                 }
@@ -1508,7 +1516,7 @@ impl Host {
                 if reply.applied {
                     self.range_epoch = reply.range_epoch;
                 }
-                log::info!(target:"sayweave", "operation=composition_edit task_id={} turn={} revision={} action={:?} applied={} code={} mutation={:?} elapsed_ms={}", self.task, self.turn, request.revision, action, reply.applied, reply.code, reply.mutation, at.elapsed().as_millis());
+                log::info!(target:"sayweave", "operation=composition_edit task_id={} turn={} native_turn={} revision={} action={:?} applied={} code={} mutation={:?} elapsed_ms={}", self.task, self.turn, request.turn, request.revision, action, reply.applied, reply.code, reply.mutation, at.elapsed().as_millis());
                 primary = Some(reply);
                 continue;
             }
@@ -1527,7 +1535,7 @@ impl Host {
                     protocol: request.protocol,
                     capability: self.capability.clone(),
                     task: self.task.clone(),
-                    turn: self.turn,
+                    turn: request.turn,
                     operation: self.operation,
                     revision: request.revision,
                     deadline_tick: unsafe { GetTickCount64() } + 2000,
@@ -1969,6 +1977,12 @@ fn target_ready(task: &str, anchor: &Anchor, gate: &DeliveryGate) -> Result<(), 
 fn editor_endpoint(anchor: &Anchor) -> Result<(u32, u32), Error> {
     super::native::editor_endpoint(anchor)
 }
+fn next_native_turn(current: u64, source: u64) -> Result<u64, Error> {
+    current
+        .checked_add(1)
+        .map(|next| next.max(source))
+        .ok_or_else(|| Error::new("staleSession"))
+}
 fn pump() {
     unsafe {
         let mut message = MSG::default();
@@ -1982,6 +1996,36 @@ fn pump() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_native_range_advances_without_changing_the_recognition_source_turn() {
+        let source_turn = 1;
+        let mut version = sayweave_text_service::wire::DraftVersion::default();
+        let mut request: Request = serde_json::from_value(serde_json::json!({
+            "protocol": sayweave_text_service::wire::PROTOCOL,
+            "engine":{"proxy_instance":uuid::Uuid::new_v4().to_string(),"engine_generation":1},
+            "capability":uuid::Uuid::new_v4().to_string(),
+            "task":uuid::Uuid::new_v4().to_string(),"turn":source_turn,
+            "operation":1,"revision":0,"deadline_tick":1000,"action":"begin","text":""
+        }))
+        .unwrap();
+        assert!(version.accepts(&request));
+        version.applied(&request);
+        request.action = Action::Handoff;
+        request.operation += 1;
+        assert!(version.accepts(&request));
+        version.applied(&request);
+        request.action = Action::Begin;
+        request.operation += 1;
+        assert!(!version.accepts(&request));
+        request.turn = next_native_turn(version.turn, source_turn).unwrap();
+        assert!(version.accepts(&request));
+        version.applied(&request);
+        let next = next_native_turn(version.turn, source_turn).unwrap();
+        assert_eq!(next, 3);
+        assert_eq!(source_turn, 1);
+        assert_eq!(next_native_turn(3, 7).unwrap(), 7);
+        assert!(next_native_turn(u64::MAX, source_turn).is_err());
+    }
     #[test]
     fn write_effect_and_tracking_refusal_are_independent_receipt_facts() {
         let reply = |phase: &str, mutation: Mutation| -> Reply {
