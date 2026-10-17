@@ -509,11 +509,8 @@ mod native {
                     let _ = std::fs::remove_dir(&self.0);
                 }
             }
-            let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .join(".local")
-                .join(format!("启动路径 test {}", uuid::Uuid::new_v4()));
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("启动路径 test");
             std::fs::create_dir(&directory).unwrap();
             let fixture = Fixture(directory);
             std::fs::write(fixture.0.join("sayweave.exe"), b"owned Shell path fixture").unwrap();

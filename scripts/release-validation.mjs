@@ -44,13 +44,22 @@ export function releaseNotes(value){
 
 export const frozenTestPaths=['tests/e2e/models.spec.ts','tests/e2e/ui-interaction.spec.ts','tests/e2e/dictation.spec.ts','tests/fixtures/voice-recovery.tsx'];
 const receiptTestPath='src-tauri/src/installer/record.rs';
-export const frozenCheckPaths=['scripts/test-richtext-block.mjs',receiptTestPath];
+const startupTestPath='src-tauri/src/installer/login_startup.rs';
+const archiveTestPath='src-tauri/src/data/archive_recovery.rs';
+export const frozenCheckPaths=['scripts/test-richtext-block.mjs',receiptTestPath,startupTestPath,archiveTestPath];
 export const frozenFormalPaths=['src-tauri/text-service/src/formal_switch_probe.rs'];
 // This one reviewed fixture repair is pinned through EOF, including module closure.
 // A marker/prefix comparison alone cannot reject runtime code appended after tests.
 const receiptTestModules={original:'817d8bf646b7b37d2c990cfbd6cf4e6981daed4f78c4eca57bffd04ca050a619',reviewed:'4a38a0a48e95900d3911eafaa65104fdd8214d9816635d9436fda7904b8fc550'};
-export function validateNativeTestOverride(original,reviewed){
- const marker=Buffer.from('\n#[cfg(test)]\nmod tests {');
+const nativeTestModules=new Map([
+ [receiptTestPath,{marker:'\n#[cfg(test)]\nmod tests {',...receiptTestModules}],
+ [startupTestPath,{marker:'\n    #[cfg(test)]\n    mod tests {',original:'167ad7649ec217716adf5f2f71d618bc0132f1556940a61ae712a73dd1ef0627',reviewed:'7ae3440675b8e9275db952acb5b0594c35c72e861fdcbfb7f431979280c8290c'}],
+ [archiveTestPath,{marker:'\n#[cfg(test)]\nmod tests {',original:'e7fdbbc88165abe9246db27a3033b137dc7c347f08ef3029b01fd22761d29f61',reviewed:'5ad59bf7e4fdefe16e1f3a0f7b57b04d070fa5f2d0dcef255b524e2918c2482d'}],
+]);
+export function validateNativeTestOverride(original,reviewed,path=receiptTestPath){
+ const identity=nativeTestModules.get(path);
+ if(!identity)throw Error('Native test override path is not reviewed');
+ const marker=Buffer.from(identity.marker);
  const prefix=(bytes,expected)=>{
   new TextDecoder('utf-8',{fatal:true}).decode(bytes);
   const start=bytes.indexOf(marker);
@@ -58,12 +67,12 @@ export function validateNativeTestOverride(original,reviewed){
   if(createHash('sha256').update(bytes.subarray(start)).digest('hex')!==expected)throw Error('Native test module differs from the reviewed frozen fixture');
   return bytes.subarray(0,start);
  };
- if(!prefix(original,receiptTestModules.original).equals(prefix(reviewed,receiptTestModules.reviewed)))throw Error('Frozen native production source differs');
+ if(!prefix(original,identity.original).equals(prefix(reviewed,identity.reviewed)))throw Error('Frozen native production source differs');
 }
 function verifyNativeTestDelta(root,product,controller,paths){
- if(paths.includes(receiptTestPath))validateNativeTestOverride(
-  execFileSync('git',['show',`${product}:${receiptTestPath}`],{cwd:root}),
-  execFileSync('git',['show',`${controller}:${receiptTestPath}`],{cwd:root}));
+ for(const path of nativeTestModules.keys())if(paths.includes(path))validateNativeTestOverride(
+  execFileSync('git',['show',`${product}:${path}`],{cwd:root}),
+  execFileSync('git',['show',`${controller}:${path}`],{cwd:root}),path);
 }
 const controllerPaths=new Set([...frozenTestPaths,...frozenCheckPaths,...frozenFormalPaths,'.github/workflows/windows-release.yml','scripts/release-validation.mjs','scripts/verify-update-release.mjs','tests/release-validation.test.ts','docs/release.md']);
 export function validateFrozenController(tag,product,controller,ref,paths){

@@ -111,7 +111,7 @@ describe('retained package resume and partial upload',()=>{
 
 describe('frozen product release controller boundaries',()=>{
  // Reconstruct the frozen fixture without requiring release tags in shallow CI clones.
- // The production validator pins both actual test modules through EOF by SHA256.
+ // The validator pins each original/reviewed native test suffix through EOF.
  const nativeReviewed=readFileSync('src-tauri/src/installer/record.rs','utf8').replaceAll('\r\n','\n');
  const start=nativeReviewed.indexOf('    fn ordinary_owner_receipt_preserves_owner_and_confirms_replacement() {');
  const end=nativeReviewed.indexOf('    #[test]\n    fn live_installer_identity_fences_receipt_recovery_including_pid_reuse()',start);
@@ -125,6 +125,43 @@ describe('frozen product release controller boundaries',()=>{
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     }
 `+nativeReviewed.slice(end);
+ const continuationFixtures=[
+  {path:'src-tauri/src/installer/login_startup.rs',before:`            let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join(".local")
+                .join(format!("启动路径 test {}", uuid::Uuid::new_v4()));`,after:`            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("启动路径 test");`},
+  {path:'src-tauri/src/data/archive_recovery.rs',before:`        assert_eq!(entries(temp.path()).unwrap().len(), 2);
+        drop(repo);
+        let repo = Repository::open(temp.path()).unwrap();`,after:`        let pending = entries(temp.path()).unwrap().len();
+        assert_eq!(pending, 2);
+        drop(repo);
+        let mut repo = Repository::open(temp.path()).unwrap();
+        // Startup replay is bounded. Continue the same maintenance path without
+        // requiring both receipts to fit in its first 25ms pass on every disk.
+        for _ in 0..pending {
+            replay_batch(&mut repo, temp.path(), false, std::time::Duration::ZERO, 1).unwrap();
+        }`},
+ ].map(({path,before,after})=>{const reviewed=readFileSync(path,'utf8').replaceAll('\r\n','\n');return {path,reviewed,original:reviewed.replace(after,before)};});
+ it.each(continuationFixtures)('permits the exact continuation fixture for $path',({path,original,reviewed})=>{
+  expect(original).not.toBe(reviewed);
+  expect(()=>validateNativeTestOverride(Buffer.from(original),Buffer.from(reviewed),path)).not.toThrow();
+ });
+ it.each(continuationFixtures.flatMap(fixture=>['production','append','original','test','path'].map(kind=>({...fixture,kind}))))('rejects $kind changes to the pinned $path fixture',({path,original,reviewed,kind})=>{
+  if(kind==='production')reviewed='fn injected_runtime() {}\n'+reviewed;
+  if(kind==='append')reviewed+='\npub fn injected_runtime() {}\n';
+  if(kind==='original')original+='\npub fn injected_runtime() {}\n';
+  if(kind==='test'){
+   const boundary=reviewed.indexOf(path.includes('login_startup')?'\n    #[cfg(test)]\n    mod tests {':'\n#[cfg(test)]\nmod tests {');
+   reviewed=reviewed.slice(0,boundary)+reviewed.slice(boundary).replace('unwrap();','expect("unreviewed");');
+  }
+  if(kind==='path')path=path.includes('login_startup')?'src-tauri/src/data/archive_recovery.rs':'src-tauri/src/installer/login_startup.rs';
+  expect(()=>validateNativeTestOverride(Buffer.from(original),Buffer.from(reviewed),path)).toThrow();
+ });
+ it('rejects a native override outside the explicit path map',()=>{
+  expect(()=>validateNativeTestOverride(Buffer.from(nativeOriginal),Buffer.from(nativeReviewed),'src-tauri/src/lib.rs')).toThrow();
+ });
  it('permits a native test fixture delta but rejects production changes and ambiguous boundaries',()=>{
   expect(()=>validateNativeTestOverride(Buffer.from(nativeOriginal),Buffer.from(nativeReviewed))).not.toThrow();
   for(const changed of ['fn runtime() {}\n'+nativeReviewed,nativeReviewed.replace('#[cfg(test)]','#[cfg(any())]'),nativeReviewed+'\n#[cfg(test)]\nmod tests {}'])expect(()=>validateNativeTestOverride(Buffer.from(nativeOriginal),Buffer.from(changed))).toThrow();
@@ -161,6 +198,8 @@ describe('frozen product release controller boundaries',()=>{
   try{
    mkdirSync(join(root,'scripts'),{recursive:true});mkdirSync(join(root,'tests/e2e'),{recursive:true});mkdirSync(join(root,'tests/fixtures'),{recursive:true});mkdirSync(join(root,'src-tauri/src/installer'),{recursive:true});
    writeFileSync(join(root,'src-tauri/src/installer/record.rs'),nativeOriginal);
+   mkdirSync(join(root,'src-tauri/src/data'),{recursive:true});
+   for(const fixture of continuationFixtures)writeFileSync(join(root,fixture.path),fixture.original);
    mkdirSync(join(root,'src-tauri/text-service/src'),{recursive:true});
    writeFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'original probe');
    writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9'}));
@@ -174,15 +213,17 @@ describe('frozen product release controller boundaries',()=>{
    writeFileSync(join(root,'tests/fixtures/voice-recovery.tsx'),'reviewed theme fixture');
    writeFileSync(join(root,'scripts/test-richtext-block.mjs'),'reviewed check');
    writeFileSync(join(root,'src-tauri/src/installer/record.rs'),nativeReviewed);
+   for(const fixture of continuationFixtures)writeFileSync(join(root,fixture.path),fixture.reviewed);
    writeFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'reviewed probe');
    git(['add','.']);git(['commit','-m','controller']);const controller=git(['rev-parse','HEAD']);git(['tag','v0.1.9-release-check-e2e-1']);git(['update-ref','refs/remotes/origin/main',controller]);git(['checkout','--detach',product]);
    const failure=`Reviewed frozen-product ${kind==='e2e'?'E2E':kind} failed`;
-   const work=runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{expect(readFileSync(join(root,'tests/fixtures/voice-recovery.tsx'),'utf8')).toBe(kind==='e2e'?'reviewed theme fixture':'original theme fixture');expect(readFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'utf8')).toBe(kind==='formal'?'reviewed probe':'original probe');expect(readFileSync(join(root,'tests/e2e/dictation.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(kind==='check'?nativeReviewed:nativeOriginal);expect(readFileSync(join(root,'tests/e2e/models.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe(kind==='check'?'reviewed check':'original check');if(status===2)writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9',unexpected:true}));return {status:status===0?0:1};},kind);
+   const work=runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{for(const fixture of continuationFixtures)expect(readFileSync(join(root,fixture.path),'utf8')).toBe(kind==='check'?fixture.reviewed:fixture.original);expect(readFileSync(join(root,'tests/fixtures/voice-recovery.tsx'),'utf8')).toBe(kind==='e2e'?'reviewed theme fixture':'original theme fixture');expect(readFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'utf8')).toBe(kind==='formal'?'reviewed probe':'original probe');expect(readFileSync(join(root,'tests/e2e/dictation.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(kind==='check'?nativeReviewed:nativeOriginal);expect(readFileSync(join(root,'tests/e2e/models.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe(kind==='check'?'reviewed check':'original check');if(status===2)writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9',unexpected:true}));return {status:status===0?0:1};},kind);
    if(status===0)await work;else if(status===1)await expect(work).rejects.toThrow(failure);else{await expect(work).rejects.toMatchObject({name:'AggregateError',errors:[expect.objectContaining({message:failure}),expect.objectContaining({message:'Frozen product checkout was not restored cleanly'})]});expect(git(['status','--porcelain'])).toContain('package.json');git(['restore','--worktree','--','package.json']);}
    for(const path of ['models','ui-interaction','dictation'])expect(readFileSync(join(root,`tests/e2e/${path}.spec.ts`),'utf8')).toBe('original');
    expect(readFileSync(join(root,'tests/fixtures/voice-recovery.tsx'),'utf8')).toBe('original theme fixture');
    expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe('original check');
    expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(nativeOriginal);
+   for(const fixture of continuationFixtures)expect(readFileSync(join(root,fixture.path),'utf8')).toBe(fixture.original);
    expect(readFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'utf8')).toBe('original probe');
    expect(git(['status','--porcelain'])).toBe('');expect(git(['rev-parse','HEAD'])).toBe(product);
    if(status===0){git(['update-ref','refs/remotes/origin/main',product]);let invoked=false;await expect(runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{invoked=true;return {status:0};})).rejects.toThrow();expect(invoked).toBe(false);expect(git(['status','--porcelain'])).toBe('');}

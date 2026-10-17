@@ -1174,9 +1174,15 @@ mod tests {
         assert_eq!(memory.facts.len(), 1);
         memory.flush(temp.path());
         assert!(memory.facts.is_empty());
-        assert_eq!(entries(temp.path()).unwrap().len(), 2);
+        let pending = entries(temp.path()).unwrap().len();
+        assert_eq!(pending, 2);
         drop(repo);
-        let repo = Repository::open(temp.path()).unwrap();
+        let mut repo = Repository::open(temp.path()).unwrap();
+        // Startup replay is bounded. Continue the same maintenance path without
+        // requiring both receipts to fit in its first 25ms pass on every disk.
+        for _ in 0..pending {
+            replay_batch(&mut repo, temp.path(), false, std::time::Duration::ZERO, 1).unwrap();
+        }
         assert!(entries(temp.path()).unwrap().is_empty());
         let rows: Vec<(String,Option<String>)>=repo.connection.prepare("SELECT state,error_code FROM delivery_attempts WHERE task_id LIKE 'copy:%' ORDER BY state").unwrap().query_map([],|row|Ok((row.get(0)?,row.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
         assert_eq!(
