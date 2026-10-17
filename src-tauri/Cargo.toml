@@ -1,6 +1,6 @@
 [package]
 name = "sayweave"
-version = "0.1.16"
+version = "0.1.17"
 description = "Sayweave desktop frontend skeleton"
 default-run = "sayweave"
 edition = "2024"
