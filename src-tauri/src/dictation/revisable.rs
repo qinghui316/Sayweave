@@ -549,9 +549,6 @@ fn seal_requested(actor: &SessionDraft, s: &mut super::State, r: &mut State) {
 
 // Only called after both the old composition and tracker have been released.
 fn sealed(actor: &SessionDraft, s: &mut super::State, r: &mut State) {
-    let deadline = r
-        .proof_deadline
-        .unwrap_or_else(|| Instant::now() + Duration::from_secs(15));
     let source = r.pending_source.take().unwrap_or_else(|| s.latest.clone());
     let coverage = r
         .visible_coverage
@@ -574,20 +571,22 @@ fn sealed(actor: &SessionDraft, s: &mut super::State, r: &mut State) {
     r.sealed_submission |= r.block.confirmed().0 > 0;
     archive_block(actor, s, r, &visible, !r.read_needed && !r.uncertain);
     r.reset_block();
-    r.proof_deadline = Some(deadline);
     r.sealing = false;
     r.offset = offset;
     r.absorbed_coverage = coverage;
     r.sealed_source = units::slice(&source.text, 0..offset);
     s.handoff = false;
     s.activity = input_state::activity();
-    s.paused_at = Some(Instant::now());
+    s.paused_at = None;
     if s.stopping || actor.control.stopping() || !s.input_delivery.live() {
         r.stop();
         return;
     }
     s.latest.sequence = 0;
     observe(actor, s, r, source);
+    // Settling the old scope completes its proof wait. Keep listening without
+    // claiming a new empty composition while the user is still typing.
+    actor.control.resume_retained(s.turn, s.activity);
     log::info!(target:"sayweave", "operation=draft_block_sealed task_id={} turn={} native_turn={} next_block={} source_offset={}", actor.task,s.turn,r.native_turn,r.block.id(),offset);
 }
 
@@ -737,6 +736,7 @@ pub(super) fn schedule(
         && !crate::contracts::draft::equivalent_text(&r.block.visible(), r.block.confirmed().1);
     if s.draft.is_none()
         && r.snapshot.is_none()
+        && !r.block.visible().is_empty()
         && (s.ending.is_none() && !s.stopping || finish_tail)
     {
         if s.paused_at
@@ -1257,7 +1257,7 @@ pub(super) fn native_done(
             s.report.cancelled = s.ending.as_ref().is_some_and(|e| e.mode == Finish::Abort);
             let mut delivery = Delivery::not_submitted(if s.report.cancelled {
                 "cancelled"
-            } else if s.report.text.trim().is_empty() {
+            } else if s.report.text.trim().is_empty() && !r.sealed_submission {
                 "emptyText"
             } else {
                 "inputUnconfirmed"
@@ -1427,6 +1427,51 @@ mod tests {
         assert_eq!(s.turn, 1);
     }
     #[test]
+    fn sealed_idle_block_keeps_audio_without_claiming_an_empty_native_range() {
+        let (actor, mut s, _) = actor(None);
+        s.draft = None;
+        let mut r = State::new();
+        baseline(&mut r, "周三开会");
+        s.latest = NativeTranscript {
+            task_id: actor.task.clone(),
+            turn: 1,
+            sequence: 1,
+            text: "周三开会".into(),
+            segments: vec![crate::contracts::processing::SourceSegment {
+                id: 1,
+                revision: 1,
+                text: "周三开会".into(),
+                confirmed: true,
+            }],
+        };
+        s.written_raw = s.latest.text.clone();
+        r.visible_coverage =
+            crate::processing::draft_source::Watermark::capture(&s.latest.segments, 4);
+        r.handoff();
+        actor.control.resume(1, s.activity);
+        actor.control.fixture_ready(1, s.activity);
+        assert_eq!(actor.control.audio.current(), 1);
+        actor.control.hold_input();
+        sealed(&actor, &mut s, &mut r);
+        assert_eq!(
+            actor.control.audio.current(),
+            1,
+            "audio must not depend on opening an empty input range"
+        );
+        assert!(r.block.visible().is_empty());
+        assert!(
+            r.proof_deadline.is_none(),
+            "old proof wait ended when its block was settled"
+        );
+        schedule(&actor, &mut s, &mut r).unwrap();
+        assert!(
+            s.native.is_none(),
+            "no new source means no new native input lease"
+        );
+        assert_eq!(r.native_turn, 1);
+        assert_eq!(s.turn, 1);
+    }
+    #[test]
     fn finishing_after_sealing_preserves_the_acknowledged_submission_fact() {
         let (actor, mut s, _) = actor(None);
         s.draft = None;
@@ -1468,6 +1513,7 @@ mod tests {
             s.report.text.is_empty(),
             "must not invent the manually edited final body"
         );
+        assert_eq!(delivery.error.as_deref(), Some("inputUnconfirmed"));
     }
     #[test]
     fn invalid_scope_release_does_not_start_an_asr_turn_at_the_new_focus() {

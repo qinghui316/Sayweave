@@ -278,6 +278,7 @@ async fn richtext_actor() {
     // Hold the first successful native Update receipt before the actor can
     // schedule Bind. This changes scheduling only, not the native result.
     static HOLD_FIRST_UPDATE: AtomicBool = AtomicBool::new(false);
+    static HOLD_SCOPE_RELEASE: AtomicBool = AtomicBool::new(false);
     static BARRIER_TIMEOUT: AtomicBool = AtomicBool::new(false);
     static RELEASE_UPDATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
         (std::sync::Mutex::new(false), std::sync::Condvar::new());
@@ -289,10 +290,11 @@ async fn richtext_actor() {
         fn log(&self, record: &log::Record<'_>) {
             let line = record.args().to_string();
             eprintln!("{line}");
-            if line.contains("operation=composition_edit")
-                && line.contains("action=Update applied=true")
-                && HOLD_FIRST_UPDATE.swap(false, Ordering::AcqRel)
-            {
+            let hold_update = line.contains("action=Update applied=true")
+                && HOLD_FIRST_UPDATE.swap(false, Ordering::AcqRel);
+            let hold_release = line.contains("code=blockReleased")
+                && HOLD_SCOPE_RELEASE.swap(false, Ordering::AcqRel);
+            if line.contains("operation=composition_edit") && (hold_update || hold_release) {
                 eprintln!("owned_bind_barrier=waiting");
                 let (lock, ready) = &RELEASE_UPDATE;
                 let released = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -403,6 +405,10 @@ async fn richtext_actor() {
         std::env::var("SAYWEAVE_BLOCK_EARLY_EDIT").as_deref() == Ok("1"),
         Ordering::Release,
     );
+    HOLD_SCOPE_RELEASE.store(
+        std::env::var("SAYWEAVE_BLOCK_SEAL_BARRIER").as_deref() == Ok("1"),
+        Ordering::Release,
+    );
     manager.activate();
     let publications = Arc::new(Mutex::new(Vec::new()));
     let events = publications.clone();
@@ -428,7 +434,11 @@ async fn richtext_actor() {
     let mut latest = NativeTranscript::default();
     let mut finished = false;
     let result: Result<(), String> = async {
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let timeout_seconds = std::env::var("SAYWEAVE_ACTOR_TIMEOUT_SECONDS")
+            .ok().map(|value| value.parse::<u64>().expect("owned actor timeout"))
+            .unwrap_or(90);
+        assert!((30..=180).contains(&timeout_seconds), "bounded owned actor timeout required");
+        let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
         for _ in 0..2000 {
             if Instant::now() >= deadline { return Err("owned actor deadline".into()); }
             let line = receiver.recv_timeout(Duration::from_secs(15)).map_err(|e|e.to_string())?;

@@ -198,7 +198,7 @@ fn update_receipt(
                 error: Error::new("compositionPartial"),
                 mutation: reply.mutation,
                 tracking_failed: true,
-                scope_unavailable: true,
+                scope_unavailable: false,
             });
         }
         return Ok(reply.block);
@@ -214,9 +214,8 @@ fn update_receipt(
         error: Error::new(error),
         mutation: reply.mutation,
         tracking_failed,
-        scope_unavailable: (reply.mutation == Mutation::NotAttempted
-            && reply.code.starts_with("draftOwnershipTerminated:"))
-            || (reply.mutation == Mutation::Changed && tracking_failed),
+        scope_unavailable: reply.mutation == Mutation::NotAttempted
+            && reply.code.starts_with("draftOwnershipTerminated:"),
     })
 }
 pub(crate) struct FinishOutcome {
@@ -2024,6 +2023,19 @@ mod tests {
         .unwrap_err();
         assert_eq!(written.mutation, Mutation::Changed);
         assert!(written.tracking_failed);
+        assert!(
+            !written.scope_unavailable,
+            "security refusals cannot grant a fresh range"
+        );
+        let mut malformed = reply("applied", Mutation::Changed);
+        malformed.applied = true;
+        let malformed = update_receipt(malformed, "正文", Some("block")).unwrap_err();
+        assert_eq!(malformed.mutation, Mutation::Changed);
+        assert!(malformed.tracking_failed);
+        assert!(
+            !malformed.scope_unavailable,
+            "a missing snapshot is a protocol fault"
+        );
         let rejected = update_receipt(
             reply("edit:updateLease:80070057", Mutation::NotAttempted),
             "正文",
@@ -2075,7 +2087,6 @@ mod tests {
         .unwrap();
         for code in [
             "blockUnavailable:blockEditEmpty:80040200",
-            "blockUnavailable:blockDocumentFocus:80040200",
             "blockUnavailable:blockProtectedAnchor:80040200",
         ] {
             reply.code = code.into();

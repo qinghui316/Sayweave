@@ -18,11 +18,14 @@ struct Step {
 }
 
 fn receive<T: serde::de::DeserializeOwned>(pipe: &Pipe, timeout: Duration) -> Result<T> {
+    Ok(serde_json::from_slice(&receive_frame(pipe, timeout)?)?)
+}
+fn receive_frame(pipe: &Pipe, timeout: Duration) -> Result<Vec<u8>> {
     let start = Instant::now();
     loop {
         pump(Duration::from_millis(5));
         if let Some(frame) = pipe.receive()? {
-            return Ok(serde_json::from_slice(&frame)?);
+            return Ok(frame);
         }
         if start.elapsed() >= timeout {
             return Err("owned rich-text acknowledgement timeout; no replay".into());
@@ -150,7 +153,8 @@ fn script(expected: u32, identity: transport::Identity, capability: &str) -> Res
             text: step.text,
         };
         pipe.send(&serde_json::to_vec(&request)?)?;
-        let reply: Reply = receive(&pipe, Duration::from_secs(2))?;
+        let frame = receive_frame(&pipe, Duration::from_secs(2))?;
+        let reply: Reply = serde_json::from_slice(&frame)?;
         if reply.task != task
             || reply.engine != *engine
             || reply.operation != operation
@@ -158,6 +162,32 @@ fn script(expected: u32, identity: transport::Identity, capability: &str) -> Res
             || reply.revision != request.revision
         {
             return Err("owned acknowledgement identity differs".into());
+        }
+        // Reading a frame does not settle the proxy's retained effect record.
+        // Use its exact serialized hash, as the ordinary input client does.
+        let receipt = ReceiptKey::from_frame(&frame).ok_or("owned receipt identity missing")?;
+        let acknowledge = ControlRequest {
+            control_protocol: 1,
+            capability: capability.into(),
+            task: task.clone(),
+            turn: request.turn,
+            operation,
+            deadline_tick: unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+                + 2000,
+            action: ControlAction::AcknowledgeRetired,
+            expected_core: descriptor.core_sha256.clone(),
+            receipt: Some(receipt),
+        };
+        pipe.send(&serde_json::to_vec(&acknowledge)?)?;
+        let acknowledged: ControlReply = receive(&pipe, Duration::from_secs(2))?;
+        if !acknowledged.ready
+            || acknowledged.task != task
+            || acknowledged.turn != request.turn
+            || acknowledged.operation != operation
+            || acknowledged.engine.as_ref() != Some(engine)
+            || acknowledged.code != "receiptAcknowledged"
+        {
+            return Err("owned effect receipt acknowledgement failed".into());
         }
         println!("{}", serde_json::json!({"request":request,"reply":reply}));
         std::io::stdout().flush()?;

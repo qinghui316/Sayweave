@@ -245,6 +245,25 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                 .is_ok_and(|id| uuid::Uuid::parse_str(&id).is_ok());
         #[cfg(not(feature = "desktop-acceptance"))]
         let fixture_event = false;
+        // The actual-host actor can observe Computer Use key injection as its
+        // explicit edit stimulus. This does not exist in a production binary
+        // and never selects or authorizes an input target.
+        #[cfg(test)]
+        let fixture_event = fixture_event || {
+            let owned = std::env::var("SAYWEAVE_TSF_OWNED_PID")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|pid| *pid != 0);
+            let enabled = std::env::var("SAYWEAVE_ACTOR_OBSERVE_INJECTED").as_deref() == Ok("1")
+                && std::env::var("SAYWEAVE_INPUT_ACCEPTANCE").as_deref() == Ok("1")
+                && std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID")
+                    .is_ok_and(|id| uuid::Uuid::parse_str(&id).is_ok());
+            let mut foreground = 0;
+            unsafe {
+                GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut foreground));
+            }
+            enabled && owned == Some(foreground) && key.dwExtraInfo != 0x53595756
+        };
         // Track the synthetic Ctrl used by AltGr without turning injected keys into triggers.
         if key.flags.0 & LLKHF_INJECTED.0 != 0
             && key.vkCode == VK_LCONTROL.0 as u32

@@ -363,8 +363,39 @@ async function runActor({page,pid,focus,start,read:readWhole,settled:settledWhol
   report.actorIdentity=await receive();
   const continuity=process.env.SAYWEAVE_BLOCK_CONTINUITY;
   if(continuity){
-   if(!['prediction','delete-empty'].includes(continuity)||sentinels)throw Error('Explicit empty-field continuity scenario required');
+   if(!['prediction','prediction-switch','delete-empty'].includes(continuity)||sentinels)throw Error('Explicit empty-field continuity scenario required');
    report.continuityScenario=continuity;
+   if(continuity==='prediction-switch'){
+    if(process.env.SAYWEAVE_BLOCK_SEAL_BARRIER!=='1')throw Error('Release barrier required');
+    segments[0]={id:1,revision:1,text:'周',confirmed:false};
+    await command({action:'asr',segments});await expectBody('before scope switch','周');
+    segments[0]={id:1,revision:2,text:'周三',confirmed:false};
+    await command({action:'asr',segments});
+    let deadline=Date.now()+5000;
+    while(!diagnostics.includes('owned_bind_barrier=waiting')){
+     if(Date.now()>deadline)throw Error('Settled scope release barrier absent');
+     await command({action:'status'});await settled();
+    }
+    await page.evaluate(()=>window.fixtureInlineEditor.set('另一个输入框',6,6));
+    await command({action:'release-bind'});
+    let status;deadline=Date.now()+5000;
+    do{status=await command({action:'status'});if(Date.now()>deadline)throw Error('Fresh scope did not write the unconsumed suffix');await settled();}while(await page.evaluate(()=>window.fixtureInlineEditor.read())!=='另一个输入框三');
+    segments[0]={id:1,revision:3,text:'周三开会',confirmed:false};
+    await command({action:'asr',segments});
+    deadline=Date.now()+5000;
+    while(await page.evaluate(()=>window.fixtureInlineEditor.read())!=='另一个输入框三开会'){
+     if(Date.now()>deadline)throw Error('Fresh scope stopped making body progress');
+     status=await command({action:'status'});await settled();
+    }
+    report.actorDelivery=await command({action:'finish'});
+    const bodies=await page.evaluate(()=>({original:window.fixtureEditor.read(),other:window.fixtureInlineEditor.read()}));
+    if(bodies.original!=='周'||bodies.other!=='另一个输入框三开会'||report.actorDelivery.resultOnly)throw Error('Fresh scope replayed old text or stopped recognition: '+JSON.stringify(bodies));
+    report.scopeSwitch={...bodies,audioRoute:status.audioRoute,resultRaw:report.actorDelivery.resultRaw};
+    if(status.audioRoute!==1)throw Error('Field change stopped recognition audio');
+    actor.stdin.end();
+    if(!exited)await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Scope-switch cleanup timeout')),5000);actor.once('exit',code=>{clearTimeout(timer);if(code===0)resolve();else reject(Error('Scope-switch actor failed: '+diagnostics));});});
+    report.actorPassed=true;return;
+   }
    for(const [revision,text]of [[1,'周'],[2,'周三'],[3,'周三开会']]){
     segments[0]={id:1,revision,text,confirmed:false};
     await command({action:'asr',segments});await expectBody('continuity stream '+revision,text);
@@ -381,9 +412,21 @@ async function runActor({page,pid,focus,start,read:readWhole,settled:settledWhol
      if(repeated&&down){remaining=remaining.slice(0,-1);await expectBody('continuity held deletion '+remaining.length,remaining);}
     }
     await expectBody('continuity actual deletion','');
+    if(process.env.SAYWEAVE_BLOCK_IDLE_TYPED_PREFIX==='1'){
+     const deadline=Date.now()+5000;
+     while(!diagnostics.includes('operation=draft_block_sealed')){
+      if(Date.now()>deadline)throw Error('Deleted old scope did not settle');
+      await command({action:'status'});await settled();
+     }
+     const typed=await focus({action:'fixture-text',process:pid,text:'手改：'});
+     if(!typed.keyResult?.accepted)throw Error('Idle manual prefix injection failed');
+     await expectBody('idle manual prefix before new speech','手改：');
+     if((diagnostics.match(/action=Begin applied=true/g)??[]).length!==1)throw Error('An empty native range was reopened before new speech');
+     report.idleManualPrefix='手改：';
+    }
     segments[0].confirmed=true;
     segments.push({id:2,revision:1,text:'新的安排',confirmed:true});
-    await command({action:'asr',segments});await expectBody('continuity after delete','新的安排。');
+    await command({action:'asr',segments});await expectBody('continuity after delete',(report.idleManualPrefix??'')+'新的安排。');
    }else{
     await command({action:'edited'});
     for(const key of ['ArrowLeft','ArrowLeft','Backspace'])for(const down of [true,false]){
@@ -399,7 +442,7 @@ async function runActor({page,pid,focus,start,read:readWhole,settled:settledWhol
     await command({action:'asr',segments});await expectBody('continuity new-block polish','周五开会，地点在上海。');
    }
    report.actorDelivery=await command({action:'finish'});
-   const final=continuity==='prediction'?'周五开会，地点在上海。':'新的安排。';
+   const final=continuity==='prediction'?'周五开会，地点在上海。':(report.idleManualPrefix??'')+'新的安排。';
    await expectBody('continuity final settled',final);
    if(report.actorDelivery.error||report.actorDelivery.resultOnly||report.actorDelivery.delivery?.restoreError)throw Error('Continuity finished without safe direct input');
    actor.stdin.end();
