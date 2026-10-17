@@ -98,6 +98,9 @@ impl SessionDraft {
                     self.archive_turn(s, &raw, &text);
                 }
                 let mut delivery = closed_delivery(s.last_handoff.take(), false, failed, false);
+                if let Some(revised) = &s.revisable {
+                    revised.preserve_submission(&mut delivery);
+                }
                 if s.revisable
                     .as_ref()
                     .is_some_and(revisable::State::uncertain)

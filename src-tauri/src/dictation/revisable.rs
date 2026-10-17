@@ -83,6 +83,27 @@ impl State {
     pub(super) fn uncertain(&self) -> bool {
         self.uncertain
     }
+    pub(super) fn preserve_submission(&self, delivery: &mut Delivery) {
+        if self.sealed_submission
+            && !self.uncertain
+            && !self.cleanup_failed
+            && !delivery.restore_error
+            && delivery.error.as_deref() != Some("compositionCleanup")
+            && delivery.submission == Submission::NotSubmitted
+        {
+            delivery.submission = Submission::Submitted;
+            delivery.verification = windows_input::Verification::Unavailable;
+            delivery.stage = "composition".into();
+            delivery.state = "unconfirmed".into();
+            if delivery
+                .error
+                .as_deref()
+                .is_none_or(|e| matches!(e, "editing" | "emptyText"))
+            {
+                delivery.error = Some("inputUnconfirmed".into());
+            }
+        }
+    }
     pub fn expire(&mut self) {
         self.stop();
         // A read raced by continued user edits cannot extend the end budget.
@@ -579,6 +600,15 @@ fn sealed(actor: &SessionDraft, s: &mut super::State, r: &mut State) {
     s.activity = input_state::activity();
     s.paused_at = None;
     if s.stopping || actor.control.stopping() || !s.input_delivery.live() {
+        // End may race the settled Release receipt. Its accepted final source
+        // still belongs to this task, even though no fresh write is permitted.
+        let has_tail = offset < source.text.chars().count();
+        s.latest = source;
+        if has_tail && s.input_delivery.live() {
+            s.input_delivery = delivery::InputDelivery::Retiring;
+            s.report.result_only = true;
+            actor.control.detach_input();
+        }
         r.stop();
         return;
     }
@@ -1425,6 +1455,123 @@ mod tests {
         assert!(s.native.is_none());
         assert_eq!(actor.control.audio.current(), 0);
         assert_eq!(s.turn, 1);
+    }
+    #[test]
+    fn finish_during_sealing_keeps_unconsumed_speech_for_result_delivery() {
+        for mode in [Finish::Commit, Finish::Abort] {
+            for end_already_received in [false, true] {
+                let (actor, mut s, _) = actor(None);
+                s.draft = None;
+                let mut r = State::new();
+                baseline(&mut r, "周");
+                s.latest = NativeTranscript {
+                    task_id: actor.task.clone(),
+                    turn: 1,
+                    sequence: 1,
+                    text: "周".into(),
+                    segments: vec![crate::contracts::processing::SourceSegment {
+                        id: 1,
+                        revision: 1,
+                        text: "周".into(),
+                        confirmed: false,
+                    }],
+                };
+                r.visible_coverage =
+                    crate::processing::draft_source::Watermark::capture(&s.latest.segments, 1);
+                s.written_raw = "周".into();
+                let mut pending = s.latest.clone();
+                pending.sequence = 2;
+                pending.text = "周三开会".into();
+                pending.segments[0].revision = 2;
+                pending.segments[0].text = pending.text.clone();
+                r.pending_source = Some(pending);
+                r.handoff();
+                r.snapshot = None;
+                r.sealing = true;
+                s.stopping = true;
+                actor.control.request_finish();
+                let ending = || {
+                    let (reply, _) = oneshot::channel();
+                    Ending {
+                        mode: mode.clone(),
+                        reply,
+                        deadline: Instant::now() + Duration::from_secs(15),
+                        expired: false,
+                    }
+                };
+                if end_already_received {
+                    s.ending = Some(ending());
+                }
+                sealed(&actor, &mut s, &mut r);
+                assert!(
+                    s.report.result_only,
+                    "the unconsumed tail must remain deliverable"
+                );
+                assert_eq!(s.latest.text, "周三开会");
+                assert!(r.stopped);
+                assert!(s.native.is_none());
+                assert_eq!(actor.control.audio.current(), 0);
+                assert!(s.stop_error.is_none());
+                s.revisable = Some(r);
+                actor.delivery_retired(
+                    &mut s,
+                    &NativeKind::RetireClose,
+                    NativeValue::Closed(Ok(())),
+                );
+                if !end_already_received {
+                    assert!(actor.result_delivery(&mut s).is_none());
+                    let mut final_source = s.latest.clone();
+                    final_source.sequence += 1;
+                    final_source.text.push('。');
+                    final_source.segments[0].text.push('。');
+                    final_source.segments[0].revision += 1;
+                    actor.observe(&mut s, final_source);
+                    s.ending = Some(ending());
+                }
+                let delivery = actor.result_delivery(&mut s).unwrap();
+                assert_eq!(delivery.submission, Submission::Submitted);
+                assert_eq!(delivery.state, "unconfirmed");
+                assert!(
+                    s.report.text.is_empty(),
+                    "unknown edited body must not be invented"
+                );
+                assert_eq!(
+                    s.report.result_raw,
+                    if mode == Finish::Commit {
+                        if end_already_received {
+                            "周三开会"
+                        } else {
+                            "周三开会。"
+                        }
+                    } else {
+                        ""
+                    }
+                );
+                assert_eq!(s.report.cancelled, mode == Finish::Abort);
+                assert_eq!(s.turn, 1);
+                assert!(s.native.is_none());
+            }
+        }
+    }
+    #[test]
+    fn sealed_submission_does_not_replace_uncertain_or_failed_cleanup_facts() {
+        let mut r = State::new();
+        r.sealed_submission = true;
+        for (submission, restore_error, error) in [
+            (Submission::Uncertain, false, "compositionPartial"),
+            (Submission::NotSubmitted, true, "restoreFailed"),
+            (Submission::NotSubmitted, false, "compositionCleanup"),
+        ] {
+            let mut delivery = Delivery {
+                submission,
+                restore_error,
+                ..Delivery::not_submitted(error)
+            };
+            r.preserve_submission(&mut delivery);
+            assert_eq!(delivery.submission, submission);
+            assert_eq!(delivery.restore_error, restore_error);
+            assert_eq!(delivery.error.as_deref(), Some(error));
+        }
     }
     #[test]
     fn sealed_idle_block_keeps_audio_without_claiming_an_empty_native_range() {
