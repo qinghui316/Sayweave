@@ -6,7 +6,7 @@ import {join,resolve,sep} from 'node:path';
 import {describe,expect,it} from 'vitest';
 // The public release tools are JavaScript entry points with separately exercised inputs.
 // @ts-expect-error JavaScript release validator has no declaration file.
-import {releaseIdentity,validateRelease,releaseNotes,validateFrozenController,validateNativeTestOverride,runFrozenReleaseTests,validateOwnedDraft,validateVerificationRun,cargoCacheKeys,validateVerifierTool,validateProducerRun,validateRetainedArtifacts,validateUploadInventory,packageArtifactName,verifierArtifactName,assertNoRetainedPackage} from '../scripts/release-validation.mjs';
+import {releaseIdentity,validateRelease,releaseNotes,validateFrozenController,validateNativeTestOverride,validateMeterTestOverride,runFrozenReleaseTests,validateOwnedDraft,validateVerificationRun,cargoCacheKeys,validateVerifierTool,validateProducerRun,validateRetainedArtifacts,validateUploadInventory,packageArtifactName,verifierArtifactName,assertNoRetainedPackage} from '../scripts/release-validation.mjs';
 function fixture(){
  const identity=releaseIdentity('0.1.7','v0.1.7','a'.repeat(40)),bytes=Buffer.from('synthetic installer'),signature='synthetic signature';
  const sha512=createHash('sha512').update(bytes).digest('base64');
@@ -144,6 +144,21 @@ describe('frozen product release controller boundaries',()=>{
             replay_batch(&mut repo, temp.path(), false, std::time::Duration::ZERO, 1).unwrap();
         }`},
  ].map(({path,before,after})=>{const reviewed=readFileSync(path,'utf8').replaceAll('\r\n','\n');return {path,reviewed,original:reviewed.replace(after,before)};});
+ const meterReviewed=readFileSync('tests/voice-edit-resume.test.tsx','utf8').replaceAll('\r\n','\n');
+ const meterFixture={path:'tests/voice-edit-resume.test.tsx',reviewed:meterReviewed,original:meterReviewed.replace(" vi.spyOn(performance,'now').mockReturnValue(1000);\n",'').replace('vi.restoreAllMocks();','')};
+ const frozenFixtures=[...continuationFixtures,meterFixture];
+ it('pins the complete original and reviewed meter clock test',()=>{
+  expect(meterFixture.original).not.toBe(meterFixture.reviewed);
+  expect(()=>validateMeterTestOverride(Buffer.from(meterFixture.original),Buffer.from(meterFixture.reviewed))).not.toThrow();
+ });
+ it.each(['append','clock','original','swap'])('rejects unreviewed standalone meter fixture: %s',kind=>{
+  let original=meterFixture.original,reviewed=meterFixture.reviewed;
+  if(kind==='append')reviewed+='\nexport const unreviewed=true;\n';
+  if(kind==='clock')reviewed=reviewed.replace('mockReturnValue(1000)','mockReturnValue(1001)');
+  if(kind==='original')original+='\n';
+  if(kind==='swap')[original,reviewed]=[reviewed,original];
+  expect(()=>validateMeterTestOverride(Buffer.from(original),Buffer.from(reviewed))).toThrow();
+ });
  it.each(continuationFixtures)('permits the exact continuation fixture for $path',({path,original,reviewed})=>{
   expect(original).not.toBe(reviewed);
   expect(()=>validateNativeTestOverride(Buffer.from(original),Buffer.from(reviewed),path)).not.toThrow();
@@ -175,6 +190,10 @@ describe('frozen product release controller boundaries',()=>{
   expect(()=>validateNativeTestOverride(Buffer.from(original),Buffer.from(reviewed))).toThrow();
  });
  const product='a'.repeat(40),controller='b'.repeat(40),ref='refs/tags/v0.1.9-release-check-e2e-1';
+ it('admits only the named meter test path beside the existing check fixtures',()=>{
+  expect(()=>validateFrozenController('v0.1.9',product,controller,ref,[meterFixture.path])).not.toThrow();
+  expect(()=>validateFrozenController('v0.1.9',product,controller,ref,['tests/voice-other.test.tsx'])).toThrow();
+ });
  it('allows the reviewed dictation E2E path without permitting neighboring tests',()=>{
   expect(()=>validateFrozenController('v0.1.9',product,controller,ref,['tests/e2e/dictation.spec.ts'])).not.toThrow();
   expect(()=>validateFrozenController('v0.1.9',product,controller,ref,['tests/e2e/speech.spec.ts'])).toThrow();
@@ -199,7 +218,7 @@ describe('frozen product release controller boundaries',()=>{
    mkdirSync(join(root,'scripts'),{recursive:true});mkdirSync(join(root,'tests/e2e'),{recursive:true});mkdirSync(join(root,'tests/fixtures'),{recursive:true});mkdirSync(join(root,'src-tauri/src/installer'),{recursive:true});
    writeFileSync(join(root,'src-tauri/src/installer/record.rs'),nativeOriginal);
    mkdirSync(join(root,'src-tauri/src/data'),{recursive:true});
-   for(const fixture of continuationFixtures)writeFileSync(join(root,fixture.path),fixture.original);
+   for(const fixture of frozenFixtures)writeFileSync(join(root,fixture.path),fixture.original);
    mkdirSync(join(root,'src-tauri/text-service/src'),{recursive:true});
    writeFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'original probe');
    writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9'}));
@@ -213,17 +232,17 @@ describe('frozen product release controller boundaries',()=>{
    writeFileSync(join(root,'tests/fixtures/voice-recovery.tsx'),'reviewed theme fixture');
    writeFileSync(join(root,'scripts/test-richtext-block.mjs'),'reviewed check');
    writeFileSync(join(root,'src-tauri/src/installer/record.rs'),nativeReviewed);
-   for(const fixture of continuationFixtures)writeFileSync(join(root,fixture.path),fixture.reviewed);
+   for(const fixture of frozenFixtures)writeFileSync(join(root,fixture.path),fixture.reviewed);
    writeFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'reviewed probe');
    git(['add','.']);git(['commit','-m','controller']);const controller=git(['rev-parse','HEAD']);git(['tag','v0.1.9-release-check-e2e-1']);git(['update-ref','refs/remotes/origin/main',controller]);git(['checkout','--detach',product]);
    const failure=`Reviewed frozen-product ${kind==='e2e'?'E2E':kind} failed`;
-   const work=runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{for(const fixture of continuationFixtures)expect(readFileSync(join(root,fixture.path),'utf8')).toBe(kind==='check'?fixture.reviewed:fixture.original);expect(readFileSync(join(root,'tests/fixtures/voice-recovery.tsx'),'utf8')).toBe(kind==='e2e'?'reviewed theme fixture':'original theme fixture');expect(readFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'utf8')).toBe(kind==='formal'?'reviewed probe':'original probe');expect(readFileSync(join(root,'tests/e2e/dictation.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(kind==='check'?nativeReviewed:nativeOriginal);expect(readFileSync(join(root,'tests/e2e/models.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe(kind==='check'?'reviewed check':'original check');if(status===2)writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9',unexpected:true}));return {status:status===0?0:1};},kind);
+   const work=runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{for(const fixture of frozenFixtures)expect(readFileSync(join(root,fixture.path),'utf8')).toBe(kind==='check'?fixture.reviewed:fixture.original);expect(readFileSync(join(root,'tests/fixtures/voice-recovery.tsx'),'utf8')).toBe(kind==='e2e'?'reviewed theme fixture':'original theme fixture');expect(readFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'utf8')).toBe(kind==='formal'?'reviewed probe':'original probe');expect(readFileSync(join(root,'tests/e2e/dictation.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(kind==='check'?nativeReviewed:nativeOriginal);expect(readFileSync(join(root,'tests/e2e/models.spec.ts'),'utf8')).toBe(kind==='e2e'?'reviewed':'original');expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe(kind==='check'?'reviewed check':'original check');if(status===2)writeFileSync(join(root,'package.json'),JSON.stringify({version:'0.1.9',unexpected:true}));return {status:status===0?0:1};},kind);
    if(status===0)await work;else if(status===1)await expect(work).rejects.toThrow(failure);else{await expect(work).rejects.toMatchObject({name:'AggregateError',errors:[expect.objectContaining({message:failure}),expect.objectContaining({message:'Frozen product checkout was not restored cleanly'})]});expect(git(['status','--porcelain'])).toContain('package.json');git(['restore','--worktree','--','package.json']);}
    for(const path of ['models','ui-interaction','dictation'])expect(readFileSync(join(root,`tests/e2e/${path}.spec.ts`),'utf8')).toBe('original');
    expect(readFileSync(join(root,'tests/fixtures/voice-recovery.tsx'),'utf8')).toBe('original theme fixture');
    expect(readFileSync(join(root,'scripts/test-richtext-block.mjs'),'utf8')).toBe('original check');
    expect(readFileSync(join(root,'src-tauri/src/installer/record.rs'),'utf8')).toBe(nativeOriginal);
-   for(const fixture of continuationFixtures)expect(readFileSync(join(root,fixture.path),'utf8')).toBe(fixture.original);
+   for(const fixture of frozenFixtures)expect(readFileSync(join(root,fixture.path),'utf8')).toBe(fixture.original);
    expect(readFileSync(join(root,'src-tauri/text-service/src/formal_switch_probe.rs'),'utf8')).toBe('original probe');
    expect(git(['status','--porcelain'])).toBe('');expect(git(['rev-parse','HEAD'])).toBe(product);
    if(status===0){git(['update-ref','refs/remotes/origin/main',product]);let invoked=false;await expect(runFrozenReleaseTests(root,{SAYWEAVE_RELEASE_TAG:'v0.1.9',SAYWEAVE_RELEASE_COMMIT:product,SAYWEAVE_CONTROLLER_COMMIT:controller,SAYWEAVE_CONTROLLER_REF:ref},()=>{invoked=true;return {status:0};})).rejects.toThrow();expect(invoked).toBe(false);expect(git(['status','--porcelain'])).toBe('');}

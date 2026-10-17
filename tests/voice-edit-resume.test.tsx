@@ -4,6 +4,7 @@ import {VoiceSurface} from '../src/features/voice';
 import type {SpeechMeterFrame, SpeechMeterSource} from '../src/contracts/speech';
 
 it('reconnects real meter frames after editing and detaches on stop',()=>{
+ vi.spyOn(performance,'now').mockReturnValue(1000);
  const frames=new Map<number,FrameRequestCallback>();let frameId=0;
  vi.stubGlobal('requestAnimationFrame',(callback:FrameRequestCallback)=>{frames.set(++frameId,callback);return frameId;});
  vi.stubGlobal('cancelAnimationFrame',(id:number)=>{frames.delete(id);});
@@ -31,5 +32,5 @@ it('reconnects real meter frames after editing and detaches on stop',()=>{
   view.rerender(<VoiceSurface {...props} presentation="idle"/>);
   expect(listener).toBeUndefined();
   expect(view.container.querySelector('[data-live]')).toBeNull();
- } finally {view.unmount();vi.unstubAllGlobals();}
+ } finally {view.unmount();vi.restoreAllMocks();vi.unstubAllGlobals();}
 });

@@ -46,7 +46,8 @@ export const frozenTestPaths=['tests/e2e/models.spec.ts','tests/e2e/ui-interacti
 const receiptTestPath='src-tauri/src/installer/record.rs';
 const startupTestPath='src-tauri/src/installer/login_startup.rs';
 const archiveTestPath='src-tauri/src/data/archive_recovery.rs';
-export const frozenCheckPaths=['scripts/test-richtext-block.mjs',receiptTestPath,startupTestPath,archiveTestPath];
+const meterTestPath='tests/voice-edit-resume.test.tsx';
+export const frozenCheckPaths=['scripts/test-richtext-block.mjs',receiptTestPath,startupTestPath,archiveTestPath,meterTestPath];
 export const frozenFormalPaths=['src-tauri/text-service/src/formal_switch_probe.rs'];
 // This one reviewed fixture repair is pinned through EOF, including module closure.
 // A marker/prefix comparison alone cannot reject runtime code appended after tests.
@@ -69,10 +70,17 @@ export function validateNativeTestOverride(original,reviewed,path=receiptTestPat
  };
  if(!prefix(original,identity.original).equals(prefix(reviewed,identity.reviewed)))throw Error('Frozen native production source differs');
 }
-function verifyNativeTestDelta(root,product,controller,paths){
+export function validateMeterTestOverride(original,reviewed){
+ const sha=bytes=>createHash('sha256').update(bytes).digest('hex');
+ if(sha(original)!=='a408ef4d17a3405fdeb1fe015640c33371812afdc17950bb1450ac96b1d3bb0c'||sha(reviewed)!=='67fe265b6e317a9ecdeb5fe7e8d2038da339fea512cb0044d99c4d56d112b6c8')throw Error('Meter test differs from the exact reviewed clock fixture');
+}
+function verifyFrozenCheckDelta(root,product,controller,paths){
  for(const path of nativeTestModules.keys())if(paths.includes(path))validateNativeTestOverride(
   execFileSync('git',['show',`${product}:${path}`],{cwd:root}),
   execFileSync('git',['show',`${controller}:${path}`],{cwd:root}),path);
+ if(paths.includes(meterTestPath))validateMeterTestOverride(
+  execFileSync('git',['show',`${product}:${meterTestPath}`],{cwd:root}),
+  execFileSync('git',['show',`${controller}:${meterTestPath}`],{cwd:root}));
 }
 const controllerPaths=new Set([...frozenTestPaths,...frozenCheckPaths,...frozenFormalPaths,'.github/workflows/windows-release.yml','scripts/release-validation.mjs','scripts/verify-update-release.mjs','tests/release-validation.test.ts','docs/release.md']);
 export function validateFrozenController(tag,product,controller,ref,paths){
@@ -87,7 +95,7 @@ export async function runFrozenReleaseTests(root=process.cwd(),env=process.env,r
  const git=(args,encoding='utf8')=>execFileSync('git',args,{cwd:root,encoding});
  const paths=git(['diff','--name-only',product,controller]).trim().split(/\r?\n/).filter(Boolean);
  validateFrozenController(tag,product,controller,ref,paths);
- verifyNativeTestDelta(root,product,controller,paths);
+ verifyFrozenCheckDelta(root,product,controller,paths);
  if(git(['rev-parse',`${ref}^{commit}`]).trim()!==controller)throw Error('Controller tag identity differs');
  for(const commit of [product,controller])git(['merge-base','--is-ancestor',commit,'origin/main']);
  git(['merge-base','--is-ancestor',product,controller]);
@@ -131,7 +139,7 @@ export function verifyReusedChecks(root=process.cwd(),env=process.env){
  for(const [commit,ref] of [[run.head_sha,`refs/tags/${run.head_branch}`],[env.SAYWEAVE_CONTROLLER_COMMIT,env.SAYWEAVE_CONTROLLER_REF]]){
   if(commit!==identity.commit)validateFrozenController(identity.tag,identity.commit,commit,ref,git(['diff','--name-only',identity.commit,commit]).trim().split(/\r?\n/).filter(Boolean));
   else if(ref!==`refs/tags/${identity.tag}`)throw Error('Original product verification tag differs');
-  verifyNativeTestDelta(root,identity.commit,commit,git(['diff','--name-only',identity.commit,commit]).trim().split(/\r?\n/).filter(Boolean));
+  verifyFrozenCheckDelta(root,identity.commit,commit,git(['diff','--name-only',identity.commit,commit]).trim().split(/\r?\n/).filter(Boolean));
   if(git(['rev-parse',`${ref}^{commit}`]).trim()!==commit)throw Error('Verification controller tag differs');
   git(['merge-base','--is-ancestor',commit,'origin/main']);git(['merge-base','--is-ancestor',identity.commit,commit]);
  }
@@ -196,7 +204,7 @@ export function trustedProducer(identity,root,env=process.env,scope='both'){
  if(producer.controllerCommit!==identity.commit){
   const paths=git(['diff','--name-only',identity.commit,producer.controllerCommit]).split(/\r?\n/).filter(Boolean);
   validateFrozenController(identity.tag,identity.commit,producer.controllerCommit,producer.ref,paths);
-  verifyNativeTestDelta(root,identity.commit,producer.controllerCommit,paths);
+  verifyFrozenCheckDelta(root,identity.commit,producer.controllerCommit,paths);
  }
  else if(producer.ref!==`refs/tags/${identity.tag}`)throw Error('Product producer tag differs');
  return producer;
