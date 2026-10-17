@@ -399,6 +399,85 @@ fn focus_metadata_at(process: u32, expected: Option<usize>) -> serde_json::Value
         CoUninitialize();result.unwrap_or_else(|e|serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}))
     }).join().unwrap_or_else(|_|serde_json::json!({"error":"metadataWorker"}))
 }
+// A read-only acceptance observer for the explicitly selected native endpoint.
+// This uses the host's existing MSAA/UIA provider when the UIA client bridge
+// returns a null TextPattern. It never supplies production write authority.
+fn owned_body_snapshot(process: u32, window: usize, expected: String) -> serde_json::Value {
+    if std::env::var("SAYWEAVE_TSF_OWNED_PID")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        != Some(process)
+    {
+        return serde_json::json!({"error":"explicitOwnedProcessRequired"});
+    }
+    thread::spawn(move || unsafe {
+        use windows::{core::Interface, Win32::{System::{Com::*, Ole::*, Variant::*}, UI::Accessibility::*}};
+        if let Err(e)=CoInitializeEx(None,COINIT_APARTMENTTHREADED).ok() {
+            return serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)});
+        }
+        let result=(|| {
+            let root=HWND(window as *mut _);
+            let focused=|| {
+                if GetForegroundWindow()!=root {return Err(windows::core::Error::from_hresult(E_ACCESSDENIED));}
+                let mut actual=0;let tid=GetWindowThreadProcessId(root,Some(&mut actual));
+                if actual!=process {return Err(windows::core::Error::from_hresult(E_ACCESSDENIED));}
+                let mut gui=GUITHREADINFO {cbSize:std::mem::size_of::<GUITHREADINFO>() as u32,..Default::default()};
+                GetGUIThreadInfo(tid,&mut gui)?;
+                if GetAncestor(gui.hwndFocus,GA_ROOT)!=root {return Err(windows::core::Error::from_hresult(E_ACCESSDENIED));}
+                let mut accessible:Option<IAccessible>=None;
+                AccessibleObjectFromWindow(gui.hwndFocus,OBJID_CLIENT.0 as u32,&IAccessible::IID,(&mut accessible as *mut Option<IAccessible>).cast())?;
+                let mut accessible=accessible.ok_or_else(||windows::core::Error::from_hresult(E_NOINTERFACE))?;
+                for _ in 0..16 {
+                    let focus=accessible.accFocus()?;
+                    if focus.vt()==VT_DISPATCH {accessible=IDispatch::try_from(&focus)?.cast()?;}
+                    else if focus.vt()==VT_I4 && i32::try_from(&focus)?!=0 {accessible=accessible.get_accChild(&focus)?.cast()?;}
+                    else {
+                        let raw:IRawElementProviderSimple=accessible.cast().or_else(|_|accessible.cast::<IServiceProvider>()?.QueryService(&IAccessible::IID))?;
+                        let kind=i32::try_from(&raw.GetPropertyValue(UIA_ControlTypePropertyId)?)?;
+                        if ![UIA_EditControlTypeId.0,UIA_GroupControlTypeId.0].contains(&kind)
+                            || !bool::try_from(&raw.GetPropertyValue(UIA_HasKeyboardFocusPropertyId)?)?
+                            || !bool::try_from(&raw.GetPropertyValue(UIA_IsEnabledPropertyId)?)?
+                            || bool::try_from(&raw.GetPropertyValue(UIA_IsPasswordPropertyId)?)? {
+                            return Err(windows::core::Error::from_hresult(E_ACCESSDENIED));
+                        }
+                        return Ok(raw);
+                    }
+                }
+                Err(windows::core::Error::from_hresult(E_FAIL))
+            };
+            let identity=|raw:&IRawElementProviderSimple| {
+                let array=raw.cast::<IRawElementProviderFragment>()?.GetRuntimeId()?;
+                let result=(|| {
+                    if array.is_null()||SafeArrayGetDim(array)!=1||SafeArrayGetVartype(array)?!=VT_I4 {return Err(windows::core::Error::from_hresult(E_NOINTERFACE));}
+                    let low=SafeArrayGetLBound(array,1)?;let high=SafeArrayGetUBound(array,1)?;
+                    if high<low||high-low>63 {return Err(windows::core::Error::from_hresult(E_INVALIDARG));}
+                    let mut values=vec![];for i in low..=high {let mut value=0i32;SafeArrayGetElement(array,&i,(&mut value as *mut i32).cast())?;values.push(value);}
+                    Ok::<_,windows::core::Error>(values)
+                })();
+                if !array.is_null(){let _=SafeArrayDestroy(array);}result
+            };
+            let raw=focused()?;let before=identity(&raw)?;
+            let pattern:ITextProvider=raw.GetPatternProvider(UIA_TextPatternId)?.cast()?;
+            let range=pattern.DocumentRange()?;
+            let readonly=range.GetAttributeValue(UIA_IsReadOnlyAttributeId)?;
+            if readonly.vt()!=VT_BOOL||bool::try_from(&readonly)? {return Err(windows::core::Error::from_hresult(E_ACCESSDENIED));}
+            let mut owner=range.GetEnclosingElement()?;let mut within=false;
+            for _ in 0..16 {
+                if identity(&owner).is_ok_and(|id|id==before){within=true;break;}
+                owner=owner.cast::<IRawElementProviderFragment>()?.Navigate(NavigateDirection_Parent)?.cast()?;
+            }
+            if !within {return Err(windows::core::Error::from_hresult(E_ACCESSDENIED));}
+            let body=range.GetText(1025)?.to_string();
+            let after=identity(&focused()?)?;
+            if before!=after||body.encode_utf16().count()>1024 {return Err(windows::core::Error::from_hresult(E_ACCESSDENIED));}
+            // An unrelated unprefixed draft is never printed by this observer.
+            let owned=body.starts_with("测试：")||body==expected||body==format!("{expected}\r\n");
+            Ok::<_,windows::core::Error>(serde_json::json!({"process":process,"window":window,"runtimeId":before,"actualBody":owned.then_some(&body),"units":body.encode_utf16().count(),"matches":body==expected,"reader":"nativeFocusedProvider","readonly":false}))
+        })();
+        CoUninitialize();
+        result.unwrap_or_else(|e|serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}))
+    }).join().unwrap_or_else(|_|serde_json::json!({"error":"ownedBodyWorker"}))
+}
 // Read only known static product labels from the explicitly owned application.
 // A native PID is not proof that the frontend rendered.
 fn product_surface(process: u32) -> serde_json::Value {
@@ -558,6 +637,21 @@ unsafe extern "system" fn process_window(window: HWND, parameter: LPARAM) -> BOO
 }
 fn main() {
     if std::env::var("SAYWEAVE_INPUT_ACCEPTANCE").as_deref() != Ok("1") {
+        return;
+    }
+    if std::env::args().nth(1).as_deref() == Some("inspect-owned-body") {
+        let process = std::env::args()
+            .nth(2)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let window = std::env::args()
+            .nth(3)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let expected = std::env::args().nth(4).unwrap_or_default();
+        if process != 0 && window != 0 && expected.len() <= 1024 {
+            println!("{}", owned_body_snapshot(process, window, expected));
+        }
         return;
     }
     if std::env::args().nth(1).as_deref() == Some("inspect-focus-window") {
