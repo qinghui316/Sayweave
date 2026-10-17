@@ -3,6 +3,172 @@
 use super::*;
 use std::io::{BufRead, Write};
 
+/// Independent host-body evidence for explicitly prefixed actual-host trials.
+/// The retained field is never used to authorize a production mutation.
+struct ActualBodyReader {
+    automation: windows::Win32::UI::Accessibility::IUIAutomation,
+    field: windows::Win32::UI::Accessibility::IUIAutomationElement,
+    anchor: windows_input::Anchor,
+    _apartment: ActualBodyApartment,
+}
+struct ActualBodyApartment;
+impl Drop for ActualBodyApartment {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::System::Com::CoUninitialize() }
+    }
+}
+impl ActualBodyReader {
+    fn open(anchor: &windows_input::Anchor) -> windows::core::Result<Self> {
+        use windows::Win32::{System::Com::*, UI::Accessibility::*};
+        use windows::core::Interface;
+        unsafe {
+            CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+            let apartment = ActualBodyApartment;
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)?;
+            let bounded: IUIAutomation2 = automation.cast()?;
+            bounded.SetConnectionTimeout(1000)?;
+            bounded.SetTransactionTimeout(1000)?;
+            let field = automation.GetFocusedElement()?;
+            let reader = Self {
+                automation,
+                field,
+                anchor: anchor.clone(),
+                _apartment: apartment,
+            };
+            reader.read()?;
+            Ok(reader)
+        }
+    }
+    fn read(&self) -> windows::core::Result<String> {
+        use windows::Win32::{Foundation::E_ACCESSDENIED, UI::Accessibility::*};
+        let reject = |stage: &str| windows::core::Error::new(E_ACCESSDENIED, stage);
+        let current = windows_input::WindowsInputService::anchor()
+            .ok_or_else(|| reject("actual-body native focus absent"))?;
+        if current.window != self.anchor.window
+            || current.process != self.anchor.process
+            || current.lifetime != self.anchor.lifetime
+            || current.editor != self.anchor.editor
+        {
+            return Err(reject("actual-body native endpoint changed"));
+        }
+        unsafe {
+            let diagnostic = |stage: &str, error: windows::core::Error| {
+                windows::core::Error::new(error.code(), format!("actual-body {stage}: {error}"))
+            };
+            let focused = self
+                .automation
+                .GetFocusedElement()
+                .map_err(|e| diagnostic("focused element", e))?;
+            let kind = self.field.CurrentControlType()?;
+            if !self
+                .automation
+                .CompareElements(&self.field, &focused)?
+                .as_bool()
+                || self.field.CurrentProcessId()? != self.anchor.editor.process as i32
+                || !self.field.CurrentHasKeyboardFocus()?.as_bool()
+                || self.field.CurrentIsPassword()?.as_bool()
+                || !self.field.CurrentIsEnabled()?.as_bool()
+                || ![UIA_EditControlTypeId, UIA_GroupControlTypeId].contains(&kind)
+            {
+                return Err(reject(&format!(
+                    "actual-body field: kind={} process={} focus={} enabled={} password={}",
+                    kind.0,
+                    self.field.CurrentProcessId()?,
+                    self.field.CurrentHasKeyboardFocus()?.as_bool(),
+                    self.field.CurrentIsEnabled()?.as_bool(),
+                    self.field.CurrentIsPassword()?.as_bool()
+                )));
+            }
+            let pattern: IUIAutomationTextPattern = self
+                .field
+                .GetCurrentPatternAs(UIA_TextPatternId)
+                .map_err(|e| diagnostic("text pattern", e))?;
+            let range = pattern
+                .DocumentRange()
+                .map_err(|e| diagnostic("document range", e))?;
+            let owner = range
+                .GetEnclosingElement()
+                .map_err(|e| diagnostic("range owner", e))?;
+            // UIA defines the enclosing element as the innermost element; a
+            // paragraph/group inside the retained editable field is valid.
+            let walker = self.automation.RawViewWalker()?;
+            let mut ancestor = owner.clone();
+            let mut owner_within_field = false;
+            let mut owner_chain = Vec::new();
+            for _ in 0..16 {
+                let kind = ancestor.CurrentControlType()?;
+                owner_chain.push(kind.0);
+                if self
+                    .automation
+                    .CompareElements(&self.field, &ancestor)?
+                    .as_bool()
+                {
+                    owner_within_field = true;
+                    break;
+                }
+                if ancestor.CurrentProcessId()? != self.anchor.editor.process as i32
+                    || [UIA_WindowControlTypeId, UIA_DocumentControlTypeId].contains(&kind)
+                {
+                    break;
+                }
+                ancestor = walker
+                    .GetParentElement(&ancestor)
+                    .map_err(|e| diagnostic("range owner ancestry", e))?;
+            }
+            let readonly = range.GetAttributeValue(UIA_IsReadOnlyAttributeId)?;
+            if !owner_within_field
+                || readonly.vt() != windows::Win32::System::Variant::VT_BOOL
+                || bool::try_from(&readonly)?
+            {
+                return Err(reject(&format!(
+                    "actual-body range: withinField={owner_within_field} ownerChain={owner_chain:?} readonlyVt={}",
+                    readonly.vt().0
+                )));
+            }
+            let text = range
+                .GetText(1025)
+                .map_err(|e| diagnostic("range text", e))?
+                .to_string();
+            if text.encode_utf16().count() > 1024 || !text.starts_with("测试：") {
+                return Err(reject(&format!(
+                    "actual-body prefix/size: units={}",
+                    text.encode_utf16().count()
+                )));
+            }
+            // Recheck the retained object after the cross-process text request.
+            if !self
+                .automation
+                .CompareElements(&self.field, &self.automation.GetFocusedElement()?)?
+                .as_bool()
+            {
+                return Err(reject("actual-body focus changed after read"));
+            }
+            Ok(text)
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires the explicit prefixed actual-host test field; read-only"]
+fn actual_body_readback_probe() {
+    assert_eq!(
+        std::env::var("SAYWEAVE_INPUT_ACCEPTANCE").as_deref(),
+        Ok("1")
+    );
+    let expected: u32 = std::env::var("SAYWEAVE_TSF_OWNED_PID")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let anchor = windows_input::WindowsInputService::anchor().unwrap();
+    assert_eq!(anchor.process, expected);
+    let reader = ActualBodyReader::open(&anchor).expect("actual focused field diagnostics");
+    println!(
+        "ACTOR_JSON:{}",
+        serde_json::json!({"actualBody":reader.read().unwrap()})
+    );
+}
+
 /// Test-only bounded maintenance window. This never changes COM registration,
 /// profile enablement or the daily executable. A durable receipt precedes CAS.
 #[test]
@@ -151,11 +317,35 @@ async fn richtext_actor() {
         .parse()
         .unwrap();
     let input = windows_input::WindowsInputService::new();
-    let anchor = windows_input::WindowsInputService::anchor().unwrap();
+    let mut anchor = windows_input::WindowsInputService::anchor().unwrap();
     assert_eq!(
         anchor.process, pid,
         "only the owned foreground editor is allowed"
     );
+    let body_reader = if std::env::var("SAYWEAVE_ACTOR_BODY_READBACK").as_deref() == Ok("1") {
+        eprintln!("owned_body_barrier=waiting");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(current) = windows_input::WindowsInputService::anchor()
+                && current.process == pid
+                && let Ok(reader) = ActualBodyReader::open(&current)
+            {
+                let before = reader.read().unwrap();
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if reader.read().is_ok_and(|after| after == before) {
+                    anchor = windows_input::WindowsInputService::anchor().unwrap();
+                    break Some(reader);
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "prefixed body readiness deadline"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    } else {
+        None
+    };
     let task = uuid::Uuid::new_v4().to_string();
     let _physical = (std::env::var("SAYWEAVE_ACTOR_PHYSICAL_INPUT").as_deref() == Ok("1"))
         .then(|| crate::shortcuts::FixturePhysicalInput::start(&task).unwrap());
@@ -247,14 +437,31 @@ async fn richtext_actor() {
                     ready.notify_one();
                 }
                 Some("status") => {},
+                Some("body") => {
+                    let reader = body_reader.as_ref().ok_or("actual body readback not enabled")?;
+                    let body = match reader.read() {
+                        Ok(body) => body,
+                        Err(error) if error.code().0 as u32 == windows::Win32::UI::Accessibility::UIA_E_TIMEOUT => {
+                            emit(serde_json::json!({"actualBody":null,"readError":format!("{error}"),"activity":input_state::activity(),"editingKeyHeld":input_state::editing_key_held()}));
+                            continue;
+                        }
+                        Err(error) => return Err(format!("actual body readback: {error}")),
+                    };
+                    emit(serde_json::json!({"actualBody":body,"activity":input_state::activity(),"editingKeyHeld":input_state::editing_key_held()}));
+                    continue;
+                }
                 Some("finish" | "stop") => {
                     let stopped = command["action"] == "stop";
                     control.request_finish();
                     cancel.send_replace(if stopped { 2 } else { 1 });
                     let delivery = manager.finish(&latest, if stopped { Finish::Abort } else { Finish::Commit }).await;
-                    let report = manager.report().ok_or("missing actor report")?;
-                    emit(serde_json::json!({"finished":true,"delivery":delivery,"text":report.text,"error":report.error,"resultOnly":report.result_only,"resultRaw":report.result_raw,"requests":provider.seen.lock().unwrap().len()}));
                     finished = true;
+                    let report = manager.report().ok_or("missing actor report")?;
+                    let actual_body = if let Some(reader) = &body_reader {
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        Some(reader.read().map_err(|e|format!("settled actual body readback: {e}"))?)
+                    } else { None };
+                    emit(serde_json::json!({"finished":true,"delivery":delivery,"text":report.text,"actualBody":actual_body,"error":report.error,"resultOnly":report.result_only,"resultRaw":report.result_raw,"requests":provider.seen.lock().unwrap().len()}));
                     if !report.result_only && (report.error.as_deref().is_some_and(|error| !stopped || error != "cancelled") || delivery.restore_error || delivery.submission == Submission::Uncertain) {
                         return Err("actor delivery was not safely settled".into());
                     }

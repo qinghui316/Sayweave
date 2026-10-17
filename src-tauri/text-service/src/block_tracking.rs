@@ -1,7 +1,6 @@
 //! Current-block capability, independent of optional language-learning watches.
 //! All ranges and subscriptions stay on the owning apartment.
 use super::*;
-use unicode_segmentation::UnicodeSegmentation;
 #[path = "block_boundary.rs"]
 mod boundary;
 use boundary::BoundaryProof;
@@ -51,7 +50,6 @@ struct Data {
     evidence: evidence::Record,
     semantic_boundary: Option<initial_selection::SemanticBoundary>,
     pending_proof: bool,
-    reacquired: bool,
     notification: u64,
     notification_depth: u32,
 }
@@ -511,7 +509,6 @@ impl Track {
                 evidence: evidence::Record::default(),
                 semantic_boundary: None,
                 pending_proof: false,
-                reacquired: false,
                 notification: 0,
                 notification_depth: 0,
             }));
@@ -1387,7 +1384,6 @@ mod acquisition_tests {
             evidence: evidence::Record::default(),
             semantic_boundary: None,
             pending_proof: false,
-            reacquired: true,
             notification: 0,
             notification_depth: 0,
         }))
@@ -1712,47 +1708,8 @@ unsafe fn acquire_composition(
         data.text = native;
         data.lease += 1;
         data.writable = true;
-        data.reacquired = true;
         *mutation = Mutation::NotAttempted;
         Ok(())
-    }
-}
-
-pub(super) unsafe fn selection_for_write(
-    shared: &Shared,
-    context: &ITfContext,
-    range: &ITfRange,
-    ec: u32,
-    next: &str,
-) -> windows::core::Result<Option<u32>> {
-    unsafe {
-        let (track, before) = {
-            let state = shared.borrow();
-            let Some(track) = state.block.clone() else {
-                return Ok(None);
-            };
-            if !track.data.borrow().reacquired {
-                return Ok(None);
-            }
-            (
-                track,
-                state
-                    .text
-                    .clone()
-                    .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
-            )
-        };
-        if !track.data.borrow().valid {
-            return Err(failure(TF_E_DISCONNECTED));
-        }
-        let native = range_text(range, ec)?;
-        let (_, end) = relative_selection(context, range, ec)?;
-        let at = before
-            .position(&native, end, false)
-            .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
-        map_endpoint(&before.semantic, next, at)
-            .map(Some)
-            .ok_or_else(|| failure(TF_E_DISCONNECTED))
     }
 }
 
@@ -1956,51 +1913,6 @@ impl ITfEditSession_Impl for EditBlock_Impl {
     }
 }
 
-fn map_endpoint(before: &str, after: &str, at: u32) -> Option<u32> {
-    fn boundary(text: &str, at: u32) -> bool {
-        let mut units = 0;
-        for part in text.graphemes(true) {
-            if units == at {
-                return true;
-            }
-            units += part.encode_utf16().count() as u32;
-        }
-        units == at
-    }
-    if !boundary(before, at) {
-        return None;
-    }
-    let a: Vec<char> = before.chars().collect();
-    let b: Vec<char> = after.chars().collect();
-    let mut prefix = 0;
-    while prefix < a.len().min(b.len()) && a[prefix] == b[prefix] {
-        prefix += 1;
-    }
-    let mut suffix = 0;
-    while suffix < a.len() - prefix
-        && suffix < b.len() - prefix
-        && a[a.len() - suffix - 1] == b[b.len() - suffix - 1]
-    {
-        suffix += 1;
-    }
-    let units = |chars: &[char]| chars.iter().map(|c| c.len_utf16() as u32).sum::<u32>();
-    let total = units(&a);
-    if at > total || !(0..=a.len()).any(|i| units(&a[..i]) == at) {
-        return None;
-    }
-    if at == total {
-        return Some(units(&b));
-    }
-    let mapped = if at >= units(&a[..a.len() - suffix]) {
-        units(&b) - (total - at)
-    } else if at <= units(&a[..prefix]) {
-        at
-    } else {
-        return None;
-    };
-    boundary(after, mapped).then_some(mapped)
-}
-
 #[cfg(test)]
 mod native_lifetime_tests {
     use super::*;
@@ -2037,7 +1949,6 @@ mod native_lifetime_tests {
                             evidence: evidence::Record::default(),
                             semantic_boundary: None,
                             pending_proof: false,
-                            reacquired: false,
                             notification: 0,
                             notification_depth: 0,
                         }));

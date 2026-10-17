@@ -3939,8 +3939,6 @@ fn write_composing(
         *phase = "updateLease";
         lease(shared, r, generation, context)?;
         *phase = "selectionMapping";
-        let mapped_selection =
-            block_tracking::selection_for_write(shared, context, range, ec, text)?;
         let tracking = block_tracking::owned_update(shared, context, range, ec)?.map(Rc::new);
         lease(shared, r, generation, context)?;
         *phase = "updateText";
@@ -3991,12 +3989,6 @@ fn write_composing(
             );
             return Err(failure(TF_E_DISCONNECTED));
         }
-        let mapped_native = mapped_selection
-            .map(|at| {
-                text.position(&actual, at, true)
-                    .ok_or_else(|| failure(TF_E_DISCONNECTED))
-            })
-            .transpose()?;
         {
             let mut s = shared.borrow_mut();
             if s.generation != generation || s.epoch != epoch || !s.version.owned {
@@ -4009,17 +4001,10 @@ fn write_composing(
         *phase = "updateCaret";
         remember_observation_tail(shared, context, range, r, generation, epoch);
         let caret = range.Clone()?;
-        if let Some(end) = mapped_native {
-            caret.Collapse(ec, TF_ANCHOR_START)?;
-            let mut moved = 0;
-            caret.ShiftEnd(ec, end as i32, &mut moved, std::ptr::null())?;
-            if moved != end as i32 {
-                return Err(failure(TF_E_DISCONNECTED));
-            }
-            caret.Collapse(ec, TF_ANCHOR_END)?;
-        } else {
-            caret.Collapse(ec, TF_ANCHOR_END)?;
-        }
+        // Resume uses the same caret contract as ordinary streaming. Leaving
+        // it inside the rewritten preedit can commit only that prefix when
+        // the next key hands the composition back to the host.
+        caret.Collapse(ec, TF_ANCHOR_END)?;
         {
             let s = shared.borrow();
             if !s.active || s.generation != generation || s.epoch != epoch || !s.version.owned {

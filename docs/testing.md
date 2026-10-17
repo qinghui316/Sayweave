@@ -10,6 +10,10 @@
 
 人工编辑时，可在同一 `richtext_actor` 入口显式启用 `SAYWEAVE_ACTOR_PHYSICAL_INPUT=1`，复用桌面的键盘、鼠标和焦点事件所有者；测试结束释放监听。按实际编辑事件及按键释放设置续写屏障，状态输出包含活动序号和按键持有状态。单次注入 `edited` 只覆盖那次通知，不能代替后续真实按键；固定等待超过既有15秒期限的退出须与早期接管失败分开。焦点回调当时的文档／窗口匹配事实随既有写锁内首拒结构输出；无法取得后续编辑锁时，这部分覆盖仍未完成。元数据不授予写入许可。
 
+实际宿主正文可在同一入口叠加 `SAYWEAVE_ACTOR_BODY_READBACK=1`。先在目标输入框放入 `测试：`，测试在30秒内等待其稳定，然后保留该聚焦可编辑 UIA 元素；`body` 命令读取该字段自己的 TextPattern 范围，范围所属内层节点必须沿父链归属该字段，结束回执另附 `actualBody`。换字段、密码／只读、范围属于其他字段、前缀不符或超过1024个 UTF-16 单元均拒绝读取。UIA 超时单独返回读取错误，不能算作正文通过。原生／模型回执与这份宿主正文分别记录，不读取会话根文档，不借正文读取授予生产写入许可。`input-fixture` 的 `fixture-text` 与原有 `fixture-key` 使用同一个验收标记；自动改字需要让文本和方向／删除键都进入原编辑监听，Unicode 注入仍与真实输入法选词分开结算。
+
+`SAYWEAVE_BLOCK_INTERIOR_EDIT=1` 在现有生产富文本 actor 中保留首次局部改字后的块内光标，直接发送下一段已确认识别；整理后再次通过原生按键交还组合，断言尾部正文完整，再继续删除和第三次修改。该模式使用普通已绑定块，不与首写屏障或首笔 Backspace 合并，覆盖接管后的写入光标与下一次组合提交之间的往返。
+
 同一入口的 `SAYWEAVE_BLOCK_CONTROL=controlled-input` 使用受控 React 输入框，默认 `richtext` 保留富文本。每次宿主事件稳定后同时断言原生可见值与 React 状态，收尾后再次核对。后续程序化局部编辑与直接 Backspace 分别记录，不将前者视为真实输入法测试。普通原生 EDIT 的持续父文档验证使用既有 `input-fixture` 和同一 SessionDraft actor，核对三轮修改、删除后续说、块外标记及同窗同正文的换框反例；临时载体清空与持久正文保留分别观察。载体读回调超期后不得再执行捕获的父锁操作，原生效果等级和实际正文分别留证。
 
 同一识别连接的 PCM 暂停／恢复由 `retained_edit_resume_sends_pcm_on_the_same_connection_without_ready_event` 验证；界面真实电平订阅由 `tests/voice-edit-resume.test.tsx` 验证。受控音频、宿主正文、用户实际 Codex 试用分别记录，原生 `submitted/unconfirmed` 不升级为 `confirmed`。本次 f2ab7319 候选的同一 Codex 三步文字与波形验收已通过，不能扩展成所有宿主和时序的保证。

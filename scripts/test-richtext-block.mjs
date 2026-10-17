@@ -367,6 +367,9 @@ async function runActor({page,pid,focus,start,read:readWhole,settled:settledWhol
   if(commitEarly&&(!process.env.SAYWEAVE_INITIAL_BARRIER||earlyEdit||process.env.SAYWEAVE_BLOCK_BACKSPACE!=='1'))throw Error('Initial commit barrier requires direct Backspace and separate receipt timing');
   report.actorScenario=earlyEdit?'edit-before-tracking-receipt':'edit-after-tracking-receipt';
   const backspace=process.env.SAYWEAVE_BLOCK_BACKSPACE==='1';
+  const interiorEdit=process.env.SAYWEAVE_BLOCK_INTERIOR_EDIT==='1';
+  if(interiorEdit&&(backspace||earlyEdit||commitEarly))throw Error('Interior-edit round trip requires the ordinary bound block');
+  report.actorInteriorEditRoundTrip=interiorEdit;
   const userNewline=process.env.SAYWEAVE_BLOCK_USER_NEWLINE==='1';
   if(userNewline&&!backspace)throw Error('User newline regression requires direct Backspace setup');
   if(userNewline)report.actorNewlineRepresentation='paragraph';
@@ -431,7 +434,7 @@ async function runActor({page,pid,focus,start,read:readWhole,settled:settledWhol
     const positioned=await settled();trace.push({label:'actor selection before edit '+index,settled:positioned});
     if(positioned.text!==before.text)throw Error('Caret-only positioning changed body');
    }
-   if(!(backspace&&index===0))await page.evaluate(({left,end,text,caret})=>{window.fixtureEditor.edit(left,end,text);window.fixtureEditor.select(caret);},{left:prefix.length+left,end:prefix.length+before.text.length-right,text:expectedEdit.slice(left,expectedEdit.length-right),caret:prefix.length+replacement.length});
+   if(!(backspace&&index===0))await page.evaluate(({left,end,text,caret})=>{window.fixtureEditor.edit(left,end,text);window.fixtureEditor.select(caret);},{left:prefix.length+left,end:prefix.length+before.text.length-right,text:expectedEdit.slice(left,expectedEdit.length-right),caret:prefix.length+(interiorEdit&&index===0?expectedEdit.length-right:replacement.length)});
    // Use this editor's supported paragraph break. A raw LF inserted into a
    // text node is normalized to a space by its own DOM parser, even during
    // ordinary typing without TSF. The separate host-control evidence retains
@@ -445,7 +448,10 @@ async function runActor({page,pid,focus,start,read:readWhole,settled:settledWhol
    }
    segments.forEach(s=>s.confirmed=true);
    segments.push({id:index+2,revision:1,text:tail.slice(0,3),confirmed:false});
-   await command({action:'asr',segments});await expectBody('actor partial '+index,replacement+tail.slice(0,3)+retained);
+   // The first edit stays inside the old body through reacquisition. Its next
+   // keyboard handoff must preserve the complete model rewrite, including the
+   // suffix after that old caret. Subsequent rounds retain partial streaming.
+   if(!interiorEdit||index!==0){await command({action:'asr',segments});await expectBody('actor partial '+index,replacement+tail.slice(0,3)+retained);}
    segments.at(-1).revision++;segments.at(-1).text=tail;segments.at(-1).confirmed=true;
    await command({action:'asr',segments});await expectBody('actor model '+index,final+retained);
    if(process.env.SAYWEAVE_BLOCK_PRESENTATION==='1'){

@@ -967,6 +967,56 @@ fn main() {
                         Err(error) => format!("failed:{:08x}", error.code().0 as u32),
                     });
                 }
+                if value["action"] == "fixture-text" {
+                    // Match fixture-key's acceptance tag so the real edit
+                    // observer sees test text as well as navigation/deletion.
+                    let mut pid = 0;
+                    GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
+                    let text = value["text"].as_str().unwrap_or_default();
+                    let units: Vec<u16> = text.encode_utf16().collect();
+                    let allowed = value["process"].as_u64() == Some(pid as u64)
+                        && !units.is_empty()
+                        && units.len() <= 8
+                        && !text.chars().any(char::is_control);
+                    let mut sent = allowed;
+                    if allowed {
+                        for unit in &units {
+                            let event = |up| INPUT {
+                                r#type: INPUT_KEYBOARD,
+                                Anonymous: INPUT_0 {
+                                    ki: KEYBDINPUT {
+                                        wScan: *unit,
+                                        dwFlags: KEYEVENTF_UNICODE
+                                            | if up {
+                                                KEYEVENTF_KEYUP
+                                            } else {
+                                                KEYBD_EVENT_FLAGS(0)
+                                            },
+                                        dwExtraInfo: 0x53595754,
+                                        ..Default::default()
+                                    },
+                                },
+                            };
+                            let count = SendInput(
+                                &[event(false), event(true)],
+                                std::mem::size_of::<INPUT>() as i32,
+                            );
+                            if count != 2 {
+                                if count == 1 {
+                                    let _ = SendInput(
+                                        &[event(true)],
+                                        std::mem::size_of::<INPUT>() as i32,
+                                    );
+                                }
+                                sent = false;
+                                break;
+                            }
+                        }
+                    }
+                    key_result = Some(
+                        serde_json::json!({"accepted":sent,"process":pid,"unicodeUnits":units.len()}),
+                    );
+                }
                 if value["action"] == "fixture-key" {
                     let mut pid = 0;
                     GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
@@ -975,6 +1025,7 @@ fn main() {
                         Some("Backspace") => Some(VK_BACK),
                         Some("Delete") => Some(VK_DELETE),
                         Some("ArrowLeft") => Some(VK_LEFT),
+                        Some("End") => Some(VK_END),
                         Some("ShiftLeft") => Some(VK_LSHIFT),
                         Some("ShiftRight") => Some(VK_RSHIFT),
                         Some("Escape") => Some(VK_ESCAPE),
@@ -998,7 +1049,11 @@ fn main() {
                             KEYBD_EVENT_FLAGS(0)
                         } else {
                             KEYEVENTF_KEYUP
-                        } | if key == VK_RMENU || key == VK_DELETE || key == VK_LEFT {
+                        } | if key == VK_RMENU
+                            || key == VK_DELETE
+                            || key == VK_LEFT
+                            || key == VK_END
+                        {
                             KEYEVENTF_EXTENDEDKEY
                         } else {
                             KEYBD_EVENT_FLAGS(0)
