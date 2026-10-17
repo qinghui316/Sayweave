@@ -333,7 +333,7 @@ async fn richtext_actor() {
                 let before = reader.read().unwrap();
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 if reader.read().is_ok_and(|after| after == before) {
-                    anchor = windows_input::WindowsInputService::anchor().unwrap();
+                    anchor = reader.anchor.clone();
                     break Some(reader);
                 }
             }
