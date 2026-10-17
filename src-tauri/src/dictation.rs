@@ -971,6 +971,10 @@ impl DictationCoordinator {
             } else {
                 None
             };
+            let copy_attempt = recognized_snapshot
+                .as_ref()
+                .and_then(|s| s.attempt_id.clone());
+            let (copy_settled, copy_outcome) = oneshot::channel::<Option<DbOperation>>();
             let archive_app = app.clone();
             let archive_id = id.clone();
             let language_source = recognized_snapshot.clone();
@@ -1000,6 +1004,18 @@ impl DictationCoordinator {
                     {
                         archive_error = true;
                     }
+                }
+                match copy_outcome.await {
+                    Ok(Some(operation)) => {
+                        archive_error |= app
+                            .state::<SpeechService>()
+                            .history
+                            .db(operation)
+                            .await
+                            .is_err()
+                    }
+                    Ok(None) => (),
+                    Err(_) => archive_error = true,
                 }
                 #[cfg(windows)]
                 if let Some(draft) = &draft {
@@ -1085,19 +1101,20 @@ impl DictationCoordinator {
             });
             app.state::<WindowsInputService>().forget(id.clone());
             coordinator.release(&app, &id).await;
+            let mut result_copy = None;
             if automatic_result_copy
                 && let Ok(snapshot) = coordinator.snapshot()
                 && snapshot.task_id.as_deref() == Some(&id)
                 && let Some(presentation) = snapshot.presentation_id
                 && let Ok((text, copy_gate)) = coordinator.begin_copy(&id, &presentation)
             {
-                // The same bound gate as explicit Copy: dismissal or a newer
-                // task can still cancel the queued clipboard write.
+                // Admission is released; this task/presentation gate still
+                // lets dismissal or a newer task cancel the clipboard effect.
                 let result = app
                     .state::<WindowsInputService>()
                     .copy_bound(text, copy_gate)
                     .await;
-                log::info!(target:"sayweave", "operation=dictation_result_copy task_id={id} result={} error={}", if result.is_ok(){"copied"}else{"failed"}, result.as_ref().err().map_or("none",|e|e.code.as_str()));
+                result_copy = copy_receipt(&id, copy_attempt.as_deref(), &result);
                 if result
                     .as_ref()
                     .is_err_and(|e| e.code != "cancelled" && e.code != "staleSession")
@@ -1109,6 +1126,7 @@ impl DictationCoordinator {
                     });
                 }
             }
+            let _ = copy_settled.send(result_copy);
         });
         result
     }
@@ -1383,6 +1401,27 @@ fn composition_finish(phase: Phase, journaled: bool, interrupted: bool) -> Finis
         Finish::Commit
     }
 }
+// Each clipboard effect has its own delivery identity and shares the immutable
+// recognition attempt. It must never overwrite the original input receipt.
+fn copy_receipt(
+    task: &str,
+    attempt: Option<&str>,
+    result: &Result<(), Error>,
+) -> Option<DbOperation> {
+    let operation = format!("copy:{}", uuid::Uuid::new_v4());
+    log::info!(target:"sayweave", "operation=dictation_result_copy task_id={task} delivery_id={operation} result={} error={}", if result.is_ok(){"copied"}else{"failed"}, result.as_ref().err().map_or("none",|e|e.code.as_str()));
+    attempt.map(|attempt| DbOperation::Delivery {
+        task: operation,
+        attempt: attempt.into(),
+        state: if result.is_ok() {
+            "confirmed"
+        } else {
+            "failed"
+        }
+        .into(),
+        error: result.as_ref().err().map(|e| e.code.clone()),
+    })
+}
 fn key_matches_task(
     id: Option<&str>,
     origin: Option<&TaskStamp>,
@@ -1395,6 +1434,58 @@ fn key_matches_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn copied_and_failed_clipboard_receipts_survive_reopen_without_replacing_native_input() {
+        use crate::{contracts::history::DbOutput, data::repository::Repository};
+        let root = tempfile::tempdir().unwrap();
+        let mut repo = Repository::open(root.path()).unwrap();
+        repo.connection
+            .execute(
+                "INSERT INTO speech_records(id,created_at,status) VALUES('r',1,'success')",
+                [],
+            )
+            .unwrap();
+        repo.connection.execute("INSERT INTO speech_attempts(id,record_id,kind,config_id,config_name,model_id,service_host,config_revision,created_at,status) VALUES('a','r','live','c','test','model','host',1,1,'success')",[]).unwrap();
+        repo.history_operation(DbOperation::Delivery {
+            task: "native-task".into(),
+            attempt: "a".into(),
+            state: "unconfirmed".into(),
+            error: Some("compositionRejected".into()),
+        })
+        .unwrap();
+        repo.history_operation(copy_receipt("native-task", Some("a"), &Ok(())).unwrap())
+            .unwrap();
+        repo.history_operation(
+            copy_receipt("native-task", Some("a"), &Err(Error::new("copyFailed"))).unwrap(),
+        )
+        .unwrap();
+        drop(repo);
+        let mut repo = Repository::open(root.path()).unwrap();
+        repo.history_operation(DbOperation::RecoverDelivery)
+            .unwrap();
+        let copies: Vec<(String,String,Option<String>)> = repo.connection.prepare("SELECT attempt_id,state,error_code FROM delivery_attempts WHERE task_id LIKE 'copy:%' ORDER BY state").unwrap().query_map([],|row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(
+            copies,
+            vec![
+                ("a".into(), "confirmed".into(), None),
+                ("a".into(), "failed".into(), Some("copyFailed".into()))
+            ]
+        );
+        let DbOutput::Deliveries(rows) = repo
+            .history_operation(DbOperation::Deliveries("r".into()))
+            .unwrap()
+        else {
+            panic!("input projection")
+        };
+        assert_eq!(
+            rows.len(),
+            1,
+            "clipboard confirmation cannot hide native input uncertainty"
+        );
+        assert_eq!(rows[0].state, "unconfirmed");
+        assert_eq!(rows[0].error.as_deref(), Some("compositionRejected"));
+        assert!(copy_receipt("unsaved-task", None, &Ok(())).is_none());
+    }
     #[cfg(windows)]
     #[test]
     fn required_journal_and_recognition_guard_commit_independently_of_archive() {
@@ -1523,9 +1614,22 @@ pub async fn dictation_copy(
 ) -> Result<(), Error> {
     caller(window.label())?;
     let (text, gate) = service.begin_copy(&task_id, &presentation_id)?;
-    app.state::<WindowsInputService>()
+    let attempt = app
+        .state::<SpeechService>()
+        .snapshot()
+        .ok()
+        .filter(|s| s.task_id.as_deref() == Some(&task_id))
+        .and_then(|s| s.attempt_id);
+    let result = app
+        .state::<WindowsInputService>()
         .copy_bound(text, gate)
-        .await?;
+        .await;
+    if let Some(receipt) = copy_receipt(&task_id, attempt.as_deref(), &result)
+        && let Err(error) = app.state::<SpeechService>().history.db(receipt).await
+    {
+        log::error!(target:"sayweave", "operation=dictation_copy_archive task_id={task_id} error={}",error.code);
+    }
+    result?;
     service.update(&app, &task_id, |s| {
         if s.presentation_id.as_deref() == Some(&presentation_id)
             && s.error.as_deref() == Some("copyFailed")

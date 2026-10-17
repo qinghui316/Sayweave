@@ -64,7 +64,10 @@ impl Repository {
                 Ok(DbOutput::Done)
             }
             DbOperation::Deliveries(id) => {
-                let mut query=self.connection.prepare("SELECT d.attempt_id,d.state,d.error_code,d.updated_at FROM delivery_attempts d JOIN speech_attempts a ON a.id=d.attempt_id WHERE a.record_id=?1 ORDER BY d.updated_at DESC,d.task_id ASC").map_err(db_error)?;
+                // This existing UI projection describes external input. Copy
+                // receipts retain their own durable operation rows; presenting
+                // a clipboard confirmation as '已填入' would hide native facts.
+                let mut query=self.connection.prepare("SELECT d.attempt_id,d.state,d.error_code,d.updated_at FROM delivery_attempts d JOIN speech_attempts a ON a.id=d.attempt_id WHERE a.record_id=?1 AND d.task_id NOT LIKE 'copy:%' ORDER BY d.updated_at DESC,d.task_id ASC").map_err(db_error)?;
                 let rows = query
                     .query_map([id], |r| {
                         Ok(DeliveryReport {
