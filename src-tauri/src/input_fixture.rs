@@ -402,7 +402,12 @@ fn focus_metadata_at(process: u32, expected: Option<usize>) -> serde_json::Value
 // A read-only acceptance observer for the explicitly selected native endpoint.
 // This uses the host's existing MSAA/UIA provider when the UIA client bridge
 // returns a null TextPattern. It never supplies production write authority.
-fn owned_body_snapshot(process: u32, window: usize, expected: String) -> serde_json::Value {
+fn owned_body_snapshot(
+    process: u32,
+    window: usize,
+    expected: String,
+    expected_runtime: Option<Vec<i32>>,
+) -> serde_json::Value {
     if std::env::var("SAYWEAVE_TSF_OWNED_PID")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -457,6 +462,7 @@ fn owned_body_snapshot(process: u32, window: usize, expected: String) -> serde_j
                 if !array.is_null(){let _=SafeArrayDestroy(array);}result
             };
             let raw=focused()?;let before=identity(&raw)?;
+            if expected_runtime.as_ref().is_some_and(|id|id!=&before) {return Err(windows::core::Error::from_hresult(E_ACCESSDENIED));}
             let pattern:ITextProvider=raw.GetPatternProvider(UIA_TextPatternId)?.cast()?;
             let range=pattern.DocumentRange()?;
             let readonly=range.GetAttributeValue(UIA_IsReadOnlyAttributeId)?;
@@ -470,8 +476,9 @@ fn owned_body_snapshot(process: u32, window: usize, expected: String) -> serde_j
             let body=range.GetText(1025)?.to_string();
             let after=identity(&focused()?)?;
             if before!=after||body.encode_utf16().count()>1024 {return Err(windows::core::Error::from_hresult(E_ACCESSDENIED));}
-            // An unrelated unprefixed draft is never printed by this observer.
-            let owned=body.starts_with("测试：")||body==expected||body==format!("{expected}\r\n");
+            // An explicitly retained field identity also admits diagnostic
+            // representation before input (for example a host suggestion).
+            let owned=expected_runtime.is_some()||body.starts_with("测试：")||body==expected||body==format!("{expected}\r\n");
             Ok::<_,windows::core::Error>(serde_json::json!({"process":process,"window":window,"runtimeId":before,"actualBody":owned.then_some(&body),"units":body.encode_utf16().count(),"matches":body==expected,"reader":"nativeFocusedProvider","readonly":false}))
         })();
         CoUninitialize();
@@ -649,8 +656,20 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         let expected = std::env::args().nth(4).unwrap_or_default();
+        let runtime = std::env::args().nth(5);
+        let expected_runtime = runtime
+            .as_ref()
+            .and_then(|raw| serde_json::from_str::<Vec<i32>>(raw).ok())
+            .filter(|id| !id.is_empty() && id.len() <= 64);
+        if runtime.is_some() && expected_runtime.is_none() {
+            println!("{{\"error\":\"invalidOwnedFieldIdentity\"}}");
+            return;
+        }
         if process != 0 && window != 0 && expected.len() <= 1024 {
-            println!("{}", owned_body_snapshot(process, window, expected));
+            println!(
+                "{}",
+                owned_body_snapshot(process, window, expected, expected_runtime)
+            );
         }
         return;
     }
