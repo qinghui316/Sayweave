@@ -6,7 +6,7 @@ mod revisable;
 #[cfg(test)]
 #[path = "drafts_tests.rs"]
 mod tests;
-use super::{Presentation, processing_context::Context};
+use super::{InputMode, Presentation, processing_context::Context};
 use crate::{
     history::types::Error,
     input_state,
@@ -385,6 +385,7 @@ struct View {
     paused: bool,
     report: Option<Report>,
     result_only: bool,
+    input_mode: InputMode,
 }
 pub(crate) struct SessionDraft {
     connection: Arc<Connection>,
@@ -486,6 +487,11 @@ impl SessionDraft {
     pub fn result_only(&self) -> bool {
         self.view.lock().is_ok_and(|v| v.result_only)
     }
+    pub fn input_mode(&self) -> InputMode {
+        self.view
+            .lock()
+            .map_or(InputMode::Revisable, |v| v.input_mode)
+    }
     pub async fn archive(&self) -> Result<Option<(Report, bool)>, Error> {
         let report = self.report();
         let mut persisted = false;
@@ -510,12 +516,16 @@ impl SessionDraft {
             v.turn = s.turn;
             v.paused = s.input_delivery.live() && (s.paused_at.is_some() || s.handoff);
             v.result_only = !s.input_delivery.live();
+            v.input_mode = s
+                .revisable
+                .as_ref()
+                .map_or(InputMode::Revisable, |r| r.mode);
         }
     }
     fn publish_projected(
         &self,
         s: &State,
-        published: &mut Option<(Presentation, bool)>,
+        published: &mut Option<(Presentation, bool, InputMode)>,
         publish: &impl Fn(Presentation),
     ) {
         self.project(s);
@@ -525,7 +535,7 @@ impl SessionDraft {
             return;
         }
         let next = self.presentation();
-        let projection = (next, !s.input_delivery.live());
+        let projection = (next, !s.input_delivery.live(), self.input_mode());
         if *published != Some(projection) {
             log::info!(target: "sayweave", "operation=draft_presentation task_id={} turn={} previous={:?} next={:?} audio_route={}", self.task, s.turn, published, next, self.control.audio.current());
             *published = Some(projection);

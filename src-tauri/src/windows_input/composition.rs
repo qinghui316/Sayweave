@@ -254,18 +254,22 @@ pub(crate) enum ReacquireOutcome {
         snapshot: BlockSnapshot,
     },
     AwaitingProof,
+    Unavailable,
     Invalidated,
     Uncertain,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BlockRefusal {
     AwaitingProof,
+    Unavailable,
     Invalidated,
     Uncertain,
 }
 pub(crate) fn block_refusal(reply: &Reply) -> BlockRefusal {
     if reply.mutation != Mutation::NotAttempted {
         BlockRefusal::Uncertain
+    } else if reply.code.starts_with("blockRetainedScopeUnavailable:") {
+        BlockRefusal::Unavailable
     } else if reply.code.starts_with("blockAwaitingRepresentation:")
         || reply.code.starts_with("blockInputMethodBusy:")
         || reply.code.starts_with("blockSnapshotChanged:")
@@ -312,6 +316,7 @@ impl Connection {
         if !reply.applied {
             return Ok(match block_refusal(&reply) {
                 BlockRefusal::AwaitingProof => ReacquireOutcome::AwaitingProof,
+                BlockRefusal::Unavailable => ReacquireOutcome::Unavailable,
                 BlockRefusal::Invalidated => ReacquireOutcome::Invalidated,
                 BlockRefusal::Uncertain => ReacquireOutcome::Uncertain,
             });
@@ -2031,6 +2036,10 @@ mod tests {
         }
         reply.code = "blockScopeInvalid:800401fd".into();
         assert_eq!(block_refusal(&reply), BlockRefusal::Invalidated);
+        reply.code = "blockRetainedScopeUnavailable:80040204".into();
+        assert_eq!(block_refusal(&reply), BlockRefusal::Unavailable);
+        reply.mutation = Mutation::Changed;
+        assert_eq!(block_refusal(&reply), BlockRefusal::Uncertain);
         reply.code = "blockSnapshotChanged:80040500".into();
         reply.mutation = Mutation::Uncertain;
         assert_eq!(block_refusal(&reply), BlockRefusal::Uncertain);

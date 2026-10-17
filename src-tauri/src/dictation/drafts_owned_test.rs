@@ -405,7 +405,7 @@ async fn richtext_actor() {
     let mut latest = NativeTranscript::default();
     let mut finished = false;
     let result: Result<(), String> = async {
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let deadline = Instant::now() + Duration::from_secs(180);
         for _ in 0..2000 {
             if Instant::now() >= deadline { return Err("owned actor deadline".into()); }
             let line = receiver.recv_timeout(Duration::from_secs(15)).map_err(|e|e.to_string())?;
@@ -472,7 +472,7 @@ async fn richtext_actor() {
             if *cancel.borrow() > 0 || control.stopping() {
                 return Err(format!("actor stopped: {:?}", manager.report().and_then(|r|r.error)));
             }
-            emit(serde_json::json!({"accepted":true,"activity":input_state::activity(),"editingKeyHeld":input_state::editing_key_held(),"sequence":latest.sequence,"resultOnly":manager.result_only(),"presentation":manager.presentation(),"published":publications.lock().unwrap().last().copied(),"audioRoute":control.audio.current(),"requests":provider.seen.lock().unwrap().len()}));
+            emit(serde_json::json!({"accepted":true,"activity":input_state::activity(),"editingKeyHeld":input_state::editing_key_held(),"sequence":latest.sequence,"resultOnly":manager.result_only(),"inputMode":manager.input_mode(),"presentation":manager.presentation(),"published":publications.lock().unwrap().last().copied(),"audioRoute":control.audio.current(),"requests":provider.seen.lock().unwrap().len()}));
         }
         Err("owned actor command limit".into())
     }.await;

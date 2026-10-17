@@ -1028,6 +1028,23 @@ impl ITfTextEditSink_Impl for Sink_Impl {
             phase = "blockEditTextRead".into();
             if text.is_empty() {
                 phase = "blockEditEmpty".into();
+                // This is a lost committed-body capability, not permission to
+                // revive the old range. The caller may retire it and prepare
+                // a separately authorized position for new speech only.
+                if self.field.has_native_origin()
+                    && !previous.is_empty()
+                    && context.GetStatus()?.dwStaticFlags & TF_SS_TRANSITORY != 0
+                {
+                    let extent = context.GetStart(ec)?;
+                    extent.ShiftEndToRange(ec, &context.GetEnd(ec)?, TF_ANCHOR_END)?;
+                    let owner: ITfContextComposition = context.cast()?;
+                    let mut items = [None];
+                    let mut count = 0;
+                    owner.EnumCompositions()?.Next(&mut items, &mut count)?;
+                    if range_text(&extent, ec)?.is_empty() && count == 0 {
+                        phase = "blockRetainedScopeUnavailable".into();
+                    }
+                }
                 return Err(failure(TF_E_DISCONNECTED));
             }
             phase = "blockEditSelectionStatus".into();

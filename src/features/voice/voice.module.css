@@ -8,3 +8,5 @@
 
 .notice { display:flex; align-items:center; gap:8px; width:360px; max-width:100%; max-height:calc(100vh - 22px); border-radius:var(--radius-card); background:var(--voice-bg); color:var(--voice-fg); font-size:var(--text-small); line-height:var(--line-small); padding:8px 12px; }
 .noticeText { flex:1; min-width:0; max-height:calc(100vh - 38px); overflow-y:auto; overflow-wrap:anywhere; }.noticeActions { display:flex; flex:none; gap:8px; align-items:center; }.notice button { flex:none; }.notice button:focus-visible { outline-color:var(--signal); outline-offset:2px; }
+
+.caretHint { margin:0 0 6px; padding:4px 10px; border-radius:var(--radius-pill); background:var(--voice-bg); color:var(--voice-fg); font-size:var(--text-small); line-height:var(--line-small); }

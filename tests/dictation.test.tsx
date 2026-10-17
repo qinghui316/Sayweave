@@ -8,6 +8,11 @@ import {parseDeliveryReports} from '../src/contracts/history';
 import {ShortcutSettings} from '../src/features/settings/ShortcutSettings';
 import {VoiceSurface} from '../src/features/voice';
 describe('dictation contracts',()=>{
+ it('accepts the optional caret mode and rejects an unknown mode',()=>{
+  expect(parseDictation(initialDictation()).inputMode).toBeUndefined();
+  expect(parseDictation({...initialDictation(),inputMode:'caret'}).inputMode).toBe('caret');
+  expect(()=>parseDictation({...initialDictation(),inputMode:'follow-anywhere'})).toThrow();
+ });
  it('rejects malformed state and exposes no native target identity',()=>{
   expect(parseDictation(initialDictation()).source).toBe('trial');
   expect(()=>parseDictation({...initialDictation(),delivery:{state:'submitted',error:null,restoreError:false,elapsedMs:1}})).toThrow();
@@ -22,6 +27,15 @@ describe('dictation contracts',()=>{
   expect(()=>parseDictation({...initialDictation(),delivery:{...delivery,verification:'assumed'}})).toThrow();
   expect(()=>parseDictation({...initialDictation(),delivery:{...delivery,submittedEvents:-1}})).toThrow();
  });
+});
+it('caret mode keeps live recording controls and meter beside its continuation hint',()=>{
+ const view=render(<VoiceSurface inputMode="caret" presentation="recording" phase="recording" level={0.4} mode="speech" start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
+ expect(screen.getByText('前文保留，继续在光标处输入')).toBeVisible();
+ expect(screen.getByRole('button',{name:'结束录音'})).toBeVisible();
+ expect(view.container.querySelector('[data-live="true"]')).not.toBeNull();
+ expect(screen.queryByRole('button',{name:'复制'})).not.toBeInTheDocument();
+ view.rerender(<VoiceSurface inputMode="revisable" presentation="recording" phase="recording" level={0.4} mode="speech" start={()=>{}} finish={()=>{}} cancel={()=>{}}/>);
+ expect(screen.queryByText('前文保留，继续在光标处输入')).not.toBeInTheDocument();
 });
 describe('shortcut settings',()=>{
  it('saves a completed capture RPC even when the subscription has not attached',async()=>{
