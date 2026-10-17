@@ -377,6 +377,18 @@ fn directory(root: &Path) -> Result<PathBuf, DataError> {
 }
 fn key(fact: &Fact) -> Result<String, DataError> {
     let (id, rank) = fact.identity();
+    if let Fact::Delivery { task, .. } = fact
+        && let Some(copy) = task.strip_prefix("copy:")
+    {
+        let parsed = uuid::Uuid::parse_str(copy).map_err(|_| DataError::new("invalid"))?;
+        if parsed.to_string() != copy {
+            return Err(DataError::new("invalid"));
+        }
+        // A closed delivery namespace, not a path supplied by the caller.
+        // Keep ':' out of Windows filenames and retain the native UUID rule
+        // for every other kind of archive fact.
+        return Ok(format!("copy-{parsed}-{rank}"));
+    }
     uuid::Uuid::parse_str(id).map_err(|_| DataError::new("invalid"))?;
     Ok(format!("{id}-{rank}"))
 }
@@ -1113,6 +1125,133 @@ fn invalidate_record(repo: &Repository, root: &Path, record: &str) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn clipboard_delivery_stages_and_replays_without_overwriting_native_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut repo = Repository::open(temp.path()).unwrap();
+        let mut prepared = prepare();
+        prepared.attempt.record_id = prepared.record_id.clone();
+        apply(
+            &mut repo,
+            Operation::History(h::DbOperation::Prepare(prepared.clone())),
+        )
+        .unwrap();
+        let native = uuid::Uuid::new_v4().to_string();
+        apply(
+            &mut repo,
+            Operation::History(h::DbOperation::Delivery {
+                task: native.clone(),
+                attempt: prepared.attempt.id.clone(),
+                state: "unconfirmed".into(),
+                error: Some("compositionRejected".into()),
+            }),
+        )
+        .unwrap();
+        let copy = |state: &str, error: Option<&str>| {
+            Operation::History(h::DbOperation::Delivery {
+                task: format!("copy:{}", uuid::Uuid::new_v4()),
+                attempt: prepared.attempt.id.clone(),
+                state: state.into(),
+                error: error.map(str::to_owned),
+            })
+        };
+        let success = copy("confirmed", None);
+        let receipt = stage(temp.path(), &success).unwrap().unwrap();
+        assert!(
+            receipt
+                .0
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("copy-")
+        );
+        let causal = std::sync::Arc::new(Causal::default());
+        assert!(causal.ticket(&success, stamp()).lease.is_some());
+        let failure = copy("failed", Some("copyFailed"));
+        let mut memory = Memory::default();
+        memory.retain(&failure);
+        assert_eq!(memory.facts.len(), 1);
+        memory.flush(temp.path());
+        assert!(memory.facts.is_empty());
+        assert_eq!(entries(temp.path()).unwrap().len(), 2);
+        drop(repo);
+        let repo = Repository::open(temp.path()).unwrap();
+        assert!(entries(temp.path()).unwrap().is_empty());
+        let rows: Vec<(String,Option<String>)>=repo.connection.prepare("SELECT state,error_code FROM delivery_attempts WHERE task_id LIKE 'copy:%' ORDER BY state").unwrap().query_map([],|row|Ok((row.get(0)?,row.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("confirmed".into(), None),
+                ("failed".into(), Some("copyFailed".into()))
+            ]
+        );
+        let original: (String, Option<String>) = repo
+            .connection
+            .query_row(
+                "SELECT state,error_code FROM delivery_attempts WHERE task_id=?1",
+                [native],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            original,
+            ("unconfirmed".into(), Some("compositionRejected".into()))
+        );
+        for task in [
+            "copy:../outside".into(),
+            format!("other:{}", uuid::Uuid::new_v4()),
+            format!("copy:{}:extra", uuid::Uuid::new_v4()),
+        ] {
+            let invalid = Fact::Delivery {
+                task,
+                attempt: prepared.attempt.id.clone(),
+                state: "confirmed".into(),
+                error: None,
+            };
+            assert!(key(&invalid).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn clipboard_receipt_uses_the_real_data_worker_archive_route() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut prepared = prepare();
+        prepared.attempt.record_id = prepared.record_id.clone();
+        let mut repo = Repository::open(temp.path()).unwrap();
+        apply(
+            &mut repo,
+            Operation::History(h::DbOperation::Prepare(prepared.clone())),
+        )
+        .unwrap();
+        drop(repo);
+        let worker = super::super::DataWorker::start(temp.path().to_owned()).unwrap();
+        let copy = format!("copy:{}", uuid::Uuid::new_v4());
+        let op = Operation::History(h::DbOperation::Delivery {
+            task: copy.clone(),
+            attempt: prepared.attempt.id,
+            state: "confirmed".into(),
+            error: None,
+        });
+        let ticket = worker.archive_ticket(&op);
+        assert!(
+            ticket.lease.is_some(),
+            "clipboard receipt must have the ordinary causal archive lease"
+        );
+        worker.request_archive_stamped(op, ticket).await.unwrap();
+        worker.shutdown().await;
+        let repo = Repository::open(temp.path()).unwrap();
+        let state: String = repo
+            .connection
+            .query_row(
+                "SELECT state FROM delivery_attempts WHERE task_id=?1",
+                [copy],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "confirmed");
+        assert!(entries(temp.path()).unwrap().is_empty());
+    }
     #[test]
     fn draft_recovery_cannot_seal_run_before_pending_attempt_and_visible_checkpoint() {
         use crate::contracts::draft::{Association, BaselineKind, Checkpoint, Snapshot};
