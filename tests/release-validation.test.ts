@@ -251,7 +251,9 @@ describe('frozen product release controller boundaries',()=>{
   }finally{
    rmSync(owned,{recursive:true});
   }
- });
+ // Each case creates and validates an independent Git repository through many
+ // real subprocesses. This is a fixture budget, not a product response deadline.
+ },30_000);
 });
 
 describe('owner draft and prior verification provenance',()=>{

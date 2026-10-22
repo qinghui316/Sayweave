@@ -8,6 +8,10 @@ pub(super) struct Record {
     ui_baseline: Option<Rc<Frame>>,
     first: Option<Rc<Frame>>,
     collecting: bool,
+    range_route: Option<serde_json::Value>,
+    range_drift: Option<serde_json::Value>,
+    source_receipt: Option<serde_json::Value>,
+    source_selection: Option<serde_json::Value>,
 }
 #[derive(Serialize)]
 struct Frame {
@@ -266,19 +270,27 @@ pub(super) unsafe fn capture(
     drop(retired_ui);
 }
 pub(super) fn suffix(data: &Rc<RefCell<Data>>) -> String {
-    let (baseline, ui_baseline, first, focus) = {
+    let (baseline, ui_baseline, first, focus, route, drift, source, source_selection) = {
         let d = data.borrow();
         (
             d.evidence.baseline.clone(),
             d.evidence.ui_baseline.clone(),
             d.evidence.first.clone(),
             d.focus_diagnostic.clone(),
+            d.evidence.range_route.clone(),
+            d.evidence.range_drift.clone(),
+            d.evidence.source_receipt.clone(),
+            d.evidence.source_selection.clone(),
         )
     };
     if first.is_none() && focus.is_none() {
         return String::new();
     }
     let mut value = serde_json::json!({"before":baseline.as_deref(),"ui_before":ui_baseline.as_deref(),"first":first.as_deref()});
+    value["rangeRoute"] = route.into();
+    value["rangeDrift"] = drift.into();
+    value["sourceReceipt"] = source.into();
+    value["sourceSelection"] = source_selection.into();
     if let Some(focus) = focus {
         value["focus"] = focus;
     }
@@ -287,6 +299,71 @@ pub(super) fn suffix(data: &Rc<RefCell<Data>>) -> String {
         return ":structure=oversize".into();
     }
     format!(":structure={encoded}")
+}
+// Values from the existing comparison only. Preserve its first sample and first
+// disagreement without querying a provider or participating in authorization.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn source_selection(
+    data: &Rc<RefCell<Data>>,
+    call: Option<u64>,
+    phase: &'static str,
+    attempt: u32,
+    readonly: bool,
+    expected: Option<[i64; 2]>,
+    observed: &windows::core::Result<[i64; 2]>,
+    captured: [u64; 4],
+    current: bool,
+) {
+    let mut d = data.borrow_mut();
+    let facts = serde_json::json!({"call":call,"phase":phase,"attempt":attempt,"readonly":readonly,"expected":expected,"actual":observed.as_ref().ok(),"hr":observed.as_ref().err().map(|error|format!("{:08x}",error.code().0 as u32)),"captured":{"epoch":captured[0],"version":captured[1],"lease":captured[2],"notification":captured[3]},"after":{"epoch":d.epoch,"version":d.version,"lease":d.lease,"notification":d.notification},"sameOwner":current});
+    let failed = !current
+        || observed.as_ref().is_err()
+        || expected
+            .is_some_and(|expected| observed.as_ref().is_ok_and(|actual| *actual != expected));
+    let record = d
+        .evidence
+        .source_selection
+        .get_or_insert_with(|| serde_json::json!({"first":facts,"failure":null}));
+    if failed && record["failure"].is_null() {
+        record["failure"] = facts;
+    }
+}
+#[allow(clippy::too_many_arguments)]
+pub(super) fn source_receipt(
+    data: &Rc<RefCell<Data>>,
+    note: &str,
+    stage: &str,
+    captured: bool,
+    host: (&str, &str),
+    events: Vec<&str>,
+    read: Option<(u32, Option<u32>, bool)>,
+    pair: Option<serde_json::Value>,
+) {
+    let mut d = data.borrow_mut();
+    if d.evidence.source_receipt.is_none() {
+        d.evidence.source_receipt = Some(
+            serde_json::json!({"note":note,"stage":stage,"captured":captured,"events":events,"pair":pair,"host":{"result":host.0,"stage":host.1},"read":read.map(|(request,session,entered)|serde_json::json!({"request":format!("{request:08x}"),"session":session.map(|hr|format!("{hr:08x}")),"entered":entered}))}),
+        );
+    }
+}
+// Preserve already-read geometry at the first route/terminal divergence. This
+// performs no provider query and never participates in capability admission.
+pub(super) fn range_geometry(
+    data: &Rc<RefCell<Data>>,
+    previous: RangePosition,
+    current: RangePosition,
+    drift: bool,
+) {
+    let mut d = data.borrow_mut();
+    let value = serde_json::json!({"previous":[previous.start,previous.end],"current":[current.start,current.end],"pending":d.pending_proof,"paragraphPending":d.paragraph_pending,"version":d.version,"lease":d.lease,"notification":d.notification});
+    let slot = if drift {
+        &mut d.evidence.range_drift
+    } else {
+        &mut d.evidence.range_route
+    };
+    if slot.is_none() {
+        *slot = Some(value);
+    }
 }
 
 #[cfg(test)]

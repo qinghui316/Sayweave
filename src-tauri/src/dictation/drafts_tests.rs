@@ -1,9 +1,181 @@
 //! Drive the production actor transitions with controlled native replies and a
 //! real local HTTPS model. Native rendering is covered by the input fixture.
 use super::*;
+#[tokio::test]
+async fn pending_initial_input_keeps_audio_and_all_asr_until_the_first_real_write() {
+    let (base, mut old, native) = production_actor(None);
+    let draft = old.draft.take().unwrap();
+    let actor = SessionDraft::new_initial(
+        base.task.clone(),
+        base.anchor.clone(),
+        InitialInput {
+            connection: draft.connection(),
+            draft: None,
+        },
+        base.control.clone(),
+        base.cancel.clone(),
+        None,
+        None,
+    );
+    let (mut state, _) = actor.initial.lock().unwrap().take().unwrap();
+    actor.control.resume(1, state.activity);
+    actor.control.fixture_ready(1, state.activity);
+    actor.activate();
+    let deadline = state.initial_preparation.unwrap();
+    actor.observe(&mut state, snapshot(1, vec![segment(1, "周三", false)]));
+    let activity = state.activity;
+    actor.native_done(
+        &mut state,
+        &NativeKind::InitialBegin { activity },
+        NativeValue::Begun(Err(Error::new("inputComposition"))),
+    );
+    actor.observe(&mut state, snapshot(2, vec![segment(1, "周三开会", true)]));
+    assert_eq!(state.latest.text, "周三开会");
+    assert_eq!(state.initial_preparation, Some(deadline));
+    assert_eq!(actor.control.audio.current(), 1);
+    assert_eq!(state.turn, 1);
+    assert!(native.try_recv().is_err());
+    actor.native_done(
+        &mut state,
+        &NativeKind::InitialBegin { activity },
+        NativeValue::Begun(Ok(draft)),
+    );
+    assert!(state.initial_preparation.is_none());
+    assert_eq!(actor.control.audio.current(), 1);
+    actor.schedule(&mut state).unwrap();
+    let Command::ReplaceTracked(_, text, raw, id, _, reply) = command(&native).await else {
+        panic!("the existing tracked write must receive the complete first source")
+    };
+    assert_eq!(text, "周三开会");
+    assert_eq!(raw.as_deref(), Some("周三开会"));
+    reply.send(Ok(tracked_snapshot(&id, &text))).unwrap();
+    acknowledge(&actor, &mut state).await;
+    assert_eq!(state.written_raw, "周三开会");
+    actor.observe(
+        &mut state,
+        snapshot(3, vec![segment(1, "周三开会地点上海", true)]),
+    );
+    actor.schedule(&mut state).unwrap();
+    assert_eq!(actor.control.audio.current(), 1);
+}
+
+#[tokio::test]
+async fn end_wins_over_a_pending_initial_begin_without_writing_or_new_audio_turn() {
+    let (actor, mut state, native) = production_actor(None);
+    let draft = state.draft.take().unwrap();
+    state.initial_preparation = Some(Instant::now() + Duration::from_secs(15));
+    actor.observe(
+        &mut state,
+        snapshot(1, vec![segment(1, "保留这次口述", true)]),
+    );
+    actor.control.request_finish();
+    let activity = state.activity;
+    actor.native_done(
+        &mut state,
+        &NativeKind::InitialBegin { activity },
+        NativeValue::Begun(Ok(draft)),
+    );
+    assert!(state.report.result_only);
+    assert!(state.initial_preparation.is_none());
+    actor.schedule(&mut state).unwrap();
+    let Command::Finish(_, text, mode, _, _, _) = command(&native).await else {
+        panic!("an end-raced empty range may only be handed off")
+    };
+    assert!(text.is_empty());
+    assert!(matches!(mode, Finish::Handoff(_)));
+    assert_eq!(state.latest.text, "保留这次口述");
+    assert_eq!(state.turn, 1);
+}
+
+#[tokio::test]
+async fn pending_initial_deadline_uses_result_delivery_without_dropping_recognition() {
+    let (actor, mut state, _native) = production_actor(None);
+    state.draft = None;
+    state.initial_preparation = Some(Instant::now());
+    actor.control.resume(1, state.activity);
+    actor.control.fixture_ready(1, state.activity);
+    actor.observe(
+        &mut state,
+        snapshot(1, vec![segment(1, "等待期间说的话", true)]),
+    );
+    actor.schedule(&mut state).unwrap();
+    assert!(state.report.result_only);
+    assert_eq!(actor.control.audio.current(), 1);
+    assert!(state.stop_error.is_none());
+    actor.native_done(
+        &mut state,
+        &NativeKind::RetireClose,
+        NativeValue::Closed(Ok(())),
+    );
+    actor.observe(
+        &mut state,
+        snapshot(2, vec![segment(1, "等待期间说的话还在继续", true)]),
+    );
+    assert_eq!(state.latest.text, "等待期间说的话还在继续");
+    assert_eq!(state.turn, 1);
+    assert_eq!(actor.control.audio.current(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn initial_begin_returning_after_the_original_deadline_only_retires_its_empty_range() {
+    for check_inflight_deadline in [false, true] {
+        let (actor, mut state, native) = production_actor(None);
+        let draft = state.draft.take().unwrap();
+        state.initial_preparation = Some(Instant::now() + Duration::from_secs(15));
+        actor.control.resume(1, state.activity);
+        actor.control.fixture_ready(1, state.activity);
+        actor.observe(
+            &mut state,
+            snapshot(1, vec![segment(1, "等待中的完整口述", true)]),
+        );
+        tokio::time::advance(Duration::from_millis(14_900)).await;
+        let (reply, returned) = oneshot::channel();
+        state.native = Some(NativeJob {
+            kind: NativeKind::InitialBegin {
+                activity: state.activity,
+            },
+            job: tokio::spawn(async move {
+                returned.await.unwrap();
+                NativeValue::Begun(Ok(draft))
+            }),
+        });
+        tokio::time::advance(Duration::from_millis(200)).await;
+        if check_inflight_deadline {
+            actor.schedule(&mut state).unwrap();
+            assert!(state.report.result_only);
+            assert!(matches!(
+                state.native.as_ref().unwrap().kind,
+                NativeKind::InitialBegin { .. }
+            ));
+            assert!(
+                native.try_recv().is_err(),
+                "the in-flight Begin must settle before cleanup"
+            );
+        }
+        reply.send(()).unwrap();
+        acknowledge(&actor, &mut state).await;
+        assert!(
+            state.report.result_only,
+            "a late Begin cannot grant write permission"
+        );
+        actor.schedule(&mut state).unwrap();
+        let Command::Finish(_, text, mode, _, _, _) = command(&native).await else {
+            panic!("the late empty range must be handed off without writing ASR")
+        };
+        assert!(text.is_empty());
+        assert!(matches!(mode, Finish::Handoff(_)));
+        assert_eq!(state.latest.text, "等待中的完整口述");
+        assert_eq!(state.turn, 1);
+        assert_eq!(actor.control.audio.current(), 1);
+    }
+}
 #[cfg(windows)]
 #[path = "drafts_owned_test.rs"]
 mod owned;
+#[cfg(windows)]
+pub(super) fn readonly_handoff_fixture_barrier() {
+    owned::readonly_handoff_barrier();
+}
 use crate::{
     contracts::processing::SourceSegment,
     models::provider::tests::{Fixture, Reply},
@@ -503,6 +675,13 @@ async fn older_equal_preview_cannot_skip_the_final_append_snapshot() {
 pub(super) fn actor(
     context: Option<Context>,
 ) -> (Arc<SessionDraft>, State, std::sync::mpsc::Receiver<Command>) {
+    let (actor, mut state, native) = production_actor(context);
+    state.revisable = None; // Legacy policy remains an independently tested rollback.
+    (actor, state, native)
+}
+pub(super) fn production_actor(
+    context: Option<Context>,
+) -> (Arc<SessionDraft>, State, std::sync::mpsc::Receiver<Command>) {
     let (draft, native) = Draft::fixture();
     let activity = input_state::activity();
     let anchor = Anchor {
@@ -532,8 +711,7 @@ pub(super) fn actor(
         context,
         None,
     );
-    let (mut state, _) = actor.initial.lock().unwrap().take().unwrap();
-    state.revisable = None; // Legacy policy remains an independently tested rollback.
+    let (state, _) = actor.initial.lock().unwrap().take().unwrap();
     (actor, state, native)
 }
 pub(super) fn block_reply(
@@ -640,6 +818,12 @@ async fn manual_edit_rebases_same_block_and_new_speech_never_replays_the_old_tur
     );
     assert_eq!(state.turn, 1);
     assert_eq!(state.latest.text, "周三开会");
+    assert!(state.paused_at.is_none());
+    // The selection-only read has now resumed successfully. The following
+    // real keystroke opens a new handoff before its edited snapshot arrives.
+    state.revisable.as_mut().unwrap().handoff();
+    // No composition is held after the preceding successful handoff. Model
+    // the next read after the actor has settled its no-composition handoff.
     let edited = sayweave_text_service::wire::BlockSnapshot {
         id,
         epoch: 1,
@@ -676,7 +860,18 @@ async fn manual_edit_rebases_same_block_and_new_speech_never_replays_the_old_tur
         source.draft.as_ref().unwrap().source.baseline_kind,
         crate::processing::draft::BaselineKind::EditorSnapshot
     );
-    assert_eq!(source.draft.as_ref().unwrap().asr_sources[0].segment, 42);
+    assert_eq!(
+        source
+            .draft
+            .as_ref()
+            .unwrap()
+            .asr_sources
+            .iter()
+            .map(|s| s.segment)
+            .collect::<Vec<_>>(),
+        vec![1, 42],
+        "the same logical block keeps earlier provenance without replaying it"
+    );
     generated(&mut state).await;
     actor.schedule(&mut state).unwrap();
     let Command::Acquire(_, request, _, _, reply) = command(&native).await else {

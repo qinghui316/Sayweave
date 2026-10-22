@@ -485,6 +485,313 @@ fn owned_body_snapshot(
         result.unwrap_or_else(|e|serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}))
     }).join().unwrap_or_else(|_|serde_json::json!({"error":"ownedBodyWorker"}))
 }
+// Read-only range continuity diagnostic for an explicitly foreground owned
+// fixture. The original raw edge objects are retained as well as the range:
+// a provider may otherwise silently relocate range endpoints after deletion.
+struct OwnedRangeProbe {
+    process: u32,
+    root: HWND,
+    field: windows::Win32::UI::Accessibility::IRawElementProviderSimple,
+    pattern: windows::Win32::UI::Accessibility::ITextProvider,
+    range: windows::Win32::UI::Accessibility::ITextRangeProvider,
+    edges: [windows::Win32::UI::Accessibility::ITextRangeProvider; 2],
+    nodes: [windows::Win32::UI::Accessibility::IRawElementProviderSimple; 2],
+    container: windows::Win32::UI::Accessibility::IRawElementProviderSimple,
+    container_range: windows::Win32::UI::Accessibility::ITextRangeProvider,
+    original_point: windows::Win32::UI::Accessibility::ITextRangeProvider,
+    original_start: windows::Win32::UI::Accessibility::ITextRangeProvider,
+}
+impl OwnedRangeProbe {
+    unsafe fn selected(
+        pattern: &windows::Win32::UI::Accessibility::ITextProvider,
+    ) -> windows::core::Result<windows::Win32::UI::Accessibility::ITextRangeProvider> {
+        use windows::{
+            Win32::System::{Ole::*, Variant::*},
+            core::{IUnknown, Interface},
+        };
+        unsafe {
+            let array = pattern.GetSelection()?;
+            let result = (|| {
+                if array.is_null()
+                    || SafeArrayGetDim(array) != 1
+                    || SafeArrayGetVartype(array)? != VT_UNKNOWN
+                {
+                    return Err(windows::core::Error::from_hresult(E_INVALIDARG));
+                }
+                let low = SafeArrayGetLBound(array, 1)?;
+                if SafeArrayGetUBound(array, 1)? != low {
+                    return Err(windows::core::Error::from_hresult(E_INVALIDARG));
+                }
+                let mut value: Option<IUnknown> = None;
+                SafeArrayGetElement(array, &low, (&mut value as *mut Option<IUnknown>).cast())?;
+                value
+                    .ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?
+                    .cast()
+            })();
+            if !array.is_null() {
+                let _ = SafeArrayDestroy(array);
+            }
+            result
+        }
+    }
+    unsafe fn focused(
+        process: u32,
+        root: HWND,
+    ) -> windows::core::Result<windows::Win32::UI::Accessibility::IRawElementProviderSimple> {
+        use windows::{
+            Win32::{
+                System::{Com::*, Variant::*},
+                UI::Accessibility::*,
+            },
+            core::Interface,
+        };
+        unsafe {
+            let mut actual = 0;
+            let tid = GetWindowThreadProcessId(root, Some(&mut actual));
+            if process == 0 || actual != process || GetForegroundWindow() != root {
+                return Err(E_ACCESSDENIED.into());
+            }
+            let mut gui = GUITHREADINFO {
+                cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                ..Default::default()
+            };
+            GetGUIThreadInfo(tid, &mut gui)?;
+            if GetAncestor(gui.hwndFocus, GA_ROOT) != root {
+                return Err(E_ACCESSDENIED.into());
+            }
+            let mut object: Option<IAccessible> = None;
+            AccessibleObjectFromWindow(
+                gui.hwndFocus,
+                OBJID_CLIENT.0 as u32,
+                &IAccessible::IID,
+                (&mut object as *mut Option<IAccessible>).cast(),
+            )?;
+            let mut object =
+                object.ok_or_else(|| windows::core::Error::from_hresult(E_NOINTERFACE))?;
+            for _ in 0..16 {
+                let focus = object.accFocus()?;
+                if focus.vt() == VT_DISPATCH {
+                    object = IDispatch::try_from(&focus)?.cast()?;
+                } else if focus.vt() == VT_I4 && i32::try_from(&focus)? != 0 {
+                    object = object.get_accChild(&focus)?.cast()?;
+                } else {
+                    let raw: IRawElementProviderSimple = object.cast().or_else(|_| {
+                        object
+                            .cast::<IServiceProvider>()?
+                            .QueryService(&IAccessible::IID)
+                    })?;
+                    if !bool::try_from(&raw.GetPropertyValue(UIA_HasKeyboardFocusPropertyId)?)?
+                        || bool::try_from(&raw.GetPropertyValue(UIA_IsPasswordPropertyId)?)?
+                    {
+                        return Err(E_ACCESSDENIED.into());
+                    }
+                    return Ok(raw);
+                }
+            }
+            Err(E_FAIL.into())
+        }
+    }
+    unsafe fn node(
+        raw: &windows::Win32::UI::Accessibility::IRawElementProviderSimple,
+    ) -> windows::core::Result<serde_json::Value> {
+        use windows::{
+            Win32::{
+                System::{Ole::*, Variant::*},
+                UI::Accessibility::*,
+            },
+            core::Interface,
+        };
+        unsafe {
+            let array = raw.cast::<IRawElementProviderFragment>()?.GetRuntimeId()?;
+            let result = (|| {
+                if array.is_null()
+                    || SafeArrayGetDim(array) != 1
+                    || SafeArrayGetVartype(array)? != VT_I4
+                {
+                    return Err(windows::core::Error::from_hresult(E_NOINTERFACE));
+                }
+                let low = SafeArrayGetLBound(array, 1)?;
+                let high = SafeArrayGetUBound(array, 1)?;
+                if high < low || high - low > 63 {
+                    return Err(windows::core::Error::from_hresult(E_INVALIDARG));
+                }
+                let mut id = vec![];
+                for index in low..=high {
+                    let mut value = 0i32;
+                    SafeArrayGetElement(array, &index, (&mut value as *mut i32).cast())?;
+                    id.push(value);
+                }
+                Ok(
+                    serde_json::json!({"runtimeId":id,"controlType":i32::try_from(&raw.GetPropertyValue(UIA_ControlTypePropertyId)?)?}),
+                )
+            })();
+            if !array.is_null() {
+                let _ = SafeArrayDestroy(array);
+            }
+            result
+        }
+    }
+    unsafe fn tree(
+        raw: &windows::Win32::UI::Accessibility::IRawElementProviderSimple,
+        pattern: &windows::Win32::UI::Accessibility::ITextProvider,
+        depth: u32,
+        remaining: &mut u32,
+    ) -> windows::core::Result<serde_json::Value> {
+        use windows::{Win32::UI::Accessibility::*, core::Interface};
+        unsafe {
+            if depth > 4 || *remaining == 0 {
+                return Err(E_BOUNDS.into());
+            }
+            *remaining -= 1;
+            let mut item = Self::node(raw)?;
+            item["name"] = raw
+                .GetPropertyValue(UIA_NamePropertyId)
+                .ok()
+                .and_then(|v| windows::core::BSTR::try_from(&v).ok())
+                .map(|v| serde_json::json!(v.to_string()))
+                .unwrap_or(serde_json::Value::Null);
+            item["range"] = pattern
+                .RangeFromChild(raw)
+                .and_then(|v| v.GetText(1025))
+                .ok()
+                .map(|v| serde_json::json!(v.to_string()))
+                .unwrap_or(serde_json::Value::Null);
+            let mut children = Vec::new();
+            let mut child = raw
+                .cast::<IRawElementProviderFragment>()?
+                .Navigate(NavigateDirection_FirstChild)
+                .ok();
+            while let Some(node) = child {
+                children.push(Self::tree(&node.cast()?, pattern, depth + 1, remaining)?);
+                child = node.Navigate(NavigateDirection_NextSibling).ok();
+            }
+            item["children"] = serde_json::json!(children);
+            Ok(item)
+        }
+    }
+    unsafe fn capture(process: u32, expected: &str) -> windows::core::Result<Self> {
+        use windows::{Win32::UI::Accessibility::*, core::Interface};
+        unsafe {
+            if std::env::var("SAYWEAVE_INPUT_ACCEPTANCE").as_deref() != Ok("1")
+                || expected.is_empty()
+                || expected.encode_utf16().count() > 1024
+            {
+                return Err(E_ACCESSDENIED.into());
+            }
+            let root = GetForegroundWindow();
+            let field = Self::focused(process, root)?;
+            let pattern: ITextProvider = field.GetPatternProvider(UIA_TextPatternId)?.cast()?;
+            let range = pattern.DocumentRange()?.Clone()?;
+            if range.GetText(1025)? != expected
+                || bool::try_from(&range.GetAttributeValue(UIA_IsReadOnlyAttributeId)?)?
+            {
+                return Err(E_ACCESSDENIED.into());
+            }
+            let first = range.Clone()?;
+            first.MoveEndpointByRange(
+                TextPatternRangeEndpoint_End,
+                &range,
+                TextPatternRangeEndpoint_Start,
+            )?;
+            first.ExpandToEnclosingUnit(TextUnit_Character)?;
+            let last = range.Clone()?;
+            last.MoveEndpointByRange(
+                TextPatternRangeEndpoint_Start,
+                &range,
+                TextPatternRangeEndpoint_End,
+            )?;
+            last.Move(TextUnit_Character, -1)?;
+            last.ExpandToEnclosingUnit(TextUnit_Character)?;
+            let nodes = [first.GetEnclosingElement()?, last.GetEnclosingElement()?];
+            let container: IRawElementProviderSimple = nodes[0]
+                .cast::<IRawElementProviderFragment>()?
+                .Navigate(NavigateDirection_Parent)?
+                .cast()?;
+            let container_range = pattern.RangeFromChild(&container)?;
+            if container_range.GetText(1025)? != expected {
+                return Err(E_ACCESSDENIED.into());
+            }
+            let original_start = container_range.Clone()?;
+            original_start.MoveEndpointByRange(
+                TextPatternRangeEndpoint_End,
+                &container_range,
+                TextPatternRangeEndpoint_Start,
+            )?;
+            let original_point = Self::selected(&pattern)?.Clone()?;
+            let probe = Self {
+                process,
+                root,
+                field,
+                pattern,
+                range,
+                edges: [first, last],
+                nodes,
+                container,
+                container_range,
+                original_point,
+                original_start,
+            };
+            probe.read()?;
+            Ok(probe)
+        }
+    }
+    unsafe fn read(&self) -> windows::core::Result<serde_json::Value> {
+        use windows::{Win32::UI::Accessibility::*, core::Interface};
+        unsafe {
+            if Self::focused(self.process, self.root)?.cast::<windows::core::IUnknown>()?
+                != self.field.cast::<windows::core::IUnknown>()?
+            {
+                return Err(E_ACCESSDENIED.into());
+            }
+            let node = |raw: &IRawElementProviderSimple| {
+                Self::node(raw).unwrap_or_else(
+                    |e| serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)}),
+                )
+            };
+            let mut edges = Vec::new();
+            for (range, original) in self.edges.iter().zip(&self.nodes) {
+                let current = range.GetEnclosingElement();
+                edges.push(serde_json::json!({"text":range.GetText(1025).ok().map(|v|v.to_string()),"original":node(original),"current":current.as_ref().ok().map(node),"sameEnclosing":current.as_ref().is_ok_and(|v|v.cast::<windows::core::IUnknown>().ok()==original.cast::<windows::core::IUnknown>().ok())}));
+            }
+            let current_container = self.pattern.RangeFromChild(&self.container);
+            let point = (|| -> windows::core::Result<serde_json::Value> {
+                let container = current_container.as_ref().map_err(Clone::clone)?;
+                let caret = Self::selected(&self.pattern)?;
+                let span = self.original_point.Clone()?;
+                span.MoveEndpointByRange(
+                    TextPatternRangeEndpoint_End,
+                    &caret,
+                    TextPatternRangeEndpoint_End,
+                )?;
+                Ok(
+                    serde_json::json!({"pointText":self.original_point.GetText(1025)?.to_string(),"savedStartText":self.original_start.GetText(1025)?.to_string(),"pointAtOriginalStart":self.original_point.Compare(&self.original_start)?.as_bool(),"pointStartVsCurrentParagraph":self.original_point.CompareEndpoints(TextPatternRangeEndpoint_Start,container,TextPatternRangeEndpoint_Start)?,"pointEndVsCurrentParagraph":self.original_point.CompareEndpoints(TextPatternRangeEndpoint_End,container,TextPatternRangeEndpoint_Start)?,"spanToCurrentCaret":span.GetText(1025)?.to_string(),"pointEnclosing":node(&self.original_point.GetEnclosingElement()?),"caretText":caret.GetText(1025)?.to_string()}),
+                )
+            })();
+            let active = (|| -> windows::core::Result<serde_json::Value> {
+                let edit: ITextEditProvider = self
+                    .field
+                    .GetPatternProvider(UIA_TextEditPatternId)?
+                    .cast()?;
+                let mut range = std::ptr::null_mut();
+                (Interface::vtable(&edit).GetActiveComposition)(
+                    Interface::as_raw(&edit),
+                    &mut range,
+                )
+                .ok()?;
+                if range.is_null() {
+                    return Ok(serde_json::json!({"active":false}));
+                }
+                let range = ITextRangeProvider::from_raw(range);
+                Ok(
+                    serde_json::json!({"active":true,"text":range.GetText(1025)?.to_string(),"wholeField":range.Compare(&self.pattern.DocumentRange()?)?.as_bool(),"wholeRetained":range.Compare(&self.range)?.as_bool()}),
+                )
+            })();
+            Ok(
+                serde_json::json!({"originalPoint":point.unwrap_or_else(|e|serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)})),"activeComposition":active.unwrap_or_else(|e|serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)})),"rangeText":self.range.GetText(1025)?.to_string(),"fieldText":self.pattern.DocumentRange()?.GetText(1025)?.to_string(),"field":node(&self.field),"enclosing":node(&self.range.GetEnclosingElement()?),"edges":edges,"container":node(&self.container),"containerRangeText":self.container_range.GetText(1025).ok().map(|v|v.to_string()),"currentContainerRangeText":current_container.as_ref().ok().and_then(|v|v.GetText(1025).ok()).map(|v|v.to_string()),"rangeEqualsContainer":current_container.as_ref().ok().and_then(|v|self.range.Compare(v).ok()).map(|v|v.as_bool()),"retainedContainerEqualsCurrent":current_container.as_ref().ok().and_then(|v|self.container_range.Compare(v).ok()).map(|v|v.as_bool())}),
+            )
+        }
+    }
+}
 // Read only known static product labels from the explicitly owned application.
 // A native PID is not proof that the frontend rendered.
 fn product_surface(process: u32) -> serde_json::Value {
@@ -810,9 +1117,83 @@ fn main() {
         let mut auxiliary = HWND::default();
         let mut auxiliary_editor = HWND::default();
         let mut sibling = HWND::default();
+        let mut retained_range: Option<OwnedRangeProbe> = None;
+        let mut origin_range: Option<OwnedRangeProbe> = None;
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             if msg.message == WM_APP + 7 {
                 let value = r.recv().unwrap();
+                if value["action"] == "retained-range" {
+                    let result = (|| -> windows::core::Result<serde_json::Value> {
+                        match value["mode"].as_str() {
+                            Some("inspect") => {
+                                use windows::{Win32::UI::Accessibility::*, core::Interface};
+                                let raw = OwnedRangeProbe::focused(
+                                    value["process"]
+                                        .as_u64()
+                                        .and_then(|v| u32::try_from(v).ok())
+                                        .unwrap_or(0),
+                                    GetForegroundWindow(),
+                                )?;
+                                let pattern: ITextProvider =
+                                    raw.GetPatternProvider(UIA_TextPatternId)?.cast()?;
+                                let value = raw
+                                    .GetPatternProvider(UIA_ValuePatternId)
+                                    .and_then(|v| v.cast::<IValueProvider>())
+                                    .and_then(|v| v.Value());
+                                return Ok(
+                                    serde_json::json!({"field":OwnedRangeProbe::node(&raw)?,"body":pattern.DocumentRange()?.GetText(1025)?.to_string(),"value":value.as_ref().ok().map(|v|v.to_string()),"valueError":value.err().map(|e|format!("{:08x}",e.code().0 as u32)),"legacyValue":raw.cast::<IAccessible>().and_then(|v|v.get_accValue(&windows::Win32::System::Variant::VARIANT::from(0))).ok().map(|v|v.to_string()),"uiaValue":raw.GetPropertyValue(UIA_ValueValuePropertyId).ok().and_then(|v|windows::core::BSTR::try_from(&v).ok()).map(|v|v.to_string()),"tree":OwnedRangeProbe::tree(&raw,&pattern,0,&mut 32).ok(),"firstChild":(raw.cast::<IRawElementProviderFragment>()?.Navigate(NavigateDirection_FirstChild).and_then(|v|v.cast::<IRawElementProviderSimple>())).ok().map(|child|serde_json::json!({"node":OwnedRangeProbe::node(&child).ok(),"range":pattern.RangeFromChild(&child).and_then(|v|v.GetText(1025)).ok().map(|v|v.to_string()),"child":child.cast::<IRawElementProviderFragment>().and_then(|v|v.Navigate(NavigateDirection_FirstChild)).is_ok(),"next":child.cast::<IRawElementProviderFragment>().and_then(|v|v.Navigate(NavigateDirection_NextSibling)).is_ok()}))}),
+                                );
+                            }
+                            Some("capture-origin") => {
+                                origin_range = None;
+                                origin_range = Some(OwnedRangeProbe::capture(
+                                    value["process"]
+                                        .as_u64()
+                                        .and_then(|v| u32::try_from(v).ok())
+                                        .unwrap_or(0),
+                                    value["expected"].as_str().unwrap_or(""),
+                                )?);
+                                return origin_range.as_ref().unwrap().read();
+                            }
+                            Some("read-origin") => {
+                                return origin_range
+                                    .as_ref()
+                                    .ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?
+                                    .read();
+                            }
+                            Some("capture") => {
+                                retained_range = None;
+                                retained_range = Some(OwnedRangeProbe::capture(
+                                    value["process"]
+                                        .as_u64()
+                                        .and_then(|v| u32::try_from(v).ok())
+                                        .unwrap_or(0),
+                                    value["expected"].as_str().unwrap_or(""),
+                                )?);
+                            }
+                            Some("read") => {}
+                            Some("release") => {
+                                retained_range = None;
+                                origin_range = None;
+                                return Ok(serde_json::json!({"released":true}));
+                            }
+                            _ => return Err(E_INVALIDARG.into()),
+                        }
+                        retained_range
+                            .as_ref()
+                            .ok_or_else(|| windows::core::Error::from_hresult(E_FAIL))?
+                            .read()
+                    })();
+                    println!(
+                        "{}",
+                        result.unwrap_or_else(
+                            |e| serde_json::json!({"error":format!("{:08x}",e.code().0 as u32)})
+                        )
+                    );
+                    io::stdout().flush().unwrap();
+                    let _ = ok.send(());
+                    continue;
+                }
                 if value["action"] == "exit" {
                     if !auxiliary.0.is_null() {
                         let _ = DestroyWindow(auxiliary);
@@ -1135,6 +1516,7 @@ fn main() {
                     GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
                     let key = match value["key"].as_str() {
                         Some("AltRight") => Some(VK_RMENU),
+                        Some("Process") => Some(VK_PROCESSKEY),
                         Some("Backspace") => Some(VK_BACK),
                         Some("Delete") => Some(VK_DELETE),
                         Some("ArrowLeft") => Some(VK_LEFT),
@@ -1177,6 +1559,7 @@ fn main() {
                             Anonymous: INPUT_0 {
                                 ki: KEYBDINPUT {
                                     wVk: key,
+                                    wScan: MapVirtualKeyW(key.0 as u32, MAPVK_VK_TO_VSC) as u16,
                                     dwFlags: flags,
                                     dwExtraInfo: 0x53595754,
                                     ..Default::default()
@@ -1320,6 +1703,8 @@ fn main() {
                 }
                 let mut foreground_process = 0;
                 GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut foreground_process));
+                let mut foreground_client = RECT::default();
+                let _ = GetClientRect(GetForegroundWindow(), &mut foreground_client);
                 let mut buf = [0u16; 4096];
                 let len = GetWindowTextW(editor, &mut buf) as usize;
                 let selection = message(editor, 0x00B0, WPARAM(0), LPARAM(0)).0 as usize;
@@ -1334,7 +1719,7 @@ fn main() {
                 };
                 println!(
                     "{}",
-                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"foregroundWindow":GetForegroundWindow().0 as usize,"nativeFocus":GetFocus().0 as usize,"sibling":sibling_value,"desktopWindow":GetShellWindow().0 as usize,"clipboardSequence":windows::Win32::System::DataExchange::GetClipboardSequenceNumber(),"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window,"controlledEdit":controlled_edit,"controlledEditSteps":controlled_edit_steps,"auxiliary":auxiliary_result,"keyResult":key_result})
+                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"foregroundWindow":GetForegroundWindow().0 as usize,"foregroundClient":[foreground_client.right,foreground_client.bottom],"nativeFocus":GetFocus().0 as usize,"sibling":sibling_value,"desktopWindow":GetShellWindow().0 as usize,"clipboardSequence":windows::Win32::System::DataExchange::GetClipboardSequenceNumber(),"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window,"controlledEdit":controlled_edit,"controlledEditSteps":controlled_edit_steps,"auxiliary":auxiliary_result,"keyResult":key_result})
                 );
                 io::stdout().flush().unwrap();
                 let _ = ok.send(());
@@ -1372,6 +1757,8 @@ fn main() {
         if let Some(library) = rich_library {
             let _ = FreeLibrary(library);
         }
+        drop(retained_range);
+        drop(origin_range);
         CoUninitialize();
         if release_failed {
             std::process::exit(1);

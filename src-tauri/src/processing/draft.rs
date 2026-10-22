@@ -366,6 +366,57 @@ impl Block {
         Ok(())
     }
 
+    /// The actor has paired a native read with the acknowledged source watermark.
+    /// Keep that owned output as a checkpoint, not a fictitious keyboard edit.
+    /// A new insertion segment still belongs to this same logical block.
+    pub fn resume_owned(&mut self, selection: Range<usize>) -> Result<(), ProcessingError> {
+        if !self.suspended || self.stopped {
+            return Err(ProcessingError::new("staleDraft"));
+        }
+        self.retain_confirmed(selection)
+    }
+
+    /// Only a current acknowledged model write may move subsequent speech to
+    /// the displayed block end. An unwritten tail must remain in its segment.
+    pub fn settle_insertion(&mut self) -> Result<(), ProcessingError> {
+        if self.suspended
+            || self.stopped
+            || !self.stable_covers_all()
+            || self.visible() != self.confirmed_visible
+            || self.preview.as_ref().is_none_or(|preview| {
+                !self.matches(&preview.source)
+                    || preview.source.speech_end != self.speech.chars().count()
+            })
+        {
+            return Err(ProcessingError::new("staleDraft"));
+        }
+        let end = self.confirmed_visible.chars().count();
+        self.retain_confirmed(end..end)?;
+        self.source_epoch += 1;
+        Ok(())
+    }
+
+    fn retain_confirmed(&mut self, selection: Range<usize>) -> Result<(), ProcessingError> {
+        if selection.start > selection.end
+            || !boundary(&self.confirmed_visible, selection.start)
+            || !boundary(&self.confirmed_visible, selection.end)
+        {
+            return Err(ProcessingError::new("sourceBoundary"));
+        }
+        self.baseline.clone_from(&self.confirmed_visible);
+        self.insertion = selection;
+        self.speech.clear();
+        self.stable = 0;
+        self.preview = None;
+        self.confirmed_preview = None;
+        self.attempted = None;
+        self.version += 1;
+        self.suspended = false;
+        // No write occurred and no user text was inferred: keep both the
+        // confirmed revision and the baseline's existing provenance kind.
+        Ok(())
+    }
+
     /// Only a native, version-checked read may supply this editor baseline.
     pub fn rebase(&mut self, text: String, selection: Range<usize>) -> Result<(), ProcessingError> {
         if self.stopped || !self.suspended {
@@ -578,6 +629,94 @@ mod tests {
         assert!(b.write().is_none());
         assert!(b.snapshot(true).is_none());
     }
+    #[test]
+    fn owned_checkpoint_relocates_without_inventing_an_edit_or_write() {
+        let mut b = Block::new("b".into());
+        b.observe("周三开会".into(), 4).unwrap();
+        let old = b.snapshot(true).unwrap();
+        let (revision, text) = b.write().unwrap();
+        b.acknowledge(revision, text).unwrap();
+        b.handoff();
+        b.resume_owned(2..2).unwrap();
+        assert_eq!(b.confirmed().0, revision);
+        assert_eq!(b.kind, BaselineKind::Asr);
+        assert!(b.snapshot(true).is_none());
+        assert!(b.write().is_none());
+        assert!(b.accept(old, "迟到整理".into()).is_err());
+        b.observe("下午三点".into(), 4).unwrap();
+        assert_eq!(b.visible(), "周三下午三点开会");
+        let model = b.snapshot(true).unwrap();
+        b.accept(model, "周三下午三点开会。".into()).unwrap();
+        assert!(
+            b.settle_insertion().is_err(),
+            "unacknowledged model cannot move insertion"
+        );
+        let (revision, text) = b.write().unwrap();
+        b.acknowledge(revision, text).unwrap();
+        b.settle_insertion().unwrap();
+        assert!(b.snapshot(true).is_none());
+        b.observe("地点在上海".into(), 5).unwrap();
+        assert_eq!(b.visible(), "周三下午三点开会。地点在上海");
+    }
+
+    #[test]
+    fn newer_unwritten_speech_survives_an_older_model_receipt() {
+        let mut b = Block::new("b".into());
+        b.observe("周三开会".into(), 4).unwrap();
+        let (revision, text) = b.write().unwrap();
+        b.acknowledge(revision, text).unwrap();
+        b.handoff();
+        b.resume_owned(2..2).unwrap();
+        b.observe("下午".into(), 2).unwrap();
+        let source = b.snapshot(true).unwrap();
+        b.accept(source, "周三下午开会。".into()).unwrap();
+        let (revision, text) = b.write().unwrap();
+        b.observe("下午三点".into(), 4).unwrap();
+        b.acknowledge(revision, text).unwrap();
+        assert!(b.settle_insertion().is_err());
+        assert_eq!(b.speech, "下午三点");
+        assert_eq!(b.visible(), "周三下午三点开会。");
+    }
+
+    #[test]
+    fn written_tail_beyond_a_model_prefix_remains_pending_for_processing() {
+        let mut b = Block::new("b".into());
+        b.observe("周三开会".into(), 4).unwrap();
+        let (revision, text) = b.write().unwrap();
+        b.acknowledge(revision, text).unwrap();
+        b.handoff();
+        b.resume_owned(2..2).unwrap();
+        b.observe("下午".into(), 2).unwrap();
+        let source = b.snapshot(false).unwrap();
+        b.accept(source, "周三下午开会。".into()).unwrap();
+        // The new unconfirmed tail is included in the same physical write,
+        // but that does not make it part of the older model's source.
+        b.observe("下午三点".into(), 2).unwrap();
+        let (revision, text) = b.write().unwrap();
+        b.acknowledge(revision, text).unwrap();
+        assert_eq!(b.visible(), b.confirmed().1);
+        assert!(b.settle_insertion().is_err());
+        assert_eq!(b.speech, "下午三点");
+        b.observe("下午四点".into(), 4).unwrap();
+        let current = b.snapshot(false).unwrap();
+        assert!(b.needs_generation(&current));
+        assert_eq!(current.text, "周三下午四点开会");
+    }
+
+    #[test]
+    fn owned_checkpoint_respects_selection_and_grapheme_boundaries() {
+        let mut b = Block::new("b".into());
+        b.observe("周三👩‍💻开会".into(), 7).unwrap();
+        let (revision, text) = b.write().unwrap();
+        b.acknowledge(revision, text).unwrap();
+        b.handoff();
+        assert!(b.resume_owned(3..3).is_err());
+        b.resume_owned(1..2).unwrap();
+        assert!(b.write().is_none(), "selection alone must not delete words");
+        b.observe("五".into(), 1).unwrap();
+        assert_eq!(b.visible(), "周五👩‍💻开会");
+    }
+
     #[test]
     fn repeated_handoff_and_selection_refresh_do_not_invent_user_text() {
         let mut b = Block::new("b".into());

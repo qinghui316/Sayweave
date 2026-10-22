@@ -2,7 +2,7 @@
 // No production trust override and no supplier request. Reports stay under .local.
 import {chromium,expect} from '@playwright/test';
 import {build as buildFixture} from 'vite';
-import {spawn} from 'node:child_process';
+import {spawn,execFileSync} from 'node:child_process';
 import {randomUUID,createHash} from 'node:crypto';
 import {createServer} from 'node:https';
 import {gzipSync,gunzipSync} from 'node:zlib';
@@ -10,6 +10,7 @@ import {createWriteStream,mkdirSync,readFileSync,writeFileSync,unlinkSync,exists
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {beginValidation,finishValidation} from './storage-policy.mjs';
+import {verifyComponentEmbeddings} from './build-text-service.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),id=randomUUID();
 const storageContext=beginValidation(root,{id,kind:'speech-desktop'});
 const directory=path.join(root,'.local','data-acceptance',id),data=path.join(directory,'data');mkdirSync(data,{recursive:true});
@@ -18,8 +19,15 @@ const polishCase=process.argv.find(value=>value.startsWith('--polish-case='))?.s
 if(polishCase&&!['cancel','no-history'].includes(polishCase))throw Error('Unknown polish acceptance case');
 const polishOnly=process.argv.includes('--polish')||Boolean(polishCase);
 const report={id,passed:false,checks:[],connections:[],handshakes:[],polishRequests:[]},delay=ms=>new Promise(r=>setTimeout(r,ms));
+report.controllerSha256=createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex');
 let app,browser,server,mode='normal',expectedProtocol='qwen',expectedModel='qwen-audio-3.1-asr-flash-streaming';const sockets=new Set(),polishReleases=new Map(),polishChannels=[],copyReleases=new Map();
-async function command(args,extraEnv={}){const child=spawn('cargo',args,{cwd:root,windowsHide:true,env:{...process.env,...extraEnv,SAYWEAVE_DATA_ACCEPTANCE_ID:id},stdio:['ignore','pipe','pipe']});const log=createWriteStream(path.join(directory,'fixture.log'),{flags:'a'});child.stdout.pipe(log);child.stderr.pipe(log);if(await new Promise((r,j)=>{child.on('exit',r);child.on('error',j);})!==0)throw Error('Fixture operation failed');}
+const restartChannels=[],readinessChannels=[];
+async function command(args,extraEnv={}){
+ const fixture=args[0]==='test'&&args.includes('--lib')?args.find(value=>['model_desktop_fixture','model_desktop_cleanup'].includes(value)):null;
+ const retained=fixture&&report.reusedBuild?.fixtureTest;
+ const child=spawn(retained??'cargo',retained?['--exact','models::tests::'+fixture,'--ignored','--test-threads=1']:args,{cwd:root,windowsHide:true,env:{...process.env,...extraEnv,SAYWEAVE_DATA_ACCEPTANCE_ID:id},stdio:['ignore','pipe','pipe']});
+ const log=createWriteStream(path.join(directory,'fixture.log'),{flags:'a'});child.stdout.pipe(log);child.stderr.pipe(log);if(await new Promise((r,j)=>{child.on('exit',r);child.on('error',j);})!==0)throw Error('Fixture operation failed');
+}
 function frame(value,opcode=1){const payload=Buffer.isBuffer(value)?value:Buffer.from(JSON.stringify(value));const header=Buffer.alloc(payload.length<126?2:4);header[0]=0x80|opcode;header[1]=payload.length<126?payload.length:126;if(payload.length>=126)header.writeUInt16BE(payload.length,2);return Buffer.concat([header,payload]);}
 function websocket(req,socket,head){
  const doubao=expectedProtocol==='doubao';
@@ -32,6 +40,7 @@ function websocket(req,socket,head){
  const connection={protocol:expectedProtocol,mode,model:null,frames:0,bytes:0,started:false,finished:false};report.connections.push(connection);let task,buffer=head,fragment=Buffer.alloc(0),fragmentOpcode=0;
  const send=(event,payload={})=>socket.write(frame({header:{task_id:task,event},payload}));
  const sentence=(sid,text,end)=>send('result-generated',{output:{sentence:{sentence_id:sid,sentence_end:end,text,begin_time:0,end_time:end?connection.bytes/32:null}}});
+ if(connection.mode.startsWith('learning-restart-'))restartChannels.push({connection,sentence});
  const result=(text,end)=>sentence(1,text,end);
  if(connection.mode==='copy-only')copyReleases.set(connection,()=>{connection.released=true;result('正在识别',false);});
  const raceOrdinal=polishChannels.filter(c=>c.mode===connection.mode).length;
@@ -48,8 +57,27 @@ function websocket(req,socket,head){
   }
 
   if(opcode===8){socket.end(frame(payload,8));return;}if(opcode===9){socket.write(frame(payload,10));return;}
+  if(connection.mode.startsWith('learning-restart-')){
+   const text=connection.mode.endsWith('-first')?'Seville':'地点在上海';
+   if(opcode===2){
+    if(!connection.started)throw Error('Restart audio arrived before task-started');
+    connection.frames++;connection.bytes+=payload.length;
+    if(connection.mode.endsWith('-first')){
+     if(connection.frames===1)result(text,false);
+     if(connection.frames===8)result(text,true);
+    }
+    return;
+   }
+   if(opcode===1&&JSON.parse(payload.toString()).header.action==='finish-task'){
+    connection.finished=true;result(text,true);send('task-finished');return;
+   }
+  }
   if(opcode===2){if(!connection.started)throw Error('Audio arrived before task-started');connection.frames++;connection.bytes+=payload.length;if(connection.mode==='copy-only')return;if(connection.mode.startsWith('polish-')){const text=connection.mode==='polish-edit'?(raceOrdinal===0?'呃，编辑前啊。':'嗯，继续输入🙂。'):connection.mode==='polish-revision'?'嗯，修订前啊。':'呃，等待原文啊。';if(connection.frames===1)sentence(1,text,false);if(connection.frames===8)sentence(1,text,true);return;}if(connection.mode==='polish'){if(connection.frames===1)sentence(1,'呃，第一段啊。',false);if(connection.frames===8)sentence(1,'呃，第一段啊。',true);if(connection.frames===16)sentence(2,'嗯，第二段啊。',false);if(connection.frames===35)sentence(2,'嗯，第二段啊。',true);if(connection.frames===45)sentence(3,'尾部',false);return;}if(connection.frames===1){if(connection.mode==='failure'){socket.write(frame({header:{task_id:task,event:'task-failed',error_code:'SERVICE_ERROR',error_message:'PRIVATE FIXTURE ERROR'}}));return;}result('正在',false);}if(connection.frames===8)result('正在识别',false);return;}
-  if(opcode!==1)return;const value=JSON.parse(payload.toString());if(value.header.action==='run-task'){task=value.header.task_id;expect(value.payload.parameters.sample_rate).toBe(16000);expect(value.payload.parameters.format).toBe('pcm');expect(value.payload.model).toBe(expectedModel);connection.model=value.payload.model;connection.started=true;send('task-started');}
+  if(opcode!==1)return;const value=JSON.parse(payload.toString());if(value.header.action==='run-task'){task=value.header.task_id;expect(value.payload.parameters.sample_rate).toBe(16000);expect(value.payload.parameters.format).toBe('pcm');expect(value.payload.model).toBe(expectedModel);connection.model=value.payload.model;
+   if(connection.mode.startsWith('readiness-')){
+    const channel={connection,receivedAt:Date.now(),released:false,release(){if(this.released)return this.releaseDelivery;this.released=true;this.releasedAt=Date.now();const sent=!socket.destroyed&&socket.writable;this.releaseDelivery={at:this.releasedAt,sent,socketDestroyed:socket.destroyed,socketWritable:socket.writable};if(sent){connection.started=true;send('task-started');}return this.releaseDelivery;}};
+    readinessChannels.push(channel);
+   }else{connection.started=true;send('task-started');}}
   else if(value.header.action==='finish-task'){connection.finished=true;if(connection.mode.startsWith('polish-')){if(connection.mode==='polish-edit'&&raceOrdinal===0)sentence(2,'旧轮尾字不应覆盖。',true);send('task-finished');return;}if(connection.mode==='polish'){sentence(3,'尾部完成🙂',true);send('task-finished');return;}if(connection.mode==='pending')return;if(connection.mode==='copy-only'&&!connection.released){send('task-finished');return;}if(connection.mode==='empty'){send('task-finished');return;}result('原生受控识别完成。',true);result('重复最终结果不应覆盖。',true);send('task-finished');}
  }
  function receive(chunk){buffer=Buffer.concat([buffer,chunk]);try{while(buffer.length>=2){const opcode=buffer[0]&15,fin=(buffer[0]&128)!==0,masked=(buffer[1]&128)!==0;let length=buffer[1]&127,offset=2;if(length===126){if(buffer.length<4)return;length=buffer.readUInt16BE(2);offset=4;}else if(length===127){if(buffer.length<10)return;length=Number(buffer.readBigUInt64BE(2));offset=10;}if(length>1024*1024)throw Error('oversize frame');if(masked)offset+=4;if(buffer.length<offset+length)return;const payload=Buffer.from(buffer.subarray(offset,offset+length));if(masked){const mask=buffer.subarray(offset-4,offset);for(let n=0;n<length;n++)payload[n]^=mask[n%4];}buffer=buffer.subarray(offset+length);if(opcode===0){fragment=Buffer.concat([fragment,payload]);if(fin){consume(fragmentOpcode,fragment);fragment=Buffer.alloc(0);}}else if(!fin&&opcode<8){fragmentOpcode=opcode;fragment=payload;}else consume(opcode,payload);}}catch(e){report.protocolError=String(e);socket.destroy();}}
@@ -58,7 +86,16 @@ function websocket(req,socket,head){
 async function modelFixture(req,res){
  if(req.url!=='/v1/chat/completions'||req.headers.authorization!=='Bearer '+key){res.writeHead(401);res.end('{}');return;}
  let bytes=0;const chunks=[];for await(const chunk of req){bytes+=chunk.length;if(bytes>16*1024){res.writeHead(413);res.end();return;}chunks.push(chunk);}
- const request=JSON.parse(Buffer.concat(chunks).toString('utf8')),data=JSON.parse(request.messages[1].content);expect(request.stream).toBe(true);expect(request.model).toBe('polish-fixture');
+ const request=JSON.parse(Buffer.concat(chunks).toString('utf8')),data=JSON.parse(request.messages[1].content);
+ if(mode.startsWith('learning-restart-')){
+  report.restartModelRequests??=[];
+  report.restartModelRequests.push({mode,stream:request.stream,input:data.input_text??null,at:performance.now()});
+  const output=request.stream?(mode.includes('-tab-')?data.input_text.replace('舟三','周三'):data.input_text):JSON.stringify({class:'lexical',original:'Seville',term:'sayweave',summary:null});
+  if(request.stream){res.writeHead(200,{'Content-Type':'text/event-stream'});res.end('data: '+JSON.stringify({choices:[{index:0,delta:{role:'assistant',content:output},finish_reason:null}]})+'\n\ndata: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n');}
+  else{res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({choices:[{index:0,message:{role:'assistant',content:output},finish_reason:'stop'}]}));}
+  return;
+ }
+ expect(request.stream).toBe(true);expect(request.model).toBe('polish-fixture');
  const receipt={input:data.input_text,context:data.previous_context,bytes,at:performance.now(),mode},requestKey=report.polishRequests.length+':'+data.input_text;report.polishRequests.push(receipt);
  const output=data.input_text.includes('第一段')?'第一段。\n':data.input_text.includes('第二段')?'第二段。\n':data.input_text.includes('继续输入')?'继续输入🙂。':data.input_text.includes('修订后')?'修订后🙂。':data.input_text;
  if(!data.input_text.includes('尾部完成')){
@@ -200,7 +237,7 @@ async function start(round){
  if(await fetch('http://127.0.0.1:'+port+'/json/version').then(()=>true).catch(()=>false))throw Error('Test port occupied');
  app=spawn(exe,[],{cwd:root,windowsHide:true,env:{...process.env,SAYWEAVE_DATA_ACCEPTANCE_ID:id,WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:'--remote-debugging-port='+port+' --remote-debugging-address=127.0.0.1'},stdio:['ignore','pipe','pipe']});app.stdout.pipe(createWriteStream(path.join(directory,`round-${round}.log`)));app.stderr.pipe(createWriteStream(path.join(directory,`round-${round}-errors.log`)));
  report.processBindings??=[];report.processBindings.push({round,pid:app.pid,exe,sha256:createHash('sha256').update(readFileSync(exe)).digest('hex'),data,logSource:'launched-process-stderr'});
- let diagnostic='';app.stderr.on('data',chunk=>{diagnostic+=chunk.toString('utf8');let at;while((at=diagnostic.indexOf('\n'))>=0){const line=diagnostic.slice(0,at);diagnostic=diagnostic.slice(at+1);if(/operation=(input_target_event|input_target_identity|input_capture|input_delivery|input_binding|voice_window|dictation_phase|composition_edit|dictation_turn)\b/.test(line)){report.taskTrace??=[];report.taskTrace.push({round,line});}}});
+ let diagnostic='';app.stderr.on('data',chunk=>{diagnostic+=chunk.toString('utf8');let at;while((at=diagnostic.indexOf('\n'))>=0){const line=diagnostic.slice(0,at);diagnostic=diagnostic.slice(at+1);if(/operation=(input_target_event|input_target_identity|input_capture|input_delivery|input_binding|voice_window|dictation_phase|dictation_presentation|draft_presentation|speech_phase|speech_turn|draft_activation|composition_edit|dictation_turn)\b/.test(line)){report.taskTrace??=[];report.taskTrace.push({round,line});}}});
  let endpoint;for(let n=0;n<200;n++){if(app.exitCode!==null)throw Error('Application exited early');endpoint=await fetch('http://127.0.0.1:'+port+'/json/version').then(r=>r.json()).catch(()=>null);if(endpoint)break;await delay(100);}if(!endpoint)throw Error('WebView unavailable');browser=await chromium.connectOverCDP(endpoint.webSocketDebuggerUrl);
  let page;for(let n=0;n<100;n++){page=browser.contexts().flatMap(c=>c.pages()).find(p=>p.url().includes('tauri')&&!p.url().includes('surface=overlay'));if(page)break;await delay(100);}if(!page)throw Error('Main page missing');await page.waitForFunction(()=>window.__TAURI_INTERNALS__?.invoke);for(let n=0;n<50;n++){const status=await invoke(page,'history_status',{retry:false});if(status.state==='ready')break;await delay(100);}await overlayPage();return page;
 }
@@ -383,13 +420,397 @@ async function homeTrialIsolation(page){
   report.checks.push('Home active trial and current retry carry trial source; history errors, navigation and hide/resync preserve trial result');
  }finally{await editor.close();}
 }
+async function learningRestartScenario(main,base){
+ const helper=await ownedEditor();
+ const targetBrowser=await chromium.launch({headless:false,args:['--force-renderer-accessibility']});
+ const pid=app.pid;
+ const evidence={passed:false,applicationProcess:pid,trials:[],lifecycle:[],inputEvents:[],cleanupErrors:[]};
+ report.learningRestart=evidence;
+ let logBuffer='';
+ const logListener=chunk=>{
+  logBuffer+=chunk.toString('utf8');let at;
+  while((at=logBuffer.indexOf('\n'))>=0){
+   const line=logBuffer.slice(0,at);logBuffer=logBuffer.slice(at+1);
+   if(/operation=(observation_retire|observation_poll|learning_field|composition_retired|composition_edit|input_composition_guard|dictation_first_error|dictation_phase|processing_dispatch|draft_delivery_detached|archive_settled|input_edit)\b/.test(line))evidence.lifecycle.push({at:Date.now(),line});
+  }
+ };
+ app.stderr.on('data',logListener);
+ let activeTask,target,scenarioError;
+ try{
+  await invoke(main,'model_save',{request:{id:null,revision:null,expectation:null,input:{name:'连续口述受控整理',protocol:'openai-chat',baseUrl:base+'/v1',modelId:'polish-fixture',usages:['text']},key:{action:'replace',value:key}}});
+  const keys=await invoke(main,'shortcut_status');
+  await invoke(main,'shortcut_save',{config:{...keys.saved,binding:'AltRight',mode:'toggle'}});
+  evidence.shortcuts=await invoke(main,'shortcut_status');
+  evidence.components=await invoke(main,'text_service_status');
+  expect(evidence.components).toMatchObject({installed:true,enabled:true,payloadAvailable:true,updateAvailable:false,error:null});
+  const session=await targetBrowser.newBrowserCDPSession();
+  const editorPid=(await session.send('SystemInfo.getProcessInfo')).processInfo.find(p=>p.type==='browser').id;
+  await session.detach();evidence.editorProcess=editorPid;evidence.browserVersion=targetBrowser.version();
+  const bundle=await buildFixture({configFile:false,logLevel:'error',define:{'process.env.NODE_ENV':JSON.stringify('production')},build:{write:false,lib:{entry:path.join(root,'tests/fixtures/input-target.ts'),name:'InputFixture',formats:['iife']}}});
+  const newTarget=async()=>{
+  target=await targetBrowser.newPage();
+  await target.setContent('<title>Sayweave 连续两轮口述验证</title><p id="instruction">正在准备同进程输入验证</p><input id="input"><textarea id="area"></textarea><div id="editable" contenteditable="true"></div>');
+  await target.addScriptTag({content:(Array.isArray(bundle)?bundle[0]:bundle).output[0].code});
+  await target.evaluate(()=>{
+   window.continuityEvents=[];
+   for(const type of ['keydown','keyup','compositionstart','compositionupdate','compositionend','beforeinput','input'])document.addEventListener(type,event=>{
+    if(!event.target.closest?.('#prosemirror'))return;
+    const record=phase=>window.continuityEvents.push({type,phase,key:event.key,code:event.code,data:event.data,inputType:event.inputType,at:Date.now(),body:window.fixtureEditor.read(),state:window.fixtureEditor.inspect()});
+    record('capture');queueMicrotask(()=>record('microtask'));setTimeout(()=>record('after-task'),0);
+   },true);
+  });
+  };
+  const settled=()=>target.evaluate(async()=>{
+   let previous='',stable=0;const samples=[],deadline=performance.now()+2000;
+   while(performance.now()<deadline){
+    await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+    const sample={text:window.fixtureEditor.read(),state:window.fixtureEditor.inspect(),eventCount:window.continuityEvents.length};
+    const next=JSON.stringify(sample);stable=next===previous?stable+1:0;previous=next;samples.push(sample);
+    if(stable>=2)return {...sample,samples};
+   }
+   throw Error('Main-process owned body did not settle');
+  });
+  const keyEvent=async(code,down)=>{
+   const result=await helper.command({action:'fixture-key',process:editorPid,key:code,down});
+   if(!result.keyResult?.accepted)throw Error('Owned main-process key refused: '+code);
+  };
+  const tap=async code=>{await keyEvent(code,true);await keyEvent(code,false);};
+  const body=async(trial,label,expected)=>{
+   const deadline=Date.now()+6000;let actual;
+   do{
+    actual=await settled();trial.bodies.push({at:Date.now(),label,...actual});
+    if(actual.text===expected)return actual;
+    await delay(50);
+   }while(Date.now()<deadline);
+   trial.firstDivergence={label,expected,actual:actual.text};
+   throw Error(label+': actual body differs');
+  };
+  const startTask=async(trial,label)=>{
+   expect(app.pid).toBe(pid);expect(app.exitCode).toBeNull();
+   expect((await helper.command({action:'read'})).foregroundProcess).toBe(editorPid);
+   const prior=(await invoke(main,'dictation_snapshot')).taskId;
+   await tap('AltRight');
+   const deadline=Date.now()+10000;let state;
+   do{
+    state=await invoke(main,'dictation_snapshot');
+    if(state.taskId&&state.taskId!==prior){activeTask=state.taskId;if(state.presentation==='recording')break;}
+    if(state.taskId!==prior&&state.error)break;
+    await delay(50);
+   }while(Date.now()<deadline);
+   trial.tasks.push({label,at:Date.now(),snapshot:state,applicationProcess:app.pid,body:await settled()});
+   if(state.taskId===prior||state.presentation!=='recording'||state.inputRoute!=='live')throw Error(label+': real shortcut did not admit live recording');
+   return state.taskId;
+  };
+  const finishTask=async(trial,label)=>{
+   await tap('AltRight');await waitPhase(main,'completed');
+   await expect.poll(async()=>{const s=await invoke(main,'dictation_snapshot');return s.taskId===activeTask&&s.delivery!==null;},{timeout:10000}).toBe(true);
+   const state=await invoke(main,'dictation_snapshot');trial.tasks.push({label,at:Date.now(),snapshot:state,body:await settled()});activeTask=null;
+   if(state.error||state.inputRoute!=='live'||state.delivery?.restoreError||state.delivery?.submission==='uncertain')throw Error(label+': unsafe terminal delivery');
+  };
+  const failures=[];
+  for(const enabled of [false,true]){
+   const settings=await invoke(main,'language_settings');
+   evidence.settings=await invoke(main,'language_save',{settings:{automaticTerms:{enabled,revision:settings.automaticTerms.revision},personalization:{enabled,revision:settings.personalization.revision}}});
+   const trial={learning:enabled,bodies:[],tasks:[],began:Date.now(),cleanupErrors:[]};evidence.trials.push(trial);
+   if(target){await target.close();trial.independentPairNewDocument=true;}
+   await newTarget();
+   try{
+   await target.evaluate(()=>{window.fixtureEditor.set('',0,0);document.querySelector('#instruction').textContent='第一轮口述由测试驱动完成，请等待纠词确认提示。';});
+   await target.bringToFront();await target.locator('#prosemirror .ProseMirror').focus();
+   expect((await helper.command({action:'focus-process',process:editorPid})).foregroundProcess).toBe(editorPid);
+   if(process.env.SAYWEAVE_LEARNING_RESTART_CORRECTION==='keyboard-replay'){
+    // Align the IME before either first round; never reset it between the two rounds.
+    trial.initialImeProbes=[];
+    for(let attempt=0;attempt<2;attempt++){
+     await tap('KeyQ');const probe=await body(trial,'IME setup probe','q');trial.initialImeProbes.push(probe);
+     if(probe.state.composing){await tap('Escape');trial.initialImeAligned=true;break;}
+     await tap('Backspace');await body(trial,'IME setup probe removed','');await tap('ShiftLeft');
+    }
+    expect(trial.initialImeAligned).toBe(true);
+    const aligned=await body(trial,'aligned empty Chinese IME','');expect(aligned.state.composing).toBe(false);
+   }
+   mode='learning-restart-'+(enabled?'on':'off')+'-first';
+   await startTask(trial,'first start');await body(trial,'first speech','Seville');
+   await finishTask(trial,'first finish');await body(trial,'after first finish','Seville');
+   const eventStart=await target.evaluate(()=>window.continuityEvents.length);
+   await target.locator('#instruction').evaluate((node,enabled)=>{node.textContent='学习'+(enabled?'开启':'关闭')+'对照：请按平时方式逐字删除 Seville，手动输入 sayweave，再按 Shift 确认。随后测试会自动发送原 Alt 快捷键开始下一轮，请保持输入框焦点。';},enabled);
+   const ready={at:Date.now(),learning:enabled,applicationProcess:pid,editorProcess:editorPid,eventStart};
+   writeFileSync(path.join(directory,'shift-ready.json'),JSON.stringify(ready,null,2));
+   console.log('CONTINUITY_SHIFT_READY '+JSON.stringify({...ready,directory}));
+   const replayCorrection=process.env.SAYWEAVE_LEARNING_RESTART_CORRECTION==='keyboard-replay';
+   if(replayCorrection){
+    // Replay the recorded physical sequence through the owned foreground helper.
+    // This is test stimulus; the application never confirms a foreign composition.
+    for(let i=0;i<7;i++)await tap('Backspace');
+    for(const letter of 'SAYWEAVE'){await tap('Key'+letter);await delay(40);}
+    await tap('ShiftLeft');
+   }
+   // Shift is the owner operation. Native composition metadata is
+   // recorded evidence, never substituted for whether the owner submitted.
+   await target.waitForFunction(start=>window.continuityEvents.slice(start).some(e=>e.type==='keyup'&&['ShiftLeft','ShiftRight'].includes(e.code)&&e.body==='sayweave'),eventStart,{timeout:180000});
+   trial.submitEvents=await target.evaluate(start=>window.continuityEvents.slice(start),eventStart);
+   trial.correctionInput=replayCorrection?'owned keyboard replay of recorded delete/retype/Shift':'physical owner delete/retype/Shift';
+   trial.beforeShift=trial.submitEvents.findLast(e=>e.type==='keydown'&&['ShiftLeft','ShiftRight'].includes(e.code)&&e.body==='sayweave');
+   trial.afterShift=await body(trial,'Shift correction confirmation','sayweave');
+   mode='learning-restart-'+(enabled?'on':'off')+'-next';
+   await startTask(trial,'next start');await body(trial,'after next preparation','sayweave');
+   await expect.poll(()=>{const c=restartChannels.at(-1)?.connection;return c?.mode===mode&&c.started&&c.frames>0;},{timeout:6000}).toBe(true);
+   const channel=restartChannels.at(-1);
+   expect(channel.connection.mode).toBe(mode);
+   channel.sentence(1,'地点',false);await body(trial,'next first native write','sayweave地点');
+   channel.sentence(1,'地点在上海',true);await body(trial,'next continued native write','sayweave地点在上海');
+   await finishTask(trial,'next finish');await body(trial,'after next finish','sayweave地点在上海');
+   trial.learningOverview=await invoke(main,'language_overview',{after:null});trial.passed=true;
+   }catch(error){
+    trial.error=String(error);evidence.firstError??=String(error);failures.push(trial.error);
+    writeFileSync(path.join(directory,'restart-'+(enabled?'on':'off')+'-first-error.json'),JSON.stringify(trial,null,2));
+    const cleanupStep=async(label,operation)=>{try{await operation();}catch(error){trial.cleanupErrors.push({label,error:String(error)});}};
+    await cleanupStep('events',async()=>{trial.eventsBeforeCleanup=await target.evaluate(()=>window.continuityEvents);});
+    await cleanupStep('body before cleanup',async()=>{trial.bodyBeforeCleanup=await settled();});
+    await cleanupStep('screenshot',()=>target.screenshot({path:path.join(directory,'restart-'+(enabled?'on':'off')+'-first-error.png')}));
+    if(activeTask){
+     await cleanupStep('cancel and settle',async()=>{
+     await invoke(main,'dictation_control',{taskId:activeTask,action:'cancel'});
+     await expect.poll(async()=>{const s=await invoke(main,'dictation_snapshot');return s.taskId===activeTask&&s.delivery!==null&&!['preparing','recording','editing','resuming','recognizing','delivering'].includes(s.presentation);},{timeout:10000}).toBe(true);
+     activeTask=null;
+     });
+    }
+    await cleanupStep('body after cancel',async()=>{const sample=await settled();if(activeTask)trial.bodyAfterCancelRequest=sample;else trial.bodyAfterCleanup=sample;});
+    writeFileSync(path.join(directory,'restart-'+(enabled?'on':'off')+'-first-error.json'),JSON.stringify(trial,null,2));
+    if(trial.cleanupErrors.length){
+     if(!enabled)evidence.trials.push({learning:true,status:'notRunDueToCleanup'});
+     break;
+    }
+   }
+  }
+  if(failures.length)throw Error('Same-main-process restart failed: '+failures.join('; '));
+  evidence.inputEvents=await target.evaluate(()=>window.continuityEvents);
+  evidence.inputPassed=true;
+ }catch(error){
+  scenarioError=error;evidence.firstError??=String(error);
+ }finally{
+  if(target&&!target.isClosed()){
+   evidence.inputEvents=await target.evaluate(()=>window.continuityEvents??[]).catch(()=>[]);
+   evidence.bodyBeforeCleanup=await target.evaluate(()=>({text:window.fixtureEditor?.read(),state:window.fixtureEditor?.inspect()})).catch(()=>null);
+   await target.screenshot({path:path.join(directory,'restart-body-before-cleanup.png')}).catch(()=>{});
+  }
+  writeFileSync(path.join(directory,'restart-before-cleanup.json'),JSON.stringify(evidence,null,2));
+  let cancelled=false;
+  if(activeTask){
+   try{
+    await invoke(main,'dictation_control',{taskId:activeTask,action:'cancel'});
+    await expect.poll(async()=>{const s=await invoke(main,'dictation_snapshot');return s.taskId===activeTask&&s.delivery!==null&&!['preparing','recording','editing','resuming','recognizing','delivering'].includes(s.presentation);},{timeout:10000}).toBe(true);
+    cancelled=true;
+   }catch(error){evidence.cleanupErrors.push(String(error));}
+  }else cancelled=true;
+  evidence.cleanupSettled=cancelled;
+  if(target&&!target.isClosed()){
+   const final=await target.evaluate(async()=>{await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));return {text:window.fixtureEditor?.read(),state:window.fixtureEditor?.inspect()};}).catch(()=>null);
+   if(cancelled)evidence.bodyAfterCleanup=final;else evidence.bodyAfterCancelRequest=final;
+  }
+  try{await helper.close();}catch(error){evidence.cleanupErrors.push(String(error));}
+  try{await targetBrowser.close();}catch(error){evidence.cleanupErrors.push(String(error));}
+  app.stderr.off('data',logListener);
+ }
+ if(scenarioError)throw scenarioError;
+ if(evidence.cleanupErrors.length)throw Error('Main-process fixture cleanup failed: '+evidence.cleanupErrors.join('; '));
+ evidence.passed=true;
+}
+async function tabStartupScenario(main,base){
+ const helper=await ownedEditor(),targetBrowser=await chromium.launch({headless:false,args:['--force-renderer-accessibility']});
+ const evidence={applicationProcess:app.pid,trials:[],lifecycle:[],cleanupErrors:[]};report.tabStartup=evidence;
+ evidence.coverage={ordinaryCore:true,acceptanceOnlyFirstWriteBarrier:false,preparingCancellationScope:'readiness'};
+ const listener=chunk=>evidence.lifecycle.push({at:Date.now(),lines:chunk.toString('utf8')});app.stderr.on('data',listener);
+ const session=await targetBrowser.newBrowserCDPSession();
+ const editorPid=(await session.send('SystemInfo.getProcessInfo')).processInfo.find(p=>p.type==='browser').id;
+ await session.detach();evidence.editorProcess=editorPid;evidence.browserVersion=targetBrowser.version();
+ let target,held=false,activeTask;
+ const keyEvent=async down=>{
+  const result=await helper.command({action:'fixture-key',process:editorPid,key:'AltRight',down});
+  if(!result.keyResult?.accepted)throw Error('Tab startup key refused');held=down;
+ };
+ const tap=async()=>{await keyEvent(true);await keyEvent(false);};
+ const failures=[];
+ try{
+  await invoke(main,'model_save',{request:{id:null,revision:null,expectation:null,input:{name:'首笔交接受控整理',protocol:'openai-chat',baseUrl:base+'/v1',modelId:'polish-fixture',usages:['text']},key:{action:'replace',value:key}}});
+  expect(await invoke(main,'text_service_status')).toMatchObject({installed:true,enabled:true,updateAvailable:false,error:null});
+  const bundle=await buildFixture({configFile:false,logLevel:'error',define:{'process.env.NODE_ENV':JSON.stringify('production')},build:{write:false,lib:{entry:path.join(root,'tests/fixtures/input-target.ts'),name:'InputFixture',formats:['iife']}}});
+  const repetitions=Number(process.env.SAYWEAVE_TAB_STARTUP_REPETITIONS??1);
+  if(!Number.isInteger(repetitions)||repetitions<1||repetitions>5)throw Error('Invalid Tab startup repetition count');
+  for(const shortcutMode of Array.from({length:repetitions},()=>['toggle','hold']).flat()){
+   const trial={shortcutMode,bodies:[],events:[],passed:false,cleanupErrors:[]};evidence.trials.push(trial);
+   const keys=await invoke(main,'shortcut_status');await invoke(main,'shortcut_save',{config:{...keys.saved,binding:'AltRight',mode:shortcutMode==='hold'?'hold':'toggle'}});
+   target=await targetBrowser.newPage();
+   await target.setContent('<title>Sayweave 首笔交接验证</title><input id="input"><textarea id="area"></textarea><div id="editable" contenteditable="true"></div>');
+   await target.addScriptTag({content:(Array.isArray(bundle)?bundle[0]:bundle).output[0].code});
+   await target.evaluate(()=>{
+    window.fixtureEditor.set('',0,0);window.fixturePrediction('示例建议 · 按 Tab 接受');window.startupEvents=[];
+    for(const type of ['keydown','keyup','compositionstart','compositionupdate','compositionend','beforeinput','input'])document.addEventListener(type,event=>{
+     if(!event.target.closest?.('#prosemirror'))return;
+     const record=phase=>window.startupEvents.push({type,phase,key:event.key,code:event.code,keyCode:event.keyCode,data:event.data,inputType:event.inputType,at:Date.now(),body:window.fixtureEditor.read(),state:window.fixtureEditor.inspect()});
+     record('capture');queueMicrotask(()=>record('microtask'));setTimeout(()=>record('after-task'),0);
+    },true);
+   });
+   const body=async(label,expected)=>{
+    const deadline=Date.now()+6000;let text;
+    do{
+     const sample=await target.evaluate(async()=>{await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));return {text:window.fixtureEditor.read(),state:window.fixtureEditor.inspect(),eventCount:window.startupEvents.length};});
+     trial.bodies.push({label,at:Date.now(),...sample});text=sample.text;
+     if(text===expected)return sample;await delay(40);
+    }while(Date.now()<deadline);
+    trial.firstDivergence={label,expected,actual:text};throw Error(label+': actual body differs');
+   };
+   try{
+    await target.bringToFront();await target.locator('#prosemirror .ProseMirror').focus();
+    expect((await helper.command({action:'focus-process',process:editorPid})).foregroundProcess).toBe(editorPid);
+    trial.initial=await body('true empty field','');expect(trial.initial.state.html).toContain('data-owned-prediction');
+    mode='learning-restart-tab-'+shortcutMode+'-next';
+    const prior=(await invoke(main,'dictation_snapshot')).taskId;
+    if(shortcutMode==='hold')await keyEvent(true);else await tap();
+    await expect.poll(async()=>{const s=await invoke(main,'dictation_snapshot');if(s.taskId!==prior)activeTask=s.taskId;trial.startSnapshot=s;return Boolean(activeTask&&s.inputRoute==='live'&&s.presentation==='recording');},{timeout:10000}).toBe(true);
+    trial.taskId=activeTask;trial.startKeyReleased=shortcutMode==='toggle'&&!held;
+    await expect.poll(()=>restartChannels.at(-1)?.connection.started===true,{timeout:10000}).toBe(true);
+    let channel=restartChannels.at(-1);trial.connectionIndex=restartChannels.length-1;
+    for(const [revision,text]of [[1,'周'],[2,'舟三开会']]){
+     channel.sentence(1,text,false);await body('stream revision '+revision,text);
+    }
+    channel.sentence(2,'地点在上海',false);await body('next segment','舟三开会地点在上海');
+    channel.sentence(1,'舟三开会',true);channel.sentence(2,'地点在上海',true);
+    if(shortcutMode==='hold')await keyEvent(false);else await tap();
+    await waitPhase(main,'completed');await body('final whole-block processing','周三开会地点在上海');
+    trial.finalSnapshot=await invoke(main,'dictation_snapshot');
+    expect(trial.finalSnapshot.error).toBeNull();expect(trial.finalSnapshot.inputRoute).toBe('live');
+    expect(app.pid).toBe(evidence.applicationProcess);trial.passed=true;activeTask=null;
+   }catch(error){trial.error=String(error);failures.push(shortcutMode+': '+error);}
+   finally{
+    trial.events=await target.evaluate(()=>window.startupEvents).catch(()=>[]);
+    trial.finalBody=await target.evaluate(()=>window.fixtureEditor.read()).catch(()=>null);
+    if(held)await keyEvent(false).catch(error=>trial.cleanupErrors.push(String(error)));
+    if(activeTask)try{
+     const cancelledTask=activeTask;
+     await invoke(main,'dictation_control',{taskId:cancelledTask,action:'cancel'});
+     await expect.poll(async()=>{const state=await invoke(main,'dictation_snapshot');return state.taskId===cancelledTask&&state.delivery!==null&&!['preparing','recording','editing','resuming','recognizing','delivering'].includes(state.presentation);},{timeout:10000}).toBe(true);
+     trial.cleanupSettled=true;
+    }catch(error){trial.cleanupErrors.push(String(error));}
+    activeTask=null;await delay(300);await target.close();target=null;
+   }
+  }
+ }finally{
+  app.stderr.off('data',listener);await targetBrowser.close().catch(error=>evidence.cleanupErrors.push(String(error)));await helper.close();
+ }
+ if(evidence.cleanupErrors.length||evidence.trials.some(t=>t.cleanupErrors.length))throw Error('Tab startup cleanup failed');
+ if(failures.length)throw Error(failures.join('; '));
+ evidence.passed=true;
+}
+
+async function readinessScenario(page){
+ const helper=await ownedEditor(),overlay=await overlayPage();
+ report.readiness={passed:false,trials:[],claims:{realDevice:true,controlledASR:true,actualSpokenFirstWord:false}};
+ let activeTask,heldKey=false;
+ const key=async down=>{const result=await helper.command({action:'fixture-key',process:helper.pid,key:'AltRight',down});expect(result.keyResult?.accepted).toBe(true);heldKey=down;};
+ await overlay.evaluate(()=>{
+  window.readinessFrames=[];window.readinessSampling=true;
+  const tick=()=>{if(!window.readinessSampling)return;const node=document.querySelector('[data-phase]');if(node)window.readinessFrames.push({at:Date.now(),phase:node.getAttribute('data-phase'),width:node.getBoundingClientRect().width});requestAnimationFrame(tick);};requestAnimationFrame(tick);
+ });
+ try{
+  for(const name of ['slow-start','cancel-before-ready','release-hold-before-ready','next-start']){
+   const trial={name,events:[],passed:false};report.readiness.trials.push(trial);
+   const shortcuts=await invoke(page,'shortcut_status');
+   await invoke(page,'shortcut_save',{config:{...shortcuts.saved,binding:'AltRight',mode:name==='release-hold-before-ready'?'hold':'toggle'}});
+   await helper.command({action:'focus',text:'准备｜',start:3,end:3});
+   mode='readiness-'+name;const count=readinessChannels.length;
+   trial.startedAt=Date.now();
+   if(name==='release-hold-before-ready'){
+    const previous=(await invoke(page,'dictation_snapshot')).taskId;await key(true);
+    await expect.poll(async()=>{const snapshot=await invoke(page,'dictation_snapshot');if(snapshot.taskId&&snapshot.taskId!==previous)activeTask=snapshot.taskId;return Boolean(activeTask);},{timeout:8000}).toBe(true);
+   }else activeTask=(await invoke(page,'dictation_start')).taskId;
+   trial.taskId=activeTask;
+   await expect.poll(()=>readinessChannels.length,{timeout:8000}).toBe(count+1);
+   const channel=readinessChannels.at(-1);trial.receivedAt=channel.receivedAt;
+   const checkHeldFrames=async()=>{
+    const until=Date.now();const frames=await overlay.evaluate(({from,until})=>window.readinessFrames.filter(frame=>frame.at>=from&&frame.at<=until),{from:trial.startedAt,until});
+    trial.heldVisual={from:trial.startedAt,until,count:frames.length,premature:frames.filter(frame=>frame.phase==='recording')};
+    expect(frames.length).toBeGreaterThan(0);expect(trial.heldVisual.premature,'no transient expanded frame while service/capture is unready').toEqual([]);
+   };
+   const sample=async label=>{
+    // Read the visual state first: a subsequent Recording snapshot is allowed,
+    // but an already expanded UI while capture still Connecting is not.
+    const visual=await overlay.evaluate(()=>{const node=document.querySelector('[data-phase]');return {at:Date.now(),phase:node?.getAttribute('data-phase')??'absent',width:node?.getBoundingClientRect().width??0};});
+    const speech=await invoke(page,'speech_snapshot'),dictation=await invoke(page,'dictation_snapshot');
+    const value={label,visual,speech:{taskId:speech.taskId,phase:speech.phase,sequence:speech.sequence,lifecycle:speech.lifecycle},dictation:{taskId:dictation.taskId,presentation:dictation.presentation,sequence:dictation.sequence},frames:channel.connection.frames};trial.events.push(value);return value;
+   };
+   const held=await sample('ASR task-started held');
+   expect(channel.connection.started).toBe(false);expect(held.speech.taskId).toBe(activeTask);expect(held.speech.phase).toBe('connecting');
+   expect(held.dictation.presentation,'no recording layout before ASR/capture ready').toBe('preparing');
+   expect(held.visual.phase).toBe('connecting');
+   if(name==='cancel-before-ready'||name==='release-hold-before-ready'){
+    if(heldKey){await key(false);trial.cancelInput='actual AltRight release';}
+    else{await invoke(page,'dictation_control',{taskId:activeTask,action:'cancel'});trial.cancelInput='explicit cancel';}
+    await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).presentation,{timeout:8000}).toBe('idle');
+    const cancelled=activeTask;await checkHeldFrames();trial.lateRelease=channel.release();
+    const after=await sample('late service release after cancel');
+    expect(after.dictation.taskId).toBe(cancelled);expect(after.dictation.presentation).toBe('idle');expect(after.visual.phase).not.toBe('recording');expect(channel.connection.frames).toBe(0);
+    trial.passed=true;activeTask=null;continue;
+   }
+   if(name==='slow-start'){
+    // Controlled fixture delay only. Production contains no timing workaround.
+    await new Promise(resolve=>setTimeout(resolve,Math.max(0,3000-(Date.now()-channel.receivedAt))));
+    const blocked=await sample('still held at three seconds');
+    expect(blocked.dictation.presentation).toBe('preparing');expect(blocked.visual.phase).toBe('connecting');expect(channel.connection.frames).toBe(0);
+   }
+   await checkHeldFrames();trial.releaseDelivery=channel.release();trial.releasedAt=channel.releasedAt;expect(trial.releaseDelivery.sent).toBe(true);
+   await expect.poll(async()=>{
+    const s=await sample('released until capture ready');
+    if(s.visual.phase==='recording')expect(s.speech.phase,'expanded recording must follow real capture readiness').toBe('recording');
+    return s.visual.phase;
+   },{timeout:8000,intervals:[10,20,50]}).toBe('recording');
+   await expect.poll(()=>channel.connection.frames,{timeout:5000}).toBeGreaterThanOrEqual(8);
+   await expect.poll(async()=>(await helper.command({action:'read'})).text,{timeout:5000}).toBe('准备｜正在识别');
+   await invoke(page,'dictation_control',{taskId:activeTask,action:'finish'});await waitPhase(page,'completed');
+   await expect.poll(async()=>{const s=await invoke(page,'dictation_snapshot');return s.taskId===activeTask&&s.stage==='result'&&s.delivery!==null;},{timeout:8000}).toBe(true);
+   trial.actualBody=(await helper.command({action:'read'})).text;expect(trial.actualBody).toBe('准备｜原生受控识别完成。');
+   const final=await invoke(page,'dictation_snapshot');trial.delivery=final.delivery;trial.audioFrames=channel.connection.frames;
+   if(final.presentationId)await dismiss(page,{taskId:final.taskId,presentationId:final.presentationId});
+   activeTask=null;trial.passed=true;
+  }
+  report.readiness.passed=true;
+ }finally{
+  if(heldKey)await key(false).catch(()=>{});
+  if(activeTask)await invoke(page,'dictation_control',{taskId:activeTask,action:'cancel'}).catch(()=>{});
+  for(const channel of readinessChannels)channel.release();
+  report.readiness.visualFrames=await overlay.evaluate(()=>{window.readinessSampling=false;return window.readinessFrames;}).catch(()=>[]);
+  await helper.close();
+ }
+}
+
 async function run(){try{
- // This entry is also invoked directly. Never reuse a stale acceptance executable.
- await buildFixture({logLevel:'error'});
- if(!process.env.SAYWEAVE_TSF_PAYLOAD)await command(['build','--manifest-path','src-tauri/text-service/Cargo.toml','--release']);
- const payload=process.env.SAYWEAVE_TSF_PAYLOAD??path.join(root,'src-tauri/text-service/target/release/sayweave_text_service.dll');report.componentSha256=createHash('sha256').update(readFileSync(payload)).digest('hex');
- await command(['build','--manifest-path','src-tauri/Cargo.toml','--release','--features','desktop-acceptance,tauri/custom-protocol','--bin','desktop-acceptance'],{SAYWEAVE_TSF_PAYLOAD:payload});
- await command(['build','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance','--bin','input-fixture']);
+ // A reviewed controller retry can retain exact already-built product bytes.
+ const retained=process.env.SAYWEAVE_SPEECH_REUSE_PREPARED;
+ if(retained){
+  expect(['learning-restart','tab-startup','readiness']).toContain(process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE);
+  const proof=JSON.parse(readFileSync(retained,'utf8').replace(/^\uFEFF/,''));
+  expect(execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim()).toBe(proof.source??proof.controllerSource);
+  if(proof.sourceSnapshot){
+   const entries=proof.sourceSnapshot.files;expect(Array.isArray(entries)&&entries.length>0).toBe(true);
+   for(const required of ['src-tauri/src/dictation.rs','src-tauri/src/dictation/presentation.rs','src-tauri/src/speech/mod.rs','src-tauri/src/speech/continuous.rs','src/contracts/dictation.ts','src/app/dictation-feedback.ts','package.json','src-tauri/Cargo.toml'])expect(entries.some(file=>file.path===required)).toBe(true);
+   // The controller is not compiled into the retained product. Every other
+   // frozen input stays exact, including fixtures and product/build sources.
+   for(const file of entries)if(file.path!=='scripts/test-speech-desktop.mjs')expect(createHash('sha256').update(readFileSync(path.join(root,file.path))).digest('hex'),file.path).toBe(file.sha256);
+   report.productSourceDigest=proof.sourceSnapshot.digest;
+  }else execFileSync('git',['diff','--quiet','HEAD','--','src','src-tauri'],{cwd:root});
+  for(const file of proof.files)expect(createHash('sha256').update(readFileSync(file.path)).digest('hex')).toBe(file.sha256);
+  for(const required of [exe,proof.fixtureTest,path.join(root,'src-tauri/target/debug/input-fixture.exe'),path.join(root,'src-tauri/resources/fixed-proxy/abi1.dll'),process.env.SAYWEAVE_TSF_PAYLOAD]){
+   expect(required).toBeTruthy();expect(proof.files.some(file=>path.resolve(file.path)===path.resolve(required))).toBe(true);
+  }
+  report.componentPayloads=verifyComponentEmbeddings([exe],{core:process.env.SAYWEAVE_TSF_PAYLOAD,proxy:path.join(root,'src-tauri/resources/fixed-proxy/abi1.dll')});
+  report.reusedBuild=proof;
+ }else{
+  await buildFixture({logLevel:'error'});
+  if(!process.env.SAYWEAVE_TSF_PAYLOAD)await command(['build','--manifest-path','src-tauri/text-service/Cargo.toml','--release']);
+  const payload=process.env.SAYWEAVE_TSF_PAYLOAD??path.join(root,'src-tauri/text-service/target/release/sayweave_text_service.dll');report.componentSha256=createHash('sha256').update(readFileSync(payload)).digest('hex');
+  await command(['build','--manifest-path','src-tauri/Cargo.toml','--release','--features','desktop-acceptance,tauri/custom-protocol','--bin','desktop-acceptance'],{SAYWEAVE_TSF_PAYLOAD:payload});
+  await command(['build','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance','--bin','input-fixture']);
+ }
  report.targetGroup=process.env.SAYWEAVE_INPUT_TARGET_GROUP??'all';
  await command(['test','--manifest-path','src-tauri/Cargo.toml','--lib','model_desktop_fixture','--','--ignored']);server=createServer({cert:readFileSync(path.join(data,'fixture-ca.pem')),key:readFileSync(path.join(data,'fixture-key.pem'))});server.on('upgrade',websocket);server.on('request',(req,res)=>void modelFixture(req,res).catch(error=>{report.modelError=String(error);res.destroy();}));await new Promise(r=>server.listen(0,'127.0.0.1',r));const base='https://localhost:'+server.address().port;
  let page=await start(1);await expect(page.getByRole('link',{name:'组件展示'})).toHaveCount(0);await page.getByRole('button',{name:'配置模型',exact:true}).click();const dialog=page.getByRole('dialog');await delay(250);await page.screenshot({path:path.join(directory,'settings-speech-native.png')});await dialog.getByRole('button',{name:'更多设置'}).click();await dialog.getByLabel('名称',{exact:true}).fill('隔离语音验收');await dialog.getByLabel('服务地址（URL）',{exact:true}).fill(base);await dialog.getByLabel('API 密钥',{exact:true}).fill(key);await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(dialog.getByText('已保存。')).toBeVisible();await dialog.getByRole('button',{name:'关闭',exact:true}).click();await expect(dialog).toHaveCount(0);
@@ -399,6 +820,9 @@ async function run(){try{
  report.scope=process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE??'all';
  if(report.scope==='result-only'){await resultOnlyScenario(page);report.passed=true;return;}
   if(report.scope==='home-trial'){await homeTrialIsolation(page);report.passed=true;return;}
+  if(report.scope==='learning-restart'){await learningRestartScenario(page,base);report.passed=true;return;}
+ if(report.scope==='tab-startup'){await tabStartupScenario(page,base);report.passed=true;return;}
+ if(report.scope==='readiness'){await readinessScenario(page);report.passed=true;return;}
  if(report.scope!=='all')throw Error('Unknown speech acceptance scope');
  const began=performance.now();await page.getByRole('button',{name:'开始录音',exact:true}).click();const live=await waitPhase(page,'recording');expect(live.source).toBe('trial');await expect(page.getByRole('region',{name:'识别文字',exact:true})).toContainText('正在识别');report.firstFixtureTextMs=Math.round(performance.now()-began);
  const nativeBefore=await processMetrics(),sampleStarted=performance.now();

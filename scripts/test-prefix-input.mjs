@@ -33,7 +33,7 @@ if(abortInitial&&interference)throw Error('Initial cancellation cannot be combin
 const suffixCase=['suffix','suffix-abort'].includes(interference);
 const abortTail=interference==='suffix-abort';
 if(interference&&(!gap||process.argv[2]!=='ProseMirror-single'||!['delete-prefix','replace-prefix','outside-edit','outside-delete','right-edit','caret-return','suffix','suffix-abort'].includes(interference)))throw Error('Invalid owned interference scenario');
-if(!['selected','selected-unicode','selected-second-line','selected-across-lines','empty','left','right'].includes(shape)||!['chromium','edge'].includes(engine))throw Error('Unknown fixture shape/runtime');
+if(!['selected','selected-unicode','selected-second-line','selected-across-lines','empty','left','right'].includes(shape)||!['chromium','edge','chrome'].includes(engine))throw Error('Unknown fixture shape/runtime');
 const report={passed:false,shape,engine,gap,stepMs,beginMs,firstMs,renderPauseMs,renderPauseEvent,setup,returnFocus,reselect,abortInitial,editPrepared,interference,cases:[],cleanup:false,nativeProtocol:Number(readFileSync(path.join(root,'src-tauri/text-service/src/wire.rs'),'utf8').match(/PROTOCOL: u32 = (\d+)/)[1])};
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 let browser,helper,probe,imeTraceSession;
@@ -56,7 +56,7 @@ try{
   const {runOwnedTermination}=await import('./test-richtext-block.mjs');
   await runOwnedTermination({focus,start,root,report,pid:helper.pid});
  }else{
- browser=await chromium.launch({headless:false,...(engine==='edge'?{executablePath:'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'}:{}),args:['--force-renderer-accessibility']});
+ browser=await chromium.launch({headless:false,...(engine==='edge'?{executablePath:'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe'}:engine==='chrome'?{executablePath:'C:/Program Files/Google/Chrome/Application/chrome.exe'}:{}),args:['--force-renderer-accessibility']});
  report.browserVersion=browser.version();
  if(process.env.SAYWEAVE_PREFIX_TRACE_IME==='1'){
   imeTraceSession=await browser.newBrowserCDPSession();
@@ -74,7 +74,10 @@ try{
  await page.setContent('<input id="input"><textarea id="area"></textarea><div id="editable" contenteditable="true"></div>');
  const bundle=await build({configFile:false,logLevel:'error',define:{'process.env.NODE_ENV':JSON.stringify('production')},build:{write:false,lib:{entry:path.join(root,'tests/fixtures/input-target.ts'),name:'InputFixture',formats:['iife']}}});
  await page.addScriptTag({content:(Array.isArray(bundle)?bundle[0]:bundle).output[0].code});
- if(process.env.SAYWEAVE_BLOCK_IME==='1'){
+ if(process.env.SAYWEAVE_DELETE_BURST_CONTROL==='1'){
+  const {runDeletionBurstControl}=await import('./test-richtext-block.mjs');
+  await runDeletionBurstControl({page,pid,focus,report});
+ }else if(process.env.SAYWEAVE_BLOCK_IME==='1'){
   const {runPostDictationIme}=await import('./test-richtext-block.mjs');
   await runPostDictationIme({page,pid,focus,start,folder,report});
  }else if(process.env.SAYWEAVE_BLOCK_REGRESSION==='1'){

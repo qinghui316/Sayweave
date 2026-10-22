@@ -14,6 +14,8 @@ mod application;
 #[cfg(windows)]
 pub(crate) mod composition;
 #[cfg(windows)]
+mod learning_observation;
+#[cfg(windows)]
 mod native;
 #[cfg(windows)]
 mod runtime_module;

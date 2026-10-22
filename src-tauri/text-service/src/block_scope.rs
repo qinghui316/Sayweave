@@ -81,6 +81,10 @@ impl BlockScope {
     }
 
     pub(super) fn matches(&self) -> windows::core::Result<bool> {
+        self.match_state()
+            .map(|state| state == initial_selection::FocusMatch::Current)
+    }
+    pub(super) fn match_state(&self) -> windows::core::Result<initial_selection::FocusMatch> {
         unsafe {
             if !IsWindow(Some(self.window)).as_bool()
                 || windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() != self.window
@@ -90,16 +94,16 @@ impl BlockScope {
                 || self.context.GetActiveView()?.cast::<IUnknown>()?
                     != self.view.cast::<IUnknown>()?
             {
-                return Ok(false);
+                return Ok(initial_selection::FocusMatch::Unfocused);
             }
             let window = self.view.GetWnd()?;
             if !window.0.is_null() && GetAncestor(window, GA_ROOT) != self.root {
-                return Ok(false);
+                return Ok(initial_selection::FocusMatch::Unfocused);
             }
             self.native.permits()?;
             match &self.field {
-                FieldProof::Accessible(field) => field.matches(),
-                FieldProof::NativeOwned => Ok(true),
+                FieldProof::Accessible(field) => field.match_state(),
+                FieldProof::NativeOwned => Ok(initial_selection::FocusMatch::Current),
             }
         }
     }

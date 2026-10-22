@@ -51,7 +51,10 @@ fn status_of(engine: &Engine) -> EngineStatusV1 {
                 || s.block.is_some(),
         ),
         pending: u32::from(
-            s.pending.is_some() || !engine.output.borrow().is_empty() || s.reply_recovery.is_some(),
+            s.pending.is_some()
+                || first_entry_pending(&s)
+                || !engine.output.borrow().is_empty()
+                || s.reply_recovery.is_some(),
         ),
         cleanup: u32::from(
             s.cleanup
@@ -132,7 +135,9 @@ unsafe extern "system" fn dispatch_frame(
 unsafe extern "system" fn poll_engine(handle: *mut c_void) -> i32 {
     guard(|| {
         let engine = unsafe { instance(handle)? };
+        poll_first_entry(&engine.state);
         drain_text_watches(&engine.state);
+        block_tracking::poll_first_source(&engine.state);
         if engine.state.borrow().active {
             activate_observations(&engine.state);
         }
@@ -259,6 +264,10 @@ unsafe extern "system" fn retire(handle: *mut c_void) -> i32 {
         let engine = unsafe { instance(handle)? };
         if CALLBACKS.load(Ordering::Acquire) != 0 {
             return Err(failure(HRESULT(BUSY)));
+        }
+        {
+            retire_first_entry(&engine.state);
+            poll_first_entry(&engine.state);
         }
         end_owned(&engine.state);
         stop_observations(&engine.state);

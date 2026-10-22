@@ -153,3 +153,23 @@ Begin 对空光标和非空选区统一只准备范围；首次非空更新才�
 普通投递 pending/delivering 记录在后台归档，不作为输入激活门禁；取消与正文恢复的安全意图仍由原生所有者处理。空结果、取消、只读以及结算安全事实不弹遮挡目标输入框的长条提示；安静投影不改变输入效果、首个错误和历史诊断。真正不确定的效果阻止后续不安全写入，终态不能由迟到准备或识别事件重新打开。
 
 Observation retirement shares one connection-owned completion between automatic expiry and explicit close. Completion is published after Host resources and the activation lease have been released; command-channel closure is not proof of either success or failure. A retained connection remains tracked through cleanup, and only its confirmed successful completion clears that exact slot. Failure stays attributable and blocks the next admission. Waiting consumes the existing preparation deadline and supports cancellation without abandoning the old cleanup.
+
+## 启动时已有输入法组合
+
+目标安全属性核验完成后，明确未执行的首次 Begin 组词拒绝可进入限时输入准备。Session 可以收音并保留同一 ASR 来源；尚未取得范围时没有可写 Draft，也不启动整理请求。现有草稿协调器保存期间的完整识别结果，在原实际编辑端点和原字段身份仍成立、原生 Begin 成功后，使用同一共享写入实现交付。等待总期限为15秒，重试和重复通知不延长。
+
+用于等待重试的可选原字段对象在首次 Begin 请求前保存；拒绝后、重试前后分别核验同一字段和当前选区可写属性。控件的 Edit／Document 类型本身不决定可写。普通 Begin 成功不依赖这份辅助证明；证明缺失或字段变化时继续保留口述结果，不重新捕获后来获得焦点的字段。超时不丢弃在途请求，晚到的成功只交还空范围，不补写缓存口述。辅助证明耗时单独记录。
+
+该路径额外保留原 UIA 字段对象用于重试前后身份复核；它不读取正文、不授予写权限，普通输入不依赖此项辅助能力。外部输入法组合仍由该输入法管理。用户提交或结束组词后，再通过普通 Begin 核验原字段及当前选区；程序不通过模拟按键或终止外部组合取得写入许可。
+
+正常编辑中的组词仍沿用既有等待。身份无法取得或改变、等待到期或用户结束时，结算原操作并沿用已有结果交付；取消不复制。输入模式与波形沿用同一 SessionDraft 投影。未提交组词时立即继续出字的兼容性仍是未完成项，不能用录音仍在运行代替正文验收。
+
+## 已封存来源的后续修订
+
+旧块封存后保留已交付文字，新块只接收未消费的口述。已完整消费的确认片段始终按片段身份吸收其后续修订，包括临时变空或重新标为未确认的回包。部分消费的片段保留完整识别上下文；前缀保持时刷新上下文，前缀改变时，仅在所有最短字素编辑路径都指向同一分界、且分界后仍有原来的未消费字素时接续。比较限定在256个字素内。来源变化、缺少右侧上下文或存在多个分界时，继续保留结果，沿用既有交付处理。该映射只处理识别来源，原生范围与写入许可仍由输入组件独立核验。
+
+## 当前稳定续写与启动展示
+
+原块不能继续核实且旧操作已安全结算时，同一录音任务封存旧块并进入光标续写。保留用户改动，新块独立核验原窗口和实际端点；只交付来源水位之后的新口述，不重发全文。该模式持续至本轮结束，不再请求或应用整理模型；下一轮重新判断完整能力。原块有效时继续原Read/Acquire和共享写入，不提前降级。
+
+识别会话就绪不等于麦克风已就绪。外部胶囊的双发布入口统一采用同任务SpeechService在Capture::wait_ready后发布的Recording权威；Connecting保持Preparing。停止、取消及旧序号不能重新展开。已经录音后的Editing/Resuming继续保留原交互和真实波形，不全局改为准备态。

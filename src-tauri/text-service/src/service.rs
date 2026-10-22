@@ -4,6 +4,8 @@
 mod block_faults;
 #[path = "block_tracking.rs"]
 mod block_tracking;
+#[path = "composition_feed.rs"]
+mod composition_feed;
 #[path = "edit_context.rs"]
 mod edit_context;
 #[path = "edit_observation.rs"]
@@ -157,6 +159,7 @@ struct State {
     key_sink: bool,
     key_handoff: bool,
     key_failure: bool,
+    first_entry: Option<FirstEntry>,
 }
 #[derive(Clone)]
 struct ObservationCandidate {
@@ -287,6 +290,9 @@ struct PreparedSelection {
     range: ITfRange,
     position: RangePosition,
     writing: bool,
+    origin: Option<Rc<initial_selection::ParagraphOrigin>>,
+    #[cfg(feature = "acceptance")]
+    origin_note: String,
 }
 // Evidence for an exact write, valid only while its text and range still match.
 #[derive(Clone)]
@@ -639,6 +645,7 @@ impl ITfTextInputProcessor_Impl for Service_Impl {
             if self.state.borrow().active
                 || self.state.borrow().composition.is_some()
                 || self.state.borrow().cleanup
+                || first_entry_pending(&self.state.borrow())
             {
                 return Err(failure(E_UNEXPECTED));
             }
@@ -723,6 +730,7 @@ impl ITfTextInputProcessor_Impl for Service_Impl {
         }
     }
     fn Deactivate(&self) -> windows::core::Result<()> {
+        retire_first_entry(&self.state);
         unsafe {
             end_owned(&self.state);
             block_tracking::release(&self.state);
@@ -775,6 +783,7 @@ unsafe extern "system" fn procedure(window: HWND, message: u32, w: WPARAM, l: LP
     }
 }
 fn disconnect(shared: &Shared) {
+    retire_first_entry(shared);
     block_tracking::release(shared);
     stop_observations(shared);
     {
@@ -838,12 +847,14 @@ fn read_request(shared: &Shared) -> Result<Option<(Request, u64)>, ()> {
     }
 }
 fn poll(shared: &Shared) {
+    poll_first_entry(shared);
     // Do not mutate TSF subscriptions or admit a new write while TSF is
     // delivering the current edit notification to its remaining listeners.
     if shared.borrow().text_notifications.depth.get() != 0 {
         return;
     }
     drain_text_watches(shared);
+    block_tracking::poll_first_source(shared);
     if !shared.borrow().active {
         return;
     }
@@ -1397,6 +1408,44 @@ fn send_reply(
             revision: r.revision,
             applied,
             code: {
+                let source_diagnostic;
+                let code = if applied
+                    && r.action == Action::Handoff
+                    && s.version.task == r.task
+                    && s.version.turn == r.turn
+                {
+                    if let Some(track) = &s.block {
+                        let (note, stage) = track.source_trace();
+                        let (host, host_stage) = track.host_source_trace();
+                        let flow = track.receipt_events().join(">");
+                        source_diagnostic = format!(
+                            "{code} sourceReceipt={note}/{stage} hostReceipt={host}/{host_stage} receiptFlow={flow}"
+                        );
+                        source_diagnostic.as_str()
+                    } else {
+                        code
+                    }
+                } else {
+                    code
+                };
+                #[cfg(feature = "acceptance")]
+                let entry_diagnostic;
+                #[cfg(feature = "acceptance")]
+                let code = if let Some(entry) = s
+                    .first_entry
+                    .as_ref()
+                    .filter(|e| e.request.task == r.task && e.request.turn == r.turn)
+                {
+                    entry_diagnostic = format!(
+                        "{code} entryDown={} entryUp={} entryStage={}",
+                        entry.counts.get()[0],
+                        entry.counts.get()[1],
+                        entry.stage
+                    );
+                    entry_diagnostic.as_str()
+                } else {
+                    code
+                };
                 let context_diagnostic;
                 let code = if r.action == Action::Begin {
                     if let Some((_, _, _, probe)) =
@@ -1406,6 +1455,20 @@ fn send_reply(
                     {
                         context_diagnostic = format!("{code} nativeContext={probe}");
                         context_diagnostic.as_str()
+                    } else {
+                        code
+                    }
+                } else {
+                    code
+                };
+                #[cfg(feature = "acceptance")]
+                let origin_diagnostic;
+                #[cfg(feature = "acceptance")]
+                let code = if r.action == Action::Begin {
+                    if let Some(prepared) = &s.prepared {
+                        origin_diagnostic =
+                            format!("{code} paragraphOrigin={}", prepared.origin_note);
+                        origin_diagnostic.as_str()
                     } else {
                         code
                     }
@@ -1430,8 +1493,12 @@ fn send_reply(
                 #[cfg(feature = "acceptance")]
                 if r.action == Action::Inspect {
                     format!(
-                        "{code} observationReads={}",
-                        edit_observation::native_read_count()
+                        "{code} observationReads={} paragraphOriginState={}",
+                        edit_observation::native_read_count(),
+                        s.block
+                            .as_ref()
+                            .map(|b| b.origin_diagnostic())
+                            .unwrap_or(serde_json::Value::Null)
                     )
                 } else if matches!(r.action, Action::Begin | Action::Abort) {
                     let evidence = s
@@ -1814,15 +1881,27 @@ fn lease(
     generation: u64,
     context: &ITfContext,
 ) -> windows::core::Result<()> {
+    lease_with_phase(shared, r, generation, context, &mut "initial")
+}
+fn lease_with_phase(
+    shared: &Shared,
+    r: &Request,
+    generation: u64,
+    context: &ITfContext,
+    phase: &mut &'static str,
+) -> windows::core::Result<()> {
     unsafe {
+        *phase = "deadline";
         if !r.live(GetTickCount64()) {
             return Err(failure(TF_E_DISCONNECTED));
         }
         let (manager, peer) = {
             let s = shared.borrow();
+            *phase = "stateVersion";
             if !s.active || s.generation != generation || !s.version.accepts(r) || s.cleanup {
                 return Err(failure(TF_E_DISCONNECTED));
             }
+            *phase = "peerChannel";
             let peer = s.peer.ok_or_else(|| failure(E_ACCESSDENIED))?;
             if let Some(pipe) = s.pipe.as_ref() {
                 if !pipe.alive() || pipe.client_pid().ok() != Some(peer.pid) {
@@ -1839,16 +1918,21 @@ fn lease(
                 peer,
             )
         };
+        *phase = "hostIdentity";
         if registration::read_host() != Some((peer.pid, r.capability.clone()))
             || identity(peer.pid).ok() != Some(peer)
         {
             return Err(failure(TF_E_DISCONNECTED));
         }
+        *phase = "retainedContext";
         let native = edit_context::retained(shared, &manager)?;
+        *phase = "contextIdentity";
         if native.context != *context {
             return Err(failure(TF_E_DISCONNECTED));
         }
+        *phase = "permits";
         native.permits()?;
+        *phase = "originalBinding";
         if r.action != Action::Begin
             && shared
                 .borrow()
@@ -1858,6 +1942,7 @@ fn lease(
         {
             return Err(failure(TF_E_DISCONNECTED));
         }
+        *phase = "viewFocus";
         let view = context.GetActiveView()?.GetWnd()?;
         let focus = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus();
         let mut pid = 0;
@@ -1873,11 +1958,14 @@ fn lease(
         // The focused TSF document and local editing HWND establish the
         // endpoint. GetWnd may omit an HWND; a returned contradictory view
         // is still rejected. The enclosing app need not share this process.
+        *phase = "readonly";
         if context.GetStatus()?.dwDynamicFlags & TF_SD_READONLY != 0 {
             return Err(failure(TF_E_READONLY));
         }
+        *phase = "enabled";
         ensure_enabled_context(context)?;
         // COM providers may reenter the apartment. Recheck after the last COM call.
+        *phase = "finalState";
         let s = shared.borrow();
         if !s.active
             || s.generation != generation
@@ -1888,6 +1976,7 @@ fn lease(
         {
             return Err(failure(TF_E_DISCONNECTED));
         }
+        *phase = "complete";
         Ok(())
     }
 }
@@ -2170,6 +2259,28 @@ fn schedule(
             capability: r.capability.clone(),
             settlement: inherited_settlement,
         });
+        if shared.borrow().hosted
+            && r.action == Action::Update
+            && r.prefix.is_none()
+            && !r.text.is_empty()
+            && shared
+                .borrow()
+                .prepared
+                .as_ref()
+                .is_some_and(|p| !p.writing && p.position.start == p.position.end)
+        {
+            queue_first_entry(
+                shared,
+                r,
+                context.clone(),
+                client,
+                edit.clone(),
+                generation,
+                connection,
+            )
+            .map_err(|e| ("firstInputQueue", e))?;
+            return Ok(());
+        }
         let session = request_native_edit(
             &context,
             client,
@@ -2190,10 +2301,486 @@ fn schedule(
         Ok(())
     }
 }
+
+const FIRST_ENTRY_FAMILY: usize = 0x5359_0000_0000_0000;
+const FIRST_ENTRY_MASK: usize = 0xffff_0000_0000_0000;
+fn send_entry_notice(down: bool, tag: usize) -> windows::core::Result<()> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+    let input = INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VK_PROCESSKEY,
+                wScan: 0,
+                dwFlags: if down {
+                    KEYBD_EVENT_FLAGS(0)
+                } else {
+                    KEYEVENTF_KEYUP
+                },
+                dwExtraInfo: tag,
+                ..Default::default()
+            },
+        },
+    };
+    if unsafe { SendInput(&[input], std::mem::size_of::<INPUT>() as i32) } == 1 {
+        Ok(())
+    } else {
+        Err(failure(E_FAIL))
+    }
+}
+
+// Keep the first edit in the native key-notification transaction. In particular,
+// Chromium must dispatch its cached Process event before applying the first
+// composition, so the editor can retain that composition's original text node.
+struct FirstEntry {
+    request: Request,
+    context: ITfContext,
+    client: u32,
+    edit: ITfEditSession,
+    generation: u64,
+    connection: u64,
+    source: ITfSource,
+    cookie: Option<u32>,
+    window: HWND,
+    counts: Rc<Cell<[u32; 2]>>,
+    stage: u8,
+    tag: usize,
+    polling: Rc<Cell<bool>>,
+    down_queued: bool,
+    up_queued: bool,
+    failed: bool,
+    retiring: bool,
+}
+#[implement(ITfKeyTraceEventSink)]
+struct EntryTrace {
+    counts: Rc<Cell<[u32; 2]>>,
+    tag: usize,
+    _lease: Lease,
+}
+impl EntryTrace {
+    fn notice(&self, key: WPARAM, index: usize) -> bool {
+        if key.0 == 0xe5 && unsafe { GetMessageExtraInfo().0 as usize } == self.tag {
+            let mut counts = self.counts.get();
+            counts[index] = counts[index].saturating_add(1);
+            self.counts.set(counts);
+            return true;
+        }
+        false
+    }
+}
+struct EntryPoll(Rc<Cell<bool>>);
+impl Drop for EntryPoll {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+fn first_entry_admitted(state: &State, tag: usize) -> bool {
+    state.first_entry.as_ref().is_some_and(|e| {
+        e.tag == tag
+            && e.stage == 0
+            && !e.retiring
+            && state.active
+            && state.connected
+            && !state.cleanup
+            && state.generation == e.generation
+            && state.connection == e.connection
+            && state.capability.as_ref() == Some(&e.request.capability)
+            && state.pending.as_ref().is_some_and(|p| {
+                p.task == e.request.task
+                    && p.turn == e.request.turn
+                    && p.operation == e.request.operation
+                    && p.revision == e.request.revision
+                    && p.connection == e.connection
+                    && p.capability == e.request.capability
+            })
+    })
+}
+impl ITfKeyTraceEventSink_Impl for EntryTrace_Impl {
+    fn OnKeyTraceDown(&self, key: WPARAM, _: LPARAM) -> windows::core::Result<()> {
+        let _callback = Callback::enter();
+        self.notice(key, 0);
+        Ok(())
+    }
+    fn OnKeyTraceUp(&self, key: WPARAM, _: LPARAM) -> windows::core::Result<()> {
+        let _callback = Callback::enter();
+        self.notice(key, 1);
+        Ok(())
+    }
+}
+#[allow(clippy::too_many_arguments)]
+fn queue_first_entry(
+    shared: &Shared,
+    r: &Request,
+    context: ITfContext,
+    client: u32,
+    edit: ITfEditSession,
+    generation: u64,
+    connection: u64,
+) -> windows::core::Result<()> {
+    unsafe {
+        let window = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus();
+        let mut pid = 0;
+        if window.0.is_null()
+            || GetWindowThreadProcessId(window, Some(&mut pid))
+                != windows::Win32::System::Threading::GetCurrentThreadId()
+            || pid != std::process::id()
+            || GetAncestor(window, GA_ROOT) != GetForegroundWindow()
+            || shared.borrow().first_entry.is_some()
+        {
+            return Err(failure(E_ACCESSDENIED));
+        }
+        lease(shared, r, generation, &context)?;
+        let manager = shared
+            .borrow()
+            .manager
+            .clone()
+            .ok_or_else(|| failure(E_FAIL))?;
+        let source: ITfSource = manager.cast()?;
+        let counts = Rc::new(Cell::new([0, 0]));
+        let tag = FIRST_ENTRY_FAMILY
+            | (u64::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap())
+                as usize
+                & !FIRST_ENTRY_MASK);
+        let polling = Rc::new(Cell::new(true));
+        let _poll = EntryPoll(polling.clone());
+        let sink: ITfKeyTraceEventSink = EntryTrace {
+            counts: counts.clone(),
+            tag,
+            _lease: Lease::new(),
+        }
+        .into();
+        // Reserve the transaction before COM can reenter through AdviseSink.
+        // Cancellation can revoke it, but cannot lose the pending subscription.
+        if shared.borrow().first_entry.is_some() {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        shared.borrow_mut().first_entry = Some(FirstEntry {
+            request: r.clone(),
+            context: context.clone(),
+            client,
+            edit,
+            generation,
+            connection,
+            source: source.clone(),
+            cookie: None,
+            window,
+            counts,
+            stage: 0,
+            tag,
+            polling,
+            down_queued: false,
+            up_queued: false,
+            failed: false,
+            retiring: false,
+        });
+        let cookie = match source.AdviseSink(&ITfKeyTraceEventSink::IID, &sink) {
+            Ok(cookie) => cookie,
+            Err(error) => {
+                release_first_entry(shared);
+                return Err(error);
+            }
+        };
+        shared.borrow_mut().first_entry.as_mut().unwrap().cookie = Some(cookie);
+        let authority = lease(shared, r, generation, &context);
+        if authority.is_err()
+            || windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() != window
+            || !first_entry_admitted(&shared.borrow(), tag)
+        {
+            retire_first_entry(shared);
+            release_first_entry(shared);
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        if let Err(error) = send_entry_notice(true, tag) {
+            // SendInput accepted no event, so there is no queued notice to drain.
+            release_first_entry(shared);
+            return Err(error);
+        }
+        shared
+            .borrow_mut()
+            .first_entry
+            .as_mut()
+            .unwrap()
+            .down_queued = true;
+        Ok(())
+    }
+}
+fn retire_first_entry(shared: &Shared) {
+    let mut state = shared.borrow_mut();
+    let generation = state.first_entry.as_mut().map(|entry| {
+        entry.retiring = true;
+        entry.generation
+    });
+    if generation == Some(state.generation) {
+        state.generation = next_generation();
+    }
+}
+fn release_first_entry(shared: &Shared) {
+    let subscription = shared
+        .borrow()
+        .first_entry
+        .as_ref()
+        .map(|entry| (entry.source.clone(), entry.cookie, entry.polling.clone()));
+    let Some((source, cookie, token)) = subscription else {
+        return;
+    };
+    // Do not report an idle engine while a callback subscription remains live.
+    if let Some(cookie) = cookie
+        && unsafe { source.UnadviseSink(cookie) }.is_err()
+    {
+        return;
+    }
+    let entry = {
+        let mut state = shared.borrow_mut();
+        if state
+            .first_entry
+            .as_ref()
+            .is_some_and(|e| Rc::ptr_eq(&e.polling, &token))
+        {
+            state.first_entry.take()
+        } else {
+            None
+        }
+    };
+    if let Some(entry) = entry {
+        #[cfg(feature = "acceptance")]
+        if let Ok(path) = std::env::var("SAYWEAVE_FIRST_ENTRY_REPORT") {
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+            {
+                let row = serde_json::json!({"process":std::process::id(),"counts":entry.counts.get(),"tag":entry.tag,"stage":entry.stage,"upQueued":entry.up_queued,"now":unsafe{GetTickCount64()},"deadline":entry.request.deadline_tick,"window":entry.window.0 as usize});
+                let _ = writeln!(file, "{row}");
+            }
+        }
+        drop(entry);
+    }
+}
+fn first_entry_pending(state: &State) -> bool {
+    state.first_entry.is_some()
+}
+fn poll_first_entry(shared: &Shared) {
+    if CALLBACKS.load(Ordering::Acquire) != 0 || shared.borrow().text_notifications.depth.get() != 0
+    {
+        return;
+    }
+    let row = {
+        let state = shared.borrow();
+        state.first_entry.as_ref().map(|e| {
+            (
+                e.request.clone(),
+                e.context.clone(),
+                e.client,
+                e.edit.clone(),
+                e.generation,
+                e.connection,
+                e.tag,
+                e.window,
+                e.polling.clone(),
+            )
+        })
+    };
+    let Some((r, context, client, edit, generation, connection, tag, window, polling)) = row else {
+        return;
+    };
+    if polling.replace(true) {
+        return;
+    }
+    let _poll = EntryPoll(polling);
+    let pending = || {
+        shared.borrow().pending.as_ref().is_some_and(|p| {
+            p.task == r.task
+                && p.turn == r.turn
+                && p.operation == r.operation
+                && p.revision == r.revision
+                && p.connection == connection
+                && p.capability == r.capability
+        })
+    };
+    let reject = |code: &str| {
+        let mutation = if shared.borrow().pending.as_ref().is_some_and(|p| p.started) {
+            Mutation::Uncertain
+        } else {
+            Mutation::NotAttempted
+        };
+        complete(shared, &r, connection, false, code, mutation, None);
+        let owns = {
+            let state = shared.borrow();
+            state.generation == generation
+                && state.version.task == r.task
+                && state.version.turn == r.turn
+        };
+        retire_first_entry(shared);
+        if owns {
+            end_owned(shared);
+        }
+    };
+    // The original operation budget also covers lock-query failure and an edit
+    // session which was queued but never called back. Neither restarts it.
+    if !r.live(unsafe { GetTickCount64() }) && pending() {
+        reject("firstInputDeadline");
+    }
+    let initial = shared
+        .borrow()
+        .first_entry
+        .as_ref()
+        .map(|e| (e.stage, e.retiring));
+    if initial == Some((0, false)) {
+        if !pending() {
+            retire_first_entry(shared);
+        } else if unsafe {
+            context
+                .InWriteSession(client)
+                .map(|v| v.as_bool())
+                .unwrap_or(true)
+        } {
+            return;
+        } else {
+            #[cfg(feature = "acceptance")]
+            let mut lease_phase = "initial";
+            #[cfg(feature = "acceptance")]
+            let authority = lease_with_phase(shared, &r, generation, &context, &mut lease_phase);
+            #[cfg(not(feature = "acceptance"))]
+            let authority = lease(shared, &r, generation, &context);
+            // lease/QueryInterface can reenter. Only this exact, still-admitted
+            // transaction may cross from waiting into the original edit.
+            let admitted = first_entry_admitted(&shared.borrow(), tag);
+            // Preserve the original short-circuit order; no diagnostic COM
+            // query may run after a refusal and report a later state.
+            let focus_same = if authority.is_ok() && admitted {
+                Some(unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() } == window)
+            } else {
+                None
+            };
+            if authority.is_err() || !admitted || focus_same == Some(false) {
+                #[cfg(feature = "acceptance")]
+                {
+                    let state = shared.borrow();
+                    let entry = state.first_entry.as_ref();
+                    let detail = format!(
+                        "firstInputQueueLease phase={lease_phase} hr={:08x} admitted={admitted} focus={focus_same:?} active={} connected={} cleanup={} generation={} connection={} tag={} pending={} remaining={}",
+                        authority.as_ref().err().map_or(0, |e| e.code().0 as u32),
+                        state.active,
+                        state.connected,
+                        state.cleanup,
+                        state.generation == generation,
+                        state.connection == connection,
+                        entry.is_some_and(|e| e.tag == tag && !e.retiring && e.stage == 0),
+                        state.pending.as_ref().is_some_and(|p| p.task == r.task
+                            && p.turn == r.turn
+                            && p.operation == r.operation
+                            && p.revision == r.revision
+                            && p.connection == connection
+                            && p.capability == r.capability),
+                        r.deadline_tick.saturating_sub(unsafe { GetTickCount64() }),
+                    );
+                    drop(state);
+                    reject(&detail);
+                }
+                #[cfg(not(feature = "acceptance"))]
+                reject("firstInputQueueLease");
+            } else {
+                let traced = shared.borrow().first_entry.as_ref().unwrap().counts.get()[0] != 0;
+                if traced {
+                    #[cfg(feature = "acceptance")]
+                    if std::env::var_os("SAYWEAVE_FIRST_ENTRY_PAUSE")
+                        .is_some_and(|path| std::path::Path::new(&path).is_file())
+                    {
+                        return;
+                    }
+                    {
+                        let mut state = shared.borrow_mut();
+                        if !first_entry_admitted(&state, tag)
+                            || !r.live(unsafe { GetTickCount64() })
+                        {
+                            return;
+                        }
+                        state.first_entry.as_mut().unwrap().stage = 1;
+                    }
+                    let result = unsafe {
+                        request_native_edit(
+                            &context,
+                            client,
+                            &edit,
+                            TF_ES_ASYNCDONTCARE | TF_ES_READWRITE,
+                        )
+                    }
+                    .and_then(|h| h.ok());
+                    if let Err(error) = result
+                        && pending()
+                    {
+                        reject(&format!("firstInputRequest:{:08x}", error.code().0 as u32));
+                    }
+                } else if !r.live(unsafe { GetTickCount64() }) {
+                    reject("firstInputTraceTimeout");
+                } else {
+                    return;
+                }
+            }
+        }
+    }
+    let pending = pending();
+    let release = {
+        let state = shared.borrow();
+        state
+            .first_entry
+            .as_ref()
+            .filter(|e| e.tag == tag)
+            .map(|e| (e.retiring || !pending, e.down_queued, e.up_queued, e.failed))
+    };
+    let Some((true, down_queued, up_queued, failed)) = release else {
+        return;
+    };
+    if failed {
+        return;
+    }
+    if down_queued && !up_queued {
+        if send_entry_notice(false, tag).is_err() {
+            if !r.live(unsafe { GetTickCount64() }) {
+                let mut state = shared.borrow_mut();
+                state.first_entry.as_mut().unwrap().failed = true;
+                state.key_failure = true;
+            }
+            return;
+        }
+        shared.borrow_mut().first_entry.as_mut().unwrap().up_queued = true;
+    }
+    // Queue acceptance is not completion of this native key transaction. Keep
+    // its existing trace until the matching nonce Up is observed, or the
+    // original deadline/cancellation retires it. This does not delay or change
+    // the already completed write receipt, and Up never grants write authority.
+    #[cfg(feature = "acceptance")]
+    let wait_for_up = std::env::var_os("SAYWEAVE_FIRST_ENTRY_EARLY_RELEASE").as_deref()
+        != Some(std::ffi::OsStr::new("1"));
+    #[cfg(not(feature = "acceptance"))]
+    let wait_for_up = true;
+    if wait_for_up
+        && r.live(unsafe { GetTickCount64() })
+        && shared
+            .borrow()
+            .first_entry
+            .as_ref()
+            .is_some_and(|entry| !entry.retiring && entry.counts.get()[1] == 0)
+    {
+        return;
+    }
+    // The actual subscription must be gone before its local resources retire.
+    release_first_entry(shared);
+    if !r.live(unsafe { GetTickCount64() }) && first_entry_pending(&shared.borrow()) {
+        let mut state = shared.borrow_mut();
+        state.first_entry.as_mut().unwrap().failed = true;
+        state.key_failure = true;
+    }
+}
+
 fn drain_text_watches(shared: &Shared) {
     let (notifications, bridges) = {
         let mut state = shared.borrow_mut();
         if state.text_notifications.depth.get() != 0 {
+            return;
+        }
+        if first_entry_pending(&state) {
             return;
         }
         (
@@ -2276,7 +2863,6 @@ fn release_composition_with_failure(
         s.materialize_allowed = false;
         s.own_change = None;
         s.empty_range = None;
-        s.prepared = None;
         s.native_position = None;
         s.native_context = None;
         s.key_failure = semantic_failed;
@@ -2297,6 +2883,7 @@ fn release_composition_with_failure(
             s.observation_tail.take(),
             s.observation_original.take(),
             s.prefix_end.take(),
+            s.prepared.take(),
         )
     };
     // Settle must terminate when editing retires its gap, even if its queued
@@ -2355,6 +2942,13 @@ fn end_owned(shared: &Shared) {
     end_owned_with_flags(shared, flags);
 }
 fn end_owned_with_flags(shared: &Shared, flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS) -> bool {
+    end_owned_with_source(shared, flags, None)
+}
+fn end_owned_with_source(
+    shared: &Shared,
+    flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS,
+    first_source: Option<block_tracking::FirstSourceClaim>,
+) -> bool {
     let writing_epoch = {
         let state = shared.borrow();
         state
@@ -2378,6 +2972,9 @@ fn end_owned_with_flags(shared: &Shared, flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS) -
         release_composition(shared, epoch, None);
         return true;
     }
+    // Carry only the exact receipt claimed before this key revoked one lease.
+    // No later generation/lease is allowed to revalidate an expired receipt.
+    let first_source = first_source.filter(|claim| claim.after_revoke(shared));
     let (data, backup) = {
         let mut s = shared.borrow_mut();
         if s.cleanup {
@@ -2396,12 +2993,19 @@ fn end_owned_with_flags(shared: &Shared, flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS) -
             s.cleanup_id = next_generation();
         }
         let data = data.map(|(context, composition, client, epoch)| {
-            (context, composition, client, epoch, s.cleanup_id)
+            (
+                context,
+                composition,
+                client,
+                epoch,
+                s.cleanup_id,
+                s.generation,
+            )
         });
         (data, backup)
     };
     drop(backup);
-    if let Some((context, composition, client, epoch, cleanup_id)) = data {
+    if let Some((context, composition, client, epoch, cleanup_id, generation)) = data {
         unsafe {
             let edit: ITfEditSession = EndOwned {
                 state: shared.clone(),
@@ -2409,6 +3013,7 @@ fn end_owned_with_flags(shared: &Shared, flags: TF_CONTEXT_EDIT_CONTEXT_FLAGS) -
                 composition,
                 epoch,
                 cleanup_id,
+                first_source: first_source.map(|claim| claim.bind(generation, cleanup_id)),
                 _lease: Lease::new(),
             }
             .into();
@@ -2642,6 +3247,12 @@ struct KeySink {
 }
 impl KeySink {
     fn owns_key(&self, context: Ref<ITfContext>, key: WPARAM) -> Option<Shared> {
+        // This is our first-write notification, not a user's editing key.
+        if key.0 == 0xe5
+            && unsafe { GetMessageExtraInfo().0 as usize } & FIRST_ENTRY_MASK == FIRST_ENTRY_FAMILY
+        {
+            return None;
+        }
         if matches!(key.0, 0x10..=0x14 | 0x1b | 0x5b..=0x5c | 0xa0..=0xa5) {
             return None;
         }
@@ -2701,6 +3312,7 @@ impl ITfKeyEventSink_Impl for KeySink_Impl {
     ) -> windows::core::Result<BOOL> {
         let _callback = Callback::enter();
         if let Some(shared) = self.owns_key(context, key) {
+            let first_source = block_tracking::claim_first_source(&shared);
             block_tracking::revoke(&shared);
             if matches!(key.0, 0x59 | 0x5a)
                 && unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) < 0 }
@@ -2708,7 +3320,7 @@ impl ITfKeyEventSink_Impl for KeySink_Impl {
                 block_tracking::invalidate(&shared, "blockUndoRedo");
             }
             let observation = prepare_key_observation(&shared);
-            let ended = end_owned_with_flags(&shared, TF_ES_SYNC);
+            let ended = end_owned_with_source(&shared, TF_ES_SYNC, first_source);
             shared.borrow_mut().key_handoff = ended;
             if let Some(request) = observation {
                 let connection = shared.borrow().connection;
@@ -2774,6 +3386,7 @@ struct EndOwned {
     composition: ITfComposition,
     epoch: u64,
     cleanup_id: u64,
+    first_source: Option<Rc<block_tracking::FirstSourceHandoff>>,
     _lease: Lease,
 }
 impl ITfEditSession_Impl for EndOwned_Impl {
@@ -2807,10 +3420,29 @@ impl ITfEditSession_Impl for EndOwned_Impl {
             Err(failure(TF_E_DISCONNECTED))
         };
         guard()?;
+        if let Some(context) = &self.context
+            && semantic.is_ok()
+        {
+            unsafe {
+                block_tracking::probe_handoff(
+                    &self.state,
+                    context,
+                    &self.composition,
+                    ec,
+                    &guard,
+                    self.first_source.as_ref(),
+                );
+            }
+            guard()?;
+        }
         let protected = block_tracking::end_guard(&self.state);
         let before = unsafe { protected.as_ref().map_or(Ok(()), |guard| guard.check(ec)) };
         let result = unsafe { self.composition.EndComposition(ec) };
         let after = unsafe { protected.as_ref().map_or(Ok(()), |guard| guard.check(ec)) };
+        #[cfg(feature = "acceptance")]
+        if result.is_ok() && before.is_ok() && after.is_ok() {
+            unsafe { block_tracking::sample_after_handoff(&self.state) };
+        }
         let semantic = semantic.and(before).and(after);
         if result.is_ok() {
             release_composition_with_failure(
@@ -2864,6 +3496,7 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
         let Some((context, generation)) = binding else {
             return Ok(());
         };
+        let first_source = block_tracking::claim_first_host_source(&self.state);
         let protected = block_tracking::end_guard(&self.state);
         let protected_before =
             unsafe { protected.as_ref().map_or(Ok(()), |guard| guard.check(ec)) };
@@ -2887,6 +3520,19 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
                     Ok(())
                 }
             });
+            // A host-ended composition needs the same receipt-proven readonly
+            // handoff as EndOwned, before materialization can refresh its range.
+            // This does not acquire a writer lease or veto the user's action.
+            unsafe {
+                block_tracking::probe_handoff(
+                    &self.state,
+                    &context,
+                    composition,
+                    ec,
+                    &guard,
+                    first_source.as_ref(),
+                );
+            }
             semantic = materialize(
                 &self.state,
                 &context,
@@ -3376,6 +4022,12 @@ impl ITfEditSession_Impl for Edit_Impl {
                     }
                     state.block_reply = None;
                 }
+                let origin = self
+                    .state
+                    .borrow()
+                    .prepared
+                    .as_ref()
+                    .and_then(|p| p.origin.clone());
                 apply(
                     &self.state,
                     &self.context,
@@ -3396,6 +4048,8 @@ impl ITfEditSession_Impl for Edit_Impl {
                             self.connection,
                             self.generation,
                             ec,
+                            origin,
+                            mutation,
                         )?
                     };
                     self.state.borrow_mut().block_reply = Some(snapshot);
@@ -3942,6 +4596,12 @@ fn write_composing(
         let tracking = block_tracking::owned_update(shared, context, range, ec)?.map(Rc::new);
         lease(shared, r, generation, context)?;
         *phase = "updateText";
+        block_tracking::observe_client_coordinates(
+            shared,
+            context,
+            ec,
+            &mutation_guard(shared, r, generation, epoch, context),
+        );
         let text = CompositionText::new(text);
         let (write_shared, write_request, write_range, write_tracking, marked) = (
             shared.clone(),
@@ -3950,24 +4610,40 @@ fn write_composing(
             tracking.clone(),
             text.marked.clone(),
         );
-        guarded_mutation(
-            shared,
-            context,
-            mutation,
-            mutation_guard(shared, r, generation, epoch, context),
-            move |attempted| {
-                if write_tracking.as_ref().is_some_and(|t| !t.arm()) {
-                    return Err(failure(TF_E_DISCONNECTED));
-                }
-                start_effect(&write_shared, &write_request)?;
-                attempted.set(true);
-                write_range.SetText(
-                    ec,
-                    TF_ST_CORRECTION,
-                    &marked.encode_utf16().collect::<Vec<_>>(),
-                )
-            },
-        )?;
+        let write_guard = mutation_guard(shared, r, generation, epoch, context);
+        let write_guard: MutationGuard = {
+            let prepared = shared.borrow().prepared.clone();
+            if let Some(prepared) = prepared.filter(|p| p.origin.is_some()) {
+                let (guard_context, guard_shared, guard_request, base) =
+                    (context.clone(), shared.clone(), r.clone(), write_guard);
+                Rc::new(move || {
+                    prepared.origin.as_ref().unwrap().before_write();
+                    if range_position(&guard_context, &prepared.range, ec)? != prepared.position
+                        || range_position(&guard_context, &selection(&guard_context, ec)?, ec)?
+                            != prepared.position
+                        || !range_text(&prepared.range, ec)?.is_empty()
+                    {
+                        return Err(failure(TF_E_DISCONNECTED));
+                    }
+                    base()?;
+                    edit_identity(&guard_shared, &guard_request, generation, epoch)
+                })
+            } else {
+                write_guard
+            }
+        };
+        guarded_mutation(shared, context, mutation, write_guard, move |attempted| {
+            if write_tracking.as_ref().is_some_and(|t| !t.arm()) {
+                return Err(failure(TF_E_DISCONNECTED));
+            }
+            start_effect(&write_shared, &write_request)?;
+            attempted.set(true);
+            write_range.SetText(
+                ec,
+                TF_ST_CORRECTION,
+                &marked.encode_utf16().collect::<Vec<_>>(),
+            )
+        })?;
         *phase = "updateAttributes";
         preserve_attributes(shared, context, range, r, generation, epoch, ec)?;
         *phase = "updateReadback";
@@ -4033,6 +4709,18 @@ fn write_composing(
             tracking.follow(context, range, ec, || lease(shared, r, generation, context))?;
         }
         lease(shared, r, generation, context)?;
+        block_tracking::remember_client_write(shared, r.operation);
+        block_tracking::complete_client_write(
+            shared,
+            context,
+            ec,
+            r.operation,
+            &mutation_guard(shared, r, generation, epoch, context),
+        );
+        // Optional provider COM may reenter. Its failure alone cannot undo the
+        // native effect, but a superseded request must never publish applied.
+        lease(shared, r, generation, context)?;
+        edit_identity(shared, r, generation, epoch)?;
         if advance {
             shared.borrow_mut().version.applied(r);
         }
@@ -4222,12 +4910,13 @@ fn apply_prepared(
             let _ = next.EndComposition(ec);
             return Err(error);
         }
-        {
+        let retired_prepared = {
             let mut s = shared.borrow_mut();
             s.composition = Some(next.clone());
-            s.prepared = None;
             s.materialize_allowed = true;
-        }
+            s.prepared.take()
+        };
+        drop(retired_prepared);
         if r.action == Action::Settle {
             settle_prefix(
                 shared,
@@ -4322,6 +5011,74 @@ fn apply(
             let mut fetched = 0;
             enumerator.Next(&mut compositions, &mut fetched)?;
             if fetched != 0 {
+                #[cfg(feature = "acceptance")]
+                {
+                    // Capture the object that actually blocks Begin. A submit
+                    // key event and a remaining TSF view are separate facts.
+                    let evidence = (|| -> windows::core::Result<String> {
+                        let view = compositions[0].as_ref().ok_or_else(|| failure(E_POINTER))?;
+                        let owner = view.GetOwnerClsid();
+                        let foreign = view.GetRange();
+                        let position = foreign.as_ref().map_err(Clone::clone).and_then(|foreign| range_position(context, foreign, ec));
+                        let selected = range_position(context, &range, ec);
+                        let owned = shared.borrow().composition.clone();
+                        let owned_view = owned.as_ref().and_then(|owned| owned.cast::<ITfCompositionView>().ok());
+                        let profile = (|| -> windows::core::Result<String> {
+                            let profiles: ITfInputProcessorProfileMgr = CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)?;
+                            let mut profile = TF_INPUTPROCESSORPROFILE::default();
+                            profiles.GetActiveProfile(&GUID_TFCAT_TIP_KEYBOARD, &mut profile)?;
+                            Ok(format!("{:?}/{:?}/{}", profile.clsid, profile.guidProfile, profile.dwProfileType))
+                        })();
+                        let composing = (|| -> windows::core::Result<String> {
+                            let foreign = foreign.as_ref().map_err(Clone::clone)?;
+                            let property = context.GetProperty(&GUID_PROP_COMPOSING)?;
+                            let value = property.GetValue(ec, foreign)?;
+                            Ok(format!("{}/{:?}", value.vt().0, i32::try_from(&value).ok()))
+                        })();
+                        let position = position.map(|p| (p.start, p.end));
+                        let selected = selected.map(|p| (p.start, p.end));
+                        let same_context = foreign.as_ref().map_err(Clone::clone).and_then(|foreign| foreign.GetContext()).map(|owner| owner == *context);
+                        Ok(format!("begin_blocker_owner={owner:?} same_owned={} same_context={same_context:?} range={position:?} selection={selected:?} composing={composing:?} keyboard={profile:?}", owned_view.as_ref() == Some(view)))
+                    })().unwrap_or_else(|error| format!("begin_blocker_probe_error={:08x}", error.code().0 as u32));
+                    shared.borrow_mut().selection_probe =
+                        Some((r.task.clone(), r.turn, r.operation, evidence));
+                }
+                #[cfg(feature = "acceptance")]
+                if std::env::var("SAYWEAVE_ACTOR_NATIVE_UI_PROBE").as_deref() == Ok("1")
+                    && std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID")
+                        .is_ok_and(|id| uuid::Uuid::parse_str(&id).is_ok())
+                {
+                    let probe = (|| -> windows::core::Result<()> {
+                        let ui: ITfUIElementMgr = manager.cast()?;
+                        let elements = ui.EnumUIElements()?;
+                        for _ in 0..16 {
+                            let mut next = [None];
+                            let mut fetched = 0;
+                            elements.Next(&mut next, &mut fetched)?;
+                            if fetched == 0 {
+                                break;
+                            }
+                            let element = next[0].as_ref().ok_or_else(|| failure(E_POINTER))?;
+                            let list = element.cast::<ITfCandidateListUIElement>();
+                            // These are independent IUnknown capabilities; absence
+                            // of the candidate-list interface cannot skip either QI.
+                            let behavior = element.cast::<ITfCandidateListUIElementBehavior>();
+                            let exact = element.cast::<ITfIntegratableCandidateListUIElement>();
+                            eprintln!(
+                                "owned_native_ui_capability guid={:?} list={} behavior={} exact={} original_document={}",
+                                element.GetGUID(),
+                                list.is_ok(),
+                                behavior.is_ok(),
+                                exact.is_ok(),
+                                list.as_ref().is_ok_and(|list| list
+                                    .GetDocumentMgr()
+                                    .is_ok_and(|document| document == native.document))
+                            );
+                        }
+                        Ok(())
+                    })();
+                    eprintln!("owned_native_ui_capability result={probe:?}");
+                }
                 return Err(failure(TF_E_LOCKED));
             }
             {
@@ -4439,10 +5196,37 @@ fn apply(
             }
             let original_selection = range.Clone()?;
             let native_position = native_edit_position(context)?;
+            let (origin, _origin_note) = if expected.is_empty() {
+                let mut origin_phase = "initial";
+                let mut origin_detail = String::new();
+                match initial_selection::ParagraphOrigin::capture(
+                    context,
+                    ec,
+                    &mut origin_phase,
+                    &mut origin_detail,
+                ) {
+                    Ok(origin) => {
+                        let note = format!("captured.{}", origin.baseline_kind());
+                        (Some(Rc::new(origin)), note)
+                    }
+                    Err(error) => (
+                        None,
+                        format!(
+                            "{:08x}:{origin_phase}:{origin_detail}",
+                            error.code().0 as u32
+                        ),
+                    ),
+                }
+            } else {
+                (None, "disabled".into())
+            };
             let prepared = Some(PreparedSelection {
                 range: range.Clone()?,
                 position: range_position(context, &range, ec)?,
                 writing: false,
+                origin,
+                #[cfg(feature = "acceptance")]
+                origin_note: _origin_note,
             });
             lease(shared, r, generation, context)?;
             let epoch = COMPOSITION_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
@@ -4485,7 +5269,7 @@ fn apply(
                 .or_else(|| (!expected.is_empty()).then(|| expected.clone()))
                 .map(Rc::<str>::from);
             s.composition = None;
-            s.prepared = prepared;
+            let retired_prepared = std::mem::replace(&mut s.prepared, prepared);
             s.preserved_attributes.clear();
             s.backup = Some(Rollback::OriginalSelection(backup, original_semantic));
             s.context = Some(context.clone());
@@ -4497,6 +5281,8 @@ fn apply(
             s.native_position = native_position;
             s.text_cookie = Some(cookie);
             s.version.applied(r);
+            drop(s);
+            drop(retired_prepared);
             return Ok(());
         }
         // Standard EDIT can expose an empty TSF range even while its native
@@ -4926,6 +5712,165 @@ pub extern "system" fn DllCanUnloadNow() -> HRESULT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn first_entry_trace_cannot_accept_another_nonce_or_key() {
+        struct RestoreExtra(LPARAM);
+        impl Drop for RestoreExtra {
+            fn drop(&mut self) {
+                unsafe { SetMessageExtraInfo(self.0) };
+            }
+        }
+        let counts = Rc::new(Cell::new([0, 0]));
+        let tag = FIRST_ENTRY_FAMILY | 37;
+        let sink: ITfKeyTraceEventSink = EntryTrace {
+            counts: counts.clone(),
+            tag,
+            _lease: Lease::new(),
+        }
+        .into();
+        unsafe {
+            let _restore = RestoreExtra(SetMessageExtraInfo(LPARAM((tag ^ 1) as isize)));
+            sink.OnKeyTraceDown(WPARAM(0xe5), LPARAM(0)).unwrap();
+            sink.OnKeyTraceUp(WPARAM(0xe5), LPARAM(0)).unwrap();
+            assert_eq!(counts.get(), [0, 0]);
+            SetMessageExtraInfo(LPARAM(tag as isize));
+            sink.OnKeyTraceUp(WPARAM(0x12), LPARAM(0)).unwrap();
+            assert_eq!(counts.get(), [0, 0]);
+            sink.OnKeyTraceDown(WPARAM(0xe5), LPARAM(0)).unwrap();
+            assert_eq!(counts.get(), [1, 0]);
+            sink.OnKeyTraceUp(WPARAM(0xe5), LPARAM(0)).unwrap();
+            assert_eq!(counts.get(), [1, 1]);
+        }
+    }
+
+    #[implement(ITfSource)]
+    struct EntryTestSource {
+        fail: Rc<Cell<bool>>,
+        releases: Rc<Cell<u32>>,
+    }
+    impl ITfSource_Impl for EntryTestSource_Impl {
+        fn AdviseSink(&self, _: *const GUID, _: Ref<IUnknown>) -> windows::core::Result<u32> {
+            Err(failure(E_NOTIMPL))
+        }
+        fn UnadviseSink(&self, cookie: u32) -> windows::core::Result<()> {
+            assert_eq!(cookie, 41);
+            self.releases.set(self.releases.get() + 1);
+            if self.fail.get() {
+                Err(failure(E_FAIL))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[implement(ITfEditSession)]
+    struct EntryTestEdit;
+    impl ITfEditSession_Impl for EntryTestEdit_Impl {
+        fn DoEditSession(&self, _: u32) -> windows::core::Result<()> {
+            panic!("completed first write must not be repeated while awaiting Up")
+        }
+    }
+
+    #[test]
+    fn missing_first_entry_up_obeys_deadline_cancel_and_real_unadvise() {
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok().unwrap();
+            let result = (|| -> windows::core::Result<()> {
+                let manager: ITfThreadMgr =
+                    CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
+                let client = manager.Activate()?;
+                let document = manager.CreateDocumentMgr()?;
+                let mut context = None;
+                let mut cookie = 0;
+                document.CreateContext(client, 0, None, &mut context, &mut cookie)?;
+                let context = context.ok_or_else(|| failure(E_FAIL))?;
+                for cancel in [false, true] {
+                    for unadvise_fails in [false, true] {
+                        let fail = Rc::new(Cell::new(unadvise_fails));
+                        let releases = Rc::new(Cell::new(0));
+                        let source: ITfSource = EntryTestSource {
+                            fail: fail.clone(),
+                            releases: releases.clone(),
+                        }
+                        .into();
+                        let request = Request {
+                            revoke: None,
+                            block: None,
+                            engine: crate::wire::fixture_binding(),
+                            protocol: PROTOCOL,
+                            capability: uuid::Uuid::new_v4().to_string(),
+                            task: uuid::Uuid::new_v4().to_string(),
+                            turn: 1,
+                            operation: 2,
+                            revision: 1,
+                            deadline_tick: GetTickCount64() + 2000,
+                            action: Action::Update,
+                            text: "周三开会".into(),
+                            prefix: None,
+                        };
+                        let generation = next_generation();
+                        let shared = Rc::new(RefCell::new(State {
+                            generation,
+                            first_entry: Some(FirstEntry {
+                                request,
+                                context: context.clone(),
+                                client,
+                                edit: EntryTestEdit.into(),
+                                generation,
+                                connection: 1,
+                                source,
+                                cookie: Some(41),
+                                window: HWND::default(),
+                                counts: Rc::new(Cell::new([1, 0])),
+                                stage: 1,
+                                tag: FIRST_ENTRY_FAMILY | 37,
+                                polling: Rc::new(Cell::new(false)),
+                                down_queued: true,
+                                up_queued: true,
+                                failed: false,
+                                retiring: false,
+                            }),
+                            ..Default::default()
+                        }));
+                        poll_first_entry(&shared);
+                        assert!(first_entry_pending(&shared.borrow()));
+                        assert_eq!(releases.get(), 0, "live request must await actual Up");
+                        if cancel {
+                            retire_first_entry(&shared);
+                            assert_ne!(shared.borrow().generation, generation);
+                        } else {
+                            shared
+                                .borrow_mut()
+                                .first_entry
+                                .as_mut()
+                                .unwrap()
+                                .request
+                                .deadline_tick = 0;
+                        }
+                        poll_first_entry(&shared);
+                        assert_eq!(releases.get(), 1);
+                        assert_eq!(first_entry_pending(&shared.borrow()), unadvise_fails);
+                        if unadvise_fails {
+                            assert_eq!(
+                                shared.borrow().first_entry.as_ref().unwrap().cookie,
+                                Some(41)
+                            );
+                            fail.set(false);
+                            release_first_entry(&shared);
+                            assert_eq!(releases.get(), 2);
+                            assert!(!first_entry_pending(&shared.borrow()));
+                        }
+                        assert!(shared.borrow().pending.is_none());
+                        assert!(!shared.borrow().version.owned);
+                    }
+                }
+                manager.Deactivate()?;
+                Ok(())
+            })();
+            CoUninitialize();
+            result.unwrap();
+        }
+    }
+
     #[test]
     fn cancel_version_precedes_reentrant_range_retirement() {
         let old = uuid::Uuid::new_v4().to_string();
@@ -5445,6 +6390,7 @@ mod tests {
             composition,
             epoch: 7,
             cleanup_id: 42,
+            first_source: None,
             _lease: Lease::new(),
         }
         .into();
@@ -5473,6 +6419,7 @@ mod tests {
             composition,
             epoch: 7,
             cleanup_id: 42,
+            first_source: None,
             _lease: Lease::new(),
         }
         .into();
@@ -5499,6 +6446,7 @@ mod tests {
             composition: old,
             epoch: 7,
             cleanup_id: 42,
+            first_source: None,
             _lease: Lease::new(),
         }
         .into();
@@ -5521,6 +6469,7 @@ mod tests {
             composition: composition.clone(),
             epoch: 7,
             cleanup_id: 0,
+            first_source: None,
             _lease: Lease::new(),
         }
         .into();

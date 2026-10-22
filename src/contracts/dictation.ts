@@ -19,6 +19,7 @@ export function inputMessage(code:string|null):string {return ({shortcutConflict
 
 export function dictationPhase(snapshot:DictationSnapshot,phase:Phase,speech:Pick<SpeechSnapshot,'taskId'|'text'>):Phase {
  if(snapshot.source==='external'&&snapshot.presentation==='idle')return 'idle';
+ if(snapshot.source==='external'&&snapshot.presentation==='preparing')return 'connecting';
  if(snapshot.source==='external'&&['recording','editing','resuming'].includes(snapshot.presentation))return 'recording';
  if(snapshot.source==='external'&&['recognizing','delivering'].includes(snapshot.presentation))return 'processing';
  if(snapshot.source==='external'&&snapshot.presentation==='completed')return 'completed';

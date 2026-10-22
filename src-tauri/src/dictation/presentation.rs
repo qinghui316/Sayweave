@@ -43,6 +43,20 @@ pub fn speech_presentation(phase: Phase, stop: u8) -> Option<Presentation> {
     }
 }
 
+pub fn live_presentation(
+    phase: Phase,
+    stop: u8,
+    draft: Option<Presentation>,
+) -> Option<Presentation> {
+    match phase {
+        // A Draft's network readiness is not microphone readiness. Only the
+        // SpeechService owner publishes Recording after Capture::wait_ready.
+        Phase::Connecting if stop == 0 => Some(Presentation::Preparing),
+        Phase::Recording if stop == 0 => Some(draft.unwrap_or(Presentation::Recording)),
+        _ => speech_presentation(phase, stop),
+    }
+}
+
 pub fn final_presentation(
     absent_target: bool,
     text: &str,

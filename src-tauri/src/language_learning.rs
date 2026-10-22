@@ -526,6 +526,99 @@ pub(crate) fn edit_messages(
     let input = serde_json::json!({"before":before,"after":after,"raw_excerpt":evidence.raw.chars().take(512).collect::<String>(),"raw_excerpt_complete":evidence.raw.chars().count()<=512,"application":evidence.application,"related":related});
     messages(EDIT_RULES, &input)
 }
+#[cfg(test)]
+pub(crate) async fn classify_observed_fixture(
+    data: &DataWorker,
+    evidence: EditEvidence,
+) -> Result<serde_json::Value, String> {
+    use crate::{
+        contracts::dictionary::{Kind, Query, Source},
+        models::provider::tests::{Fixture, Reply},
+    };
+    let correction = [
+        ("SQLit", "SQLite"),
+        ("Seville", "Sayweave"),
+        ("Seville", "sayweave"),
+    ]
+    .into_iter()
+    .find(|(before, after)| evidence.before.contains(before) && evidence.after.contains(after));
+    let lexical = correction.is_some();
+    let handoff_edit = evidence.before == "项目使用SQLit" && evidence.after == "应用使用SQLit";
+    let deletion = evidence.before == "eville"
+        && evidence.before.starts_with(&evidence.after)
+        && evidence.after.len() < evidence.before.len();
+    if !lexical && !handoff_edit && !deletion {
+        return Err(format!(
+            "owned lexical fixture correction differs: {:?} -> {:?}",
+            evidence.before, evidence.after
+        ));
+    }
+    let decision = if let Some((before, after)) = correction {
+        serde_json::json!({"class":"lexical","original":before,"term":after,"summary":null})
+    } else if deletion {
+        serde_json::json!({"class":"deletion","original":null,"term":null,"summary":null})
+    } else {
+        serde_json::json!({"class":"content","original":null,"term":null,"summary":null})
+    };
+    let body=serde_json::json!({"choices":[{"index":0,"message":{"role":"assistant","content":decision.to_string()},"finish_reason":"stop"}]}).to_string();
+    let fixture = Fixture::start(vec![Reply::json(200, &body)]);
+    let observed = serde_json::to_value(&evidence).map_err(|e| e.to_string())?;
+    let generator = &fixture;
+    classify_frozen(data, evidence, |messages, _| async move {
+        let generated = generator
+            .provider
+            .generate_unit(
+                &generator.input(),
+                "test-key",
+                &uuid::Uuid::new_v4().to_string(),
+                &messages,
+                tokio::time::Instant::now() + Duration::from_secs(3),
+            )
+            .await?;
+        Ok(AnalysisOutput {
+            text: generated.text,
+            analysis: AnalysisStamp {
+                config_id: "owned-native-observation".into(),
+                config_revision: 1,
+                model_id: "fixture".into(),
+                service_host: "localhost".into(),
+                template_version: "lexical-v1".into(),
+                strategy_version: "application-learning-v1".into(),
+            },
+        })
+    })
+    .await
+    .map_err(|e| e.code)?;
+    let Output::Page(page) = data
+        .request(
+            "main",
+            Operation::List(Query {
+                kind: Kind::Term,
+                search: String::new(),
+                page: 1,
+                source: Some(Source::Automatic),
+            }),
+        )
+        .await
+        .map_err(|e| e.code)?
+    else {
+        return Err("automatic term page absent".into());
+    };
+    let dictionary = crate::processing::prompt::DictionaryIndex::new(page.records.clone());
+    let prompt =
+        crate::processing::prompt::build_with_context("请检查这个配置", "", &dictionary, None, &[])
+            .map_err(|e| e.code)?;
+    let prompt = serde_json::to_string(&prompt.messages).map_err(|e| e.to_string())?;
+    let next_contains_term = correction.is_some_and(|(_, term)| {
+        dictionary.hotwords().iter().any(|word| word == term) && prompt.contains(term)
+    });
+    if lexical && !next_contains_term {
+        return Err("learned term absent from next input snapshot".into());
+    }
+    Ok(
+        serde_json::json!({"observed":observed,"class":decision["class"],"terms":page.records,"nextHotwords":dictionary.hotwords(),"nextPromptContainsTerm":next_contains_term,"classifierRequests":fixture.seen.lock().unwrap().len()}),
+    )
+}
 fn edit_blocks(before: &str, after: &str) -> (String, String) {
     use unicode_segmentation::UnicodeSegmentation;
     let before = before.graphemes(true).collect::<Vec<_>>();

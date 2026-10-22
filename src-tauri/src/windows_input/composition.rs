@@ -2,7 +2,7 @@
 use super::{Anchor, Delivery, DeliveryGate, Submission, Verification};
 use crate::history::types::Error;
 use sayweave_text_service::{
-    client::ProfileLease,
+    client::{self, ProfileLease, SpeechActivation},
     lifecycle::{ControlAction, ControlReply, ControlRequest, ReceiptKey},
     registration,
     transport::Pipe,
@@ -24,9 +24,11 @@ use tokio::sync::oneshot;
 use windows::Win32::{
     Foundation::*,
     System::{Com::*, SystemInformation::GetTickCount64},
-    UI::WindowsAndMessaging::*,
+    UI::{TextServices::*, WindowsAndMessaging::*},
 };
+use windows::core::{GUID, Interface};
 mod retirement;
+use super::learning_observation::{FieldObserver, OutputSeed};
 use retirement::{Retirement, WorkerCompletion};
 
 pub(crate) enum Command {
@@ -54,6 +56,11 @@ pub(crate) enum Command {
         oneshot::Sender<Result<Reply, Error>>,
     ),
     Observe(Arc<ObservationSink>, oneshot::Sender<bool>),
+    #[cfg(test)]
+    ObserveFieldFixture(Arc<ObservationSink>, oneshot::Sender<bool>),
+    #[cfg(test)]
+    InspectFixture(oneshot::Sender<Result<Reply, Error>>),
+    EndInput(oneshot::Sender<Result<bool, Error>>),
     Begin(u64, Anchor, oneshot::Sender<Result<(), Error>>),
     Finish(
         u64,
@@ -85,12 +92,32 @@ pub(crate) struct ObservationSink {
     pub emit: Arc<dyn Fn(crate::contracts::language::EditEvidence) + Send + Sync>,
 }
 impl ObservationSink {
-    fn allowed(&self) -> bool {
+    pub(super) fn allowed(&self) -> bool {
         self.control
             .live(&crate::contracts::language::LearningEligibility::capture(
                 &self.snapshot.settings,
             ))
             .any()
+    }
+    pub(super) fn emit_evidence(&self, mut evidence: crate::contracts::language::EditEvidence) {
+        use sha2::{Digest, Sha256};
+        if !self.allowed() {
+            return;
+        }
+        // Both readers describe the same delivered source. Native operation and
+        // polling sequence are not independent learning evidence.
+        let key = serde_json::to_vec(&(
+            &evidence.task,
+            evidence.turn,
+            &evidence.region,
+            &evidence.raw,
+            &evidence.before,
+            &evidence.after,
+            &evidence.eligibility,
+        ))
+        .expect("plain evidence identity serializes");
+        evidence.id = format!("correction:{:x}", Sha256::digest(key));
+        (self.emit)(evidence);
     }
 }
 struct SourceReceipt {
@@ -255,6 +282,24 @@ pub struct Draft {
     closed: AtomicBool,
     source_sequence: AtomicU64,
 }
+/// One authenticated worker, with or without an acknowledged initial range.
+/// A pending preparation owns no writable Draft.
+pub(crate) struct InitialInput {
+    pub connection: Arc<Connection>,
+    pub draft: Option<Arc<Draft>>,
+}
+impl InitialInput {
+    pub(crate) async fn observe(&self, sink: Arc<ObservationSink>) -> bool {
+        self.connection.observe(sink).await
+    }
+    pub(crate) async fn abort(self) {
+        if let Some(draft) = self.draft {
+            let _ = draft.finish(String::new(), Finish::Abort).await;
+        } else {
+            let _ = self.connection.close().await;
+        }
+    }
+}
 pub(crate) enum ReacquireOutcome {
     Ready {
         draft: Arc<Draft>,
@@ -276,6 +321,7 @@ pub(crate) fn block_refusal(reply: &Reply) -> BlockRefusal {
     if reply.mutation != Mutation::NotAttempted {
         BlockRefusal::Uncertain
     } else if reply.code.starts_with("blockAwaitingRepresentation:")
+        || reply.code.starts_with("blockAwaitingSelectionSync:")
         || reply.code.starts_with("blockInputMethodBusy:")
         || reply.code.starts_with("blockSnapshotChanged:")
         || reply.code.ends_with(":80040500")
@@ -294,6 +340,31 @@ pub(crate) struct Connection {
     retirement: Arc<Retirement>,
 }
 impl Connection {
+    /// Read existing owner facts without Block Read/Acquire or a profile change.
+    #[cfg(test)]
+    pub(crate) async fn inspect_fixture(&self) -> Result<Reply, Error> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .try_send(Command::InspectFixture(reply))
+            .map_err(|_| Error::new("compositionWorker"))?;
+        result.await.map_err(|_| Error::new("compositionWorker"))?
+    }
+    async fn observe(&self, sink: Arc<ObservationSink>) -> bool {
+        let (reply, result) = oneshot::channel();
+        if self.sender.try_send(Command::Observe(sink, reply)).is_err() {
+            return false;
+        }
+        result.await.unwrap_or(false)
+    }
+    /// Input has already been handed off and its block released. This command
+    /// never submits text; it transfers only a read-only observation lease.
+    pub(crate) async fn end_input(&self) -> Result<bool, Error> {
+        let (send, receive) = oneshot::channel();
+        self.sender
+            .try_send(Command::EndInput(send))
+            .map_err(|_| Error::new("compositionWorker"))?;
+        receive.await.map_err(|_| Error::new("compositionWorker"))?
+    }
     pub(crate) async fn reacquire_block(
         self: &Arc<Self>,
         turn: u64,
@@ -396,12 +467,33 @@ impl Draft {
             receiver,
         )
     }
+    #[cfg(any(test, feature = "desktop-acceptance"))]
     pub async fn begin(
         task: String,
         turn: u64,
         anchor: Anchor,
         gate: Arc<DeliveryGate>,
     ) -> Result<Arc<Self>, Error> {
+        Self::start(task, turn, anchor, gate, false)
+            .await?
+            .draft
+            .ok_or_else(|| Error::new("inputComposition"))
+    }
+    pub(crate) async fn prepare(
+        task: String,
+        turn: u64,
+        anchor: Anchor,
+        gate: Arc<DeliveryGate>,
+    ) -> Result<InitialInput, Error> {
+        Self::start(task, turn, anchor, gate, true).await
+    }
+    async fn start(
+        task: String,
+        turn: u64,
+        anchor: Anchor,
+        gate: Arc<DeliveryGate>,
+        allow_pending: bool,
+    ) -> Result<InitialInput, Error> {
         // Retire the previous read-only lease before acquiring the exclusive
         // activation. An old observer can never deactivate the next session.
         stop_observer_for(Some(&gate)).await?;
@@ -427,7 +519,7 @@ impl Draft {
                 let mut completion = WorkerCompletion::new(retirement);
                 let began = Instant::now();
                 let diagnostic_task = task.clone();
-                let mut host = match Host::open(task, turn, anchor, gate) {
+                let mut host = match Host::open(task, turn, anchor, gate, allow_pending) {
                     Ok(host) => host,
                     Err(error) => {
                         log::info!(target:"sayweave", "operation=draft_admission task_id={} turn={} result=rejected error={} elapsed_ms={}", diagnostic_task,turn,error.code,began.elapsed().as_millis());
@@ -437,11 +529,16 @@ impl Draft {
                     }
                 };
                 log::info!(target:"sayweave", "operation=draft_admission task_id={} turn={} result=ready elapsed_ms={}", diagnostic_task,turn,began.elapsed().as_millis());
-                if ready.send(Ok(())).is_err() {
+                if ready.send(Ok(host.range_open)).is_err() {
                     let _ = host.retire(&mut completion, "admissionAbandoned");
                     return;
                 }
                 loop {
+                    // Local evidence deadlines also run while recording. This
+                    // never calls UIA or waits for its reader apartment.
+                    if let Some(field) = &host.field_observer {
+                        field.poll_native();
+                    }
                     if completion.requested() {
                         let _ = host.retire(&mut completion, "closeRequested");
                         return;
@@ -457,6 +554,24 @@ impl Draft {
                             let _=reply.send(result);
                         },
                         Ok(Command::Observe(sink,reply))=>{let ready=host.observe(sink);let _=reply.send(ready);},
+                        #[cfg(test)]
+                        Ok(Command::ObserveFieldFixture(sink,reply))=>{host.supports_observation=false;let ready=host.observe(sink);let _=reply.send(ready);},
+                        #[cfg(test)]
+                        Ok(Command::InspectFixture(reply))=>{let _=reply.send(host.exchange_reply(Action::Inspect,"",None,true,None));},
+                        Ok(Command::EndInput(reply))=>{
+                            if host.range_open || host.block.is_some() {
+                                let _=reply.send(Err(Error::new("compositionCleanup")));
+                                continue;
+                            }
+                            if let Err(error)=host.acknowledge_receipt(){let _=reply.send(Err(error));continue;}
+                            if host.sink.as_ref().is_some_and(|s|s.allowed()) && let Some(connection)=weak_connection.upgrade() {
+                                host.retained_at=Some(Instant::now());
+                                if let Ok(mut retained)=RETAINED.lock(){*retained=Some(connection);}
+                                let _=reply.send(Ok(true));continue;
+                            }
+                            let result=host.retire(&mut completion,"inputFinished").map(|()|false);
+                            let _=reply.send(result);return;
+                        },
                         Ok(Command::Replace(turn,text,raw,permit,reply))=>{
                             let result=if turn==host.turn {host.update_guarded(&text,permit.as_deref())}else{Err(WriteFailure::not_attempted("staleSession"))};
                             if result.is_ok(){host.remember_tail(raw);}
@@ -474,14 +589,14 @@ impl Draft {
                             let outcome=if turn!=host.turn {PrefixOutcome {prefix:Mutation::NotAttempted,tail_owned:false,error:Some("staleSession".into())}}
                             else if !permit.load(Ordering::Acquire) {PrefixOutcome {prefix:Mutation::NotAttempted,tail_owned:false,error:Some("staleSnapshot".into())}}
                             else {host.settle(&prefix,&tail,&permit)};
-                            if outcome.prefix==Mutation::Changed&&let Some((prefix_source,tail_source))=source {host.remember_receipt(OutputRegion::Prefix,prefix_source);host.remember_tail(Some(tail_source));}
+                            if outcome.prefix==Mutation::Changed&&let Some((prefix_source,tail_source))=source {host.remember_receipt(OutputRegion::Prefix,prefix_source,&prefix);host.remember_tail(Some(tail_source));}
                             let _=reply.send(outcome);
                         },
                         Ok(Command::Begin(turn,anchor,reply))=>{let _=reply.send(host.begin_turn(turn,anchor));},
                         Ok(Command::Finish(turn,text,mode,raw,keep,reply))=>{
                             if turn!=host.turn {let _=reply.send(FinishOutcome::rejected("staleSession"));continue;}
                             let mut delivery=host.finish(&text,mode);
-                            if delivery.committed || delivery.handed_off {host.remember_receipt(OutputRegion::Tail,raw.or_else(||host.raw_tail.as_ref().map(|v|v.raw.clone())).unwrap_or_default());}
+                            if delivery.committed || delivery.handed_off {let text=host.text.clone();host.remember_receipt(OutputRegion::Tail,raw.or_else(||host.raw_tail.as_ref().map(|v|v.raw.clone())).unwrap_or_default(),&text);}
                             if keep {let _=reply.send(delivery);continue;}
                             if host.sink.is_some() && let Some(connection)=weak_connection.upgrade() {
                                 host.retained_at=Some(Instant::now());
@@ -502,16 +617,20 @@ impl Draft {
                 }
             })
             .map_err(|_| Error::new("compositionWorker"))?;
-        result
+        let range_ready = result
             .await
             .map_err(|_| Error::new("compositionWorker"))??;
-        Ok(Arc::new(Self {
-            connection,
-            turn,
-            closed: AtomicBool::new(false),
-            source_sequence: AtomicU64::new(0),
-        }))
+        let draft = range_ready.then(|| {
+            Arc::new(Self {
+                connection: connection.clone(),
+                turn,
+                closed: AtomicBool::new(false),
+                source_sequence: AtomicU64::new(0),
+            })
+        });
+        Ok(InitialInput { connection, draft })
     }
+    #[cfg(any(test, feature = "desktop-acceptance"))]
     pub(crate) fn connection(&self) -> Arc<Connection> {
         self.connection.clone()
     }
@@ -519,17 +638,22 @@ impl Draft {
     pub async fn replace(&self, sequence: u64, text: String) -> Result<(), Error> {
         self.replace_with_source(sequence, text, None).await
     }
+    #[cfg(feature = "desktop-acceptance")]
     pub async fn observe(&self, sink: Arc<ObservationSink>) -> bool {
-        let (reply, result) = oneshot::channel();
+        self.connection.observe(sink).await
+    }
+    #[cfg(test)]
+    pub(crate) async fn observe_field_fixture(&self, sink: Arc<ObservationSink>) -> bool {
+        let (send, receive) = oneshot::channel();
         if self
             .connection
             .sender
-            .try_send(Command::Observe(sink, reply))
+            .try_send(Command::ObserveFieldFixture(sink, send))
             .is_err()
         {
             return false;
         }
-        result.await.unwrap_or(false)
+        receive.await.unwrap_or(false)
     }
     pub async fn replace_with_source(
         &self,
@@ -716,6 +840,7 @@ struct Host {
     optional_disabled: bool,
     observer_reversal: u64,
     sink: Option<Arc<ObservationSink>>,
+    field_observer: Option<FieldObserver>,
     raw_tail: Option<SourceReceipt>,
     receipts: HashMap<(u64, u64, OutputRegion), SourceReceipt>,
     retained_at: Option<Instant>,
@@ -739,9 +864,12 @@ struct Host {
     visible: bool,
     failure: Option<String>,
     range_open: bool,
+    initial_pending: bool,
+    pending_focus: Option<super::native::PendingFocus>,
     /// Exact successful Settle that already ended an empty composition.
     settled_empty_revision: Option<u64>,
-    profile: ProfileLease,
+    // An already active speech profile belongs to the session, not this worker.
+    profile: Option<ProfileLease>,
     _lease: registration::HostLease,
     _apartment: Apartment,
 }
@@ -806,6 +934,9 @@ impl Host {
                 self.visible = true;
                 self.failure = None;
                 self.settled_empty_revision = None;
+                if let Some(sink) = self.sink.clone() {
+                    let _ = self.observe(sink);
+                }
             }
         }
         Ok(reply)
@@ -821,16 +952,21 @@ impl Host {
         result
     }
     fn remember_tail(&mut self, raw: Option<String>) {
+        if let Some(raw) = &raw {
+            let text = self.text.clone();
+            self.remember_field(OutputRegion::Tail, raw, &text);
+        }
         self.raw_tail = raw.map(|raw| SourceReceipt {
             operation: self.operation,
             revision: self.revision,
             raw,
         });
     }
-    fn remember_receipt(&mut self, region: OutputRegion, raw: String) {
+    fn remember_receipt(&mut self, region: OutputRegion, raw: String, text: &str) {
         if raw.is_empty() || self.receipts.len() >= 16 {
             return;
         }
+        self.remember_field(region, &raw, text);
         self.receipts.insert(
             (self.turn, self.operation, region),
             SourceReceipt {
@@ -840,24 +976,52 @@ impl Host {
             },
         );
     }
+    fn remember_field(&mut self, region: OutputRegion, raw: &str, text: &str) {
+        if raw.is_empty() || text.is_empty() {
+            return;
+        }
+        if self.field_observer.as_ref().is_none_or(|f| !f.live()) {
+            if let Some(observer) = self.field_observer.take() {
+                observer.stop(true);
+            }
+            if let Some(sink) = self.sink.as_ref().filter(|s| s.allowed()) {
+                self.field_observer = FieldObserver::start(sink.clone(), self.anchor.clone());
+            }
+        }
+        if let Some(observer) = &self.field_observer {
+            observer.delivered(OutputSeed {
+                task: self.task.clone(),
+                turn: self.turn,
+                operation: self.operation,
+                revision: self.revision,
+                region: if region == OutputRegion::Prefix {
+                    "prefix"
+                } else {
+                    "tail"
+                }
+                .into(),
+                raw: raw.into(),
+                text: text.into(),
+            });
+        }
+    }
     fn observe(&mut self, sink: Arc<ObservationSink>) -> bool {
         if !sink.allowed() {
             return false;
         }
         self.observer_reversal = crate::input_state::reversal_epoch();
-        if !self.supports_observation
-            || !crate::contracts::language::LearningEligibility::capture(&sink.snapshot.settings)
-                .any()
+        if !crate::contracts::language::LearningEligibility::capture(&sink.snapshot.settings).any()
             || sink.snapshot.application.key == "unknown"
         {
             return false;
         }
-        if self.exchange(Action::ObserveStart, "", true).is_ok() {
-            self.sink = Some(sink);
-            true
-        } else {
-            false
+        self.sink = Some(sink.clone());
+        if self.field_observer.is_none() {
+            self.field_observer = FieldObserver::start(sink, self.anchor.clone());
         }
+        let native =
+            self.supports_observation && self.exchange(Action::ObserveStart, "", true).is_ok();
+        native || self.field_observer.as_ref().is_some_and(|f| f.live())
     }
     fn observation_records(&mut self, reply: Reply) {
         let Some(observation) = reply.edit_observation else {
@@ -900,7 +1064,7 @@ impl Host {
             ) else {
                 continue;
             };
-            (sink.emit)(crate::contracts::language::EditEvidence {
+            let evidence = crate::contracts::language::EditEvidence {
                 id: format!(
                     "{}:{}:{}:{:?}:{}",
                     value.task, value.turn, value.operation, value.region, value.sequence
@@ -923,23 +1087,35 @@ impl Host {
                 raw: source.raw.clone(),
                 before: value.before,
                 after: value.after,
-            });
+            };
+            if let Some(field) = &self.field_observer {
+                field.native_evidence(evidence, value.revision);
+            } else {
+                sink.emit_evidence(evidence);
+            }
             self.receipts
                 .remove(&(value.turn, value.operation, value.region));
         }
     }
     fn stop_observation(&mut self) {
         if self.sink.is_some()
+            && self.supports_observation
             && let Ok(reply) = self.exchange_reply(Action::ObserveStop, "", None, true, None)
         {
             self.observation_records(reply);
         }
     }
     fn poll_observer(&mut self) -> bool {
+        if let Some(field) = &self.field_observer {
+            field.poll_native();
+        }
         if self.sink.as_ref().is_some_and(|s| !s.allowed())
             || self.observer_reversal != crate::input_state::reversal_epoch()
         {
             self.stop_observation();
+            if let Some(observer) = self.field_observer.take() {
+                observer.stop(false);
+            }
             self.sink = None;
             return false;
         }
@@ -947,7 +1123,10 @@ impl Host {
             return true;
         }
         self.poll_at = Instant::now();
-        if let Ok(reply) = self.exchange_reply(Action::ObservePoll, "", None, true, None) {
+        let field_alive = self.field_observer.as_ref().is_some_and(|f| f.live());
+        if self.supports_observation
+            && let Ok(reply) = self.exchange_reply(Action::ObservePoll, "", None, true, None)
+        {
             if let Some(value) = &reply.edit_observation {
                 log::info!(target:"sayweave","operation=observation_poll task_id={} turn={} active={} records={}",self.task,self.turn,value.active,value.records.len());
             }
@@ -957,11 +1136,12 @@ impl Host {
                 .is_some_and(|v| v.active > 0);
             self.observation_records(reply);
             active
+                || field_alive
                 || self
                     .retained_at
                     .is_some_and(|at| at.elapsed() < Duration::from_secs(1))
         } else {
-            false
+            field_alive
         }
     }
     fn open(
@@ -969,6 +1149,7 @@ impl Host {
         turn: u64,
         anchor: Anchor,
         gate: Arc<DeliveryGate>,
+        allow_pending: bool,
     ) -> Result<Self, Error> {
         unsafe {
             CoInitializeEx(None, COINIT_APARTMENTTHREADED)
@@ -980,7 +1161,28 @@ impl Host {
         let lease = registration::host_capability(std::process::id(), &capability)
             .map_err(|_| Error::new("compositionBusy"))?;
         crate::text_service::require_ready()?;
-        let profile = ProfileLease::open().map_err(|error| {
+        let profile = (|| {
+            let (activation, language) = client::speech_activation()?;
+            if activation == SpeechActivation::Own {
+                let keyboard = keyboard_profile()?;
+                if client::speech_activation()? != (SpeechActivation::Own, language)
+                    || !client::own_profile_active(language)?
+                    || keyboard_profile()? != keyboard
+                {
+                    return Err(windows::core::Error::new(E_FAIL, "speech activation changed"));
+                }
+                // Activating a second, non-editor ThreadMgr also activates the
+                // keyboard TIP on this STA. Reuse the verified speech profile
+                // without creating that unrelated keyboard input context.
+                log::info!(target:"sayweave", "operation=draft_activation task_id={} turn={} profile=reused",task,turn);
+                Ok(None)
+            } else if activation == SpeechActivation::Inactive {
+                ProfileLease::open().map(Some)
+            } else {
+                Err(windows::core::Error::new(E_FAIL, "another speech profile is active"))
+            }
+        })()
+        .map_err(|error| {
             log::info!(target:"sayweave", "operation=draft_activation task_id={} turn={} hresult={:08x}", task, turn, error.code().0 as u32);
             Error::new("compositionActivationFailed")
         })?;
@@ -1006,6 +1208,7 @@ impl Host {
             optional_disabled: false,
             observer_reversal: crate::input_state::reversal_epoch(),
             sink: None,
+            field_observer: None,
             raw_tail: None,
             receipts: HashMap::new(),
             retained_at: None,
@@ -1031,6 +1234,8 @@ impl Host {
             visible: false,
             failure: None,
             range_open: false,
+            initial_pending: false,
+            pending_focus: None,
             settled_empty_revision: None,
             profile,
             _lease: lease,
@@ -1049,7 +1254,31 @@ impl Host {
         })?;
         // prepare_engine already verified the actual proxy and executing core.
         super::native::composition_begin_target(&host.task, &host.anchor)?;
-        if let Err(error) = host.exchange(Action::Begin, "", false) {
+        let proof_started = Instant::now();
+        let original_focus = allow_pending
+            .then(|| super::native::PendingFocus::capture(&host.anchor).ok())
+            .flatten();
+        if allow_pending {
+            log::info!(target:"sayweave", "operation=draft_admission_proof task_id={} captured={} elapsed_ms={}",host.task,original_focus.is_some(),proof_started.elapsed().as_millis());
+        }
+        let readiness = host
+            .exchange_reply(Action::Begin, "", None, false, None)
+            .and_then(|reply| initial_begin_ready(&reply));
+        let ready = match readiness {
+            Ok(false) if allow_pending => {
+                host.initial_pending = true;
+                // This field identity only fences a future native Begin. It
+                // grants no text/range permission and is never a learning cache.
+                host.pending_focus =
+                    original_focus.filter(|proof| proof.check(&host.anchor).is_ok());
+                log::info!(target:"sayweave", "operation=draft_admission task_id={} result=pendingComposition field_verified={}",host.task,host.pending_focus.is_some());
+                return Ok(host);
+            }
+            Ok(false) => Err(Error::new("inputComposition")),
+            Ok(true) => Ok(()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = ready {
             if error.code == "targetReadonlyContext" {
                 // This is the only refused Begin that can admit recording
                 // without a target. Check activation/pipe cleanup explicitly;
@@ -1076,6 +1305,12 @@ impl Host {
         {
             return Err(Error::new("staleSession"));
         }
+        if self.initial_pending {
+            self.pending_focus
+                .as_ref()
+                .ok_or_else(|| Error::new("targetChanged"))?
+                .check(&anchor)?;
+        }
         self.stop_observation();
         self.anchor = anchor;
         self.turn = turn;
@@ -1086,15 +1321,34 @@ impl Host {
         self.raw_tail = None;
         self.receipts.clear();
         self.visible = false;
-        self.exchange(Action::Begin, "", false)?;
+        if self.initial_pending {
+            let reply = self.exchange_reply(Action::Begin, "", None, false, None)?;
+            if !initial_begin_ready(&reply)? {
+                return Err(Error::new("inputComposition"));
+            }
+        } else {
+            self.exchange(Action::Begin, "", false)?;
+        }
         self.range_open = true;
-        if let Err(error) = super::native::composition_begin_target(&self.task, &self.anchor) {
+        let checked =
+            super::native::composition_begin_target(&self.task, &self.anchor).and_then(|()| {
+                if self.initial_pending {
+                    self.pending_focus
+                        .as_ref()
+                        .ok_or_else(|| Error::new("targetChanged"))?
+                        .check(&self.anchor)?;
+                }
+                Ok(())
+            });
+        if let Err(error) = checked {
             // No text was written. Retire this unpublished range before a retry can
             // acquire another one; never leave an acknowledged Begin orphaned.
             self.exchange(Action::Handoff, "", true)?;
             self.range_open = false;
             return Err(error);
         }
+        self.initial_pending = false;
+        self.pending_focus = None;
         if let Some(sink) = self.sink.clone() {
             let _ = self.observe(sink);
         }
@@ -1383,6 +1637,14 @@ impl Host {
             (Some(command), deadline)
         });
         self.transport_attempted = false;
+        if (matches!(action, Action::Update | Action::Settle)
+            || block
+                .as_ref()
+                .is_some_and(|b| b.action == BlockAction::Apply))
+            && let Some(observer) = &self.field_observer
+        {
+            observer.begin_write();
+        }
         self.acknowledge_receipt()?;
         let optional = matches!(
             action,
@@ -1730,6 +1992,9 @@ impl Host {
     fn finish(&mut self, text: &str, mode: Finish) -> FinishOutcome {
         let began = Instant::now();
         let aborted = mode == Finish::Abort;
+        if aborted && let Some(observer) = self.field_observer.take() {
+            observer.stop(false);
+        }
         let mut cancelled = aborted;
         let mut rollback_failed = false;
         let mut cleanup_failed = false;
@@ -1876,12 +2141,30 @@ impl Host {
             Ok(())
         };
         self.stop_observation();
+        if let Some(observer) = self.field_observer.take() {
+            observer.stop(true);
+        }
         self.sink = None;
-        let closed = self
-            .profile
-            .close()
-            .map_err(|_| Error::new("compositionCleanup"));
+        let closed = self.profile.as_mut().map_or(Ok(()), |profile| {
+            profile
+                .close()
+                .map_err(|_| Error::new("compositionCleanup"))
+        });
         receipt.and(block).and(closed)
+    }
+}
+fn keyboard_profile() -> windows::core::Result<(u32, u16, GUID, GUID, isize)> {
+    unsafe {
+        let manager: ITfInputProcessorProfileMgr = registration::profiles()?.cast()?;
+        let mut profile = TF_INPUTPROCESSORPROFILE::default();
+        manager.GetActiveProfile(&GUID_TFCAT_TIP_KEYBOARD, &mut profile)?;
+        Ok((
+            profile.dwProfileType,
+            profile.langid,
+            profile.clsid,
+            profile.guidProfile,
+            profile.hkl.0 as isize,
+        ))
     }
 }
 fn pending_business_receipt(
@@ -1915,6 +2198,24 @@ fn discard_optional_reply(
 }
 fn completed_prefix(receipt: Option<u64>, revision: u64, stored: &str, requested: &str) -> bool {
     receipt == Some(revision) && stored.is_empty() && requested.is_empty()
+}
+fn initial_begin_ready(reply: &Reply) -> Result<bool, Error> {
+    if reply.applied {
+        Ok(true)
+    } else if reply.mutation == Mutation::NotAttempted
+        && reply.code.split_whitespace().next() == Some("edit:beginProperties:80040500")
+    {
+        Ok(false)
+    } else {
+        let code = reply_error(&reply.code);
+        Err(Error::new(if reply.mutation != Mutation::NotAttempted {
+            "compositionPartial"
+        } else if code == "inputComposition" {
+            "compositionRejected"
+        } else {
+            code
+        }))
+    }
 }
 fn reply_error(code: &str) -> &'static str {
     // Native diagnostic metadata follows the stable business code.
@@ -2006,6 +2307,35 @@ fn pump() {
 mod tests {
     use super::*;
     #[test]
+    fn initial_foreign_composition_is_pending_only_with_a_not_attempted_begin_receipt() {
+        let reply = |code: &str, mutation: Mutation| -> Reply {
+            serde_json::from_value(serde_json::json!({
+                "engine":EngineBinding { proxy_instance:uuid::Uuid::new_v4().to_string(), engine_generation:1 },
+                "task":"initial-ime", "turn":1,"operation":1,"revision":0,
+                "applied":false,"code":code,"mutation":mutation
+            })).unwrap()
+        };
+        assert!(
+            !initial_begin_ready(&reply(
+                "edit:beginProperties:80040500",
+                Mutation::NotAttempted
+            ))
+            .unwrap()
+        );
+        for mutation in [Mutation::Changed, Mutation::Uncertain] {
+            assert!(
+                initial_begin_ready(&reply("edit:beginProperties:80040500", mutation)).is_err()
+            );
+        }
+        for code in [
+            "edit:beginProperties:80070005",
+            "edit:updateText:80040500",
+            "requestEdit:80040500",
+        ] {
+            assert!(initial_begin_ready(&reply(code, Mutation::NotAttempted)).is_err());
+        }
+    }
+    #[test]
     fn write_effect_and_tracking_refusal_are_independent_receipt_facts() {
         let reply = |phase: &str, mutation: Mutation| -> Reply {
             serde_json::from_value(serde_json::json!({
@@ -2064,6 +2394,7 @@ mod tests {
         .unwrap();
         for phase in [
             "blockAwaitingRepresentation",
+            "blockAwaitingSelectionSync",
             "blockInputMethodBusy",
             "blockSnapshotChanged",
         ] {

@@ -20,7 +20,7 @@ pub(crate) mod processing_context;
 #[cfg(windows)]
 use crate::windows_input::composition::{Draft, Finish};
 pub use presentation::Presentation;
-use presentation::{final_presentation, speech_presentation};
+use presentation::{final_presentation, live_presentation};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum InputRoute {
@@ -80,6 +80,7 @@ struct Active {
     gate: Arc<DeliveryGate>,
     overlay_revision: u64,
     began: std::time::Instant,
+    presentation_speech_sequence: u64,
     continuous: Option<crate::speech::continuous::Control>,
     #[cfg(windows)]
     draft: Option<Arc<drafts::SessionDraft>>,
@@ -208,48 +209,73 @@ impl DictationCoordinator {
             s.sequence += 1;
             let copy = s.clone();
             drop(s);
-            if layout {
-                crate::refresh_voice(app);
-            }
-            let _ = app.emit_to("main", "dictation:snapshot", &copy);
-            let _ = app.emit_to("voice-overlay", "dictation:snapshot", &copy);
+            Self::publish_snapshot(app, &copy, layout);
         }
     }
-    pub fn observe_speech(&self, app: &tauri::AppHandle, speech: &SpeechSnapshot) {
-        let Some(id) = speech.task_id.as_deref() else {
-            return;
-        };
-        let Ok(current) = self.snapshot() else {
-            return;
-        };
+    fn publish_snapshot(app: &tauri::AppHandle, copy: &Snapshot, layout: bool) {
+        if layout {
+            crate::refresh_voice(app);
+        }
+        let _ = app.emit_to("main", "dictation:snapshot", copy);
+        let _ = app.emit_to("voice-overlay", "dictation:snapshot", copy);
+    }
+    fn apply_live_projection(
+        &self,
+        speech: &SpeechSnapshot,
+        draft: Option<(Presentation, bool)>,
+    ) -> Option<(Snapshot, bool)> {
+        let id = speech.task_id.as_deref()?;
+        let mut active = self.active.lock().ok()?;
+        let task = active
+            .as_mut()
+            .filter(|a| a.id == id && a.source == "external" && !a.gate.cancelled())?;
+        if self.stopping.load(Ordering::Acquire)
+            || speech.source != Some(SpeechSource::External)
+            || speech.sequence < task.presentation_speech_sequence
+        {
+            return None;
+        }
+        let mut current = self.snapshot.lock().ok()?;
         if current.task_id.as_deref() != Some(id)
             || current.source != "external"
             || !matches!(current.stage.as_str(), "preparing" | "recognizing")
         {
-            return;
+            return None;
         }
-        let Ok(active) = self.active.lock() else {
-            return;
-        };
-        let Some(task) = active.as_ref().filter(|a| a.id == id) else {
-            return;
-        };
-        let Some(next) = speech_presentation(speech.phase, *task.cancel.borrow()) else {
-            return;
-        };
+        // Fence every observed phase, including failures with no live layout,
+        // so a delayed older Recording/Connecting cannot win afterward.
+        task.presentation_speech_sequence = speech.sequence;
+        let next = live_presentation(speech.phase, *task.cancel.borrow(), draft.map(|d| d.0))?;
+        let result_only = draft.is_some_and(|d| d.1);
+        if next == current.presentation
+            && (!result_only || current.input_route == InputRoute::ResultOnly)
+        {
+            return None;
+        }
+        let layout = next != current.presentation;
+        current.presentation = next;
+        if result_only {
+            current.input_route = InputRoute::ResultOnly;
+        }
+        current.sequence += 1;
+        Some((current.clone(), layout))
+    }
+    pub fn observe_speech(&self, app: &tauri::AppHandle, speech: &SpeechSnapshot) {
+        // Read the Draft outside the coordinator locks. Both speech events and
+        // Draft callbacks finish through the same task/phase/stop transaction.
         #[cfg(windows)]
-        let next = if next == Presentation::Recording {
-            task.draft.as_ref().map_or(next, |d| d.presentation())
-        } else {
-            next
-        };
-        drop(active);
-        if next != current.presentation {
-            self.update(app, id, |s| {
-                if matches!(s.stage.as_str(), "preparing" | "recognizing") {
-                    s.presentation = next;
-                }
-            });
+        let draft = self.active.lock().ok().and_then(|a| {
+            a.as_ref()
+                .filter(|a| Some(a.id.as_str()) == speech.task_id.as_deref())
+                .and_then(|a| a.draft.clone())
+        });
+        #[cfg(windows)]
+        let projection = draft.as_ref().map(|d| (d.presentation(), d.result_only()));
+        #[cfg(not(windows))]
+        let projection = None;
+        if let Some((snapshot, layout)) = self.apply_live_projection(speech, projection) {
+            log::info!(target:"sayweave", "operation=dictation_presentation task_id={} speech_sequence={} speech_phase={:?} presentation={:?}", snapshot.task_id.as_deref().unwrap_or("none"),speech.sequence,speech.phase,snapshot.presentation);
+            Self::publish_snapshot(app, &snapshot, layout);
         }
     }
     pub fn key(
@@ -407,6 +433,7 @@ impl DictationCoordinator {
                 gate: gate.clone(),
                 overlay_revision: crate::OVERLAY_VISIBILITY.load(Ordering::Acquire),
                 began: std::time::Instant::now(),
+                presentation_speech_sequence: 0,
                 continuous: None,
                 #[cfg(windows)]
                 draft: None,
@@ -565,7 +592,9 @@ impl DictationCoordinator {
                 // before audio starts; this task cannot follow later focus.
                 input.forget(id.clone());
                 anchor = None;
-            } else if let Some(code) = crate::windows_input::draft_rejection(&assessment) {
+            } else if let Some(code) = crate::windows_input::draft_rejection(&assessment)
+                && code != "inputComposition"
+            {
                 let error = Error::new(&code);
                 self.reject_preparation(&app, &id, speech_source, &error, &gate)
                     .await;
@@ -576,7 +605,7 @@ impl DictationCoordinator {
         let raw_draft = if source == "external"
             && let Some(target) = anchor.clone()
         {
-            match Draft::begin(id.clone(), 1, target, gate.clone()).await {
+            match Draft::prepare(id.clone(), 1, target, gate.clone()).await {
                 Ok(draft) => Some(draft),
                 Err(error) if error.code == "targetReadonlyContext" => {
                     input.forget(id.clone());
@@ -665,7 +694,7 @@ impl DictationCoordinator {
         if result.is_err() {
             #[cfg(windows)]
             if let Some(draft) = raw_draft {
-                let _ = draft.finish(String::new(), Finish::Abort).await;
+                draft.abort().await;
             }
             input.forget(id.clone());
             self.update(&app, &id, |s| {
@@ -743,7 +772,7 @@ impl DictationCoordinator {
             };
             #[cfg(windows)]
             let draft = raw_draft.map(|native| {
-                drafts::SessionDraft::new(
+                drafts::SessionDraft::new_initial(
                     id.clone(),
                     session_anchor.clone().unwrap(),
                     native,
@@ -772,20 +801,18 @@ impl DictationCoordinator {
                 // Every admitted range has a cleanup owner, including the
                 // cancelled/failed-journal path which may never write text.
                 let manager = draft.clone();
-                let projection = draft.clone();
                 let handle = app.clone();
                 let task_id = id.clone();
                 tauri::async_runtime::spawn(async move {
                     manager
-                        .maintain(move |presentation| {
-                            handle
-                                .state::<DictationCoordinator>()
-                                .update(&handle, &task_id, |s| {
-                                    s.presentation = presentation;
-                                    if projection.result_only() {
-                                        s.input_route = InputRoute::ResultOnly;
-                                    }
-                                });
+                        .maintain(move |_| {
+                            if let Ok(speech) = handle.state::<SpeechService>().snapshot()
+                                && speech.task_id.as_deref() == Some(&task_id)
+                            {
+                                handle
+                                    .state::<DictationCoordinator>()
+                                    .observe_speech(&handle, &speech);
+                            }
                         })
                         .await;
                 });
@@ -1434,6 +1461,196 @@ fn key_matches_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recording_projection_task() -> DictationCoordinator {
+        let coordinator = DictationCoordinator::default();
+        let (cancel, _) = watch::channel(0);
+        *coordinator.active.lock().unwrap() = Some(Active {
+            id: "recording-task".into(),
+            source: "external".into(),
+            epoch: 1,
+            origin: None,
+            cancel,
+            explicit_end: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(DeliveryGate::default()),
+            overlay_revision: 0,
+            began: std::time::Instant::now(),
+            presentation_speech_sequence: 0,
+            continuous: None,
+            #[cfg(windows)]
+            draft: None,
+        });
+        *coordinator.snapshot.lock().unwrap() = Snapshot {
+            task_id: Some("recording-task".into()),
+            source: "external".into(),
+            stage: "recognizing".into(),
+            presentation_id: Some("recording-view".into()),
+            presentation: Presentation::Preparing,
+            ..Snapshot::default()
+        };
+        coordinator
+    }
+    fn recording_speech(phase: Phase, sequence: u64) -> SpeechSnapshot {
+        SpeechSnapshot {
+            task_id: Some("recording-task".into()),
+            source: Some(SpeechSource::External),
+            phase,
+            sequence,
+            ..SpeechSnapshot::default()
+        }
+    }
+    #[test]
+    fn recording_projection_waits_for_capture_even_when_draft_network_is_ready() {
+        for proposed in [
+            Presentation::Resuming,
+            Presentation::Recording,
+            Presentation::Editing,
+        ] {
+            let coordinator = recording_projection_task();
+            assert!(
+                coordinator
+                    .apply_live_projection(
+                        &recording_speech(Phase::Connecting, 3),
+                        Some((proposed, false))
+                    )
+                    .is_none()
+            );
+            assert_eq!(
+                coordinator.snapshot().unwrap().presentation,
+                Presentation::Preparing
+            );
+            let (ready, _) = coordinator
+                .apply_live_projection(
+                    &recording_speech(Phase::Recording, 4),
+                    Some((proposed, false)),
+                )
+                .unwrap();
+            assert_eq!(ready.presentation, proposed);
+        }
+    }
+    #[test]
+    fn recording_projection_keeps_editing_resuming_and_result_route_after_capture_ready() {
+        let coordinator = recording_projection_task();
+        let ready = recording_speech(Phase::Recording, 5);
+        for proposed in [
+            Presentation::Recording,
+            Presentation::Editing,
+            Presentation::Resuming,
+            Presentation::Recording,
+        ] {
+            let (snapshot, _) = coordinator
+                .apply_live_projection(&ready, Some((proposed, false)))
+                .unwrap();
+            assert_eq!(snapshot.presentation, proposed);
+        }
+        let (snapshot, _) = coordinator
+            .apply_live_projection(&ready, Some((Presentation::Recording, true)))
+            .unwrap();
+        assert_eq!(snapshot.input_route, InputRoute::ResultOnly);
+        assert_eq!(snapshot.presentation, Presentation::Recording);
+    }
+    #[test]
+    fn recording_projection_rejects_older_phase_from_either_publication_entry() {
+        let coordinator = recording_projection_task();
+        coordinator
+            .apply_live_projection(
+                &recording_speech(Phase::Recording, 7),
+                Some((Presentation::Recording, false)),
+            )
+            .unwrap();
+        assert!(
+            coordinator
+                .apply_live_projection(
+                    &recording_speech(Phase::Connecting, 6),
+                    Some((Presentation::Resuming, false))
+                )
+                .is_none()
+        );
+        assert_eq!(
+            coordinator.snapshot().unwrap().presentation,
+            Presentation::Recording
+        );
+        coordinator
+            .apply_live_projection(&recording_speech(Phase::Processing, 8), None)
+            .unwrap();
+        assert!(
+            coordinator
+                .apply_live_projection(&recording_speech(Phase::Recording, 7), None)
+                .is_none()
+        );
+        assert_eq!(
+            coordinator.snapshot().unwrap().presentation,
+            Presentation::Recognizing
+        );
+    }
+    #[test]
+    fn recording_projection_fences_failure_even_before_terminal_delivery() {
+        let coordinator = recording_projection_task();
+        assert!(
+            coordinator
+                .apply_live_projection(&recording_speech(Phase::Failed, 9), None)
+                .is_none()
+        );
+        assert!(
+            coordinator
+                .apply_live_projection(&recording_speech(Phase::Recording, 8), None)
+                .is_none()
+        );
+        assert_eq!(
+            coordinator.snapshot().unwrap().presentation,
+            Presentation::Preparing
+        );
+    }
+    #[test]
+    fn recording_projection_cannot_reopen_finished_cancelled_or_replaced_tasks() {
+        for reason in [1, 2] {
+            let coordinator = recording_projection_task();
+            coordinator
+                .active
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .cancel
+                .send_replace(reason);
+            coordinator.snapshot.lock().unwrap().presentation = Presentation::Recognizing;
+            assert!(
+                coordinator
+                    .apply_live_projection(&recording_speech(Phase::Recording, 10), None)
+                    .is_none()
+            );
+            assert_eq!(
+                coordinator.snapshot().unwrap().presentation,
+                Presentation::Recognizing
+            );
+        }
+        let coordinator = recording_projection_task();
+        let mut other = recording_speech(Phase::Recording, 10);
+        other.task_id = Some("old-task".into());
+        assert!(coordinator.apply_live_projection(&other, None).is_none());
+        other.task_id = Some("recording-task".into());
+        other.source = Some(SpeechSource::Trial);
+        assert!(coordinator.apply_live_projection(&other, None).is_none());
+        coordinator.snapshot.lock().unwrap().stage = "result".into();
+        assert!(
+            coordinator
+                .apply_live_projection(&recording_speech(Phase::Recording, 11), None)
+                .is_none()
+        );
+    }
+    #[test]
+    fn recording_projection_without_native_draft_still_requires_real_capture() {
+        let coordinator = recording_projection_task();
+        assert!(
+            coordinator
+                .apply_live_projection(&recording_speech(Phase::Connecting, 3), None)
+                .is_none()
+        );
+        let (snapshot, _) = coordinator
+            .apply_live_projection(&recording_speech(Phase::Recording, 4), None)
+            .unwrap();
+        assert_eq!(snapshot.presentation, Presentation::Recording);
+    }
     #[test]
     fn copied_and_failed_clipboard_receipts_survive_reopen_without_replacing_native_input() {
         use crate::{contracts::history::DbOutput, data::repository::Repository};

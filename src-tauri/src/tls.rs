@@ -69,8 +69,7 @@ mod tests {
             // with neither fixture trust nor an explicit per-connection provider.
             let error = tokio_tungstenite::connect_async(url.as_str())
                 .await
-                .err()
-                .expect("an unauthenticated TLS peer must not succeed");
+                .expect_err("an unauthenticated TLS peer must not succeed");
             assert!(matches!(
                 error,
                 tokio_tungstenite::tungstenite::Error::Io(_)

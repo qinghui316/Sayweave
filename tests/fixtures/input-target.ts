@@ -30,11 +30,12 @@ function prediction(text:string){
 }
 declare global {interface Window {fixturePrediction(text:string|null):void}}
 window.fixturePrediction=text=>view.updateState(view.state.reconfigure({plugins:text?[prediction(text)]:[]}));
-declare global {interface Window {fixtureEditor:{set(text:string,start:number,end:number):void;edit(from:number,to:number,text:string):void;appendParagraph():void;select(position:number,end?:number):void;read():string;inspect():unknown}}}
+declare global {interface Window {fixtureEditor:{set(text:string,start:number,end:number):void;edit(from:number,to:number,text:string):void;appendParagraph():void;select(position:number,end?:number):void;read():string;inspect():unknown;rebuildParagraph?():void}}}
 window.fixtureEditor={
  set(text,start,end){const doc=schema.node('doc',null,text.split('\n').map(line=>schema.node('paragraph',null,line?schema.text(line):undefined)));const position=(offset:number)=>offset+1+(text.slice(0,offset).match(/\n/g)?.length??0);view.updateState(EditorState.create({schema,doc,selection:TextSelection.create(doc,position(start),position(end))}));view.focus();},
  edit(from,to,text){view.dispatch(view.state.tr.insertText(text,from+1,to+1));},
  appendParagraph(){view.dispatch(view.state.tr.insert(view.state.doc.content.size,schema.nodes.paragraph.create()));},
+ rebuildParagraph(){view.setProps({nodeViews:{paragraph(){const dom=document.createElement('p');return {dom,contentDOM:dom};}}});view.focus();},
  select(position,end=position){view.dispatch(view.state.tr.setSelection(TextSelection.create(view.state.doc,position+1,end+1)));},
  read(){return view.state.doc.textBetween(0,view.state.doc.content.size,'\n');},
  inspect(){const selection=getSelection();return {composing:view.composing,html:view.dom.innerHTML,selection:{from:view.state.selection.from,to:view.state.selection.to},semanticSelection:semanticSelection(view),domSelection:selection?{anchor:{parent:selection.anchorNode?.parentElement?.tagName,offset:selection.anchorOffset,text:selection.anchorNode?.textContent},focus:{parent:selection.focusNode?.parentElement?.tagName,offset:selection.focusOffset,text:selection.focusNode?.textContent}}:null,document:view.state.doc.toJSON()};},

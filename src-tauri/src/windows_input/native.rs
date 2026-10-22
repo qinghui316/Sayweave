@@ -159,6 +159,98 @@ pub(crate) fn reanchor_turn(id: &str, original: &Anchor) -> Result<Anchor, Error
     watch.anchor = next.clone();
     Ok(next)
 }
+/// Apartment-owned identity fence for a refused initial Begin. Ordinary input
+/// does not depend on this optional capability. It never reads or writes text.
+pub(super) struct PendingFocus {
+    automation: IUIAutomation,
+    element: IUIAutomationElement,
+}
+impl PendingFocus {
+    pub(super) fn capture(anchor: &Anchor) -> Result<Self, Error> {
+        unsafe {
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
+                    .map_err(|_| err("targetProbeFailed"))?;
+            if let Ok(options) = automation.cast::<IUIAutomation2>() {
+                let _ = options.SetConnectionTimeout(50);
+                let _ = options.SetTransactionTimeout(50);
+            }
+            let element = automation
+                .GetFocusedElement()
+                .map_err(|_| err("targetProbeFailed"))?;
+            if element
+                .CurrentProcessId()
+                .map_err(|_| err("targetProbeFailed"))?
+                != anchor.editor.process as i32
+            {
+                return Err(err("targetChanged"));
+            }
+            // Retain the original object before sending Begin. Safety and
+            // current-caret editability are checked only if a retry is needed;
+            // ordinary successful native admission does not depend on UIA.
+            Ok(Self {
+                automation,
+                element,
+            })
+        }
+    }
+    pub(super) fn check(&self, anchor: &Anchor) -> Result<(), Error> {
+        deadline(350);
+        unsafe {
+            let focused = self
+                .automation
+                .GetFocusedElement()
+                .map_err(|_| err("targetChanged"))?;
+            if !self
+                .automation
+                .CompareElements(&focused, &self.element)
+                .map_err(|_| err("targetChanged"))?
+                .as_bool()
+                || self
+                    .element
+                    .CurrentProcessId()
+                    .map_err(|_| err("targetChanged"))?
+                    != anchor.editor.process as i32
+            {
+                return Err(err("targetChanged"));
+            }
+            if self
+                .element
+                .CurrentIsPassword()
+                .map_err(|_| err("targetSafetyUnknown"))?
+                .as_bool()
+            {
+                return Err(err("targetPassword"));
+            }
+            if !self
+                .element
+                .CurrentIsEnabled()
+                .map_err(|_| err("targetSafetyUnknown"))?
+                .as_bool()
+            {
+                return Err(err("targetReadonly"));
+            }
+            if !self
+                .element
+                .CurrentHasKeyboardFocus()
+                .map_err(|_| err("targetEditabilityUnknown"))?
+                .as_bool()
+            {
+                return Err(err("targetChanged"));
+            }
+            // Rich edit fields may have Document role. Require positive
+            // writable-caret evidence instead of a particular UIA role.
+            let pattern = self
+                .element
+                .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                .ok();
+            if uia_readonly(&self.element, pattern.as_ref())? {
+                return Err(err("targetReadonly"));
+            }
+            budget()
+        }
+    }
+}
 /// Physical pointer evidence shares the same task-window lease as WinEvent evidence.
 /// WebView descendants can live in another process; process identity is not ownership.
 pub(super) fn observe_pointer(window: usize, event_tick: u32) {
@@ -593,6 +685,31 @@ fn composing(a: &Anchor) -> bool {
         count > 0
     }
 }
+/// Read-only observation has no dependency on the task's writable WATCH.
+pub(super) fn learning_target(a: &Anchor) -> Result<(), Error> {
+    let current = read_anchor()?.ok_or_else(|| err("targetChanged"))?;
+    if current.window != a.window
+        || current.process != a.process
+        || current.lifetime != a.lifetime
+        || current.editor != a.editor
+        || !permitted(a)
+    {
+        return Err(err("targetChanged"));
+    }
+    editor_endpoint(a).map(|_| ())
+}
+#[cfg(test)]
+pub(super) fn learning_composition(a: &Anchor) -> Option<bool> {
+    unsafe {
+        let context = ImmGetContext(hwnd(a.focus));
+        if context.0.is_null() {
+            return None;
+        }
+        let count = ImmGetCompositionStringW(context, GCS_COMPSTR, None, 0);
+        let _ = ImmReleaseContext(hwnd(a.focus), context);
+        (count >= 0).then_some(count > 0)
+    }
+}
 fn uia_selection(pattern: &IUIAutomationTextPattern) -> Result<IUIAutomationTextRange, Error> {
     unsafe {
         let ranges =
@@ -675,10 +792,7 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<(), Error> {
         if !permitted(&a) {
             return Err(err("targetPermission"));
         }
-        if composing(&a) {
-            log::info!(target:"sayweave", "operation=input_composition_guard capture_id={} source=imm", a.capture_id);
-            return Err(err("inputComposition"));
-        }
+        let input_composing = composing(&a);
         let control = hwnd(a.focus);
         let mut class = [0u16; 128];
         let count = GetClassNameW(control, &mut class) as usize;
@@ -727,6 +841,10 @@ fn capture(a: Anchor, automation: &Option<IUIAutomation>) -> Result<(), Error> {
         budget()?;
         if !same(&a) {
             return Err(err("targetChanged"));
+        }
+        if input_composing {
+            log::info!(target:"sayweave", "operation=input_composition_guard capture_id={} source=imm", a.capture_id);
+            return Err(err("inputComposition"));
         }
         Ok(())
     }

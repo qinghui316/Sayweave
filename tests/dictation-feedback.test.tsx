@@ -6,6 +6,11 @@ import {initialSpeech} from '../src/contracts/speech';
 import {VoiceSurface} from '../src/features/voice';
 import {Home} from '../src/features/home';
 
+it.each(['recording','completed','failed'] as const)('current external preparation ignores stale Runtime phase %s',phase=>{
+ const snapshot={...initialDictation(),source:'external' as const,taskId:'new',presentationId:'new-view',stage:'recognizing' as const,presentation:'preparing' as const};
+ expect(dictationPhase(snapshot,phase,{taskId:'old',text:'上一次口述'})).toBe('connecting');
+});
+
 it('clipboard failure keeps the result and original input facts visible',()=>{
  const value={...initialDictation(),source:'external' as const,taskId:'current',presentationId:'view',presentation:'result' as const,error:'copyFailed',text:'完整口述',delivery:{state:'unconfirmed' as const,submission:'uncertain' as const,verification:'unavailable' as const,stage:'composition',submittedEvents:0,error:'compositionPartial',restoreError:false,elapsedMs:1}};
  const message=dictationFeedback(value,initialSpeech());

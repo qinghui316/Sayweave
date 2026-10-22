@@ -293,6 +293,21 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                 crate::input_state::reversed();
             }
             if pressed && edits_target(b, value) {
+                #[cfg(test)]
+                if std::env::var("SAYWEAVE_INPUT_ACCEPTANCE").as_deref() == Ok("1")
+                    && std::env::var("SAYWEAVE_ACTOR_OBSERVE_INJECTED").as_deref() == Ok("1")
+                    && std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID")
+                        .is_ok_and(|id| uuid::Uuid::parse_str(&id).is_ok())
+                {
+                    let mut foreground = 0;
+                    unsafe {
+                        GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut foreground));
+                    }
+                    eprintln!(
+                        "operation=owned_key_probe vk={value:04x} flags={:x} extra={:x} foreground={foreground} fixture={fixture_event}",
+                        key.flags.0, key.dwExtraInfo
+                    );
+                }
                 crate::input_state::edit_key_pressed(value);
                 if let Some(task) = &b.task_active {
                     let kind = match value {
@@ -431,7 +446,32 @@ unsafe extern "system" fn input_event(
 unsafe extern "system" fn mouse_hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if n >= 0 && [WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN].contains(&(w.0 as u32)) {
         let event = unsafe { &*(l.0 as *const MSLLHOOKSTRUCT) };
-        if event.flags & 1 == 0 {
+        // Owned acceptance input must traverse the same pre-dispatch pointer
+        // evidence as a real click, rather than stamp an edit after the click.
+        #[cfg(test)]
+        let fixture_event = {
+            let owned = std::env::var("SAYWEAVE_TSF_OWNED_PID")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|pid| *pid != 0);
+            let enabled = std::env::var("SAYWEAVE_ACTOR_OBSERVE_POINTER").as_deref() == Ok("1")
+                && std::env::var("SAYWEAVE_INPUT_ACCEPTANCE").as_deref() == Ok("1")
+                && std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID")
+                    .is_ok_and(|id| uuid::Uuid::parse_str(&id).is_ok());
+            let mut foreground = 0;
+            unsafe {
+                GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut foreground));
+            }
+            enabled && owned == Some(foreground)
+        };
+        #[cfg(not(test))]
+        let fixture_event = false;
+        if event.flags & 1 == 0 || fixture_event {
+            #[cfg(test)]
+            if fixture_event {
+                eprintln!("operation=owned_pointer_probe flags={}", event.flags);
+            }
+            crate::input_state::observation_pointer();
             crate::windows_input::observe_pointer(
                 unsafe { WindowFromPoint(event.pt) }.0 as usize,
                 event.time,

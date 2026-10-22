@@ -31,6 +31,9 @@ pub(super) struct State {
     pending_coverage: Option<(u64, crate::processing::draft_source::Watermark)>,
     visible_coverage: Option<crate::processing::draft_source::Watermark>,
     absorbed_coverage: Option<crate::processing::draft_source::Watermark>,
+    block_source: Option<crate::processing::draft_source::Watermark>,
+    interior_insertion: bool,
+    caret_only: bool,
 }
 impl State {
     pub fn configured() -> Option<Self> {
@@ -64,6 +67,9 @@ impl State {
             pending_coverage: None,
             visible_coverage: None,
             absorbed_coverage: None,
+            block_source: None,
+            interior_insertion: false,
+            caret_only: false,
         }
     }
     pub fn handoff(&mut self) {
@@ -122,6 +128,8 @@ impl State {
         self.rollover = false;
         self.pending_coverage = None;
         self.visible_coverage = None;
+        self.block_source = self.absorbed_coverage.clone();
+        self.interior_insertion = false;
         self.permit = Arc::new(AtomicBool::new(true));
     }
     fn seal_source(&mut self, source: &NativeTranscript) {
@@ -147,11 +155,12 @@ pub(super) enum Effect {
         abandon: bool,
     },
     Split {
-        raw: String,
+        sequence: u64,
         text: String,
     },
     Keep,
     Close,
+    EndInput,
 }
 fn command(snapshot: &BlockSnapshot, action: BlockAction) -> BlockCommand {
     BlockCommand {
@@ -191,7 +200,13 @@ pub(super) fn observe(
     r: &mut State,
     value: NativeTranscript,
 ) {
-    if value.task_id != actor.task || value.turn != s.turn || value.sequence <= s.latest.sequence {
+    if value.task_id != actor.task
+        || value.turn != s.turn
+        || value.sequence <= s.latest.sequence
+        || r.pending_source
+            .as_ref()
+            .is_some_and(|pending| value.sequence <= pending.sequence)
+    {
         return;
     }
     if r.stopped {
@@ -199,6 +214,20 @@ pub(super) fn observe(
         // can first arrive after a settled seal and before the End envelope.
         s.latest = value;
         return;
+    }
+    // Keep the observed right-hand source anchor even while writes or handoff
+    // coalesce transcripts. This refreshes proof of the same consumed cut,
+    // never its amount, the editor baseline, or any external write permit.
+    for coverage in r
+        .visible_coverage
+        .iter_mut()
+        .chain(r.pending_coverage.iter_mut().map(|(_, coverage)| coverage))
+        .chain(r.absorbed_coverage.iter_mut())
+        .chain(r.block_source.iter_mut())
+    {
+        if let Some((_, refreshed)) = coverage.refreshed(&value.segments) {
+            *coverage = refreshed;
+        }
     }
     if s.handoff || r.read_needed || s.activity != input_state::activity() {
         if r.pending_source
@@ -210,11 +239,12 @@ pub(super) fn observe(
         return;
     }
     if let Some(coverage) = &r.absorbed_coverage {
-        let Some(offset) = coverage.offset(&value.segments) else {
+        let Some((offset, refreshed)) = coverage.refreshed(&value.segments) else {
             s.record_failure(&actor.task, "sourceChanged".into());
             return;
         };
         r.offset = offset;
+        r.absorbed_coverage = Some(refreshed);
     } else if !value.text.starts_with(&r.sealed_source) {
         s.record_failure(&actor.task, "sourceChanged".into());
         return;
@@ -280,13 +310,62 @@ pub(super) fn observe(
     }
     s.latest = value;
 }
+fn retained_cut(
+    r: &State,
+    s: &super::State,
+    source: &NativeTranscript,
+) -> Option<(usize, Option<crate::processing::draft_source::Watermark>)> {
+    if source.task_id != s.latest.task_id || source.turn != s.turn {
+        return None;
+    }
+    if s.written_raw.is_empty() {
+        return Some((0, None));
+    }
+    r.visible_coverage
+        .as_ref()?
+        .refreshed(&source.segments)
+        .map(|(cut, mark)| (cut, Some(mark)))
+}
+fn settle_model_insertion(actor: &SessionDraft, s: &mut super::State, r: &mut State) {
+    if !r.interior_insertion
+        || r.read_needed
+        || r.stopped
+        || s.stopping
+        || actor.control.stopping()
+        || s.ending.is_some()
+        || s.activity != input_state::activity()
+        || !r.permit.load(Ordering::Acquire)
+        || r.block.visible() != r.block.confirmed().1
+    {
+        return;
+    }
+    let source = s.latest.clone();
+    let Some((offset, coverage)) = retained_cut(r, s, &source) else {
+        return;
+    };
+    if r.block.settle_insertion().is_err() {
+        return;
+    }
+    r.offset = offset;
+    r.absorbed_coverage = coverage;
+    r.sealed_source = units::slice(&source.text, 0..offset);
+    r.interior_insertion = false;
+    cancel(actor, s, r);
+    checkpoint(actor, r, "preview");
+}
 fn unit(r: &State, state: &super::State, snapshot: Snapshot, delivery: bool) -> Unit {
     let mut association = Association::attempt(r.order, snapshot.clone());
     association.asr_turn = state.turn;
     let mut cursor = 0;
+    // Insertion checkpoints do not seal the logical block or lose its earlier
+    // ASR associations. Only a real block delivery advances this lower bound.
+    let source_start = r
+        .block_source
+        .as_ref()
+        .map_or(Some(0), |mark| mark.offset(&state.latest.segments));
     for segment in &state.latest.segments {
         let end = cursor + segment.text.chars().count();
-        let begin = cursor.max(r.offset);
+        let begin = cursor.max(source_start.unwrap_or(r.offset));
         let finish = end.min(r.offset + snapshot.speech_end);
         if begin < finish {
             association.asr_sources.push(units::SourceSpan {
@@ -345,6 +424,7 @@ pub(super) fn start_generation(
     let request = unit(r, s, snapshot, false);
     if actor.context.as_ref().is_none_or(|c| !c.model_ready())
         || s.model_disabled
+        || r.caret_only
         || request.text.chars().count() > crate::processing::draft::BLOCK_LIMIT
         || s.ending.as_ref().is_some_and(|e| e.expired)
     {
@@ -398,6 +478,7 @@ fn accept(
                 && r.block.matches(source)
                 && !r.stopped
                 && !r.read_needed
+                && !r.caret_only
             {
                 match r.block.accept(source.clone(), output.text) {
                     Ok(()) => {
@@ -431,6 +512,9 @@ fn accept(
             }
             record.error = Some(error.code);
         }
+    }
+    if record.application == "applied" {
+        settle_model_insertion(actor, s, r);
     }
     log::info!(target:"sayweave", "operation=draft_candidate task_id={} block={} version={} unit={} generation={} application={} elapsed_ms={}",
         actor.task,r.block.id(),unit.draft.as_ref().map_or(0,|d|d.source.version),unit.id,record.generation,record.application,record.elapsed_ms);
@@ -483,10 +567,23 @@ fn archive_block(
     );
     s.report.revisable = true;
     let source = r.block.state_snapshot();
-    let raw = units::slice(
-        &s.written_raw,
-        r.offset.min(s.written_raw.chars().count())..s.written_raw.chars().count(),
-    );
+    let raw = r
+        .visible_coverage
+        .as_ref()
+        .and_then(|mark| mark.offset(&s.latest.segments))
+        .zip(
+            r.block_source
+                .as_ref()
+                .map_or(Some(0), |mark| mark.offset(&s.latest.segments)),
+        )
+        .filter(|(end, start)| start <= end)
+        .map(|(end, start)| units::slice(&s.latest.text, start..end))
+        .unwrap_or_else(|| {
+            units::slice(
+                &s.written_raw,
+                r.offset.min(s.written_raw.chars().count())..s.written_raw.chars().count(),
+            )
+        });
     if !raw.is_empty() {
         if !s.report.raw.is_empty() {
             s.report.raw.push('\n');
@@ -565,6 +662,13 @@ fn handed_off(s: &mut super::State, _r: &mut State) {
 
 fn seal_requested(actor: &SessionDraft, s: &mut super::State, r: &mut State) {
     r.permit.store(false, Ordering::Release);
+    // Losing the old block ends its revision scope, not the recognition
+    // session. Once it is safely released, deliver only new literal speech at
+    // the fresh caret; a model correction must not be appended as a new block.
+    if !r.caret_only {
+        r.caret_only = true;
+        log::info!(target:"sayweave", "operation=draft_input_mode task_id={} block={} mode=caret reason=oldBlockUnavailable", actor.task,r.block.id());
+    }
     cancel(actor, s, r);
     r.sealing = true;
     s.handoff = false;
@@ -597,6 +701,7 @@ fn sealed(actor: &SessionDraft, s: &mut super::State, r: &mut State) {
     r.sealing = false;
     r.offset = offset;
     r.absorbed_coverage = coverage;
+    r.block_source = r.absorbed_coverage.clone();
     r.sealed_source = units::slice(&source.text, 0..offset);
     s.handoff = false;
     s.activity = input_state::activity();
@@ -810,7 +915,18 @@ pub(super) fn schedule(
             0..(r.offset + r.block.state_snapshot().speech_end).min(s.latest.text.chars().count()),
         );
         let body = text.clone();
-        let source = raw.clone();
+        // Consumption/history retain the complete recognition watermark. The
+        // new caret range's learning receipt owns only its own oral source.
+        let source = if r.caret_only {
+            let start = r
+                .block_source
+                .as_ref()
+                .map_or(Some(0), |mark| mark.offset(&s.latest.segments))
+                .ok_or_else(|| Error::new("sourceChanged"))?;
+            units::slice(&raw, start..raw.chars().count())
+        } else {
+            raw.clone()
+        };
         if let Some(draft) = s.draft.clone() {
             r.pending_coverage = crate::processing::draft_source::Watermark::capture(
                 &s.latest.segments,
@@ -883,15 +999,39 @@ pub(super) fn schedule(
         }
         let draft = s.draft.as_ref().unwrap().clone();
         let text = r.block.confirmed().1.to_owned();
-        let raw = r.block.state_snapshot().text;
+        // The editor/model baseline can differ in both spelling and length
+        // from ASR. Only the acknowledged source watermark owns this cut.
+        let coverage = r
+            .visible_coverage
+            .clone()
+            .ok_or_else(|| Error::new("sourceChanged"))?;
+        let end = coverage
+            .offset(&s.latest.segments)
+            .ok_or_else(|| Error::new("sourceChanged"))?;
+        let start = r
+            .block_source
+            .as_ref()
+            .map_or(Some(0), |mark| mark.offset(&s.latest.segments))
+            .filter(|start| *start <= end)
+            .ok_or_else(|| Error::new("sourceChanged"))?;
         let body = text.clone();
+        let source = units::slice(&s.latest.text, start..end);
         r.sequence += 1;
         let sequence = r.sequence;
+        // observe() refreshes this same proven boundary while Settle is in
+        // flight. Completion must not consume a stale numeric source offset.
+        r.pending_coverage = Some((sequence, coverage));
         let permit = r.permit.clone();
-        job(s, Effect::Split { raw, text }, async move {
+        job(s, Effect::Split { sequence, text }, async move {
             NativeValue::Settled(
                 draft
-                    .settle_with_source(sequence, body, String::new(), None, permit)
+                    .settle_with_source(
+                        sequence,
+                        body,
+                        String::new(),
+                        Some((source, String::new())),
+                        permit,
+                    )
                     .await,
             )
         });
@@ -923,9 +1063,19 @@ pub(super) fn schedule(
     let text = r.block.confirmed().1.to_owned();
     archive_block(actor, s, r, &text, s.stop_error.is_none());
     let connection = actor.connection.clone();
-    job(s, Effect::Close, async move {
-        NativeValue::Closed(connection.close().await)
-    });
+    if s.ending.as_ref().is_some_and(|e| e.mode == Finish::Commit)
+        && s.stop_error.is_none()
+        && !r.uncertain
+        && !r.cleanup_failed
+    {
+        job(s, Effect::EndInput, async move {
+            NativeValue::InputFinished(connection.end_input().await.map(|_| ()))
+        });
+    } else {
+        job(s, Effect::Close, async move {
+            NativeValue::Closed(connection.close().await)
+        });
+    }
     Ok(())
 }
 
@@ -1004,7 +1154,18 @@ pub(super) fn native_done(
                         return None;
                     }
                     if failure.mutation == Mutation::NotAttempted && failure.scope_unavailable {
-                        seal_requested(actor, s, r);
+                        if r.snapshot.is_some() {
+                            // Composition ownership ended, but its independent
+                            // block has not yet been read or proven unavailable.
+                            // Reuse the ordinary handoff/read/acquire path; no
+                            // source is absorbed by this permission change.
+                            r.handoff();
+                            cancel(actor, s, r);
+                            s.handoff = true;
+                            s.paused_at = Some(Instant::now());
+                        } else {
+                            seal_requested(actor, s, r);
+                        }
                         return None;
                     }
                     mutation = failure.mutation;
@@ -1040,7 +1201,10 @@ pub(super) fn native_done(
                     }
                 }
                 Ok(()) => {
-                    let _ = r.block.acknowledge(*revision, text.clone());
+                    let current_model = preview
+                        .as_ref()
+                        .is_some_and(|p| r.block.preview_source().as_ref() == Some(p));
+                    let acknowledged = r.block.acknowledge(*revision, text.clone()).is_ok();
                     if let Some((written_revision, coverage)) = r.pending_coverage.take()
                         && written_revision == *revision
                     {
@@ -1048,6 +1212,9 @@ pub(super) fn native_done(
                     }
                     s.written_raw = raw.clone();
                     s.last_write = Some(Instant::now());
+                    if acknowledged && current_model {
+                        settle_model_insertion(actor, s, r);
+                    }
                     checkpoint(actor, r, "preview");
                     if let Some(preview) = preview
                         && let Some(record) =
@@ -1114,6 +1281,8 @@ pub(super) fn native_done(
             }
         }
         (NativeKind::Revisable(Effect::Handoff), NativeValue::HandedOff(outcome)) => {
+            #[cfg(all(test, windows))]
+            super::tests::readonly_handoff_fixture_barrier();
             if !outcome.handed_off {
                 s.record_failure(&actor.task, "compositionCleanup".into());
             }
@@ -1139,7 +1308,9 @@ pub(super) fn native_done(
                             let identity = (snapshot.id.clone(), snapshot.epoch, snapshot.version);
                             let fresh = r.edit_identity.as_ref() != Some(&identity)
                                 && snapshot.text != r.block.confirmed().1;
-                            let source = r.pending_source.as_ref().unwrap_or(&s.latest);
+                            let source = r.pending_source.as_ref().unwrap_or(&s.latest).clone();
+                            let cut = retained_cut(r, s, &source);
+                            let mut checkpointed = false;
                             let finish_visible = !fresh
                                 && s.ending.as_ref().is_some_and(|e| e.mode == Finish::Commit)
                                 && s.unit.is_none()
@@ -1152,7 +1323,12 @@ pub(super) fn native_done(
                                 });
                             let mut stopped = r.stopped;
                             let rebased = if fresh {
-                                r.block.rebase_retained(snapshot.text.clone(), start..end)
+                                if cut.is_some() {
+                                    checkpointed = true;
+                                    r.block.rebase_retained(snapshot.text.clone(), start..end)
+                                } else {
+                                    Err(crate::processing::ProcessingError::new("sourceSelection"))
+                                }
                             } else if stopped {
                                 // Ending unchanged editor text needs no source
                                 // insertion mapping and grants no write permit.
@@ -1168,13 +1344,27 @@ pub(super) fn native_done(
                                     stopped = true;
                                     Ok(())
                                 }
+                                Err(error)
+                                    if error.code == "sourceSelection"
+                                        && !s.stopping
+                                        && !actor.control.stopping()
+                                        && s.ending.is_none()
+                                        && snapshot.text == r.block.confirmed().1
+                                        && cut.is_some() =>
+                                {
+                                    checkpointed = true;
+                                    r.block.resume_owned(start..end)
+                                }
                                 result => result,
                             };
                             if rebased.is_ok() {
-                                if fresh {
-                                    r.offset = s.written_raw.chars().count();
-                                    r.absorbed_coverage = r.visible_coverage.clone();
-                                    r.sealed_source = s.written_raw.clone();
+                                if checkpointed {
+                                    let (offset, coverage) =
+                                        cut.expect("checkpoint requires acknowledged source");
+                                    r.offset = offset;
+                                    r.absorbed_coverage = coverage;
+                                    r.sealed_source = units::slice(&source.text, 0..offset);
+                                    r.interior_insertion = end < snapshot.text.chars().count();
                                 }
                                 r.edit_identity = Some(identity);
                                 r.snapshot = Some(snapshot);
@@ -1200,12 +1390,8 @@ pub(super) fn native_done(
                                     observe(actor, s, r, pending);
                                 }
                             } else if rebased.is_err_and(|e| e.code == "sourceSelection") {
-                                // The native range is valid; only the ASR insertion
-                                // mapping is unavailable while the user positions
-                                // the caret to edit. Keep the read-only tracker,
-                                // revoked permit and original source watermark.
-                                // A later verified text edit can establish a new
-                                // baseline. The existing proof deadline still wins.
+                                // No proven source cut yet: retain the native
+                                // tracker and pending speech, never guess a split.
                                 r.snapshot = Some(snapshot);
                                 s.paused_at = Some(Instant::now());
                                 log::info!(target:"sayweave", "operation=draft_selection_wait task_id={} block={} reason=sourceSelection", actor.task,r.block.id());
@@ -1275,10 +1461,22 @@ pub(super) fn native_done(
                 }
             }
         }
-        (NativeKind::Revisable(Effect::Split { raw, text }), NativeValue::Settled(outcome)) => {
+        (
+            NativeKind::Revisable(Effect::Split { sequence, text }),
+            NativeValue::Settled(outcome),
+        ) => {
+            let coverage = r
+                .pending_coverage
+                .take()
+                .filter(|(pending, _)| pending == sequence)
+                .and_then(|(_, mark)| mark.refreshed(&s.latest.segments));
             if outcome.prefix == Mutation::Changed && outcome.tail_owned {
                 archive_block(actor, s, r, text, true);
-                r.offset += raw.chars().count();
+                let Some((offset, _)) = coverage else {
+                    s.record_failure(&actor.task, "sourceChanged".into());
+                    return None;
+                };
+                r.offset = offset;
                 r.seal_source(&s.latest);
                 r.reset_block();
                 let latest = s.latest.clone();
@@ -1297,7 +1495,8 @@ pub(super) fn native_done(
             }
             s.last_handoff = Some(outcome);
         }
-        (NativeKind::Revisable(Effect::Close), NativeValue::Closed(result)) => {
+        (NativeKind::Revisable(Effect::Close), NativeValue::Closed(result))
+        | (NativeKind::Revisable(Effect::EndInput), NativeValue::InputFinished(result)) => {
             s.report.cancelled = s.ending.as_ref().is_some_and(|e| e.mode == Finish::Abort);
             let mut delivery = Delivery::not_submitted(if s.report.cancelled {
                 "cancelled"
@@ -1334,6 +1533,357 @@ mod tests {
     use super::super::tests::{actor, block_reply, command};
     use super::*;
     use crate::windows_input::composition::Command;
+    #[tokio::test]
+    async fn production_completion_keeps_readonly_learning_after_write_resources_are_released() {
+        let (actor, mut s, native) = super::super::tests::production_actor(None);
+        let mut r = s
+            .revisable
+            .take()
+            .expect("production default must be revisable");
+        baseline(&mut r, "项目使用SQLit");
+        r.snapshot = None; // The real Handoff and Release already completed.
+        r.stop();
+        s.draft = None;
+        ending(&mut s, false);
+        schedule(&actor, &mut s, &mut r).unwrap();
+        assert!(s.native.is_some());
+        assert!(
+            !matches!(
+                s.native.as_ref().unwrap().kind,
+                NativeKind::Revisable(Effect::Close)
+            ),
+            "normal completion must not hard-close the learning observer"
+        );
+        let Command::EndInput(reply) = command(&native).await else {
+            panic!("completion must only transfer readonly observation, without another write")
+        };
+        reply.send(Ok(true)).unwrap();
+        let value = SessionDraft::native_value(&mut s.native).await.unwrap();
+        let completed = s.native.take().unwrap();
+        let delivery = native_done(&actor, &mut s, &mut r, &completed.kind, value).unwrap();
+        assert_eq!(s.report.text, "项目使用SQLit");
+        assert_eq!(delivery.submission, Submission::Submitted);
+    }
+
+    #[tokio::test]
+    async fn production_split_carries_its_actual_source_into_learning_receipt() {
+        production_split_source_case(0).await;
+    }
+    #[tokio::test]
+    async fn production_split_maps_its_consumed_cut_through_inflight_source_revision() {
+        production_split_source_case(1).await;
+    }
+    #[tokio::test]
+    async fn production_split_refuses_an_unprovable_inflight_source_cut() {
+        production_split_source_case(2).await;
+    }
+    #[tokio::test]
+    async fn failed_production_split_does_not_consume_source() {
+        production_split_source_case(3).await;
+    }
+    async fn production_split_source_case(case: u8) {
+        let (actor, mut s, native) = super::super::tests::production_actor(None);
+        let mut r = s
+            .revisable
+            .take()
+            .expect("production default must be revisable");
+        let turn = s.turn;
+        let source = |sequence, suffix: &str| NativeTranscript {
+            task_id: actor.task.clone(),
+            turn,
+            sequence,
+            text: format!("项目使用SQLit{suffix}"),
+            segments: vec![
+                crate::contracts::processing::SourceSegment {
+                    id: 1,
+                    revision: 1,
+                    text: "项目使用SQLit".into(),
+                    confirmed: true,
+                },
+                crate::contracts::processing::SourceSegment {
+                    id: 2,
+                    revision: sequence,
+                    text: suffix.into(),
+                    confirmed: true,
+                },
+            ],
+        };
+        s.latest = source(1, "");
+        s.written_raw = s.latest.text.clone();
+        baseline(&mut r, "项目使用SQLite");
+        r.offset = "项目使用SQLit".chars().count();
+        r.seal_source(&s.latest);
+        let next = source(2, &format!("{}乙", "甲".repeat(1990)));
+        observe(&actor, &mut s, &mut r, next);
+        assert!(r.capacity, "the production observation must reach capacity");
+        assert_eq!(r.block.state_snapshot().speech_end, 1990);
+        schedule(&actor, &mut s, &mut r).unwrap();
+        let Command::ReplaceTracked(_, body, _, id, _, reply) = command(&native).await else {
+            panic!("real write before capacity settlement")
+        };
+        let mut tracked = r.snapshot.clone().unwrap();
+        tracked.id = id;
+        tracked.text = body;
+        reply.send(Ok(tracked)).unwrap();
+        let value = SessionDraft::native_value(&mut s.native).await.unwrap();
+        let completed = s.native.take().unwrap();
+        native_done(&actor, &mut s, &mut r, &completed.kind, value);
+        start_generation(&actor, &mut s, &mut r).unwrap();
+        schedule(&actor, &mut s, &mut r).unwrap();
+        let Command::Block(_, _, request, _, _, reply) = command(&native).await else {
+            panic!("release the confirmed tracker")
+        };
+        assert_eq!(request.action, BlockAction::Release);
+        reply
+            .send(Ok(block_reply(&actor.task, None, true)))
+            .unwrap();
+        let value = SessionDraft::native_value(&mut s.native).await.unwrap();
+        let completed = s.native.take().unwrap();
+        native_done(&actor, &mut s, &mut r, &completed.kind, value);
+        schedule(&actor, &mut s, &mut r).unwrap();
+        let Command::Settle(_, body, tail, receipt_source, _, reply) = command(&native).await
+        else {
+            panic!("production prefix settlement expected")
+        };
+        assert_eq!(body, format!("项目使用SQLite{}", "甲".repeat(1990)));
+        assert!(tail.is_empty());
+        assert_eq!(
+            receipt_source,
+            Some((format!("项目使用SQLit{}", "甲".repeat(1990)), String::new()))
+        );
+        if case == 1 {
+            let mut revised = source(3, &format!("{}乙", "甲".repeat(1990)));
+            revised.segments[0].text = "项目使用SQLitt".into();
+            revised.segments[0].revision = 2;
+            revised.text = revised
+                .segments
+                .iter()
+                .map(|part| part.text.as_str())
+                .collect();
+            observe(&actor, &mut s, &mut r, revised);
+        } else if case == 2 {
+            let revised = source(3, &format!("{}乙", "丙".repeat(1990)));
+            observe(&actor, &mut s, &mut r, revised);
+        }
+        reply
+            .send(PrefixOutcome {
+                prefix: if case == 3 {
+                    Mutation::NotAttempted
+                } else {
+                    Mutation::Changed
+                },
+                tail_owned: case != 3,
+                error: None,
+            })
+            .ok()
+            .unwrap();
+        let value = SessionDraft::native_value(&mut s.native).await.unwrap();
+        let completed = s.native.take().unwrap();
+        native_done(&actor, &mut s, &mut r, &completed.kind, value);
+        if case < 2 {
+            assert_eq!(
+                r.offset,
+                1999 + usize::from(case == 1),
+                "consume ASR, not the edited body length"
+            );
+            assert_eq!(r.block.visible(), "乙");
+            assert!(s.stop_error.is_none());
+        } else {
+            assert_eq!(
+                r.offset, 9,
+                "unproven or failed settlement cannot consume source"
+            );
+            assert_eq!(
+                s.stop_error.as_deref(),
+                Some(if case == 2 {
+                    "sourceChanged"
+                } else {
+                    "compositionPartial"
+                })
+            );
+        }
+        assert!(r.pending_coverage.is_none());
+    }
+    #[tokio::test]
+    async fn unavailable_old_block_continues_literal_speech_without_new_model_rewrites() {
+        use crate::models::provider::tests::{Fixture, Reply};
+        let fixture = Fixture::start(vec![Reply::json(
+            200,
+            &serde_json::json!({"choices":[{"index":0,"message":{"role":"assistant","content":"下周一上午开会"},"finish_reason":"stop"}]}).to_string(),
+        )]);
+        let root = tempfile::tempdir().unwrap();
+        let data = crate::data::DataWorker::start(root.path().to_path_buf()).unwrap();
+        let context = Context::fixture(fixture.provider.clone(), fixture.input(), data.clone());
+        let (actor, mut s, native) = super::super::tests::production_actor(Some(context));
+        let mut r = s.revisable.take().expect("production revisable strategy");
+        s.draft = None;
+        let old = baseline(&mut r, "周三开会");
+        let source = |sequence, spoken: &str| NativeTranscript {
+            task_id: actor.task.clone(),
+            turn: 1,
+            sequence,
+            text: format!("周三开会{spoken}"),
+            segments: vec![
+                crate::contracts::processing::SourceSegment {
+                    id: 1,
+                    revision: 1,
+                    text: "周三开会".into(),
+                    confirmed: true,
+                },
+                crate::contracts::processing::SourceSegment {
+                    id: 2,
+                    revision: sequence,
+                    text: spoken.into(),
+                    confirmed: true,
+                },
+            ],
+        };
+        s.latest = source(1, "地点");
+        s.written_raw = "周三开会".into();
+        r.visible_coverage =
+            crate::processing::draft_source::Watermark::capture(&s.latest.segments, 4);
+        r.handoff();
+        let mut refusal = block_reply(&actor.task, Some(old), false);
+        refusal.code = "blockUnavailable:blockEditRangeDrift:80040200".into();
+        native_done(
+            &actor,
+            &mut s,
+            &mut r,
+            &NativeKind::Revisable(Effect::Read {
+                activity: input_state::activity(),
+            }),
+            NativeValue::block(Ok(refusal)),
+        );
+        let Command::Block(_, _, released, _, _, reply) = command(&native).await else {
+            panic!("settle the old tracker before any new input")
+        };
+        assert_eq!(released.action, BlockAction::Release);
+        reply
+            .send(Ok(block_reply(&actor.task, None, true)))
+            .unwrap();
+        let value = SessionDraft::native_value(&mut s.native).await.unwrap();
+        let completed = s.native.take().unwrap();
+        native_done(&actor, &mut s, &mut r, &completed.kind, value);
+        assert!(s.stop_error.is_none());
+        assert_eq!(s.turn, 1);
+        assert_eq!(r.block.visible(), "地点");
+
+        s.merge_at = Some(Instant::now() - Duration::from_millis(151));
+        start_generation(&actor, &mut s, &mut r).unwrap();
+        assert!(
+            matches!(s.unit, Some(UnitSlot::Ready(_, Err(ref e))) if e.code == "preserveRaw"),
+            "a lost old block must not schedule a model rewrite in the new caret block"
+        );
+        let UnitSlot::Ready(unit, output) = s.unit.take().unwrap() else {
+            unreachable!()
+        };
+        accept(&actor, &mut s, &mut r, unit, output);
+        assert_eq!(r.block.visible(), "地点");
+        assert!(fixture.seen.lock().unwrap().is_empty());
+
+        begin_block(&actor, &mut s, &mut r, actor.anchor.clone()).unwrap();
+        let Command::Begin(turn, _, reply) = command(&native).await else {
+            panic!("fresh original-endpoint Begin")
+        };
+        assert_eq!(turn, 2);
+        reply.send(Ok(())).ok().unwrap();
+        let value = SessionDraft::native_value(&mut s.native).await.unwrap();
+        let completed = s.native.take().unwrap();
+        native_done(&actor, &mut s, &mut r, &completed.kind, value);
+        for (sequence, spoken) in [(2, "地点在上海"), (3, "地点在上海明天确认")] {
+            observe(&actor, &mut s, &mut r, source(sequence, spoken));
+            schedule(&actor, &mut s, &mut r).unwrap();
+            match command(&native).await {
+                Command::ReplaceTracked(turn, text, raw, id, _, reply) => {
+                    assert_eq!(sequence, 2);
+                    assert_eq!(turn, 2);
+                    assert_eq!(text, spoken);
+                    assert_eq!(
+                        raw.as_deref(),
+                        Some(spoken),
+                        "new learning range excludes sealed oral source"
+                    );
+                    let count = text.encode_utf16().count() as u32;
+                    reply
+                        .send(Ok(BlockSnapshot {
+                            id,
+                            epoch: 2,
+                            version: sequence,
+                            lease: 0,
+                            text,
+                            selection_start: count,
+                            selection_end: count,
+                            writable: false,
+                        }))
+                        .unwrap();
+                }
+                Command::Replace(turn, text, raw, _, reply) => {
+                    assert_eq!(sequence, 3);
+                    assert_eq!(turn, 2);
+                    assert_eq!(text, spoken);
+                    assert_eq!(raw.as_deref(), Some(spoken));
+                    reply.send(Ok(())).unwrap();
+                }
+                _ => panic!("new literal speech must reach the shared writer"),
+            }
+            let value = SessionDraft::native_value(&mut s.native).await.unwrap();
+            let completed = s.native.take().unwrap();
+            native_done(&actor, &mut s, &mut r, &completed.kind, value);
+            assert_eq!(r.block.confirmed().1, spoken);
+            assert_eq!(s.written_raw, format!("周三开会{spoken}"));
+        }
+        assert!(fixture.seen.lock().unwrap().is_empty());
+        assert!(
+            !s.model_disabled,
+            "caret mode is not a model authentication failure"
+        );
+        assert!(s.stop_error.is_none());
+        drop(r);
+        drop(s);
+        drop(actor);
+        data.shutdown().await;
+    }
+    #[tokio::test]
+    async fn switching_to_caret_cancels_a_ready_whole_block_model_before_it_can_apply() {
+        let (actor, mut s, _) = actor(None);
+        let mut r = State::new();
+        observe(
+            &actor,
+            &mut s,
+            &mut r,
+            NativeTranscript {
+                task_id: actor.task.clone(),
+                turn: 1,
+                sequence: 1,
+                text: "周三开会".into(),
+                segments: vec![crate::contracts::processing::SourceSegment {
+                    id: 1,
+                    revision: 1,
+                    text: "周三开会".into(),
+                    confirmed: true,
+                }],
+            },
+        );
+        let request = unit(&r, &s, r.block.snapshot(false).unwrap(), false);
+        s.unit = Some(UnitSlot::Ready(
+            request,
+            Ok(crate::contracts::processing::GeneratedText {
+                text: "下周一上午开会".into(),
+                usage: crate::contracts::processing::TokenUsage::default(),
+                first_output_ms: None,
+                elapsed_ms: 1,
+            }),
+        ));
+        seal_requested(&actor, &mut s, &mut r);
+        assert!(s.unit.is_none());
+        assert_eq!(r.block.visible(), "周三开会");
+        assert_eq!(s.report.units.last().unwrap().application, "notApplied");
+        assert!(!r.permit.load(Ordering::Acquire));
+        assert!(
+            !State::new().caret_only,
+            "a new session still starts revisable"
+        );
+    }
     #[tokio::test]
     async fn lost_old_block_seals_only_acknowledged_source_without_stopping_speech() {
         let (actor, mut s, native) = actor(None);
@@ -1404,7 +1954,7 @@ mod tests {
         assert_eq!(turn, 2);
         assert_eq!(s.turn, 1);
         assert_eq!(text, "三开会");
-        assert_eq!(raw.as_deref(), Some("周三开会"));
+        assert_eq!(raw.as_deref(), Some("三开会"));
         let snapshot = BlockSnapshot {
             id,
             epoch: 2,
@@ -1421,6 +1971,108 @@ mod tests {
         native_done(&actor, &mut s, &mut r, &completed.kind, value);
         assert_eq!(r.block.confirmed().1, "三开会");
         assert_eq!(s.written_raw, "周三开会");
+    }
+    #[test]
+    fn terminated_composition_checks_independent_block_before_sealing() {
+        let (actor, mut s, _) = actor(None);
+        let mut r = State::new();
+        let snapshot = baseline(&mut r, "周");
+        let block = r.block.id().to_owned();
+        native_done(
+            &actor,
+            &mut s,
+            &mut r,
+            &NativeKind::Revisable(Effect::Write {
+                preview: None,
+                revision: 2,
+                text: "周三".into(),
+                raw: "周三".into(),
+            }),
+            NativeValue::TrackedReplaced(Err(windows_input::composition::WriteFailure {
+                error: Error::new("compositionRejected"),
+                mutation: Mutation::NotAttempted,
+                tracking_failed: false,
+                scope_unavailable: true,
+            })),
+        );
+        assert!(!r.sealing, "composition loss alone is not range loss");
+        assert!(r.read_needed && s.handoff);
+        assert!(!r.permit.load(Ordering::Acquire));
+        assert_eq!(r.block.id(), block);
+        assert_eq!(r.snapshot.as_ref().unwrap().epoch, snapshot.epoch);
+        assert_eq!(r.native_turn, 1);
+        assert!(s.stop_error.is_none());
+    }
+    #[test]
+    fn uncertain_write_never_uses_composition_loss_to_acquire_a_block() {
+        for mutation in [Mutation::Changed, Mutation::Uncertain] {
+            let (actor, mut s, _) = actor(None);
+            let mut r = State::new();
+            baseline(&mut r, "周");
+            native_done(
+                &actor,
+                &mut s,
+                &mut r,
+                &NativeKind::Revisable(Effect::Write {
+                    preview: None,
+                    revision: 2,
+                    text: "周三".into(),
+                    raw: "周三".into(),
+                }),
+                NativeValue::TrackedReplaced(Err(windows_input::composition::WriteFailure {
+                    error: Error::new("compositionPartial"),
+                    mutation,
+                    tracking_failed: false,
+                    scope_unavailable: true,
+                })),
+            );
+            assert!(!s.handoff && !r.read_needed && !r.sealing);
+            assert!(r.uncertain);
+            assert_eq!(s.stop_error.as_deref(), Some("compositionPartial"));
+        }
+    }
+    #[test]
+    fn handoff_keeps_ordered_source_boundary_evidence_without_consuming_the_tail() {
+        let (actor, mut s, _) = actor(None);
+        let mut r = State::new();
+        baseline(&mut r, "周");
+        let source = |sequence, text: &str| NativeTranscript {
+            task_id: actor.task.clone(),
+            turn: 1,
+            sequence,
+            text: text.into(),
+            segments: vec![crate::contracts::processing::SourceSegment {
+                id: 8,
+                revision: sequence,
+                text: text.into(),
+                confirmed: false,
+            }],
+        };
+        s.latest = source(1, "周");
+        s.written_raw = "周".into();
+        r.visible_coverage =
+            crate::processing::draft_source::Watermark::capture(&s.latest.segments, 1);
+        s.handoff = true;
+        r.handoff();
+        observe(&actor, &mut s, &mut r, source(2, "周三"));
+        observe(&actor, &mut s, &mut r, source(3, "舟三开会"));
+        observe(&actor, &mut s, &mut r, source(2, "周四"));
+        assert_eq!(
+            s.written_raw, "周",
+            "observing source cannot consume its tail"
+        );
+        assert_eq!(r.offset, 0);
+        s.draft = None;
+        r.snapshot = None;
+        r.sealing = true;
+        sealed(&actor, &mut s, &mut r);
+        assert!(
+            s.stop_error.is_none(),
+            "known source anchor was lost during coalescing"
+        );
+        assert_eq!(r.offset, 1);
+        assert_eq!(r.block.state_snapshot().text, "三开会");
+        assert_eq!(s.turn, 1);
     }
     #[test]
     fn sealed_partial_source_revision_never_guesses_a_new_split() {
@@ -2209,6 +2861,190 @@ mod tests {
             s.native.as_ref().unwrap().kind,
             NativeKind::Revisable(Effect::Close)
         ));
+    }
+
+    #[tokio::test]
+    async fn verified_caret_relocation_keeps_whole_block_and_unwritten_source() {
+        let (actor, mut s, _) = actor(None);
+        let mut r = State::new();
+        r.block.observe("周三开会".into(), 4).unwrap();
+        let (revision, text) = r.block.write().unwrap();
+        r.block.acknowledge(revision, text.clone()).unwrap();
+        s.written_raw = text.clone();
+        s.latest = NativeTranscript {
+            task_id: actor.task.clone(),
+            turn: s.turn,
+            sequence: 2,
+            text: "周三开会下午三点".into(),
+            segments: vec![
+                crate::contracts::processing::SourceSegment {
+                    id: 1,
+                    revision: 1,
+                    text: text.clone(),
+                    confirmed: true,
+                },
+                crate::contracts::processing::SourceSegment {
+                    id: 2,
+                    revision: 1,
+                    text: "下午三点".into(),
+                    confirmed: false,
+                },
+            ],
+        };
+        r.visible_coverage =
+            crate::processing::draft_source::Watermark::capture(&s.latest.segments, 4);
+        r.handoff();
+        let snapshot = BlockSnapshot {
+            id: r.block.id().into(),
+            epoch: 1,
+            version: 1,
+            lease: 2,
+            text,
+            selection_start: 2,
+            selection_end: 2,
+            writable: false,
+        };
+        let old_id = r.block.id().to_owned();
+        native_done(
+            &actor,
+            &mut s,
+            &mut r,
+            &NativeKind::Revisable(Effect::Read {
+                activity: input_state::activity(),
+            }),
+            NativeValue::block(Ok(block_reply(&actor.task, Some(snapshot), true))),
+        );
+        assert!(
+            !r.read_needed,
+            "valid caret-only relocation must not wait for a text edit"
+        );
+        assert_eq!(r.block.id(), old_id);
+        assert_eq!(r.block.visible(), "周三下午三点开会");
+        assert_eq!(r.offset, 4, "the unseen new speech must not be absorbed");
+        assert_eq!(
+            r.block.state_snapshot().baseline_kind,
+            crate::contracts::draft::BaselineKind::Asr
+        );
+        assert!(r.permit.load(Ordering::Acquire));
+        assert!(!r.sealing);
+    }
+
+    #[tokio::test]
+    async fn caret_relocation_without_an_acknowledged_cut_stays_readonly() {
+        let (actor, mut s, _) = actor(None);
+        let mut r = State::new();
+        r.block.observe("周三开会".into(), 4).unwrap();
+        let (revision, text) = r.block.write().unwrap();
+        r.block.acknowledge(revision, text.clone()).unwrap();
+        s.written_raw = text.clone();
+        r.handoff();
+        let snapshot = BlockSnapshot {
+            id: r.block.id().into(),
+            epoch: 1,
+            version: 1,
+            lease: 2,
+            text,
+            selection_start: 2,
+            selection_end: 2,
+            writable: false,
+        };
+        native_done(
+            &actor,
+            &mut s,
+            &mut r,
+            &NativeKind::Revisable(Effect::Read {
+                activity: input_state::activity(),
+            }),
+            NativeValue::block(Ok(block_reply(&actor.task, Some(snapshot), true))),
+        );
+        assert!(r.read_needed);
+        assert!(!r.permit.load(Ordering::Acquire));
+        assert_eq!(r.offset, 0);
+        assert!(r.block.write().is_none());
+    }
+
+    #[tokio::test]
+    async fn insertion_checkpoint_keeps_full_block_history_and_source_spans() {
+        let (actor, mut s, _) = actor(None);
+        let mut r = State::new();
+        let source = crate::contracts::processing::SourceSegment {
+            id: 1,
+            revision: 1,
+            text: "周三开会".into(),
+            confirmed: true,
+        };
+        s.latest = NativeTranscript {
+            task_id: actor.task.clone(),
+            turn: s.turn,
+            sequence: 1,
+            text: source.text.clone(),
+            segments: vec![source],
+        };
+        r.block.observe(s.latest.text.clone(), 4).unwrap();
+        let (revision, text) = r.block.write().unwrap();
+        r.block.acknowledge(revision, text.clone()).unwrap();
+        s.written_raw = text;
+        r.visible_coverage =
+            crate::processing::draft_source::Watermark::capture(&s.latest.segments, 4);
+        r.block.handoff();
+        r.block.resume_owned(2..2).unwrap();
+        r.offset = 4;
+        r.absorbed_coverage = r.visible_coverage.clone();
+        let snapshot = r.block.state_snapshot();
+        let association = unit(&r, &s, snapshot, true).draft.unwrap();
+        assert_eq!(association.asr_sources.len(), 1);
+        assert_eq!(association.asr_sources[0].chars, 0..4);
+        archive_block(&actor, &mut s, &mut r, "周三开会", true);
+        assert_eq!(s.report.raw, "周三开会");
+        assert_eq!(s.report.text, "周三开会");
+    }
+
+    #[tokio::test]
+    async fn block_source_retains_its_cut_through_revision_and_insertion_checkpoint() {
+        let (actor, mut s, _) = actor(None);
+        let mut r = State::new();
+        let source = |sequence, text: &str| NativeTranscript {
+            task_id: actor.task.clone(),
+            turn: 1,
+            sequence,
+            text: text.into(),
+            segments: vec![crate::contracts::processing::SourceSegment {
+                id: 8,
+                revision: sequence,
+                text: text.into(),
+                confirmed: false,
+            }],
+        };
+        s.latest = source(1, "周");
+        r.offset = 1;
+        r.absorbed_coverage =
+            crate::processing::draft_source::Watermark::capture(&s.latest.segments, 1);
+        r.block_source = r.absorbed_coverage.clone();
+        s.handoff = true;
+        observe(&actor, &mut s, &mut r, source(2, "周三"));
+        observe(&actor, &mut s, &mut r, source(3, "舟三开会"));
+        s.latest = r.pending_source.take().unwrap();
+        s.handoff = false;
+        assert_eq!(
+            r.block_source.as_ref().unwrap().offset(&s.latest.segments),
+            Some(1)
+        );
+        assert_eq!(r.offset, 1, "refreshing proof never consumes new source");
+        r.block.observe("三开会".into(), 0).unwrap();
+        let (revision, text) = r.block.write().unwrap();
+        r.block.acknowledge(revision, text).unwrap();
+        s.written_raw = s.latest.text.clone();
+        r.visible_coverage =
+            crate::processing::draft_source::Watermark::capture(&s.latest.segments, 4);
+        r.block.handoff();
+        r.block.resume_owned(1..1).unwrap();
+        r.offset = 4;
+        r.absorbed_coverage = r.visible_coverage.clone();
+        let association = unit(&r, &s, r.block.state_snapshot(), true).draft.unwrap();
+        assert_eq!(association.asr_sources.len(), 1);
+        assert_eq!(association.asr_sources[0].chars, 1..4);
+        archive_block(&actor, &mut s, &mut r, "三开会", true);
+        assert_eq!(s.report.raw, "三开会");
     }
 
     #[tokio::test]

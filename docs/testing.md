@@ -183,6 +183,18 @@ Rust数据测试覆盖Unicode、约束、版本冲突、事务、迁移拒绝、
 
 `node scripts/test-speech-desktop.mjs --polish` 使用隔离模型、数据库、录音和实际编辑器验证分段整理；报告包含实际目标文字及组件哈希，结束后关闭自有窗口并清理测试凭据。若输入组件源码、协议和已验收产物均未变，可通过构建环境变量 `SAYWEAVE_TSF_PAYLOAD` 指定该已核实DLL，避免一次重建导致无功能变化的组件安装要求；必须记录来源提交与SHA256。未设置时按源码构建。这个变量只影响构建产物，不向前端开放组件路径。
 
+### 结束后纠词采集验证
+
+`windows_input::learning_observation` 覆盖原输入框快照的归属、重复文本、范围外变化、IME、撤销、删除、来源栅栏和两种观察来源的幂等入库。`dictation::revisable` 的生产默认路径回归核对正常结束只转移只读观察、分段结算携带实际来源；测试不能切回旧草稿策略代替生产路径。
+
+现有 `scripts/test-prefix-input.mjs` 的 actor 分支可显式设置 `SAYWEAVE_ACTOR_LEARNING=1`。它驱动真实 `SessionDraft`、注册的原生输入组件和自有 ProseMirror，实际交付 `项目使用SQLit`，正常结束后通过受控原生按键补上 `e`，分别核对宿主事件处理后的正文、真实采集证据、隔离数据库自动词条，以及下一轮词典热词和整理上下文。模型分类回复在这项测试中固定；真实供应商仍由 `test:learning:live` 单独验收。
+
+测试二进制必须先以已核实的 `SAYWEAVE_TSF_PAYLOAD` 和 `SAYWEAVE_TSF_PROXY_PAYLOAD` 构建，并通过 `SAYWEAVE_ACTOR_TEST_EXE` 指定；组件身份不一致时仍拒绝输入。入口设置 `SAYWEAVE_BLOCK_REGRESSION=1`、`SAYWEAVE_BLOCK_ACTOR_ONLY=1`，普通结束场景再设置 `SAYWEAVE_ACTOR_RAW_ONLY=1`。`SAYWEAVE_ACTOR_LEARNING_FIELD=1` 仅在测试二进制内关闭原范围观察，独立证明快照采集；它不是产品设置。`SAYWEAVE_ACTOR_LEARNING_CASE=resume` 配合固定回复 `应用使用SQLit，配置完成`，核对手动编辑与接管后观察重新建立。`regression` 则保持学习观察开启，运行原有三次编辑及正文回归。
+
+`replace-word` 在结束后用原生选择键整词替换 `Seville→Sayweave`；`delete-word` 逐字符 Backspace，再重新输入该词。后者叠加 `SAYWEAVE_BLOCK_FLOATING_PREDICTION=1` 使 `S` 与 `eville` 分属两个真实输入块，核对最终正文和完整词形证据；固定模型只回复当前可改的 `eville`，不能返回整词改变被测条件。该富文本提供者在空文档返回末尾 CR，不能代替真正空字符串提供者的清空分支验收。`recording-word` 在录音中改词，等待采集屏障后于既有编辑总期限内续说，检查学习及结束后的正文。注入 Unicode 键不代表真实输入法候选已提交；未提交组词、确认提交后计时、并发结算、范围失效、超时和下一轮即时结算另由定向单元覆盖。
+
+报告保存于 `.local/prefix-input/<run-id>/report.json`，包括实际正文、交付、证据、词条、组件身份及清理事实。自有宿主通过不代表微信、Codex 或其他宿主的读取能力已通过；实际软件另记录输入、读取、纠错、分类、入词和下一轮使用六项结果。
+
 性能记录区分ASR句段确认、请求派发、服务返回、原生应用与保存完成。同一段文字确认状态改变仍须进入调度。真实服务可能直到结束才确认；在未采集相应时序前，只能报告受控接续通过。显式真实文字模型测试只上传固定合成语料、只读原配置和凭据；数据目录为空时拒绝网络请求。模型返回成功、正文可用及实际原生应用分别记录；内容质量通过人工评测判断，单次耗时不作为p95或客户端优化比例。
 
 ### Explicit recording-time supplier acceptance
@@ -247,3 +259,23 @@ Current WebView2 runtimes ignore environment/HKCU browser-argument overrides for
 `atomic_record::tests` 使用自有临时目录检查真实读句柄短暂/持续占用、阶段期限、权限/路径拒绝和目标变化。`deployment::retired::tests::protected_collection_and_journal_contention` 为显式管理员隔离测试：只创建 `Program Files/Sayweave/MaintenanceTest-<UUID>`，验证64项清单、双载荷容量、保留身份、打开/映射文件、哈希不符、中断清理及真实DACL拒绝，不修改系统登记、真实事务、正式程序或用户数据库。该测试默认忽略；需要相应授权时单独执行，不加入普通CI的系统维护。
 
 完整检查/E2E/分发检查由正式发布流程执行。发布及文件实验通过不表示用户应用内更新已经通过，实际升级结果另行记录。
+
+## 实际 IME 学习与首次输入等待
+
+生产 actor 的只读学习用例可启用 `SAYWEAVE_ACTOR_LEARNING_IME=1`，与 `SAYWEAVE_ACTOR_LEARNING_CASE=delete-word`、`SAYWEAVE_ACTOR_LEARNING_FIELD=1` 配合。自有编辑器先取得真实交付收据，逐字删除到空，再通过原生字母／Shift／选词按键产生真实组词。断言短暂变化不提前发布；最近字段稳定15秒后，即使UIA仍缓存组合范围，也应生成单一纠错、自动词条及下一轮热词和整理上下文。实际选词提交后核对完整正文及去重。状态查询用于维持测试驱动存活，不产生键盘活动。Unicode 文本注入不能替代这项覆盖。
+
+`SAYWEAVE_ACTOR_INITIAL_IME=1` 与 `SAYWEAVE_ACTOR_RAW_ONLY=1` 在现有 `test-prefix-input` actor-only入口验证：实际 IME 组合存在时准备输入，等待期间多批 ASR 与音频路由保持；提交原组合后一次交付完整来源，并继续流式。无原字段身份、超时、结束、取消与迟到 Begin 使用受控 actor 测试，实际正文和同窗换框另外核对。测试只操作自有窗口；功能结果仍绑定各宿主实测，不能由模拟回执或单元测试数量代替。
+
+`SAYWEAVE_ACTOR_INITIAL_IME_EARLY_SWITCH=1` 在原生首次拒绝回执返回前设置日志屏障，同窗口切到另一个字段后释放，断言新字段保持空白、原 ASR 来源进入结果交付。`SAYWEAVE_ACTOR_INITIAL_IME_SWITCH=1` 覆盖进入等待后换框；`SAYWEAVE_ACTOR_INITIAL_IME_TIMEOUT=1` 覆盖等待原期限耗尽。暂停时钟测试另覆盖14.9秒发出、15.1秒成功返回，以及成功返回前已观察到超时的两种顺序。普通受控 actor 也使用生产 `Draft::prepare` 入口，避免只测试旧启动入口。
+
+`SAYWEAVE_ACTOR_INITIAL_IME_DIRECT=1` 配合首次组词用例，保留真实 IME 的 `hello`，直接提供多批口述。夹具不按空格或回车提交组词；断言 `hello周三`、`hello周三开会`、`hello周三开会地点在上海`，固定整理回复后结束正文保持，且实际发生一次整理请求。必须使用普通候选核心复核；验收专用核心的结果单独记录。
+
+`SAYWEAVE_ACTOR_LEARNING_RESTART=pending|committed` 配合 `delete-word`、`SAYWEAVE_ACTOR_LEARNING_IME=1`，连续验证首轮交付、真实输入法纠词及下一轮口述。两轮保留同一页面和字段，先核对旧任务退出后的修正词，再检查第二轮准备、Begin、首次更新及最终退役后的全文。两轮任务 ID 必须不同、编辑器 PID 相同；只完成首轮不能通过。`pending` 保留外部组合，`committed` 使用真实空格确认。两轮 actor 是独立进程，不代替主程序内复用观察线程的验收。未提交组合的直接输入仍保持未通过状态；曾出现修正词在准备阶段清空的候选保留为失败证据。
+
+所有 actor 分支必须等待退出码0，并在退出后核对最后一份完整预期正文。场景首个错误与收尾错误分别保留；提前返回、仅采样而未比较正文或等待超时均不能视为退役成功。
+
+`SAYWEAVE_ACTOR_INITIAL_IME_END_SWITCH=1` 保留在原组词真实 compositionend 回调中切到同窗第二字段的交错夹具，检查原文、新字段及结果交付。该夹具曾在已撤回的外部组词自动完成候选上运行；取消／连接变化后的捕获发布、编辑和焦点通知撤销提交资格的原生单元结果也属于该历史候选。当前原生源码恢复至 `9ef8f54`，相关自动完成路径及其单元测试已撤回；当前覆盖以回退后的执行记录为准。
+
+`SAYWEAVE_ACTOR_LEARNING_SUBMIT=enter` 配合 `delete-word` 或 `recording-word`，使用原生键盘逐字删除、重打纠词，在15秒前由自有宿主处理真实 Enter 并清空输入框。断言单份证据、自动词条及下一轮热词／整理上下文；录音中提交另核对停止后正文仍为空。与停键15秒、录音中修改后继续说分别验证。物理监听用例须显式设置 `SAYWEAVE_ACTOR_PHYSICAL_INPUT=1`、`SAYWEAVE_ACTOR_OBSERVE_INJECTED=1`；脚本为 actor 提供独立验收 UUID，监听器只接受授权的自有前台进程。缺少标记时的注入不能被记为真实编辑监听覆盖。
+
+`SAYWEAVE_BLOCK_CONTINUITY=prediction-revision` 配合空白浮动建议，依次提供同一未确认来源的 `周`、`周三`、`舟三开会`，再提供新片段 `地点在上海`。封存首字保持为 `周`；后续正文必须持续变为 `周三开会`、`周三开会地点在上海`，最终整理为 `周三开会，地点在上海。`。固定整理回复只覆盖可修改的新块。只有首字或音频仍在运行均不通过。来源单元另覆盖缺少上下文、重复锚点、片段替换、字素分界及已确认片段刷新后的吸收保持。

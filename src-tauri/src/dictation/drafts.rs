@@ -17,7 +17,7 @@ use crate::{
     speech::{NativeTranscript, continuous::Control},
     windows_input::{
         self, Anchor, Delivery, Submission,
-        composition::{Connection, Draft, Finish, FinishOutcome, PrefixOutcome},
+        composition::{Connection, Draft, Finish, FinishOutcome, InitialInput, PrefixOutcome},
     },
 };
 use sayweave_text_service::{settlement_boundary::SettlementBoundary, wire::Mutation};
@@ -248,6 +248,9 @@ impl UnitSlot {
     }
 }
 enum NativeKind {
+    InitialBegin {
+        activity: u64,
+    },
     RetireHandoff,
     RetireClose,
     Revisable(revisable::Effect),
@@ -291,6 +294,7 @@ enum NativeValue {
     HandedOff(FinishOutcome),
     Finalized(FinishOutcome),
     Closed(Result<(), Error>),
+    InputFinished(Result<(), Error>),
 }
 impl NativeValue {
     fn block(result: Result<sayweave_text_service::wire::Reply, Error>) -> Self {
@@ -318,6 +322,7 @@ struct Ending {
     expired: bool,
 }
 struct State {
+    initial_preparation: Option<Instant>,
     input_delivery: delivery::InputDelivery,
     revisable: Option<revisable::State>,
     draft: Option<Arc<Draft>>,
@@ -387,6 +392,7 @@ struct View {
     result_only: bool,
 }
 pub(crate) struct SessionDraft {
+    initially_pending: bool,
     connection: Arc<Connection>,
     task: String,
     anchor: Anchor,
@@ -400,6 +406,7 @@ pub(crate) struct SessionDraft {
     record: Mutex<Option<Arc<crate::history::RecordLease>>>,
 }
 impl SessionDraft {
+    #[cfg(any(test, feature = "desktop-acceptance"))]
     pub fn new(
         task: String,
         anchor: Anchor,
@@ -409,10 +416,34 @@ impl SessionDraft {
         context: Option<Context>,
         record: Option<Arc<crate::history::RecordLease>>,
     ) -> Arc<Self> {
+        Self::new_initial(
+            task,
+            anchor,
+            InitialInput {
+                connection: draft.connection(),
+                draft: Some(draft),
+            },
+            control,
+            cancel,
+            context,
+            record,
+        )
+    }
+    pub fn new_initial(
+        task: String,
+        anchor: Anchor,
+        initial: InitialInput,
+        control: Control,
+        cancel: watch::Sender<u8>,
+        context: Option<Context>,
+        record: Option<Arc<crate::history::RecordLease>>,
+    ) -> Arc<Self> {
+        let initially_pending = initial.draft.is_none();
         let (latest, _) = watch::channel(NativeTranscript::default());
         let (ends, receiver) = mpsc::channel(1);
         Arc::new(Self {
-            connection: draft.connection(),
+            initially_pending,
+            connection: initial.connection,
             task,
             anchor: anchor.clone(),
             control,
@@ -422,9 +453,11 @@ impl SessionDraft {
             ends,
             initial: Mutex::new(Some((
                 State {
+                    initial_preparation: initially_pending
+                        .then(|| Instant::now() + Duration::from_secs(15)),
                     input_delivery: delivery::InputDelivery::Live,
                     revisable: revisable::State::configured(),
-                    draft: Some(draft),
+                    draft: initial.draft,
                     turn: 1,
                     activity: anchor.activity,
                     latest: NativeTranscript::default(),
@@ -473,7 +506,9 @@ impl SessionDraft {
             .unwrap_or(Presentation::Editing)
     }
     pub fn activate(&self) {
-        self.control.draft_started(self.anchor.activity);
+        if !self.initially_pending {
+            self.control.draft_started(self.anchor.activity);
+        }
     }
     pub fn update(&self, value: &NativeTranscript) {
         if value.task_id == self.task {
@@ -508,7 +543,9 @@ impl SessionDraft {
     fn project(&self, s: &State) {
         if let Ok(mut v) = self.view.lock() {
             v.turn = s.turn;
-            v.paused = s.input_delivery.live() && (s.paused_at.is_some() || s.handoff);
+            v.paused = s.initial_preparation.is_none()
+                && s.input_delivery.live()
+                && (s.paused_at.is_some() || s.handoff);
             v.result_only = !s.input_delivery.live();
         }
     }
@@ -533,6 +570,15 @@ impl SessionDraft {
         }
     }
     fn observe(&self, s: &mut State, value: NativeTranscript) {
+        if s.initial_preparation.is_some() {
+            if value.task_id == self.task
+                && value.turn == s.turn
+                && value.sequence > s.latest.sequence
+            {
+                s.latest = value;
+            }
+            return;
+        }
         if !s.input_delivery.live() {
             if value.task_id == self.task
                 && value.turn == s.turn
@@ -620,6 +666,13 @@ impl SessionDraft {
         }
     }
     fn request_handoff(&self, s: &mut State) {
+        if s.initial_preparation.is_some() {
+            if s.activity != input_state::activity() {
+                s.activity = input_state::activity();
+                s.paused_at = Some(Instant::now());
+            }
+            return;
+        }
         if !s.input_delivery.live() || s.activity == input_state::activity() {
             return;
         }
@@ -672,7 +725,7 @@ impl SessionDraft {
         s.handoff = false;
     }
     fn start_generation(&self, s: &mut State) -> Result<(), Error> {
-        if !s.input_delivery.live() {
+        if s.initial_preparation.is_some() || !s.input_delivery.live() {
             return Ok(());
         }
         if let Some(mut revised) = s.revisable.take() {
@@ -937,6 +990,34 @@ impl SessionDraft {
             self.schedule_delivery_retirement(s);
             return Ok(());
         }
+        if let Some(deadline) = s.initial_preparation {
+            if s.stopping
+                || self.control.stopping()
+                || s.ending.is_some()
+                || Instant::now() >= deadline
+            {
+                self.retire_initial(s);
+                self.schedule_delivery_retirement(s);
+            } else if s.native.is_some() {
+                return Ok(());
+            } else if s
+                .paused_at
+                .is_none_or(|at| at.elapsed() >= Duration::from_millis(300))
+                && !input_state::editing_key_held()
+            {
+                let anchor = windows_input::reanchor_turn(&self.task, &self.anchor)?;
+                let activity = anchor.activity;
+                let turn = s.turn;
+                let connection = self.connection.clone();
+                s.native = Some(NativeJob {
+                    kind: NativeKind::InitialBegin { activity },
+                    job: tokio::spawn(async move {
+                        NativeValue::Begun(connection.begin_turn(turn, anchor).await)
+                    }),
+                });
+            }
+            return Ok(());
+        }
         if let Some(mut revised) = s.revisable.take() {
             let result = revisable::schedule(self, s, &mut revised);
             s.revisable = Some(revised);
@@ -1038,6 +1119,18 @@ impl SessionDraft {
         }
         Ok(())
     }
+    fn retire_initial(&self, s: &mut State) {
+        s.initial_preparation = None;
+        self.cancel_generation(s);
+        if let Some(revised) = &mut s.revisable {
+            revised.stop();
+        }
+        s.input_delivery = delivery::InputDelivery::Retiring;
+        s.report.result_only = true;
+        s.handoff = false;
+        s.paused_at = None;
+        self.control.detach_input();
+    }
     fn schedule_final(&self, s: &mut State) -> Result<(), Error> {
         self.cancel_generation(s);
         let Some(ending) = &s.ending else {
@@ -1115,6 +1208,50 @@ impl SessionDraft {
         kind: &NativeKind,
         value: NativeValue,
     ) -> Option<Delivery> {
+        if let NativeKind::InitialBegin { activity } = kind {
+            match value {
+                NativeValue::Begun(Ok(draft)) => {
+                    s.draft = Some(draft);
+                    if s.initial_preparation
+                        .is_none_or(|deadline| Instant::now() >= deadline)
+                        || !s.input_delivery.live()
+                        || s.stopping
+                        || self.control.stopping()
+                        || s.ending.is_some()
+                    {
+                        self.retire_initial(s);
+                    } else {
+                        s.initial_preparation = None;
+                        s.activity = *activity;
+                        s.paused_at = None;
+                        self.control.draft_started(*activity);
+                        let latest = std::mem::take(&mut s.latest);
+                        self.request_handoff(s);
+                        self.observe(s, latest);
+                        if !s.handoff {
+                            self.control.resume_retained(s.turn, *activity);
+                        }
+                    }
+                }
+                NativeValue::Begun(Err(error))
+                    if (s.stopping || self.control.stopping() || s.ending.is_some())
+                        && (normal_preparation_refusal(&error.code)
+                            || error.code == "cancelled") =>
+                {
+                    self.retire_initial(s);
+                }
+                NativeValue::Begun(Err(error))
+                    if matches!(error.code.as_str(), "inputComposition" | "editing") =>
+                {
+                    if s.initial_preparation.is_some() && s.input_delivery.live() {
+                        s.paused_at = Some(Instant::now());
+                    }
+                }
+                NativeValue::Begun(Err(error)) => s.record_failure(&self.task, error.code),
+                _ => s.record_failure(&self.task, "compositionProtocol".into()),
+            }
+            return None;
+        }
         if matches!(kind, NativeKind::RetireHandoff | NativeKind::RetireClose) {
             self.delivery_retired(s, kind, value);
             return None;
