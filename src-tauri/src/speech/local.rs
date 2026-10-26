@@ -375,9 +375,12 @@ mod tests {
             let mut text = String::new();
             let mut progress = Vec::new();
             let mut confirmed = String::new();
+            let mut last_pcm_ms = 0.0;
             let start = tokio::time::Instant::now() + Duration::from_millis(100);
             let mut tick = tokio::time::interval_at(start, Duration::from_millis(100));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Keep capture deadlines anchored. Windows timer granularity must
+            // not accumulate a delay on every packet and slow the test audio.
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
             tokio::time::timeout(Duration::from_secs_f64(audio_seconds + 15.0),async {
                 loop {tokio::select! {
                     event=session.next_event()=>match event.unwrap() {
@@ -391,7 +394,7 @@ mod tests {
                         Event::Finished=>{assert!(final_at.is_some());break;},Event::Heartbeat=>{},
                     },
                     _=tick.tick(),if final_at.is_none()=>{
-                        if at<pcm.len(){let end=(at+1600).min(pcm.len());session.send_pcm(&pcm[at..end]).await.unwrap();at=end;}
+                        if at<pcm.len(){let end=(at+1600).min(pcm.len());session.send_pcm(&pcm[at..end]).await.unwrap();at=end;last_pcm_ms=began.elapsed().as_secs_f64()*1000.0;}
                         else {final_at=Some(Instant::now());session.finish().await.unwrap();}
                     },
                 }}
@@ -399,7 +402,7 @@ mod tests {
             assert!(updates > 2);
             assert_eq!(text, confirmed);
             assert_eq!(at, pcm.len());
-            runs.push(serde_json::json!({"turn":turn,"updates":updates,"firstTextMs":first.unwrap(),"finalizeMs":final_at.unwrap().elapsed().as_secs_f64()*1000.0,"elapsedMs":began.elapsed().as_secs_f64()*1000.0,"full":text,"progressMs":progress}));
+            runs.push(serde_json::json!({"turn":turn,"updates":updates,"firstTextMs":first.unwrap(),"finalizeMs":final_at.unwrap().elapsed().as_secs_f64()*1000.0,"lastPcmMs":last_pcm_ms,"elapsedMs":began.elapsed().as_secs_f64()*1000.0,"full":text,"progressMs":progress}));
             drop(session);
         }
         // Exercise the production dispatcher with queued PCM at cooperative
@@ -416,11 +419,13 @@ mod tests {
             )
             .await
             .unwrap();
-            for chunk in pcm.chunks(1600).take(16) {
+            for chunk in pcm.chunks(1600).take(24) {
                 old.send_pcm(chunk).await.unwrap();
             }
+            eprintln!("local_cancel_acceptance=waiting_first_update_after_2400ms_audio");
             assert!(matches!(old.next_event().await.unwrap(), Event::Update(_)));
-            for chunk in pcm.chunks(1600).take(16) {
+            eprintln!("local_cancel_acceptance=first_update_received");
+            for chunk in pcm.chunks(1600).take(8) {
                 old.send_pcm(chunk).await.unwrap();
             }
             drop(old);
@@ -446,7 +451,7 @@ mod tests {
         let memory = runtime.process_memory().await;
         runtime.shutdown().await.unwrap();
         let worker_sha = format!("{:x}", Sha256::digest(std::fs::read(program).unwrap()));
-        let report = serde_json::json!({"kind":"main-recognition-real-worker-fixed-audio","audioFile":audio,"audioSha256":format!("{:x}", Sha256::digest(std::fs::read(&audio).unwrap())),"durationSeconds":audio_seconds,"syntheticAudio":audio.file_name().is_some_and(|n|n.to_string_lossy().contains("sapi")),"requestedDevice":requested,"prepared":metadata,"prepareMs":prepare_ms,"workerSha256":worker_sha,"testDriverSha256":format!("{:x}", Sha256::digest(std::fs::read(std::env::current_exe().unwrap()).unwrap())),"runtimeManifest":manifest,"modelSha256":model_assets::MODEL_SHA256,"processMemory":memory,"runs":runs,"cancellationBacklogNextTurnPassed":true,"cancellationRecoveryMs":cancellation_ms,"processAndComputeClosed":true});
+        let report = serde_json::json!({"kind":"main-recognition-real-worker-fixed-audio","audioPacing":"absolute-100ms","audioFile":audio,"audioSha256":format!("{:x}", Sha256::digest(std::fs::read(&audio).unwrap())),"durationSeconds":audio_seconds,"syntheticAudio":audio.file_name().is_some_and(|n|n.to_string_lossy().contains("sapi")),"requestedDevice":requested,"prepared":metadata,"prepareMs":prepare_ms,"workerSha256":worker_sha,"testDriverSha256":format!("{:x}", Sha256::digest(std::fs::read(std::env::current_exe().unwrap()).unwrap())),"runtimeManifest":manifest,"modelSha256":model_assets::MODEL_SHA256,"processMemory":memory,"runs":runs,"cancellationNextTurnPassed":true,"cancellationRecoveryMs":cancellation_ms,"processAndComputeClosed":true});
         std::fs::write(output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
 }
