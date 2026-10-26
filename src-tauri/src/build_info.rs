@@ -24,15 +24,15 @@ pub(crate) fn development_profile() -> bool {
     profile_for(env!("SAYWEAVE_BUILD_CHANNEL"), cfg!(debug_assertions))
 }
 fn profile_for(channel: &str, debug: bool) -> bool {
-    debug || channel == "development"
+    debug || channel == "internal"
 }
 #[cfg(test)]
 mod profile_tests {
     use super::*;
     #[test]
     fn optimized_development_keeps_a_separate_profile_and_stable_does_not_move() {
-        assert!(profile_for("development", false));
-        assert!(profile_for("development", true));
+        assert!(profile_for("internal", false));
+        assert!(profile_for("internal", true));
         assert!(!profile_for("stable", false));
         assert!(!profile_for("test", false));
         assert!(profile_for("stable", true));

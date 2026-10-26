@@ -1,9 +1,9 @@
 //! Explicit test-only developer handoff. Never linked into a shipping application.
 use super::credentials::{Credentials, WindowsCredentials};
-use crate::data::DataWorker;
+use crate::data::{DataWorker, Operation};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{collections::BTreeMap, io::Write, path::Path, time::Duration};
 
 const PRESERVED: &[&str] = &[
     "model_configs",
@@ -74,7 +74,18 @@ async fn seed(
             .map_err(|_| "profile-backup")?
             .run_to_completion(128, Duration::from_millis(1), None)
             .map_err(|_| "profile-backup")?;
-        target.execute_batch("PRAGMA foreign_keys=ON; BEGIN; DELETE FROM speech_records; DELETE FROM language_edits WHERE id NOT IN (SELECT evidence_id FROM language_term_sources WHERE evidence_id IS NOT NULL); DELETE FROM language_lexical_candidates; UPDATE language_edits SET state=CASE WHEN state='pending' THEN 'expired' ELSE state END,automatic_terms_state=CASE WHEN automatic_terms_state='pending' THEN 'expired' ELSE automatic_terms_state END,personalization_state=CASE WHEN personalization_state='pending' THEN 'expired' ELSE personalization_state END; DELETE FROM language_observations; DELETE FROM language_profile_revisions; DELETE FROM language_profiles; COMMIT; VACUUM;")
+        target.execute_batch("PRAGMA foreign_keys=ON; BEGIN;
+            DELETE FROM speech_records;
+            DELETE FROM language_edits WHERE id NOT IN (SELECT evidence_id FROM language_term_sources WHERE evidence_id IS NOT NULL);
+            DELETE FROM language_lexical_candidates;
+            UPDATE language_edits SET
+                state=CASE WHEN state='pending' THEN 'expired' ELSE state END,
+                automatic_terms_state=CASE WHEN automatic_terms_state='pending' THEN 'cancelled' ELSE automatic_terms_state END,
+                personalization_state=CASE WHEN personalization_state='pending' THEN 'cancelled' ELSE personalization_state END;
+            DELETE FROM language_observations;
+            DELETE FROM language_profile_revisions;
+            DELETE FROM language_profiles;
+            COMMIT; VACUUM;")
             .map_err(|_| "profile-prune")?;
         for table in [
             "speech_records",
@@ -90,8 +101,21 @@ async fn seed(
     // Only the independent staging database is migrated. The source connection
     // remains read-only throughout, including all credential-copy failures.
     let data = DataWorker::start(staging.path().to_path_buf()).map_err(|_| "profile-migration")?;
-    data.shutdown().await;
+    let ready = data
+        .request(
+            "main",
+            Operation::Models(super::types::DbOperation::Overview),
+        )
+        .await;
+    let status = data.status();
+    let drained = data.seal_and_drain().await;
     drop(data);
+    if ready.is_err()
+        || drained.is_err()
+        || !status.is_ok_and(|s| s.state == "ready" && s.schema_version == 11)
+    {
+        return Err("profile-migration");
+    }
     let target = Connection::open_with_flags(&db_file, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|_| "profile-verification")?;
     for (table, before) in &preserved {
@@ -112,6 +136,9 @@ async fn seed(
             r.get(0)
         })
         .map_err(|_| "profile-verification")?;
+    if target_schema != 11 {
+        return Err("profile-migration");
+    }
     let refs = target
         .prepare(
             "SELECT DISTINCT credential_ref FROM model_configs WHERE credential_ref IS NOT NULL",
@@ -134,6 +161,16 @@ async fn seed(
             Err(_) => return Err("profile-target-credential"),
         }
     }
+    let intent = serde_json::json!({"namespace":"local.sayweave.skeleton.dev","target":destination,"references":pending.iter().map(|(r,_)|r).collect::<Vec<_>>()});
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(staging.path().join("credential-copy-intent.json"))
+        .map_err(|_| "profile-credential-intent")?;
+    file.write_all(&serde_json::to_vec(&intent).map_err(|_| "profile-credential-intent")?)
+        .map_err(|_| "profile-credential-intent")?;
+    file.sync_all().map_err(|_| "profile-credential-intent")?;
+    drop(file);
     let mut created = Vec::new();
     let result = (|| {
         for (reference, key) in &pending {
@@ -145,13 +182,31 @@ async fn seed(
         std::fs::rename(staging.path(), destination).map_err(|_| "profile-publish")
     })();
     if let Err(code) = result {
-        for reference in created {
-            target_vault
-                .delete(&reference)
-                .map_err(|_| "profile-credential-cleanup")?;
+        let unresolved = created
+            .into_iter()
+            .filter(|r| target_vault.delete(r).is_err())
+            .collect::<Vec<_>>();
+        if !unresolved.is_empty() {
+            // Keep the pre-synced intent even if the secondary failure receipt
+            // cannot be written (e.g. a full disk). It lists only newly owned
+            // dev references, never key values or pre-existing credentials.
+            let kept = staging.keep();
+            let failure = serde_json::json!({"cause":code,"unresolved":unresolved});
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(kept.join("credential-copy-failure.json"))
+                && let Ok(bytes) = serde_json::to_vec(&failure)
+            {
+                let _ = file.write_all(&bytes);
+                let _ = file.sync_all();
+            }
+            eprintln!("developer_profile_recovery={}", kept.display());
+            return Err("profile-credential-cleanup");
         }
         return Err(code);
     }
+    let _ = std::fs::remove_file(destination.join("credential-copy-intent.json"));
     Ok(Receipt {
         source_schema,
         target_schema,
@@ -197,6 +252,8 @@ async fn seed_independent_developer_profile() {
 struct MemoryVault {
     values: BTreeMap<String, String>,
     fail: Option<String>,
+    delete_fail: Option<String>,
+    deletions: Vec<String>,
 }
 impl Credentials for MemoryVault {
     fn get(&mut self, r: &str) -> Result<String, super::types::ModelError> {
@@ -213,6 +270,10 @@ impl Credentials for MemoryVault {
         Ok(())
     }
     fn delete(&mut self, r: &str) -> Result<(), super::types::ModelError> {
+        self.deletions.push(r.into());
+        if self.delete_fail.as_deref() == Some(r) {
+            return Err(super::types::ModelError::new("credentialUnavailable"));
+        }
         self.values.remove(r);
         Ok(())
     }
@@ -239,12 +300,16 @@ async fn fixture() -> (tempfile::TempDir, std::path::PathBuf, MemoryVault) {
                 ("two".into(), "second".into()),
             ]),
             fail: None,
+            ..Default::default()
         },
     )
 }
 #[tokio::test]
 async fn developer_seed_preserves_settings_and_words_without_history_or_shared_credentials() {
     let (folder, source, mut original) = fixture().await;
+    let original_db = Connection::open(&source).unwrap();
+    original_db.execute_batch("UPDATE language_edits SET automatic_terms_state='settled',personalization_state='pending' WHERE id='proof';").unwrap();
+    drop(original_db);
     let dest = folder.path().join("dev");
     let mut independent = MemoryVault::default();
     let receipt = seed(&source, &dest, &mut original, &mut independent)
@@ -261,6 +326,16 @@ async fn developer_seed_preserves_settings_and_words_without_history_or_shared_c
     )
     .unwrap();
     assert_eq!(count(&copied, "language_edits").unwrap(), 1);
+    assert_eq!(
+        copied
+            .query_row(
+                "SELECT personalization_state FROM language_edits WHERE id='proof'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "cancelled"
+    );
     assert_eq!(
         copied
             .query_row(
@@ -318,5 +393,59 @@ async fn developer_seed_does_not_publish_or_leave_copied_keys_when_vault_write_f
     );
     assert!(!dest.exists());
     assert!(target.values.is_empty());
+    assert_eq!(original.values.len(), 2);
+}
+#[tokio::test]
+async fn developer_seed_rejects_unready_migration_before_any_key_copy() {
+    let (folder, source, mut original) = fixture().await;
+    let db = Connection::open(&source).unwrap();
+    db.execute(
+        "UPDATE schema_migrations SET checksum='broken' WHERE version=1",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let dest = folder.path().join("dev");
+    let mut target = MemoryVault::default();
+    assert_eq!(
+        seed(&source, &dest, &mut original, &mut target)
+            .await
+            .unwrap_err(),
+        "profile-migration"
+    );
+    assert!(!dest.exists());
+    assert!(target.values.is_empty());
+}
+#[tokio::test]
+async fn developer_seed_attempts_all_rollback_and_retains_nonsecret_recovery() {
+    let (folder, source, mut original) = fixture().await;
+    let dest = folder.path().join("dev");
+    let mut target = MemoryVault {
+        fail: Some("two".into()),
+        delete_fail: Some("one".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        seed(&source, &dest, &mut original, &mut target)
+            .await
+            .unwrap_err(),
+        "profile-credential-cleanup"
+    );
+    assert_eq!(target.deletions, vec!["one", "two"]);
+    assert!(!dest.exists());
+    let recovery = std::fs::read_dir(folder.path())
+        .unwrap()
+        .map(|p| p.unwrap().path())
+        .find(|p| p.join("credential-copy-intent.json").is_file())
+        .unwrap();
+    let intent = std::fs::read_to_string(recovery.join("credential-copy-intent.json")).unwrap();
+    assert!(intent.contains("one") && intent.contains("two"));
+    assert!(!intent.contains("first") && !intent.contains("second"));
+    let failure: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(recovery.join("credential-copy-failure.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(failure["cause"], "profile-credential-copy");
+    assert_eq!(failure["unresolved"], serde_json::json!(["one"]));
     assert_eq!(original.values.len(), 2);
 }
