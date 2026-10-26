@@ -244,7 +244,7 @@ fn main() {
                         &Event::Hello {
                             version: VERSION,
                             instance,
-                            engine: transcribe_cpp::version().into(),
+                            engine: transcribe_cpp::version(),
                         },
                     );
                     continue;
