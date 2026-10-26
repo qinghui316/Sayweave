@@ -1,7 +1,7 @@
 // Real native-worker probe. Audio is paced at capture speed; no host input is injected.
 import {spawn} from 'node:child_process';
 import {createHash,randomUUID} from 'node:crypto';
-import {readFileSync,writeFileSync,mkdirSync} from 'node:fs';
+import {readFileSync,writeFileSync,mkdirSync,existsSync} from 'node:fs';
 import {once} from 'node:events';
 import path from 'node:path';
 import {setTimeout as delay} from 'node:timers/promises';
@@ -9,6 +9,9 @@ import {setTimeout as delay} from 'node:timers/promises';
 const [workerArg,modelArg,audioArg,reportArg,device='cpu',expectedBackend]=process.argv.slice(2);
 if(!reportArg||!['auto','cpu'].includes(device))throw Error('Usage: node scripts/test-local-asr.mjs worker.exe model.gguf mono16k.wav report.json [cpu|auto]');
 const worker=path.resolve(workerArg),model=path.resolve(modelArg),audio=path.resolve(audioArg),report=path.resolve(reportArg);
+if(existsSync(report)||existsSync(`${report}.stderr.log`))throw Error('Preserve the first probe result; choose a new report path');
+const protocolVersion=Number(readFileSync(new URL('../src-tauri/local-asr-protocol/src/lib.rs',import.meta.url),'utf8').match(/pub const VERSION: u32 = (\d+);/u)?.[1]);
+if(!Number.isSafeInteger(protocolVersion)||protocolVersion<1)throw Error('Missing private protocol identity');
 const wav=readFileSync(audio);
 if(wav.toString('ascii',0,4)!=='RIFF'||wav.toString('ascii',8,12)!=='WAVE')throw Error('Expected RIFF WAV');
 let pcm,format;
@@ -71,9 +74,9 @@ const command=value=>writeFrame(0,Buffer.from(JSON.stringify(value)));
 const runs=[];
 let passed=false;
 try{
- await command({kind:'hello',version:1,instance});
+ await command({kind:'hello',version:protocolVersion,instance});
  const hello=await waitFor(value=>value.kind==='hello');
- if(hello.instance!==instance||hello.engine!=='0.1.3')throw Error('Worker identity/version mismatch');
+ if(hello.version!==protocolVersion||hello.instance!==instance||hello.engine!=='0.1.3')throw Error('Worker identity/version mismatch');
  await command({kind:'prepare',id:ids[0],path:model,sha256:'41c99fa5fb6f3d35f68e79adc3e755eca2232a8d921178bd647b71194792b8fd',device});
  const prepared=await waitFor(value=>value.kind==='prepared'&&value.id.request===ids[0].request,0,60000);
  if(!prepared.streaming||(device==='cpu'&&prepared.backend.toLowerCase()!=='cpu'))throw Error('Actual worker backend differs');
