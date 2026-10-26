@@ -192,6 +192,9 @@ async fn seed(
             // dev references, never key values or pre-existing credentials.
             let kept = staging.keep();
             let failure = serde_json::json!({"cause":code,"unresolved":unresolved});
+            // Emit the cause before any fallible recovery-file write, so a
+            // full disk cannot replace the original error with only a path.
+            eprintln!("developer_profile_cleanup_failure={failure}");
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
