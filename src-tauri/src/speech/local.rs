@@ -1,77 +1,11 @@
 //! Native model facts enter the existing recognition contract here only.
-use super::recognition::{Command, Event, RecognitionSession, Segment, Transcript};
+use super::recognition::{Command, Event, RecognitionSession};
 use crate::{history::types::Error, models::LocalConfiguration};
 use sayweave_local_asr_protocol::{Event as NativeEvent, RunId};
 use tokio::sync::mpsc;
 
-#[derive(Default)]
-struct Projection {
-    confirmed: String,
-    segments: Vec<Segment>,
-    next_id: u64,
-    revision: i32,
-    tail_revision: u64,
-    final_seen: bool,
-}
-impl Projection {
-    fn update(&mut self, event: NativeEvent) -> Result<Transcript, Error> {
-        let NativeEvent::Update {
-            revision,
-            full,
-            confirmed,
-            final_result,
-            ..
-        } = event
-        else {
-            return Err(Error::new("localProtocol"));
-        };
-        // Only verified native confirmation is allowed to advance source IDs.
-        if self.final_seen
-            || revision < self.revision
-            || !confirmed.starts_with(&self.confirmed)
-            || !full.starts_with(&confirmed)
-            || (final_result && full != confirmed)
-        {
-            return Err(Error::new("localSourceChanged"));
-        }
-        self.revision = revision;
-        if self.next_id == 0 {
-            self.next_id = 1;
-        }
-        if confirmed.len() > self.confirmed.len() {
-            self.tail_revision += 1;
-            self.segments.push(Segment {
-                id: self.next_id,
-                sequence: self.tail_revision,
-                text: confirmed[self.confirmed.len()..].into(),
-                confirmed: true,
-                begin_ms: None,
-                end_ms: None,
-            });
-            self.next_id += 1;
-            self.tail_revision = 0;
-            self.confirmed = confirmed.clone();
-        }
-        let mut segments = self.segments.clone();
-        if full.len() > confirmed.len() {
-            self.tail_revision += 1;
-            segments.push(Segment {
-                id: self.next_id,
-                sequence: self.tail_revision,
-                text: full[confirmed.len()..].into(),
-                confirmed: false,
-                begin_ms: None,
-                end_ms: None,
-            });
-        }
-        self.final_seen = final_result;
-        Ok(Transcript {
-            text: full,
-            confirmed_text: confirmed,
-            segments,
-        })
-    }
-}
+mod projection;
+use projection::Projection;
 
 pub async fn open(config: &LocalConfiguration, id: RunId) -> Result<RecognitionSession, Error> {
     let mut native = config
@@ -130,6 +64,23 @@ async fn publish(send: &mpsc::Sender<Result<Event, Error>>, event: Event) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn local_alignment_regression_han_spaces_are_not_published() {
+        let mut p = Projection::default();
+        let t = p
+            .update(update(1, "今 天 下 午", "今 天 下 午", false))
+            .unwrap();
+        assert_eq!(t.text, "今天下午");
+    }
+    #[test]
+    fn local_alignment_regression_native_tokens_are_not_sentence_boundaries() {
+        let mut p = Projection::default();
+        for (revision, text) in [(1, "今"), (2, "今天"), (3, "今天下午")] {
+            let t = p.update(update(revision, text, text, false)).unwrap();
+            assert_eq!(t.text, text);
+            assert!(t.confirmed_text.is_empty(), "no processing boundary yet");
+        }
+    }
     #[tokio::test]
     #[ignore = "explicit isolated pipe-peer binary, built by local-ASR validation"]
     async fn stalled_adapter_consumer_releases_the_stream_and_preserves_local_errors() {
@@ -218,31 +169,9 @@ mod tests {
             native_token_count: 1,
             audio_received_ms: 100,
             audio_committed_ms: 100,
+            pause: None,
             final_result,
         }
-    }
-    #[test]
-    fn display_text_does_not_confirm_sources_and_verified_ids_remain_immutable() {
-        let mut p = Projection::default();
-        let a = p.update(update(1, "项目使用SQLit", "", false)).unwrap();
-        assert_eq!(a.confirmed_text, "");
-        assert!(!a.segments[0].confirmed);
-        let b = p
-            .update(update(2, "项目使用SQLite", "项目使用SQLite", false))
-            .unwrap();
-        assert_eq!(b.segments[0].id, a.segments[0].id);
-        assert!(b.segments[0].confirmed);
-        let c = p
-            .update(update(
-                3,
-                "项目使用SQLite。下一句",
-                "项目使用SQLite。",
-                false,
-            ))
-            .unwrap();
-        assert_eq!(c.segments[0].text, b.segments[0].text);
-        assert_eq!(c.segments[2].text, "下一句");
-        assert!(p.update(update(4, "其他正文", "其他正文", true)).is_err());
     }
     #[test]
     fn final_authority_must_include_all_visible_text_and_cannot_revive() {
@@ -306,9 +235,12 @@ mod tests {
         let runtime = Runtime::new(program.clone(), inventory);
         runtime.select(true);
         let model = model_assets::ModelLease::acquire(
-            &root
-                .join(".local/local-asr/models")
-                .join(model_assets::MODEL_FILE),
+            &std::env::var_os("SAYWEAVE_LOCAL_MODEL")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    root.join(".local/local-asr/models")
+                        .join(model_assets::MODEL_FILE)
+                }),
             model_assets::MODEL_BYTES,
             model_assets::MODEL_SHA256,
         )
@@ -374,6 +306,8 @@ mod tests {
             let mut first = None;
             let mut text = String::new();
             let mut progress = Vec::new();
+            let mut projection_events = Vec::new();
+            let mut confirmed_before_finish = 0;
             let mut confirmed = String::new();
             let mut last_pcm_ms = 0.0;
             let start = tokio::time::Instant::now() + Duration::from_millis(100);
@@ -385,6 +319,8 @@ mod tests {
                 loop {tokio::select! {
                     event=session.next_event()=>match event.unwrap() {
                         Event::Update(value)=>{
+                            projection_events.push(serde_json::json!({"atMs":began.elapsed().as_secs_f64()*1000.0,"beforeFinish":final_at.is_none(),"full":value.text,"confirmed":value.confirmed_text,"segments":value.segments}));
+                            if final_at.is_none() && !value.confirmed_text.is_empty(){confirmed_before_finish+=1;}
                             assert!(value.confirmed_text.starts_with(&confirmed));confirmed=value.confirmed_text.clone();
                             assert_eq!(value.segments.iter().filter(|s|s.confirmed).map(|s|s.text.as_str()).collect::<String>(),value.confirmed_text);
                             assert_eq!(value.segments.iter().map(|s|s.text.as_str()).collect::<String>(),value.text);
@@ -402,7 +338,7 @@ mod tests {
             assert!(updates > 2);
             assert_eq!(text, confirmed);
             assert_eq!(at, pcm.len());
-            runs.push(serde_json::json!({"turn":turn,"updates":updates,"firstTextMs":first.unwrap(),"finalizeMs":final_at.unwrap().elapsed().as_secs_f64()*1000.0,"lastPcmMs":last_pcm_ms,"elapsedMs":began.elapsed().as_secs_f64()*1000.0,"full":text,"progressMs":progress}));
+            runs.push(serde_json::json!({"turn":turn,"updates":updates,"firstTextMs":first.unwrap(),"finalizeMs":final_at.unwrap().elapsed().as_secs_f64()*1000.0,"lastPcmMs":last_pcm_ms,"elapsedMs":began.elapsed().as_secs_f64()*1000.0,"full":text,"progressMs":progress,"projectionEvents":projection_events,"confirmedUpdatesBeforeFinish":confirmed_before_finish}));
             drop(session);
         }
         // Exercise the production dispatcher with queued PCM at cooperative

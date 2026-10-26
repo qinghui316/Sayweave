@@ -88,6 +88,7 @@ fn main() {
                 native_token_count: seq as usize,
                 audio_received_ms: seq as i64 * 100,
                 audio_committed_ms: seq as i64 * 100,
+                pause: None,
                 final_result: false,
             });
             continue;
@@ -160,6 +161,7 @@ fn main() {
                         native_token_count: 1,
                         audio_received_ms: 100,
                         audio_committed_ms: 100,
+                        pause: None,
                         final_result: true,
                     });
                     emit(&Event::Finished { id: old.clone() });
@@ -190,6 +192,7 @@ fn main() {
                     native_token_count: sequence as usize,
                     audio_received_ms: sequence as i64 * 100,
                     audio_committed_ms: sequence as i64 * 100,
+                    pause: None,
                     final_result: true,
                 });
                 log(&path, "finished", &id);

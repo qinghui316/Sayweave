@@ -1,4 +1,5 @@
 //! Native inference implementation. Only the isolated worker depends on this crate.
+pub mod pause;
 pub mod proof;
 
 use sayweave_local_asr_protocol::{DevicePolicy, Event, RunId};
@@ -121,6 +122,7 @@ pub fn snapshot(
         native_token_count: tokens.len(),
         audio_received_ms: update.input_received_ms,
         audio_committed_ms: update.audio_committed_ms,
+        pause: None,
         final_result: update.is_final,
     })
 }

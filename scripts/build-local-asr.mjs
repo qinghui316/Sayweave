@@ -59,10 +59,10 @@ export function nativeBuildEnvironment(project=root){
  if(!env.VULKAN_SDK)throw Error('Install a Vulkan development SDK or run setup-local-asr-tools.mjs. End users do not need the SDK.');
  return env;
 }
-export function buildLocalAsr(project=root,{debug=false,target}={}){
+export function buildLocalAsr(project=root,{debug=false,target,stagingDirectory}={}){
  if(process.platform!=='win32'||target&&target!=='x86_64-pc-windows-msvc')throw Error('Local runtime v1 requires Windows x64 MSVC');
  const output=path.resolve(project,process.env.CARGO_TARGET_DIR??'src-tauri/target',...(target?[target]:[]),debug?'debug':'release');
- const directory=path.join(output,'local-asr'),manifestFile=path.join(directory,'manifest.json'),source=sourceIdentity(project,debug,target??'host-x86_64-pc-windows-msvc');
+ const directory=stagingDirectory?path.resolve(stagingDirectory):path.join(output,'local-asr'),manifestFile=path.join(directory,'manifest.json'),source=sourceIdentity(project,debug,target??'host-x86_64-pc-windows-msvc');
  const notices=readFileSync(path.join(project,'src-tauri/local-asr-worker/THIRD_PARTY_NOTICES.txt'));
  if(existsSync(manifestFile)){
   const saved=JSON.parse(readFileSync(manifestFile,'utf8'));

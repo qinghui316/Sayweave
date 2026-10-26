@@ -283,3 +283,5 @@ Current WebView2 runtimes ignore environment/HKCU browser-argument overrides for
 `SAYWEAVE_ACTOR_LEARNING_SUBMIT=enter` 配合 `delete-word` 或 `recording-word`，使用原生键盘逐字删除、重打纠词，在15秒前由自有宿主处理真实 Enter 并清空输入框。断言单份证据、自动词条及下一轮热词／整理上下文；录音中提交另核对停止后正文仍为空。与停键15秒、录音中修改后继续说分别验证。物理监听用例须显式设置 `SAYWEAVE_ACTOR_PHYSICAL_INPUT=1`、`SAYWEAVE_ACTOR_OBSERVE_INJECTED=1`；脚本为 actor 提供独立验收 UUID，监听器只接受授权的自有前台进程。缺少标记时的注入不能被记为真实编辑监听覆盖。
 
 `SAYWEAVE_BLOCK_CONTINUITY=prediction-revision` 配合空白浮动建议，依次提供同一未确认来源的 `周`、`周三`、`舟三开会`，再提供新片段 `地点在上海`。封存首字保持为 `周`；后续正文必须持续变为 `周三开会`、`周三开会地点在上海`，最终整理为 `周三开会，地点在上海。`。固定整理回复只覆盖可修改的新块。只有首字或音频仍在运行均不通过。来源单元另覆盖缺少上下文、重复锚点、片段替换、字素分界及已确认片段刷新后的吸收保持。
+
+本地行为对齐验收额外记录每批投影全文、确认前缀、片段身份及结束前确认次数。SAYWEAVE_LOCAL_MODEL显式指定已有且通过固定身份校验的模型文件，避免复制权重。检查中文间隔时不得去空白后才比较；原始错误轨迹、纯映射检查、实际模型、生产输入正文及麦克风分别结算。800ms停顿按实际PCM时钟产生；没有PCM的编辑暂停不触发分段，停顿不产生Finished。

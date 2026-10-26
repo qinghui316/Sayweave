@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{self, Read, Write};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const MAX_JSON: usize = 1024 * 1024;
 pub const MAX_PCM_SAMPLES: usize = 32_000;
 pub fn runtime_file_names() -> &'static [String] {
@@ -56,6 +56,15 @@ impl RunId {
 pub enum DevicePolicy {
     Auto,
     Cpu,
+}
+
+/// A pause in accepted PCM, never a source confirmation or end-of-stream.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PauseBoundary {
+    pub sequence: u64,
+    pub sample_end: u64,
+    pub native_revision: i32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -127,6 +136,7 @@ pub enum Event {
         native_token_count: usize,
         audio_received_ms: i64,
         audio_committed_ms: i64,
+        pause: Option<PauseBoundary>,
         final_result: bool,
     },
     Finished {

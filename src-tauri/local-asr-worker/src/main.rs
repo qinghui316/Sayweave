@@ -136,6 +136,7 @@ fn serve(
         .stream(&options, &stream_options)
         .map_err(|e| error_code(&e))?;
     let mut proof = NativeAppendProof::default();
+    let mut pauses = sayweave_local_asr_worker::pause::PauseDetector::default();
     let mut sequence = 0;
     emit(out, &Event::Ready { id: id.clone() })?;
     loop {
@@ -159,8 +160,13 @@ fn serve(
                 sequence = next;
                 let samples = pcm.iter().map(|s| *s as f32 / 32768.0).collect::<Vec<_>>();
                 let update = stream.feed(&samples).map_err(|e| error_code(&e))?;
-                if update.result_changed && !token.is_cancelled() {
-                    emit(out, &snapshot(&stream, id, update, &mut proof)?)?;
+                let pause = pauses.feed(&pcm, update.revision)?;
+                if (update.result_changed || pause.is_some()) && !token.is_cancelled() {
+                    let mut event = snapshot(&stream, id, update, &mut proof)?;
+                    if let Event::Update { pause: slot, .. } = &mut event {
+                        *slot = pause;
+                    }
+                    emit(out, &event)?;
                 }
             }
             frame => match decode_json::<Command>(frame).map_err(|_| "localProtocol")? {
