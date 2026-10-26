@@ -230,7 +230,7 @@ try{
  const sevenZip=path.join(process.env.ProgramFiles,'7-Zip','7z.exe');
  if(!existsSync(sevenZip))throw Error('Disposable runner lacks the static 7-Zip extractor; no installation was attempted.');
  const extracted=path.join(directory,'payload');
- report.payloadInventory=nsisPayloadInventory(await command(sevenZip,['l','-slt',packages.old]));persist();
+ report.payloadInventory=nsisPayloadInventory(await command(sevenZip,['l','-slt',packages.old]),{localRuntime:packages.manifest.localRuntime===true});persist();
  await command(sevenZip,['x',packages.old,`-o${extracted}`,'sayweave.exe','sayweave-installer-helper.exe','$PLUGINSDIR\\sayweave-maintenance.exe','-y']);
  report.helperIdentity=nsisHelperIdentity(readFileSync(path.join(extracted,'sayweave-installer-helper.exe')),readFileSync(path.join(extracted,'$PLUGINSDIR','sayweave-maintenance.exe')));persist();
  const payload=readFileSync(path.join(extracted,'sayweave.exe'));

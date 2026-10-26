@@ -1,4 +1,35 @@
 fn main() {
+    println!("cargo:rerun-if-env-changed=SAYWEAVE_LOCAL_ASR_MANIFEST");
+    let local_manifest = if let Some(path) = std::env::var_os("SAYWEAVE_LOCAL_ASR_MANIFEST") {
+        println!(
+            "cargo:rerun-if-changed={}",
+            std::path::Path::new(&path).display()
+        );
+        let bytes = std::fs::read(path).expect("local runtime manifest");
+        assert!(
+            bytes.len() <= 32 * 1024,
+            "local runtime manifest exceeds bound"
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("local runtime manifest JSON");
+        assert_eq!(value["version"], 1);
+        assert_eq!(value["engine"], "0.1.3");
+        assert!(
+            value["files"]
+                .as_object()
+                .is_some_and(|files| files.contains_key("sayweave-local-asr-worker.exe")),
+            "local worker missing from manifest"
+        );
+        bytes
+    } else {
+        b"{\"version\":1,\"engine\":\"0.1.3\",\"files\":{}}".to_vec()
+    };
+    std::fs::write(
+        std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"))
+            .join("local-asr.json"),
+        local_manifest,
+    )
+    .expect("local manifest embedding");
     for name in [
         "SAYWEAVE_BUILD_CHANNEL",
         "SAYWEAVE_BUILD_COMMIT",

@@ -39,7 +39,7 @@ pub enum Event {
     Finished,
     Heartbeat,
 }
-enum Command {
+pub(super) enum Command {
     Audio(Vec<i16>),
     Finish(oneshot::Sender<Result<(), Error>>),
 }
@@ -89,20 +89,48 @@ impl Parser {
 
 /// Owns transport tasks only. Recording, persistence and windows stay in SpeechService.
 pub struct RecognitionSession {
-    audio: mpsc::Sender<Command>,
-    events: mpsc::Receiver<Result<Event, Error>>,
-    worker: tokio::task::JoinHandle<()>,
+    pub(super) audio: mpsc::Sender<Command>,
+    pub(super) events: mpsc::Receiver<Result<Event, Error>>,
+    pub(super) worker: tokio::task::JoinHandle<()>,
+    pub(super) closed_error: &'static str,
 }
 impl RecognitionSession {
     #[cfg(test)]
-    pub async fn open(cfg: &SpeechConfiguration, task: &str) -> Result<Self, Error> {
+    pub async fn open(
+        cfg: &(impl Clone + Into<SpeechConfiguration>),
+        task: &str,
+    ) -> Result<Self, Error> {
         Self::open_with_hotwords(cfg, task, &[]).await
     }
     pub async fn open_with_hotwords(
-        cfg: &SpeechConfiguration,
+        cfg: &(impl Clone + Into<SpeechConfiguration>),
         task: &str,
         hotwords: &[String],
     ) -> Result<Self, Error> {
+        Self::open_for_turn(&cfg.clone().into(), task, 1, task, hotwords).await
+    }
+    pub async fn open_for_turn(
+        cfg: &SpeechConfiguration,
+        task: &str,
+        turn: u64,
+        request: &str,
+        hotwords: &[String],
+    ) -> Result<Self, Error> {
+        if let SpeechConfiguration::Local(local) = cfg {
+            return super::local::open(
+                local,
+                sayweave_local_asr_protocol::RunId {
+                    task: task.into(),
+                    turn,
+                    request: request.into(),
+                },
+            )
+            .await;
+        }
+        let SpeechConfiguration::Cloud(cfg) = cfg else {
+            unreachable!()
+        };
+        let task = request;
         if !crate::models::types::capabilities(&cfg.input.protocol).is_some_and(|c| c.live_text) {
             return Err(Error::new("unsupported"));
         }
@@ -252,6 +280,7 @@ impl RecognitionSession {
             audio,
             events,
             worker,
+            closed_error: "network",
         }
     }
     pub async fn send_pcm(&self, pcm: &[i16]) -> Result<(), Error> {
@@ -266,7 +295,7 @@ impl RecognitionSession {
         )
         .await
         .map_err(|_| Error::new("bufferOverflow"))?
-        .map_err(|_| Error::new("network"))
+        .map_err(|_| Error::new(self.closed_error))
     }
     pub async fn finish(&self) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
@@ -274,14 +303,17 @@ impl RecognitionSession {
             self.audio
                 .send(Command::Finish(tx))
                 .await
-                .map_err(|_| Error::new("network"))?;
-            rx.await.map_err(|_| Error::new("network"))?
+                .map_err(|_| Error::new(self.closed_error))?;
+            rx.await.map_err(|_| Error::new(self.closed_error))?
         })
         .await
         .map_err(|_| Error::new("timeout"))?
     }
     pub async fn next_event(&mut self) -> Result<Event, Error> {
-        self.events.recv().await.ok_or(Error::new("network"))?
+        self.events
+            .recv()
+            .await
+            .ok_or(Error::new(self.closed_error))?
     }
 }
 impl Drop for RecognitionSession {
@@ -330,6 +362,7 @@ impl RecognitionSession {
                 audio,
                 events,
                 worker: tokio::spawn(std::future::pending()),
+                closed_error: "network",
             },
             ControlledPeer {
                 events: send,
@@ -425,6 +458,7 @@ mod tests {
             audio: tx,
             events,
             worker,
+            closed_error: "network",
         };
         for _ in 0..40 {
             session.send_pcm(&[1; 320]).await.unwrap();
@@ -441,6 +475,7 @@ mod tests {
             audio: tx,
             events,
             worker,
+            closed_error: "network",
         };
         session.send_pcm(&[1]).await.unwrap();
         assert_eq!(

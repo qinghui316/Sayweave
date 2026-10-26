@@ -9,9 +9,26 @@ import {BrowserModels} from '../src/adapters/models-browser';
 import {parseFeed,parseRecord,summarizeHistory,type HistoryRecord} from '../src/contracts/history';
 import {initialSpeech} from '../src/contracts/speech';
 import {SaveSettings} from '../src/features/history/SaveSettings';
+import {localAssetId} from '../src/contracts/models';
 function record(n=1,text='完整的识别文字'):HistoryRecord {const id=`record-${n}`,a=`attempt-${n}`;return {id,createdAt:1000+n,endedAt:2000+n,durationMs:1000,status:'success',currentAttempt:a,revision:1,audio:null,attempts:[{id:a,recordId:id,kind:'live',configId:'fixture',configName:'模型',configRevision:1,modelId:'fixture',serviceHost:'example.invalid',createdAt:1000+n,endedAt:2000+n,status:'success',text,errorCode:null,elapsedMs:1}]};}
 function fixture(records:HistoryRecord[]){const speech=new BrowserSpeech();speech.records.push(...records);return {speech,port:new BrowserHistory(speech),models:new BrowserModels()};}
 function deferred<T>(){let resolve!:(value:T)=>void;const promise=new Promise<T>(r=>resolve=r);return {promise,resolve};}
+it('retries retained audio with a local default without claiming a cloud upload',async()=>{
+ const r=record(),f=fixture([r]);r.audio={id:'retained-audio',recordId:r.id,status:'ready',bytes:32000,expiresAt:null};
+ await f.models.local.download();
+ const view=await f.models.local.save({input:{name:'本地识别',assetId:localAssetId,engine:'transcribe-cpp-0.1.3',device:'cpu'},id:null,revision:null});
+ const model=view.localConfigs![0]!;
+ await f.models.setDefault({usage:'speech',configId:model.id,revision:view.defaults.find(d=>d.usage==='speech')!.revision});
+ const retry=vi.spyOn(f.port,'retry').mockResolvedValue(initialSpeech());
+ render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
+ await screen.findByRole('listitem');
+ const user=userEvent.setup();screen.getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');
+ await user.click(await screen.findByRole('menuitem',{name:'重新识别'}));
+ const confirm=await screen.findByRole('group',{name:'重识别确认'});
+ expect(confirm).toHaveTextContent('本地识别');expect(confirm).not.toHaveTextContent('会发送这份录音');
+ await user.click(within(confirm).getByRole('button',{name:'开始识别'}));
+ await waitFor(()=>expect(retry).toHaveBeenCalledWith(r.id,model.id,model.revision));
+});
 it('copies and searches the full processed version independently of raw text',async()=>{
  const r=record(1,'识别原文'),full='整理后的完整正文🙂'.repeat(50);
  r.processing=[{id:'processed-1',attemptId:r.currentAttempt!,configName:'文字模型',modelId:'fixture',state:'success',text:full,revision:1,errorCode:null,units:[]}];

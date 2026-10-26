@@ -1,6 +1,8 @@
 import {spawnSync} from 'node:child_process';
 import path from 'node:path';
 import { buildTextService,verifyComponentEmbeddings } from './build-text-service.mjs';
+import {buildLocalAsr} from './build-local-asr.mjs';
+import {setupLocalAsrTools} from './setup-local-asr-tools.mjs';
 import {fileURLToPath} from 'node:url';
 import {readFileSync,writeFileSync,mkdirSync,existsSync} from 'node:fs';
 import {createHash} from 'node:crypto';
@@ -12,7 +14,10 @@ if(process.platform!=='win32')throw new Error('Windows text-service builds requi
 // A release may reuse its independently verified, unchanged component artifact.
 // The caller must bind its source revision/hash; the default builds from source.
 const components=buildTextService(root);
-const env={...process.env,SAYWEAVE_TSF_PAYLOAD:components.core,SAYWEAVE_TSF_PROXY_PAYLOAD:components.proxy};
+await setupLocalAsrTools(root);
+const requestedTarget=process.argv.indexOf('--target');
+const local=buildLocalAsr(root,{debug:mode==='dev'||process.argv.includes('--debug'),...(requestedTarget>=0?{target:process.argv[requestedTarget+1]}:{})});
+const env={...process.env,SAYWEAVE_TSF_PAYLOAD:components.core,SAYWEAVE_TSF_PROXY_PAYLOAD:components.proxy,SAYWEAVE_LOCAL_ASR_MANIFEST:local.manifestFile};
 let extra=process.argv.slice(3);
 let packagedHelper;
 if(mode==='package'){
@@ -52,7 +57,8 @@ if(mode==='package'){
  const helper=path.join(directory,'sayweave-installer-helper.exe');
  packagedHelper=helper;
  if(existsSync(helper)){if(!readFileSync(helper).equals(bytes))throw Error('Installer helper cache identity differs.');}else writeFileSync(helper,bytes,{flag:'wx'});
- const combined={...config,build:{...config.build,beforeBuildCommand:''},bundle:{...config.bundle,resources:{[helper]:'sayweave-installer-helper.exe'}}};
+ const localResources=Object.fromEntries(Object.keys(local.manifest.files).map(name=>[path.join(local.directory,name),`local-asr/${name}`]));
+ const combined={...config,build:{...config.build,beforeBuildCommand:''},bundle:{...config.bundle,resources:{[helper]:'sayweave-installer-helper.exe',...localResources}}};
  const configFile=path.join(directory,'package-config.json');writeFileSync(configFile,JSON.stringify(combined));
  extra=[...rest,'--config',configFile];
 }

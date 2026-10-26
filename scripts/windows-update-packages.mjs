@@ -1,18 +1,22 @@
 import {createHash} from 'node:crypto';
 import {mkdirSync,readFileSync,writeFileSync,lstatSync,realpathSync,existsSync} from 'node:fs';
 import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {retainInstaller} from './storage-policy.mjs';
 
 const limit=128*1024*1024;
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
-export function nsisPayloadInventory(listing){
+const runtimeNames=JSON.parse(readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../src-tauri/local-asr-protocol/runtime-files.json'),'utf8'));
+export function nsisPayloadInventory(listing,{localRuntime=false}={}){
  if(typeof listing!=='string'||listing.length>2*1024*1024||!/^Type = Nsis\r?$/m.test(listing))throw Error('NSIS inventory format differs');
  const normalized=listing.replaceAll('\r\n','\n'),marker='\n----------\n',start=normalized.indexOf(marker);
  if(start<0)throw Error('NSIS inventory records missing');
  const paths=[...normalized.slice(start+marker.length).matchAll(/^Path = ([^\r\n]+)$/gm)].map(match=>match[1]);
  if(paths.length<6||paths.length>64||paths.some(value=>value.length>2048||value.includes('\0')||value.split(/[\\/]/).some(part=>part==='..'||part==='.'||part==='')))throw Error('NSIS inventory path exceeds contract');
  const installed=paths.filter(value=>!value.startsWith('$PLUGINSDIR\\')).sort();
- if(JSON.stringify(installed)!==JSON.stringify(['sayweave-installer-helper.exe','sayweave.exe','uninstall.exe']))throw Error('NSIS installed payload expands or duplicates the owned file manifest');
+ const ordinary=['sayweave-installer-helper.exe','sayweave.exe','uninstall.exe'];
+ const local=[...ordinary,...runtimeNames.map(name=>`local-asr\\${name}`)].sort();
+ if(JSON.stringify(installed)!==JSON.stringify(localRuntime?local:ordinary))throw Error('NSIS installed payload expands, omits or duplicates the owned file manifest');
  for(const name of ['sayweave-main.exe','sayweave-maintenance.exe','sayweave-uninstall.exe'])if(paths.filter(value=>value===`$PLUGINSDIR\\${name}`).length!==1)throw Error('NSIS transaction payload missing or duplicated');
  return {installed,temporaryCount:paths.length-installed.length};
 }
@@ -47,11 +51,11 @@ function context(manifest,commit){
  if(!/^[a-f0-9]{40}$/.test(commit)||manifest.commit!==commit||manifest.schemaVersion!==1||manifest.kind!=='sayweave-test-packages'||manifest.target!=='windows-x86_64')throw Error('Package artifact commit/identity differs');
  const uuid=manifest.identifier?.slice('local.sayweave.acceptance.'.length);
  if(typeof manifest.identifier!=='string'||!manifest.identifier.startsWith('local.sayweave.acceptance.')||!/^([a-f0-9]{8}-)([a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(uuid)||manifest.product!==`Sayweave 验收 ${uuid}`||!Number.isSafeInteger(manifest.port)||manifest.port<1024||manifest.port>65535||manifest.url!==`https://localhost:${manifest.port}/latest.json`||typeof manifest.publicKey!=='string'||manifest.publicKey.length<32||manifest.publicKey.length>4096||!/^[a-f0-9]{64}$/.test(manifest.componentSha256))throw Error('Package build context differs');
- if(!manifest.artifacts?.old||Object.keys(manifest.artifacts).some(key=>!Object.hasOwn(names,key)))throw Error('Package inventory is incomplete');
+ if((manifest.localRuntime!==undefined&&typeof manifest.localRuntime!=='boolean')||!manifest.artifacts?.old||Object.keys(manifest.artifacts).some(key=>!Object.hasOwn(names,key)))throw Error('Package inventory is incomplete');
 }
 export function writePackages(directory,commit,build,entries,startupProof){
  mkdirSync(directory,{recursive:true});if(lstatSync(directory).isSymbolicLink())throw Error('Package output contains a link');
- const manifest={schemaVersion:1,kind:'sayweave-test-packages',commit,target:'windows-x86_64',identifier:build.identifier,product:build.product,port:build.port,url:`https://localhost:${build.port}/latest.json`,publicKey:build.publicKey,componentSha256:build.componentSha256,artifacts:{},startupProof};
+ const manifest={schemaVersion:1,kind:'sayweave-test-packages',commit,target:'windows-x86_64',identifier:build.identifier,product:build.product,port:build.port,url:`https://localhost:${build.port}/latest.json`,publicKey:build.publicKey,componentSha256:build.componentSha256,localRuntime:build.localRuntime===true,artifacts:{},startupProof};
  for(const [key,entry] of Object.entries(entries)){
   if(!Object.hasOwn(names,key))throw Error('Unknown package');
   const bytes=readFileSync(entry.installer),signature=readFileSync(`${entry.installer}.sig`);if(!bytes.length||bytes.length>limit||!signature.length||signature.length>16384)throw Error('Package output exceeds bound');

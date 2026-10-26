@@ -2,6 +2,8 @@
 //! None of these entries starts Tauri, opens SQLite, or reads Windows credentials.
 #[cfg(windows)]
 mod ipc;
+#[cfg(test)]
+mod local_payload_tests;
 pub(crate) mod login_startup;
 #[cfg(windows)]
 mod machine;

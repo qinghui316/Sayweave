@@ -45,6 +45,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "revisable_drafts_v1",
         include_str!("migrations/010_revisable_drafts.sql"),
     ),
+    (
+        "local_models_v1",
+        include_str!("migrations/011_local_models.sql"),
+    ),
 ];
 pub fn now() -> i64 {
     SystemTime::now()

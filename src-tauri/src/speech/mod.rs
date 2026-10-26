@@ -7,6 +7,7 @@ mod hotwords;
 mod live_continuation;
 #[cfg(all(test, windows))]
 mod live_hotwords;
+mod local;
 pub mod qwen;
 mod recognition;
 #[cfg(all(test, windows))]
@@ -175,6 +176,7 @@ pub struct NativeStart {
     pub terminal: tokio::sync::oneshot::Sender<NativeTerminal>,
     pub continuous: Option<continuous::Control>,
     pub hotwords: Vec<String>,
+    pub configuration: Option<crate::models::SpeechConfiguration>,
 }
 /// Native cumulative recognition stream; separate from renderer and lifecycle projection.
 #[derive(Clone, Default)]
@@ -442,14 +444,18 @@ impl SpeechService {
             return Err(Error::new("cancelled"));
         }
         self.initialize().await?;
-        let cfg = app
-            .state::<ModelService>()
-            .speech_config()
-            .await
-            .map_err(|e| Error::new(&e.code))?;
+        let cfg =
+            if let Some(configuration) = context.as_ref().and_then(|c| c.configuration.as_ref()) {
+                configuration.clone()
+            } else {
+                app.state::<ModelService>()
+                    .speech_config()
+                    .await
+                    .map_err(|e| Error::new(&e.code))?
+            };
         if expected_config
             .as_ref()
-            .is_some_and(|(id, revision)| id != &cfg.id || *revision != cfg.revision)
+            .is_some_and(|(id, revision)| id != cfg.id() || *revision != cfg.revision())
         {
             return Err(Error::new("conflict"));
         }
@@ -541,17 +547,15 @@ impl SpeechService {
             return Err(Error::new("stopping"));
         }
         let attempt = Attempt {
-            config_revision: cfg.revision,
+            config_revision: cfg.revision(),
             id: attempt_id.clone(),
             record_id: record_id.clone(),
             kind: if retry_id.is_some() { "retry" } else { "live" }.into(),
-            config_id: cfg.id.clone(),
-            config_name: cfg.input.name.clone(),
-            model_id: cfg.input.model_id.clone(),
-            service_host: reqwest::Url::parse(&cfg.input.base_url)
-                .ok()
-                .and_then(|u| u.host_str().map(String::from))
-                .unwrap_or_default(),
+            config_id: cfg.id().into(),
+            config_name: cfg.name().into(),
+            model_id: cfg.model_id().into(),
+            service_host: cfg.service_host(),
+            source: cfg.source(),
             created_at: crate::data::repository::now(),
             ended_at: None,
             status: "preparing".into(),
@@ -641,7 +645,7 @@ impl SpeechService {
             },
             sequence: old.sequence + 1,
             lifecycle: old.lifecycle + 1,
-            model_name: Some(cfg.input.model_id.clone()),
+            model_name: Some(cfg.model_id().into()),
             device_name: device.map(|d| d.name.clone()),
             retry: retry_id.is_some(),
             ..Snapshot::default()

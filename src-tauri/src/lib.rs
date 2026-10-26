@@ -14,6 +14,8 @@ mod installer;
 mod language_learning;
 mod language_policy;
 mod lifecycle;
+mod local_asr;
+mod model_assets;
 mod models;
 mod network;
 mod processing;
@@ -650,6 +652,11 @@ pub fn run() {
             model_status,
             model_overview,
             model_save,
+            model_local_save,
+            model_asset_status,
+            model_asset_download,
+            model_asset_cancel,
+            model_asset_delete,
             model_remove,
             model_default,
             model_fetch,

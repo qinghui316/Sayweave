@@ -1,4 +1,5 @@
 use serde::Serialize;
+pub(crate) mod local_runtime;
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildInfo {

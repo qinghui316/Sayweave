@@ -16,7 +16,7 @@ async fn model_desktop_cleanup() {
     }
     let c = rusqlite::Connection::open_with_flags(file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .unwrap();
-    let mut q = c.prepare("SELECT credential_ref FROM model_configs UNION SELECT credential_ref FROM credential_operations").unwrap();
+    let mut q = c.prepare("SELECT credential_ref FROM model_configs WHERE credential_ref IS NOT NULL UNION SELECT credential_ref FROM credential_operations").unwrap();
     let refs = q
         .query_map([], |r| r.get::<_, String>(0))
         .unwrap()
@@ -94,6 +94,220 @@ fn input(name: &str, usages: Vec<Usage>) -> ConfigInput {
         model_id: "example-model".into(),
         usages,
     }
+}
+#[tokio::test]
+async fn second_registered_asset_uses_the_same_model_selection_and_frozen_asr_contract() {
+    use sha2::{Digest, Sha256};
+    let (root, service, vault) = service().await;
+    let definitions = Box::leak(
+        vec![local::AsrDefinition {
+            asset_id: "fixture-second-asr",
+            engine: "transcribe-cpp-0.1.3",
+            right_context: 5,
+        }]
+        .into_boxed_slice(),
+    );
+    let descriptors = Box::leak(
+        vec![crate::model_assets::catalog::Descriptor {
+            id: "fixture-second-asr",
+            file: "second.gguf",
+            bytes: 7,
+            sha256: Box::leak(format!("{:x}", Sha256::digest(b"fixture")).into_boxed_str()),
+            sources: &[],
+        }]
+        .into_boxed_slice(),
+    );
+    std::fs::write(root.path().join("second.gguf"), b"fixture").unwrap();
+    let assets =
+        crate::model_assets::Assets::with_catalog(root.path().to_owned(), descriptors).unwrap();
+    assert!(
+        service
+            .local
+            .set(local::LocalServices {
+                runtime: crate::local_asr::Runtime::new(
+                    root.path().join("unstarted-worker.exe"),
+                    vec![]
+                ),
+                assets,
+                definitions,
+            })
+            .is_ok()
+    );
+    let view = service
+        .save_local(
+            "main",
+            LocalSaveRequest {
+                input: LocalConfigInput {
+                    name: "Second adapter fixture".into(),
+                    asset_id: "fixture-second-asr".into(),
+                    engine: "transcribe-cpp-0.1.3".into(),
+                    device: sayweave_local_asr_protocol::DevicePolicy::Cpu,
+                },
+                id: None,
+                revision: None,
+            },
+        )
+        .await
+        .unwrap();
+    let view = service
+        .set_default(
+            "main",
+            DefaultRequest {
+                usage: Usage::Speech,
+                config_id: view.local_configs[0].id.clone(),
+                revision: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let frozen = service
+        .speech_choice()
+        .await
+        .unwrap()
+        .configuration
+        .unwrap();
+    assert_eq!(frozen.id(), view.local_configs[0].id);
+    let local::SpeechConfiguration::Local(config) = frozen else {
+        panic!("expected local ASR");
+    };
+    assert_eq!(config.record.input.asset_id, "fixture-second-asr");
+    assert_eq!(config.settings.right_context, 5);
+    assert!(vault.values.lock().unwrap().is_empty());
+    drop(config);
+    service.finish_shutdown().await.unwrap();
+}
+#[tokio::test]
+async fn local_configuration_has_no_vault_or_transport_and_shares_guarded_defaults() {
+    let (root, service, vault) = service().await;
+    let _ = service
+        .local
+        .set(local::LocalServices::new(root.path()).unwrap());
+    let local = LocalConfigInput {
+        name: "本地识别".into(),
+        asset_id: crate::model_assets::MODEL_ID.into(),
+        engine: "transcribe-cpp-0.1.3".into(),
+        device: sayweave_local_asr_protocol::DevicePolicy::Cpu,
+    };
+    assert!(serde_json::from_value::<LocalConfigInput>(serde_json::json!({"name":"local","assetId":local.asset_id,"engine":local.engine,"device":"cpu","baseUrl":"https://example.com"})).is_err());
+    let view = service
+        .save_local(
+            "main",
+            LocalSaveRequest {
+                input: local.clone(),
+                id: None,
+                revision: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(view.configs.is_empty());
+    assert!(view.defaults.iter().all(|d| d.config_id.is_none()));
+    assert!(vault.values.lock().unwrap().is_empty());
+    let record = &view.local_configs[0];
+    let json = serde_json::to_value(record).unwrap();
+    assert!(json.get("baseUrl").is_none());
+    assert!(json.get("credentialStatus").is_none());
+    assert!(
+        service
+            .save_local(
+                "voice-overlay",
+                LocalSaveRequest {
+                    input: local.clone(),
+                    id: Some(record.id.clone()),
+                    revision: Some(record.revision)
+                }
+            )
+            .await
+            .is_err()
+    );
+    service
+        .db(DbOperation::SetDefault(DefaultRequest {
+            usage: Usage::Speech,
+            config_id: record.id.clone(),
+            revision: 1,
+        }))
+        .await
+        .unwrap();
+    assert!(
+        service
+            .db(DbOperation::SetDefault(DefaultRequest {
+                usage: Usage::Text,
+                config_id: record.id.clone(),
+                revision: 1
+            }))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        service
+            .save_local(
+                "main",
+                LocalSaveRequest {
+                    input: local,
+                    id: Some(record.id.clone()),
+                    revision: Some(99)
+                }
+            )
+            .await
+            .err()
+            .unwrap()
+            .code,
+        "conflict"
+    );
+    let before = service.stored().await.unwrap();
+    service
+        .remove(
+            "main",
+            RemoveRequest {
+                id: record.id.clone(),
+                revision: record.revision,
+                expectation: Expectation {
+                    defaults: before.defaults.clone(),
+                    replacements: replacements(&before, &record.id, &[]),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        service
+            .stored()
+            .await
+            .unwrap()
+            .defaults
+            .iter()
+            .all(|d| d.config_id.is_none())
+    );
+    assert!(vault.values.lock().unwrap().is_empty());
+}
+
+#[test]
+fn schema10_upgrade_preserves_cloud_identity_and_rejects_mixed_local_secrets() {
+    use crate::data::repository::{MIGRATIONS, configure, migrate};
+    let root = tempfile::tempdir().unwrap();
+    let mut connection = rusqlite::Connection::open(root.path().join("dictionary.sqlite")).unwrap();
+    configure(&connection).unwrap();
+    migrate(&mut connection, root.path(), &MIGRATIONS[..10]).unwrap();
+    connection.execute("INSERT INTO model_configs VALUES('existing','cloud','qwen-audio-streaming','https://example.com','model',1,0,'credential-ref',7,100,200)",[]).unwrap();
+    connection
+        .execute(
+            "UPDATE model_defaults SET config_id='existing',revision=9 WHERE usage='speech'",
+            [],
+        )
+        .unwrap();
+    migrate(&mut connection, root.path(), MIGRATIONS).unwrap();
+    let state:(String,String,i64,i64)=connection.query_row("SELECT c.id,c.credential_ref,c.revision,d.revision FROM model_configs c JOIN model_defaults d ON d.config_id=c.id WHERE d.usage='speech'",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    assert_eq!(state, ("existing".into(), "credential-ref".into(), 7, 9));
+    assert!(connection.execute("INSERT INTO model_configs(id,name,speech,text,revision,created_at,updated_at,source_kind,asset_id,engine,device,credential_ref) VALUES('bad','bad',1,0,1,1,1,'local','model','engine','cpu','secret')",[]).is_err());
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+        0
+    );
 }
 fn request(name: &str, usages: Vec<Usage>) -> SaveRequest {
     SaveRequest {

@@ -27,6 +27,7 @@ pub fn target(main_source: &Path) -> Result<Target> {
     let build = crate::build_info::current();
     let exe = std::env::current_exe().map_err(|_| "installerExecutable")?;
     let value = Target {
+        local_files: crate::build_info::local_runtime::embedded().map_err(String::from)?,
         version: build.version.into(),
         commit: build.commit.into(),
         product: env!("SAYWEAVE_BUILD_PRODUCT").into(),
@@ -83,6 +84,7 @@ fn running_target() -> Result<Target> {
         .join("sayweave-installer-helper.exe");
     let build = crate::build_info::current();
     let value = Target {
+        local_files: crate::build_info::local_runtime::embedded().map_err(String::from)?,
         version: build.version.into(),
         commit: build.commit.into(),
         product: env!("SAYWEAVE_BUILD_PRODUCT").into(),
@@ -235,7 +237,9 @@ pub fn dispatch(args: &[String]) -> Result<()> {
             if machine.phase != Phase::Prepared || !ipc::live(&machine.server) {
                 return Err("installerSessionEnded".into());
             }
-            if ipc::running_at(&directory.join("sayweave.exe"))? {
+            if ipc::running_at(&directory.join("sayweave.exe"))?
+                || ipc::running_at(&directory.join("local-asr/sayweave-local-asr-worker.exe"))?
+            {
                 Err("installerAppRunning".into())
             } else {
                 Ok(())
@@ -293,30 +297,48 @@ fn load(root: &Path) -> Result<Option<UserRecord>> {
     validate_paths(&record)?;
     Ok(Some(record))
 }
-fn file_paths(directory: &Path, product: &str) -> Result<[(PathBuf, &'static str); 5]> {
-    Ok([
-        (directory.join("sayweave.exe"), "main"),
-        (directory.join("uninstall.exe"), "uninstall"),
-        (directory.join("sayweave-installer-helper.exe"), "helper"),
+fn file_paths(
+    directory: &Path,
+    product: &str,
+    runtime: &[crate::build_info::local_runtime::RuntimeFile],
+) -> Result<Vec<(PathBuf, String)>> {
+    let mut files = vec![
+        (directory.join("sayweave.exe"), "main".to_owned()),
+        (directory.join("uninstall.exe"), "uninstall".to_owned()),
+        (
+            directory.join("sayweave-installer-helper.exe"),
+            "helper".to_owned(),
+        ),
         (
             metadata::folder(&FOLDERID_Desktop)?.join(format!("{product}.lnk")),
-            "desktop",
+            "desktop".to_owned(),
         ),
         (
             metadata::folder(&FOLDERID_Programs)?.join(format!("{product}.lnk")),
-            "startMenu",
+            "startMenu".to_owned(),
         ),
-    ])
+    ];
+    files.extend(runtime.iter().map(|f| {
+        (
+            directory.join("local-asr").join(&f.name),
+            format!("asr-{}", f.name),
+        )
+    }));
+    Ok(files)
 }
 fn validate_paths(record: &UserRecord) -> Result<()> {
     let directory = PathBuf::from(&record.install_dir);
     reject_links(&directory)?;
-    let paths = file_paths(&directory, &record.target.product)?;
+    let paths = file_paths(
+        &directory,
+        &record.target.product,
+        &record.target.local_files,
+    )?;
     if record.files.len() != paths.len() {
         return Err("installerBackupInvalid".into());
     }
     for ((path, name), file) in paths.iter().zip(&record.files) {
-        if *name != file.backup || !metadata::same_path(&path.to_string_lossy(), &file.path) {
+        if name != &file.backup || !metadata::same_path(&path.to_string_lossy(), &file.path) {
             return Err("installerBackupInvalid".into());
         }
     }
@@ -390,7 +412,9 @@ fn begin(
         recover(&root, &mut prior, &installer)?;
     }
     let deadline = Instant::now() + Duration::from_secs(10);
-    while ipc::running_at(&directory.join("sayweave.exe"))? {
+    while ipc::running_at(&directory.join("sayweave.exe"))?
+        || ipc::running_at(&directory.join("local-asr/sayweave-local-asr-worker.exe"))?
+    {
         if Instant::now() > deadline {
             return Err("installerAppRunning".into());
         }
@@ -404,7 +428,8 @@ fn begin(
     if !key_snapshots[1].existed
         && (directory.join("sayweave.exe").exists()
             || directory.join("uninstall.exe").exists()
-            || directory.join("sayweave-installer-helper.exe").exists())
+            || directory.join("sayweave-installer-helper.exe").exists()
+            || directory.join("local-asr").exists())
     {
         return Err("installerUnknownProgram".into());
     }
@@ -422,19 +447,23 @@ fn begin(
         return Err("componentDowngradeRejected".into());
     }
     let mut files = Vec::new();
-    for (path, name) in file_paths(directory, &target.product)? {
+    for (path, name) in file_paths(directory, &target.product, &target.local_files)? {
         if path.exists()
-            && matches!(name, "desktop" | "startMenu")
+            && matches!(name.as_str(), "desktop" | "startMenu")
             && !metadata::shortcut_owned(&path, &directory.to_string_lossy())?
         {
             return Err("installerShortcutChanged".into());
         }
-        let mut file = backup(&root, &path, name, &transaction)?;
-        file.installed_hash = match name {
+        let mut file = backup(&root, &path, &name, &transaction)?;
+        file.installed_hash = match name.as_str() {
             "main" => Some(target.main_hash.clone()),
             "uninstall" => Some(target.uninstall_hash.clone()),
             "helper" => Some(target.helper_hash.clone()),
-            _ => None,
+            _ => target
+                .local_files
+                .iter()
+                .find(|f| name == format!("asr-{}", f.name))
+                .map(|f| f.sha256.clone()),
         };
         files.push(file);
     }
@@ -498,6 +527,19 @@ fn installed_files(record: &mut UserRecord) -> Result<()> {
         || record.files[2].installed_hash.as_deref() != Some(record.target.helper_hash.as_str())
     {
         return Err("installerProgramIdentity".into());
+    }
+    for entry in &record.target.local_files {
+        let path = PathBuf::from(&record.install_dir)
+            .join("local-asr")
+            .join(&entry.name);
+        if std::fs::metadata(&path)
+            .map_err(|_| "installerProgramIdentity")?
+            .len()
+            != entry.bytes
+            || hash(&read(&path, MAX_FILE)?) != entry.sha256
+        {
+            return Err("installerProgramIdentity".into());
+        }
     }
     let location = metadata::uninstall_owned_location(&record.target.product)?
         .ok_or("installerRegistryIdentity")?;
@@ -690,7 +732,9 @@ fn uninstall(directory: &Path, keys: [String; 2], process: &Process) -> Result<(
     {
         return Err("installerProgramIdentity".into());
     }
-    if ipc::running_at(&directory.join("sayweave.exe"))? {
+    if ipc::running_at(&directory.join("sayweave.exe"))?
+        || ipc::running_at(&directory.join("local-asr/sayweave-local-asr-worker.exe"))?
+    {
         return Err("installerAppRunning".into());
     }
     for file in &original.files {
@@ -705,8 +749,12 @@ fn uninstall(directory: &Path, keys: [String; 2], process: &Process) -> Result<(
     }
     let transaction = uuid::Uuid::new_v4().to_string();
     let mut files = Vec::new();
-    for (path, name) in file_paths(directory, &original.target.product)? {
-        files.push(backup(&root, &path, name, &transaction)?);
+    for (path, name) in file_paths(
+        directory,
+        &original.target.product,
+        &original.target.local_files,
+    )? {
+        files.push(backup(&root, &path, &name, &transaction)?);
     }
     let mut record = UserRecord {
         transaction,
@@ -755,10 +803,22 @@ fn uninstall(directory: &Path, keys: [String; 2], process: &Process) -> Result<(
             super::login_startup::WARNING.to_owned()
         });
     remove_backups(&root, &record);
+    let _ = fs::remove_dir(directory.join("local-asr"));
     let _ = fs::remove_dir(directory);
     startup
 }
 fn verify_ready(record: &UserRecord) -> Result<()> {
+    for entry in &record.target.local_files {
+        let bytes = read(
+            &PathBuf::from(&record.install_dir)
+                .join("local-asr")
+                .join(&entry.name),
+            MAX_FILE,
+        )?;
+        if bytes.len() as u64 != entry.bytes || hash(&bytes) != entry.sha256 {
+            return Err("installerProofIncomplete".into());
+        }
+    }
     let machine = machine::load()?.ok_or("installerProofMissing")?;
     if machine.transaction != record.transaction
         || machine.phase != Phase::Committed

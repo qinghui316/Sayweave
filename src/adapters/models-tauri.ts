@@ -1,8 +1,15 @@
 import {invoke,isTauri} from '@tauri-apps/api/core';
-import {modelError,parseModelOverview,parseModelStatus,parseModelTest,parseModelIds,type ModelConfigPort,type ModelSave,type ModelRemove,type ModelDefaultRequest,type ModelDraft} from '../contracts/models';
+import {modelError,parseModelOverview,parseModelStatus,parseModelTest,parseModelIds,parseLocalAsset,type ModelConfigPort,type ModelSave,type ModelRemove,type ModelDefaultRequest,type ModelDraft,type LocalModelSave} from '../contracts/models';
 import {BrowserModels} from './models-browser';
 class TauriModels implements ModelConfigPort {
  readonly mode='native' as const;
+ readonly local={
+  status:async(assetId:string)=>parseLocalAsset(await this.call('model_asset_status',{assetId})),
+  download:async(assetId:string)=>parseLocalAsset(await this.call('model_asset_download',{assetId})),
+  cancel:async(assetId:string)=>{await this.call('model_asset_cancel',{assetId});},
+  delete:async(assetId:string)=>{await this.call('model_asset_delete',{assetId});},
+  save:async(request:LocalModelSave)=>parseModelOverview(await this.call('model_local_save',{request})),
+ };
  private async call(command:string,args:Record<string,unknown>={}){try{return await invoke<unknown>(command,args);}catch(e){throw modelError(e);}}
  async status(retry=false){return parseModelStatus(await this.call('model_status',{retry}));}
  async overview(){return parseModelOverview(await this.call('model_overview'));}

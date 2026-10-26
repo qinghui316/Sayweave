@@ -1,4 +1,6 @@
 pub mod commands;
+mod local;
+pub use local::{LocalConfiguration, SpeechConfiguration};
 mod credentials;
 #[cfg(feature = "desktop-acceptance")]
 pub(crate) mod language_actor_acceptance;
@@ -33,6 +35,7 @@ impl From<crate::network::RequestError> for ModelError {
     }
 }
 pub struct ModelService {
+    pub(crate) local: std::sync::OnceLock<local::LocalServices>,
     data: DataWorker,
     vault: Vault,
     pub provider: Arc<Provider>,
@@ -70,11 +73,13 @@ impl ModelService {
         } else {
             provider
         };
-        Self::with_vault(
+        let service = Self::with_vault(
             data,
             Vault::new(WindowsCredentials::new(namespace)),
             Arc::new(provider),
-        )
+        )?;
+        let _ = service.local.set(local::LocalServices::new(root)?);
+        Ok(service)
     }
     fn with_vault(
         data: DataWorker,
@@ -82,6 +87,7 @@ impl ModelService {
         provider: Arc<Provider>,
     ) -> Result<Self, ModelError> {
         Ok(Self {
+            local: std::sync::OnceLock::new(),
             data,
             vault,
             requests: provider.requests.clone(),
@@ -197,6 +203,7 @@ impl ModelService {
         }
         Overview {
             configs,
+            local_configs: view.local_configs,
             defaults: view.defaults,
             cleanup_pending: self.cleanup_pending.load(Ordering::Acquire),
         }
@@ -297,6 +304,19 @@ impl ModelService {
         self.check(caller)?;
         let _guard = self.gate.try_lock().map_err(|_| ModelError::new("busy"))?;
         self.check(caller)?;
+        if self
+            .stored()
+            .await?
+            .local_configs
+            .iter()
+            .any(|c| c.id == req.id)
+            && self
+                .local
+                .get()
+                .is_some_and(|local| local.runtime.is_in_use())
+        {
+            return Err(ModelError::new("busy"));
+        }
         let view = match self.db(DbOperation::Remove(req)).await? {
             DbOutput::Overview(v) => v,
             _ => return Err(ModelError::new("unavailable")),
@@ -304,6 +324,7 @@ impl ModelService {
         if self.recover().await.is_err() {
             self.cleanup_pending.store(true, Ordering::Release);
         }
+        self.local_selection(&view);
         Ok(self.public(view).await)
     }
     pub async fn set_default(
@@ -314,8 +335,19 @@ impl ModelService {
         self.check(caller)?;
         let _guard = self.gate.try_lock().map_err(|_| ModelError::new("busy"))?;
         self.check(caller)?;
+        let view = self.stored().await?;
+        if let Some(record) = view.local_configs.iter().find(|c| c.id == req.config_id) {
+            let _verified = self
+                .local_assets()?
+                .lease(&record.input.asset_id)
+                .await
+                .map_err(ModelError::new)?;
+        }
         match self.db(DbOperation::SetDefault(req)).await? {
-            DbOutput::Overview(v) => Ok(self.public(v).await),
+            DbOutput::Overview(v) => {
+                self.local_selection(&v);
+                Ok(self.public(v).await)
+            }
             _ => Err(ModelError::new("unavailable")),
         }
     }
@@ -382,7 +414,7 @@ impl ModelService {
     }
     // Internal task snapshot. Never Serialize/Debug or expose to a renderer.
     pub async fn speech_config(&self) -> Result<SpeechConfiguration, ModelError> {
-        self.default_config(Usage::Speech).await
+        self.freeze_speech().await
     }
     pub async fn text_config(&self) -> Result<ExecutableConfiguration, ModelError> {
         self.default_config(Usage::Text).await
@@ -415,14 +447,19 @@ impl ModelService {
         })
     }
     pub async fn finish_shutdown(&self) -> Result<(), crate::data::model::DataError> {
+        if let Some(local) = self.local.get() {
+            let released = local.runtime.shutdown().await;
+            local.assets.shutdown().await;
+            released.map_err(crate::data::model::DataError::new)?;
+        }
         let _guard = self.gate.lock().await;
         Ok(())
     }
 }
+#[derive(Clone)]
 pub struct ExecutableConfiguration {
     pub id: String,
     pub input: ConfigInput,
     pub revision: i64,
     pub key: String,
 }
-pub type SpeechConfiguration = ExecutableConfiguration;

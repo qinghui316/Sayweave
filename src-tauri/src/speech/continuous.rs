@@ -270,20 +270,21 @@ pub enum Stream {
 }
 impl Stream {
     pub async fn open(
-        cfg: &SpeechConfiguration,
+        cfg: &(impl Clone + Into<SpeechConfiguration>),
         task: &str,
         control: Option<Control>,
         requests: Arc<RequestCoordinator>,
         hotwords: &[String],
     ) -> Result<Self, Error> {
-        let first = RecognitionSession::open_with_hotwords(cfg, task, hotwords).await?;
+        let cfg = cfg.clone().into();
+        let first = RecognitionSession::open_with_hotwords(&cfg, task, hotwords).await?;
         Ok(if let Some(control) = control {
             let _ = control.task.set(task.into());
             let route = *control.requested.borrow();
             control.enabled(route);
             Self::Continuous(Continuous::spawn(
                 first,
-                cfg,
+                &cfg,
                 control,
                 route,
                 requests,
@@ -409,20 +410,22 @@ impl Continuous {
         requests: Arc<RequestCoordinator>,
         hotwords: Vec<String>,
     ) -> Self {
-        let cfg = Arc::new(SpeechConfiguration {
-            id: cfg.id.clone(),
-            input: cfg.input.clone(),
-            revision: cfg.revision,
-            key: cfg.key.clone(),
-        });
+        let cfg = cfg.clone();
+        let task = control
+            .task
+            .get()
+            .cloned()
+            .expect("task bound before continuous spawn");
         Self::run(first, control, route, move |turn| {
             let cfg = cfg.clone();
             let requests = requests.clone();
             let hotwords = hotwords.clone();
+            let task = task.clone();
             async move {
                 let id = uuid::Uuid::new_v4().to_string();
                 let slot = requests.register(&id).map_err(|e| Error::new(&e.code))?;
-                let session = RecognitionSession::open_with_hotwords(&cfg, &id, &hotwords).await?;
+                let session =
+                    RecognitionSession::open_for_turn(&cfg, &task, turn, &id, &hotwords).await?;
                 Ok(Connection {
                     turn,
                     session,

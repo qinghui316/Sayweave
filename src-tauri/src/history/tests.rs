@@ -474,7 +474,7 @@ fn migration_v4_to_v5_preserves_configs_defaults_history_and_constraints() {
         .unwrap(),
         0
     );
-    c.execute("INSERT INTO model_configs VALUES('d','豆包','doubao-asr-streaming','https://openspeech.bytedance.com','Doubao-Seed-ASR-2.0',1,0,'doubao-ref',1,30,30)",[]).unwrap();
+    c.execute("INSERT INTO model_configs(id,name,protocol,base_url,model_id,speech,text,credential_ref,revision,created_at,updated_at) VALUES('d','豆包','doubao-asr-streaming','https://openspeech.bytedance.com','Doubao-Seed-ASR-2.0',1,0,'doubao-ref',1,30,30)",[]).unwrap();
     assert!(
         c.execute("UPDATE model_configs SET text=1 WHERE id='d'", [])
             .is_err()
@@ -525,6 +525,7 @@ fn attempt(record: &str, kind: &str) -> Attempt {
         config_revision: 1,
         model_id: "fixture".into(),
         service_host: "example.invalid".into(),
+        source: Default::default(),
         created_at: crate::data::repository::now(),
         ended_at: None,
         status: "preparing".into(),

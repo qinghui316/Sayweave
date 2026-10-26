@@ -66,7 +66,7 @@ async function candidatePayload(installer){
  if(payloadProofCache.has(sha))return payloadProofCache.get(sha);
  const extractor=path.join(process.env.ProgramFiles,'7-Zip','7z.exe');
  if(!existsSync(extractor))throw Error('Disposable runner lacks the candidate payload extractor');
- const inventory=nsisPayloadInventory((await command(extractor,['l','-slt',installer])).stdout);
+ const inventory=nsisPayloadInventory((await command(extractor,['l','-slt',installer])).stdout,{localRuntime:priorPackages?priorPackages.manifest.localRuntime===true:existsSync(path.join(root,'src-tauri/local-asr-protocol/runtime-files.json'))});
  const output=path.join(directory,'checked-payload',sha);
  await command(extractor,['x',installer,`-o${output}`,'sayweave-installer-helper.exe','$PLUGINSDIR\\sayweave-maintenance.exe','-y']);
  const helper=nsisHelperIdentity(readFileSync(path.join(output,'sayweave-installer-helper.exe')),readFileSync(path.join(output,'$PLUGINSDIR','sayweave-maintenance.exe')));
@@ -304,7 +304,7 @@ async function build(version,channel='test'){
  stage(`signed NSIS payload identity ${version}`);
  const extracted=path.join(directory,`payload-${channel}-${version}`),sevenZip=path.join(process.env.ProgramFiles,'7-Zip','7z.exe');
  if(!existsSync(sevenZip))throw Error('Disposable runner lacks the static signed-payload extractor');
- const inventory=nsisPayloadInventory((await command(sevenZip,['l','-slt',copy])).stdout);
+ const inventory=nsisPayloadInventory((await command(sevenZip,['l','-slt',copy])).stdout,{localRuntime:existsSync(path.join(source,'src-tauri/local-asr-protocol/runtime-files.json'))});
  await command(sevenZip,['x',copy,`-o${extracted}`,'sayweave.exe','sayweave-installer-helper.exe','$PLUGINSDIR\\sayweave-maintenance.exe','-y']);
  const helper=nsisHelperIdentity(readFileSync(path.join(extracted,'sayweave-installer-helper.exe')),readFileSync(path.join(extracted,'$PLUGINSDIR','sayweave-maintenance.exe')));
  nsisHelperIdentity(readFileSync(path.join(extracted,'sayweave-installer-helper.exe')),readFileSync(path.join(extracted,'$PLUGINSDIR','sayweave-maintenance.exe')),readFileSync(path.join(source,'.local','installer-helper',helper.helperSha256,'sayweave-installer-helper.exe')));
@@ -418,7 +418,7 @@ try{
  let page;
  const probe=tools.probe;
  if(!stableInstaller){
- const context=priorPackages?.manifest??{identifier,product,port:server.address().port,url:`https://localhost:${server.address().port}/latest.json`,publicKey:readFileSync(`${keyPath}.pub`,'utf8').trim(),componentSha256:tools.manifest.artifacts.component.sha256};
+ const context=priorPackages?.manifest??{identifier,product,port:server.address().port,url:`https://localhost:${server.address().port}/latest.json`,publicKey:readFileSync(`${keyPath}.pub`,'utf8').trim(),componentSha256:tools.manifest.artifacts.component.sha256,localRuntime:existsSync(path.join(source,'src-tauri/local-asr-protocol/runtime-files.json'))};
  const packageOutput=path.join(root,'.local/windows-update-packages');
  const publishPackages=()=>{writePackages(packageOutput,commit,context,packageEntries,report.startupProof??null);report.packages=readPackages(packageOutput,commit).manifest;checkpoint();};
  const old=priorPackages?.old??await build('0.1.700');

@@ -1,5 +1,19 @@
 # API 模型配置与后端基础
 
+## 本地流式识别开发契约（尚未正式交付）
+
+`sayweave-local-streaming-asr-v01` 分支接入 Nemotron 3.5 ASR Streaming 0.6B Q4，真实模型质量、最终宿主回归及开发版试用分别验收。公开 0.1.18 的能力不因此改变。
+
+语音设置中的本地卡管理下载、校验、取消、重试、使用和删除。下载不会改变默认模型；选择“使用”才变更现有语音默认。计算方式默认自动选择可用设备，没有可用 GPU 时使用 CPU，也可选择“仅 CPU”。文字处理仍独立选择当前云端模型；启用整理时文字会按该配置发送。
+
+本地配置使用 `assetId/engine/device`，没有云端 URL 或凭据。ModelAssets 只管理文件与占用；LocalAsrRuntime 管理按需启动的计算子进程；识别适配器输出既有 RecognitionSession 事件。Session、Draft 和原生输入不按模型名称分支。只有模型和真实流、麦克风均就绪才发布录音状态，冷加载不提前展开。
+
+首版不提供 Nemotron 原生 ASR 热词注入。已有词典、自动词条和表达偏好继续按原入口用于文字整理，不强制替换原始识别文字。CPU/GPU、受控音频、目标软件正文和真实麦克风分别记录结果。
+
+资产 ID 绑定不可变的文件版本、大小和 SHA256；权重或量化版本改变时新增 ID，不覆盖旧身份。同一引擎增加模型只扩展资产定义和 `models/local.rs` 的识别参数映射；不同引擎增加相同事件契约的运行时适配；未来本地 LLM 复用资产服务，进入文字处理接口。GGUF 文件扩展名本身不证明引擎兼容。
+
+权重来自固定修订 `cswk/sayit-asr-gguf@d686eb53176aa2e136fb80869fddbb41fc5ef3dc`，495831520 字节，SHA256 `41c99fa5fb6f3d35f68e79adc3e755eca2232a8d921178bd647b71194792b8fd`。转换来源及运行库许可见随组件分发的 `local-asr/licenses.txt`；[原模型](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) 采用 OpenMDW-1.1，模型权重按需下载。
+
 原位持续草稿使用 faithful-v4：模型接收当前块完整有效正文，可依据后文修正块内前文，只返回该块正文。2000 Unicode标量块、512标量只读前文、32KiB消息、4096输出tokens与16KiB正文分别受限；模型不授予范围写权限。旧策略与历史faithful-v3快照保留。结构与成本证据边界见 [持续草稿](revisable-draft.md)。
 
 模型设置支持多份 OpenAI 兼容 Chat Completions 和千问/豆包流式语音配置，两种用途分别指定默认。保存不发请求，文字测试和真实录音由用户主动触发。新增或显式选择语音默认只接受已实现的语音协议；旧 Chat 语音默认迁移保留并提示补充协议。浏览器是内存模拟。语音地址、参数及未验证事项见 [speech.md](speech.md)。

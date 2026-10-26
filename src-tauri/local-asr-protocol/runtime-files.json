@@ -1,0 +1,23 @@
+[
+  "sayweave-local-asr-worker.exe",
+  "transcribe.dll",
+  "ggml.dll",
+  "ggml-base.dll",
+  "ggml-vulkan.dll",
+  "ggml-cpu-alderlake.dll",
+  "ggml-cpu-cannonlake.dll",
+  "ggml-cpu-cascadelake.dll",
+  "ggml-cpu-haswell.dll",
+  "ggml-cpu-icelake.dll",
+  "ggml-cpu-sandybridge.dll",
+  "ggml-cpu-skylakex.dll",
+  "ggml-cpu-sse42.dll",
+  "ggml-cpu-x64.dll",
+  "msvcp140.dll",
+  "msvcp140_1.dll",
+  "msvcp140_2.dll",
+  "vcruntime140.dll",
+  "vcruntime140_1.dll",
+  "concrt140.dll",
+  "licenses.txt"
+]

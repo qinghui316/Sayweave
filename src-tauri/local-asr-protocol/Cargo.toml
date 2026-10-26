@@ -1,0 +1,18 @@
+[package]
+name = "sayweave-local-asr-protocol"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[features]
+fixture = []
+
+[[bin]]
+name = "local-asr-fixture"
+path = "src/fixture.rs"
+required-features = ["fixture"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -4245,6 +4245,7 @@ dependencies = [
  "rubato",
  "rusqlite",
  "rustls",
+ "sayweave-local-asr-protocol",
  "sayweave-text-service",
  "serde",
  "serde_json",
@@ -4263,6 +4264,14 @@ dependencies = [
  "uuid",
  "windows",
  "windows-core",
+]
+
+[[package]]
+name = "sayweave-local-asr-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -5501,6 +5510,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

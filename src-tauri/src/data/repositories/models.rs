@@ -5,7 +5,7 @@ fn error(e: rusqlite::Error) -> ModelError {
     db_error(e).into()
 }
 fn overview(c: &Connection) -> Result<StoredOverview, ModelError> {
-    let configs=c.prepare("SELECT id,name,protocol,base_url,model_id,speech,text,credential_ref,revision,created_at,updated_at FROM model_configs ORDER BY created_at ASC,id ASC").map_err(error)?
+    let configs=c.prepare("SELECT id,name,protocol,base_url,model_id,speech,text,credential_ref,revision,created_at,updated_at FROM model_configs WHERE source_kind='cloud' ORDER BY created_at ASC,id ASC").map_err(error)?
  .query_map([],|r|{let mut usages=vec![];if r.get::<_,bool>(5)? {usages.push(Usage::Speech);}
 if r.get::<_,bool>(6)? {usages.push(Usage::Text);}
  Ok(StoredConfig{id:r.get(0)?,input:ConfigInput{name:r.get(1)?,protocol:r.get(2)?,base_url:r.get(3)?,model_id:r.get(4)?,usages},credential_ref:r.get(7)?,revision:r.get(8)?,created_at:r.get(9)?,updated_at:r.get(10)?})}).map_err(error)?
@@ -27,7 +27,16 @@ if r.get::<_,bool>(6)? {usages.push(Usage::Text);}
         .map_err(error)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(error)?;
-    Ok(StoredOverview { configs, defaults })
+    let local_configs = c.prepare("SELECT id,name,asset_id,engine,device,revision,created_at,updated_at FROM model_configs WHERE source_kind='local' ORDER BY created_at,id").map_err(error)?
+        .query_map([], |r| Ok(LocalConfigRecord { id:r.get(0)?,input:LocalConfigInput {
+            name:r.get(1)?,asset_id:r.get(2)?,engine:r.get(3)?,device:if r.get::<_,String>(4)?=="cpu" {sayweave_local_asr_protocol::DevicePolicy::Cpu} else {sayweave_local_asr_protocol::DevicePolicy::Auto}
+        },revision:r.get(5)?,created_at:r.get(6)?,updated_at:r.get(7)? })).map_err(error)?
+        .collect::<Result<Vec<_>,_>>().map_err(error)?;
+    Ok(StoredOverview {
+        configs,
+        local_configs,
+        defaults,
+    })
 }
 fn current<'a>(
     view: &'a StoredOverview,
@@ -77,6 +86,40 @@ fn cleanup(c: &Connection, reference: &str) -> Result<(), ModelError> {
 impl Repository {
     pub fn model_operation(&mut self, op: DbOperation) -> Result<DbOutput, ModelError> {
         match op {
+            DbOperation::CommitLocal(req) => {
+                let input = req.input.validate()?;
+                let tx = self
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(error)?;
+                let view = overview(&tx)?;
+                let time = now();
+                let device = match input.device {
+                    sayweave_local_asr_protocol::DevicePolicy::Auto => "auto",
+                    sayweave_local_asr_protocol::DevicePolicy::Cpu => "cpu",
+                };
+                if let Some(id) = req.id {
+                    let old = view
+                        .local_configs
+                        .iter()
+                        .find(|c| c.id == id)
+                        .ok_or(ModelError::new("notFound"))?;
+                    if Some(old.revision) != req.revision {
+                        return Err(ModelError::new("conflict"));
+                    }
+                    tx.execute("UPDATE model_configs SET name=?2,asset_id=?3,engine=?4,device=?5,revision=revision+1,updated_at=?6 WHERE id=?1",params![id,input.name,input.asset_id,input.engine,device,time]).map_err(error)?;
+                } else {
+                    if req.revision.is_some() {
+                        return Err(ModelError::new("invalid"));
+                    }
+                    let id = uuid::Uuid::new_v4().to_string();
+                    tx.execute("INSERT INTO model_configs(id,name,speech,text,revision,created_at,updated_at,source_kind,asset_id,engine,device) VALUES(?1,?2,1,0,1,?3,?3,'local',?4,?5,?6)",params![id,input.name,time,input.asset_id,input.engine,device]).map_err(error)?;
+                    // Download/save never changes a default. Explicit existing SetDefault selects local.
+                }
+                let result = overview(&tx)?;
+                tx.commit().map_err(error)?;
+                Ok(DbOutput::Overview(result))
+            }
             DbOperation::Overview => {
                 let tx = self.connection.transaction().map_err(error)?;
                 let view = overview(&tx)?;
@@ -153,7 +196,7 @@ impl Repository {
                     }
                     let id = uuid::Uuid::new_v4().to_string();
                     tx.execute(
-                        "INSERT INTO model_configs VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?9)",
+                        "INSERT INTO model_configs(id,name,protocol,base_url,model_id,speech,text,credential_ref,revision,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9,?9)",
                         params![
                             id,
                             input.name,
@@ -191,12 +234,29 @@ impl Repository {
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(error)?;
                 let view = overview(&tx)?;
-                let old = current(&view, &req.id, req.revision)?;
+                let reference = if let Some(old) = view.configs.iter().find(|c| c.id == req.id) {
+                    if old.revision != req.revision {
+                        return Err(ModelError::new("conflict"));
+                    }
+                    Some(old.credential_ref.clone())
+                } else {
+                    let old = view
+                        .local_configs
+                        .iter()
+                        .find(|c| c.id == req.id)
+                        .ok_or(ModelError::new("notFound"))?;
+                    if old.revision != req.revision {
+                        return Err(ModelError::new("conflict"));
+                    }
+                    None
+                };
                 let changes = expectation(&view, &req.id, &[], &req.expectation)?;
                 apply(&tx, &changes)?;
                 tx.execute("DELETE FROM model_configs WHERE id=?1", [req.id])
                     .map_err(error)?;
-                cleanup(&tx, &old.credential_ref)?;
+                if let Some(reference) = reference {
+                    cleanup(&tx, &reference)?;
+                }
                 let result = overview(&tx)?;
                 tx.commit().map_err(error)?;
                 Ok(DbOutput::Overview(result))
@@ -207,7 +267,7 @@ impl Repository {
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(error)?;
                 let applicable:Option<bool>=tx.query_row("SELECT CASE WHEN ?2='speech' THEN speech ELSE text END FROM model_configs WHERE id=?1",params![req.config_id,req.usage.key()],|r|r.get(0)).optional().map_err(error)?;
-                let protocol: Option<String> = tx
+                let protocol: Option<Option<String>> = tx
                     .query_row(
                         "SELECT protocol FROM model_configs WHERE id=?1",
                         [&req.config_id],
@@ -215,12 +275,14 @@ impl Repository {
                     )
                     .optional()
                     .map_err(error)?;
-                if applicable != Some(true)
-                    || !protocol
-                        .as_deref()
-                        .and_then(capabilities)
-                        .is_some_and(|c| c.usages.contains(&req.usage))
-                {
+                let supported = match protocol {
+                    Some(Some(protocol)) => {
+                        capabilities(&protocol).is_some_and(|c| c.usages.contains(&req.usage))
+                    }
+                    Some(None) => req.usage == Usage::Speech,
+                    None => false,
+                };
+                if applicable != Some(true) || !supported {
                     return Err(ModelError::new("invalid"));
                 }
                 let changed=tx.execute("UPDATE model_defaults SET config_id=?2,revision=revision+1 WHERE usage=?1 AND revision=?3",params![req.usage.key(),req.config_id,req.revision]).map_err(error)?;

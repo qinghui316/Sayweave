@@ -88,6 +88,85 @@ pub async fn model_save(
     observed("model_save", None, state.save(window.label(), request)).await
 }
 #[tauri::command]
+pub async fn model_local_save(
+    window: WebviewWindow,
+    state: State<'_, ModelService>,
+    request: LocalSaveRequest,
+) -> Result<Overview, ModelError> {
+    let _admission = crate::lifecycle::mutation(&window).map_err(ModelError::from)?;
+    observed(
+        "model_local_save",
+        None,
+        state.save_local(window.label(), request),
+    )
+    .await
+}
+#[tauri::command]
+pub async fn model_asset_status(
+    window: WebviewWindow,
+    state: State<'_, ModelService>,
+    asset_id: String,
+) -> Result<crate::model_assets::AssetStatus, ModelError> {
+    authorize(window.label())?;
+    state
+        .local_assets()?
+        .status(&asset_id)
+        .await
+        .map_err(ModelError::new)
+}
+#[tauri::command]
+pub async fn model_asset_download(
+    window: WebviewWindow,
+    state: State<'_, ModelService>,
+    asset_id: String,
+) -> Result<crate::model_assets::AssetStatus, ModelError> {
+    let _admission = crate::lifecycle::mutation(&window).map_err(ModelError::from)?;
+    authorize(window.label())?;
+    state
+        .local_assets()?
+        .download(&asset_id)
+        .await
+        .map_err(ModelError::new)
+}
+#[tauri::command]
+pub fn model_asset_cancel(
+    window: WebviewWindow,
+    state: State<'_, ModelService>,
+    asset_id: String,
+) -> Result<(), ModelError> {
+    authorize(window.label())?;
+    state
+        .local_assets()?
+        .cancel(&asset_id)
+        .map_err(ModelError::new)
+}
+#[tauri::command]
+pub async fn model_asset_delete(
+    window: WebviewWindow,
+    state: State<'_, ModelService>,
+    asset_id: String,
+) -> Result<(), ModelError> {
+    let _admission = crate::lifecycle::mutation(&window).map_err(ModelError::from)?;
+    state.check(window.label())?;
+    let _guard = state.gate.try_lock().map_err(|_| ModelError::new("busy"))?;
+    let view = state.stored().await?;
+    if view
+        .local_configs
+        .iter()
+        .any(|c| c.input.asset_id == asset_id)
+    {
+        return Err(ModelError::new("localConfigurationPresent"));
+    }
+    if let Some(local) = state.local.get() {
+        local.runtime.unload_idle().await.map_err(ModelError::new)?;
+    }
+    state
+        .local_assets()?
+        .delete(&asset_id)
+        .await
+        .map_err(ModelError::new)
+}
+#[tauri::command]
 pub async fn model_remove(
     window: WebviewWindow,
     state: State<'_, ModelService>,

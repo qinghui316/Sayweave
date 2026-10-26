@@ -78,6 +78,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Controller release contracts failed.' }
       - if: needs.windows-tooling.outputs.product_commit == '' && env.FROZEN_ACCEPTANCE_PRODUCT == ''
         run: npx playwright install chromium
+      - name: Check isolated local inference and process contracts
+        if: needs.windows-tooling.outputs.product_commit == '' && env.FROZEN_ACCEPTANCE_PRODUCT == ''
+        run: node scripts/check-local-asr.mjs
       - if: needs.windows-tooling.outputs.product_commit == '' && env.FROZEN_ACCEPTANCE_PRODUCT == ''
         run: npm run check
       - if: needs.windows-tooling.outputs.product_commit == '' && env.FROZEN_ACCEPTANCE_PRODUCT == ''

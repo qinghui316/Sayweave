@@ -223,7 +223,42 @@ pub struct StoredConfig {
 #[derive(Clone, Debug)]
 pub struct StoredOverview {
     pub configs: Vec<StoredConfig>,
+    pub local_configs: Vec<LocalConfigRecord>,
     pub defaults: Vec<DefaultRecord>,
+}
+/// Local configurations carry neither a transport endpoint nor a credential reference.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalConfigInput {
+    pub name: String,
+    pub asset_id: String,
+    pub engine: String,
+    pub device: sayweave_local_asr_protocol::DevicePolicy,
+}
+impl LocalConfigInput {
+    pub fn validate(mut self) -> Result<Self, ModelError> {
+        self.name = text(&self.name, 64, "name")?;
+        self.asset_id = text(&self.asset_id, 128, "assetId")?;
+        self.engine = text(&self.engine, 64, "engine")?;
+        Ok(self)
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalConfigRecord {
+    pub id: String,
+    #[serde(flatten)]
+    pub input: LocalConfigInput,
+    pub revision: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalSaveRequest {
+    pub input: LocalConfigInput,
+    pub id: Option<String>,
+    pub revision: Option<i64>,
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -240,6 +275,7 @@ pub struct ConfigRecord {
 #[serde(rename_all = "camelCase")]
 pub struct Overview {
     pub configs: Vec<ConfigRecord>,
+    pub local_configs: Vec<LocalConfigRecord>,
     pub defaults: Vec<DefaultRecord>,
     pub cleanup_pending: bool,
 }
@@ -253,6 +289,7 @@ pub struct ModelStatus {
 #[derive(Clone)]
 pub enum DbOperation {
     Overview,
+    CommitLocal(LocalSaveRequest),
     Prepare(String),
     Commit {
         input: ConfigInput,
@@ -287,11 +324,24 @@ pub fn replacements(view: &StoredOverview, id: &str, usages: &[Usage]) -> Vec<Re
         .filter(|d| d.config_id.as_deref() == Some(id) && !usages.contains(&d.usage))
         .map(|d| Replacement {
             usage: d.usage.clone(),
-            config_id: view
-                .configs
-                .iter()
-                .find(|c| c.id != id && executable(&c.input, &d.usage))
-                .map(|c| c.id.clone()),
+            config_id: {
+                let mut candidates = view
+                    .configs
+                    .iter()
+                    .filter(|c| c.id != id && executable(&c.input, &d.usage))
+                    .map(|c| (c.created_at, c.id.clone()))
+                    .collect::<Vec<_>>();
+                if d.usage == Usage::Speech {
+                    candidates.extend(
+                        view.local_configs
+                            .iter()
+                            .filter(|c| c.id != id)
+                            .map(|c| (c.created_at, c.id.clone())),
+                    );
+                }
+                candidates.sort();
+                candidates.into_iter().next().map(|(_, id)| id)
+            },
         })
         .collect()
 }

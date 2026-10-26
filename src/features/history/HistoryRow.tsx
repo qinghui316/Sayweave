@@ -3,7 +3,7 @@ import {ActionIcon,ActionMenu,Button,CopyFeedbackButton,Field,Select,IconButton,
 import {SpeechError,speechError,type SpeechPort,type SpeechSnapshot} from '../../contracts/speech';
 import {inputMessage} from '../../contracts/dictation';
 import {historySelection,historyVersion,type DeliveryReport,type HistoryPort,type HistoryRecord,type HistorySummary,type PlaybackState} from '../../contracts/history';
-import {modelExecutable,type ModelConfigPort,type ModelRecord} from '../../contracts/models';
+import {defaultSpeechModel,modelExecutable,type ModelConfigPort,type SpeechModelRecord} from '../../contracts/models';
 import {speechMessages} from '../../locales/speech';
 import s from './history.module.css';
 export const duration=(ms:number)=>`${Math.floor(ms/60000)}:${String(Math.floor(ms/1000)%60).padStart(2,'0')}`;
@@ -15,7 +15,7 @@ export type ExpandMode='text'|'versions'|'retry'|'delete'|'play';
 type Props={deliveryRevision?:string;summary:HistorySummary;expanded:boolean;mode:ExpandMode;activation:number;port:HistoryPort;speech:SpeechPort;models:ModelConfigPort;snapshot:SpeechSnapshot;player:PlaybackState;playBusy:boolean;expand:(id:string,mode:ExpandMode)=>Promise<boolean>;collapse:()=>void;play:(action:'play'|'pause'|'resume'|'seek'|'stop',resource?:string,ms?:number)=>Promise<void>;changed:(id:string,removed?:boolean)=>void;onRecord:()=>void;copyFull:(id:string,attemptId:string|null,current:()=>boolean)=>Promise<boolean>};
 export const HistoryRow=memo(function HistoryRow({deliveryRevision='',summary:r,expanded,mode,activation,port,speech,models,snapshot,player,playBusy,expand,collapse,play,changed,onRecord,copyFull}:Props){
  const display=historySelection(r);
- const [record,setRecord]=useState<HistoryRecord|null>(null),[version,setVersion]=useState(''),[loading,setLoading]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState(''),[retryModel,setRetryModel]=useState<ModelRecord|null>(null),[confirm,setConfirm]=useState<'retry'|'delete'|null>(null),[menuOpen,setMenuOpen]=useState(false),[overflow,setOverflow]=useState(false);
+ const [record,setRecord]=useState<HistoryRecord|null>(null),[version,setVersion]=useState(''),[loading,setLoading]=useState(false),[busy,setBusy]=useState(false),[error,setError]=useState(''),[retryModel,setRetryModel]=useState<SpeechModelRecord|null>(null),[confirm,setConfirm]=useState<'retry'|'delete'|null>(null),[menuOpen,setMenuOpen]=useState(false),[overflow,setOverflow]=useState(false);
  const [deliveries,setDeliveries]=useState<DeliveryReport[]>([]);
  const alive=useRef(false),request=useRef(0),actionGeneration=useRef(0),working=useRef(false),preview=useRef<HTMLParagraphElement>(null),confirmRef=useRef<HTMLDivElement>(null),article=useRef<HTMLElement>(null);
  const selection=useRef({version,display,generation:0});useEffect(()=>{selection.current={version,display,generation:selection.current.generation+1};},[version,display]);
@@ -37,7 +37,7 @@ export const HistoryRow=memo(function HistoryRow({deliveryRevision='',summary:r,
  useEffect(()=>{
   const token=++actionGeneration.current;if(!expanded)return;
   if(mode==='delete')setConfirm('delete');
-  if(mode==='retry')void act(async()=>{const overview=await models.overview();if(!alive.current||token!==actionGeneration.current)return;const model=overview.configs.find(c=>c.id===overview.defaults.find(d=>d.usage==='speech')?.configId);if(!model)throw new SpeechError('notConfigured');if(!modelExecutable(model,'speech'))throw new SpeechError('unsupported');setRetryModel(model);setConfirm('retry');});
+  if(mode==='retry')void act(async()=>{const overview=await models.overview();if(!alive.current||token!==actionGeneration.current)return;const model=defaultSpeechModel(overview);if(!model)throw new SpeechError('notConfigured');if(!modelExecutable(model,'speech'))throw new SpeechError('unsupported');setRetryModel(model);setConfirm('retry');});
   if(mode==='text'||mode==='play'||mode==='versions'){setConfirm(null);setRetryModel(null);}
   // Mode changes represent explicit user actions, not record refreshes.
  },[expanded,mode,activation,models]);
@@ -74,8 +74,8 @@ export const HistoryRow=memo(function HistoryRow({deliveryRevision='',summary:r,
    </>}
    {error&&<InlineMessage status="error">{error}</InlineMessage>}
    {confirm&&<div ref={confirmRef} className={s.confirm} role="group" aria-label={confirm==='delete'?'删除历史确认':'重识别确认'} onKeyDown={e=>{if(e.key==='Escape'&&!busy){dismissConfirm();e.stopPropagation();}}}>
-    <h3>{confirm==='delete'?'删除这条记录？':'重新识别这份录音？'}</h3><p className={s.meta}>{confirm==='delete'?'文字、所有识别版本和录音将一起删除。':retryModel?`${retryModel.name} · ${retryModel.modelId}`:'正在读取模型…'}</p>
-    {confirm==='retry'&&<p className={s.meta}>会发送这份录音，可能产生费用。</p>}
+    <h3>{confirm==='delete'?'删除这条记录？':'重新识别这份录音？'}</h3><p className={s.meta}>{confirm==='delete'?'文字、所有识别版本和录音将一起删除。':retryModel?`${retryModel.name}${'modelId' in retryModel?' · '+retryModel.modelId:''}`:'正在读取模型…'}</p>
+    {confirm==='retry'&&retryModel&&<p className={s.meta}>{'assetId' in retryModel?'使用本地模型识别这份录音。':'会发送这份录音，可能产生费用。'}</p>}
     <div className={s.actions}><Button disabled={busy} onClick={dismissConfirm}>取消</Button><Button variant="primary" loading={busy} disabled={!record||(confirm==='retry'&&!retryModel)} onClick={()=>void(confirm==='delete'?remove():retry())}>{confirm==='delete'?'确认删除':'开始识别'}</Button></div>
    </div>}
   </div>}

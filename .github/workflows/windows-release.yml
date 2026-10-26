@@ -188,6 +188,10 @@ jobs:
         if: inputs.verification_run_id == '' && inputs.phase != 'resume-package' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
         shell: pwsh
         run: |
+          if (Test-Path scripts/check-local-asr.mjs) {
+            node scripts/check-local-asr.mjs
+            if ($LASTEXITCODE -ne 0) { throw 'Local inference contracts failed.' }
+          }
           if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen') {
             node $env:SAYWEAVE_RELEASE_HELPER check-frozen
           } else {

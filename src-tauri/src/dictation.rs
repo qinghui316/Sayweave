@@ -502,6 +502,49 @@ impl DictationCoordinator {
                 return Err(error);
             }
         };
+        // Freeze model/asset choice once. Slow local compute preparation owns no
+        // native range or write lease, and keeps the original target anchor.
+        let choice = match crate::task_stop::optional_read(
+            async {
+                let choice = app
+                    .state::<crate::models::ModelService>()
+                    .speech_choice()
+                    .await
+                    .map_err(|e| Error::new(&e.code))?;
+                if expected.as_ref().is_some_and(|(wanted, revision)| {
+                    wanted != &choice.id || *revision != choice.revision
+                }) {
+                    return Err(Error::new("conflict"));
+                }
+                if let Some(configuration) = choice.configuration.as_ref() {
+                    configuration
+                        .prepare(&id)
+                        .await
+                        .map_err(|e| Error::new(&e.code))?;
+                }
+                Ok::<_, Error>(choice)
+            },
+            tx.subscribe(),
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        {
+            crate::task_stop::OptionalRead::Ready(Ok(configuration)) => configuration,
+            result => {
+                let error = match result {
+                    crate::task_stop::OptionalRead::Ready(Err(error)) => error,
+                    crate::task_stop::OptionalRead::Unavailable => {
+                        Error::new("localPreparationTimeout")
+                    }
+                    _ => Error::new("cancelled"),
+                };
+                self.reject_preparation(&app, &id, speech_source, &error, &gate)
+                    .await;
+                return Err(error);
+            }
+        };
+        let expected = Some((choice.id, choice.revision));
+        let configuration = choice.configuration;
         let preparation_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
         gate.set_preparation_budget(std::time::Duration::from_secs(15));
         let optional = async {
@@ -688,6 +731,7 @@ impl DictationCoordinator {
                     terminal: terminal_tx,
                     continuous: continuous.clone(),
                     hotwords,
+                    configuration,
                 },
             )
             .await;

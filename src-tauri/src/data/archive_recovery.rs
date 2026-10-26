@@ -1369,6 +1369,7 @@ mod tests {
                 config_name: "fixture".into(),
                 model_id: "fixture".into(),
                 service_host: "localhost".into(),
+                source: Default::default(),
                 config_revision: 1,
                 created_at: super::super::repository::now(),
                 ended_at: None,

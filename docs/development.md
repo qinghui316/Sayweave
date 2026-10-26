@@ -55,6 +55,10 @@ npm run desktop:build
 
 ## 数据与资源
 
+本地识别分支的桌面包装另行构建独立工作程序及 CPU/Vulkan DLL，主程序和安装辅助程序不链接推理库。首次 Windows 构建可运行 `node scripts/setup-local-asr-tools.mjs`，固定校验后只准备最小 Vulkan 编译工具；已有 SDK 或本机工具直接复用。终端用户不需要 Python、CUDA、SDK 或编译器。`node scripts/build-local-asr.mjs --debug` 在原 Cargo target 下复用按来源与哈希核验的运行载荷，不新建工作树或复制依赖目录。
+
+桌面安装载荷包括 `local-asr/` 中明确列出的工作程序、后端 DLL、CRT 和许可证；清单位于 `src-tauri/local-asr-protocol/runtime-files.json`。安装备份、恢复和卸载使用同一文件身份，更新前先结算子进程。权重位于各自资料目录的 `models/`，不属于安装器载荷或卸载清单。此开发分支仍须完成最终验收，不能用构建成功代替可用交付。
+
 字体随依赖打包，普通构建不访问在线字体。开发和发布使用不同的数据子目录，详见 [本地数据](local-data.md)。不要在用户数据目录运行破坏性测试。
 
 提交前检查 `npm run check:distribution`，审核新增源码和文档的用途；测试生成的 `.local/`、截图、报告、数据库及构建产物保留在本地。

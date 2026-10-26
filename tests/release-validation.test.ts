@@ -145,7 +145,7 @@ describe('frozen product release controller boundaries',()=>{
         for _ in 0..pending {
             replay_batch(&mut repo, temp.path(), false, std::time::Duration::ZERO, 1).unwrap();
         }`},
- ].map(({path,before,after})=>{const reviewed=readFileSync(path,'utf8').replaceAll('\r\n','\n');let original=reviewed.replace(after,before);if(path==='src-tauri/src/installer/login_startup.rs')original=original.replace(startupExpectedAfter,startupExpectedBefore);return {path,reviewed,original};});
+ ].map(({path,before,after})=>{const reviewed=readFileSync(path==='src-tauri/src/data/archive_recovery.rs'?'tests/fixtures/frozen-archive-recovery.rs.txt':path,'utf8').replaceAll('\r\n','\n');let original=reviewed.replace(after,before);if(path==='src-tauri/src/installer/login_startup.rs')original=original.replace(startupExpectedAfter,startupExpectedBefore);return {path,reviewed,original};});
  const meterReviewed=readFileSync('tests/voice-edit-resume.test.tsx','utf8').replaceAll('\r\n','\n');
  const meterFixture={path:'tests/voice-edit-resume.test.tsx',reviewed:meterReviewed,original:meterReviewed.replace(" vi.spyOn(performance,'now').mockReturnValue(1000);\n",'').replace('vi.restoreAllMocks();','')};
  const frozenFixtures=[...continuationFixtures,meterFixture];
@@ -164,6 +164,10 @@ describe('frozen product release controller boundaries',()=>{
  it.each(continuationFixtures)('permits the exact continuation fixture for $path',({path,original,reviewed})=>{
   expect(original).not.toBe(reviewed);
   expect(()=>validateNativeTestOverride(Buffer.from(original),Buffer.from(reviewed),path)).not.toThrow();
+ });
+ it('does not treat the schema11 archive tests as the historical frozen repair',()=>{
+  const fixture=continuationFixtures.find(value=>value.path==='src-tauri/src/data/archive_recovery.rs')!;
+  expect(()=>validateNativeTestOverride(Buffer.from(fixture.original),readFileSync(fixture.path),fixture.path)).toThrow('reviewed frozen fixture');
  });
  it.each(continuationFixtures.flatMap(fixture=>['production','append','original','test','path'].map(kind=>({...fixture,kind}))))('rejects $kind changes to the pinned $path fixture',({path,original,reviewed,kind})=>{
   if(kind==='production')reviewed='fn injected_runtime() {}\n'+reviewed;

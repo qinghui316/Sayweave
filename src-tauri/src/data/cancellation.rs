@@ -417,6 +417,7 @@ mod tests {
                 config_revision: 1,
                 model_id: "fixture".into(),
                 service_host: "example.invalid".into(),
+                source: Default::default(),
                 created_at: now(),
                 ended_at: None,
                 status: "preparing".into(),

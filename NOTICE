@@ -6,3 +6,5 @@ their respective licenses. See src/assets/licenses for the project-maintained
 license notices.
 
 Brand lettering uses Newsreader Italic outlines, Copyright2020 The Newsreader Project Authors, under SIL OFL1.1. Source: https://github.com/productiontype/Newsreader . License: src/assets/licenses/Newsreader-OFL.txt.
+
+Local ASR uses transcribe.cpp 0.1.3 and ggml under MIT. Full runtime notices and model provenance are in src-tauri/local-asr-worker/THIRD_PARTY_NOTICES.txt and are included with the local runtime. Nemotron weights are downloaded separately under their upstream model terms.

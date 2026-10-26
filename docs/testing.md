@@ -20,6 +20,10 @@
 
 ## 常规检查
 
+本地识别分支增加 `node scripts/check-local-asr.mjs`：复用原 target，检查固定工作程序、私有有界协议和隔离管道替身的轮次／取消契约，不下载模型或访问麦克风。真实模型测试使用主程序的 `speech::local::tests::real_worker_through_main_recognition_adapter` 显式入口；`SAYWEAVE_LOCAL_DEVICE`、`SAYWEAVE_LOCAL_EXPECT_BACKEND`、`SAYWEAVE_LOCAL_AUDIO`、`SAYWEAVE_LOCAL_ROUNDS` 和唯一 `SAYWEAVE_LOCAL_REPORT` 分别固定设备、素材、重复次数及报告。报告保留实际转写、时序、进程、源码载荷和驱动身份；不能覆盖首个失败或将合成音频视为麦克风试用。
+
+下载用本机 HTTP 夹具验证断点范围、ETag、完整哈希、取消和文件租约；schema10→11 与旧配置／凭据／默认选择在独立资料内验证。新包必须显式要求完整本地运行载荷，旧冻结安装包按其原清单验证，不运行额外安装故障专项。
+
 已通过的验证在源码、构建身份与覆盖范围未变化时直接复用，保留原提交与记录；新改动只补受影响的检查。本地 I2 合入使用已有验证和精确候选审查，不等待远程 CI。CI 在 PR 或手动触发，普通主线直推不重复检查；实际安装与升级验收仅在相关改动或发版时执行。
 
 纯流程、配置或文档收尾按实际影响检查，不重建未变化的产品。合入外部 PR 时仍要求 GitHub Actions 的 `CI` 通过；所有者日常直推例外不用于跳过外部 PR 的验收。开发分支和候选的保存、合入与清理顺序见 [开发说明](development.md)。

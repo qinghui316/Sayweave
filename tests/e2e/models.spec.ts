@@ -4,6 +4,23 @@ async function manualModel(dialog:Locator){const button=dialog.getByRole('button
 async function hitVisible(locator:Locator){
  await expect.poll(()=>locator.evaluate(el=>{const r=el.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;const top=document.elementFromPoint(x,y);return r.width>0&&r.height>0&&x>=0&&y>=0&&x<innerWidth&&y<innerHeight&&!!top&&(el===top||el.contains(top));})).toBe(true);
 }
+test('local model controls remain usable in the compact settings window without changing the default on download',async({page})=>{
+ await page.setViewportSize({width:960,height:640});
+ const dialog=await open(page), local=dialog.getByRole('region',{name:'本地语音模型'});
+ await local.getByRole('button',{name:'下载模型',exact:true}).click();
+ await expect(local.getByRole('button',{name:'使用本地模型',exact:true})).toBeVisible();
+ await expect(local.getByText('当前使用',{exact:true})).toHaveCount(0);
+ const device=local.getByRole('combobox',{name:'本地识别计算方式'});
+ await device.click();await page.getByRole('option',{name:'仅 CPU',exact:true}).click();
+ await local.getByRole('button',{name:'使用本地模型',exact:true}).click();
+ await expect(local.getByText('当前使用',{exact:true})).toBeVisible();
+ await expect(device).toHaveText('仅 CPU');
+ await local.getByRole('button',{name:'删除本地模型',exact:true}).click();
+ const confirm=page.getByRole('alertdialog');await hitVisible(confirm.getByRole('button',{name:'确认删除',exact:true}));
+ await confirm.getByRole('button',{name:'确认删除',exact:true}).click();
+ await expect(confirm).toHaveCount(0);await expect(local.getByRole('button',{name:'下载模型',exact:true})).toBeVisible();
+ await expect(local.getByText('当前使用',{exact:true})).toHaveCount(0);
+});
 test('task-based model settings save, select, edit and discard with focus restoration',async({page})=>{
  const dialog=await open(page);await expect(dialog.getByRole('tab',{name:'语音识别'})).toHaveAttribute('aria-selected','true');
  await dialog.getByRole('tab',{name:'文字处理'}).click();

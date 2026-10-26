@@ -80,6 +80,8 @@ pub struct Attempt {
     pub config_name: String,
     pub model_id: String,
     pub service_host: String,
+    #[serde(default)]
+    pub source: RecognitionSource,
     pub config_revision: i64,
     pub created_at: i64,
     pub ended_at: Option<i64>,
@@ -87,6 +89,21 @@ pub struct Attempt {
     pub text: String,
     pub error_code: Option<String>,
     pub elapsed_ms: u64,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum RecognitionSource {
+    #[default]
+    Cloud,
+    Local {
+        asset_id: String,
+        engine: String,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

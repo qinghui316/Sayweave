@@ -59,10 +59,24 @@ pub struct Target {
     pub main_hash: String,
     pub helper_hash: String,
     pub uninstall_hash: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_files: Vec<crate::build_info::local_runtime::RuntimeFile>,
 }
 impl Target {
     pub fn validate(&self) -> Result<()> {
         if !hex(&self.commit, 40)
+            || self.local_files.len() > 24
+            || (!self.local_files.is_empty()
+                && self.local_files.len()
+                    != sayweave_local_asr_protocol::runtime_file_names().len())
+            || self.local_files.iter().any(|f| !f.valid())
+            || self
+                .local_files
+                .iter()
+                .map(|f| &f.name)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != self.local_files.len()
             || !hex(&self.payload_hash, 64)
             || self.core_hash.as_ref().is_some_and(|h| !hex(h, 64))
             || !hex(&self.main_hash, 64)
@@ -252,7 +266,7 @@ impl UserRecord {
         if self.schema_version != 1
             || uuid::Uuid::parse_str(&self.transaction).is_err()
             || self.language == 0
-            || self.files.len() > 5
+            || self.files.len() > 29
             || self.keys.len() != 2
             || self.installer.pid == 0
             || !hex(&self.installer.image_hash, 64)
@@ -261,10 +275,15 @@ impl UserRecord {
             return Err("installerRecordInvalid".into());
         }
         if self.files.iter().any(|f| {
-            !matches!(
+            !(matches!(
                 f.backup.as_str(),
                 "main" | "uninstall" | "helper" | "desktop" | "startMenu"
-            ) || f.before_hash.as_ref().is_some_and(|v| !hex(v, 64))
+            ) || self
+                .target
+                .local_files
+                .iter()
+                .any(|v| f.backup == format!("asr-{}", v.name)))
+                || f.before_hash.as_ref().is_some_and(|v| !hex(v, 64))
                 || f.installed_hash.as_ref().is_some_and(|v| !hex(v, 64))
         }) {
             return Err("installerRecordInvalid".into());
