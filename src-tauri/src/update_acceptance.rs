@@ -169,7 +169,6 @@ pub async fn acceptance_update_seed(
                 config_revision: 1,
                 model_id: "update-fixture".into(),
                 service_host: "example.invalid".into(),
-                source: Default::default(),
                 template_version: "fixture-v1".into(),
                 strategy_version: "application-learning-v1".into(),
             },

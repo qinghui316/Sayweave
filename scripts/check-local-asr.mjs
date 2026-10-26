@@ -15,6 +15,7 @@ const commands=[
  ['test','--locked','--manifest-path','src-tauri/local-asr-protocol/Cargo.toml','--features','fixture'],
  ['test','--locked','--manifest-path','src-tauri/local-asr-worker/Cargo.toml','--lib'],
  ['clippy','--locked','--manifest-path','src-tauri/local-asr-worker/Cargo.toml','--all-targets','--','-D','warnings'],
+ ['check','--locked','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance'],
  ['test','--locked','--manifest-path','src-tauri/Cargo.toml','--lib','local_asr::tests','--','--ignored','--nocapture'],
  ['test','--locked','--manifest-path','src-tauri/Cargo.toml','--lib','stalled_adapter_consumer','--','--ignored','--nocapture'],
 ];
