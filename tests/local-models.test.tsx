@@ -11,7 +11,7 @@ describe('local model contracts and settings',()=>{
   await port.local.download();
   await port.local.save({input:{name:'备用本地识别',assetId:localAssetId,engine:'transcribe-cpp-0.1.3',device:'cpu'},id:null,revision:null});
   render(<ModelPanel port={port}/>);
-  fireEvent.click(await screen.findByRole('button',{name:'删除',exact:true}));
+  fireEvent.click(await screen.findByRole('button',{name:/^删除$/u}));
   const dialog=screen.getByRole('alertdialog');
   expect(dialog).toHaveTextContent('备用本地识别');expect(dialog).not.toHaveTextContent('清空');
   fireEvent.click(within(dialog).getByRole('button',{name:'确认删除'}));
