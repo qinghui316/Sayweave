@@ -5,6 +5,20 @@ import {ModelPanel} from '../src/features/models';
 import {localAssetId,parseModelOverview,modelExpectation} from '../src/contracts/models';
 
 describe('local model contracts and settings',()=>{
+ it('confirms the actual local replacement before deleting the current cloud default',async()=>{
+  const port=new BrowserModels();
+  await port.save({id:null,revision:null,expectation:null,key:{action:'replace',value:'fixture-key'},input:{name:'云端识别',protocol:'qwen-audio-streaming',baseUrl:'https://example.com',modelId:'fixture',usages:['speech']}});
+  await port.local.download();
+  await port.local.save({input:{name:'备用本地识别',assetId:localAssetId,engine:'transcribe-cpp-0.1.3',device:'cpu'},id:null,revision:null});
+  render(<ModelPanel port={port}/>);
+  fireEvent.click(await screen.findByRole('button',{name:'删除',exact:true}));
+  const dialog=screen.getByRole('alertdialog');
+  expect(dialog).toHaveTextContent('备用本地识别');expect(dialog).not.toHaveTextContent('清空');
+  fireEvent.click(within(dialog).getByRole('button',{name:'确认删除'}));
+  await waitFor(async()=>expect((await port.overview()).configs).toEqual([]));
+  const view=await port.overview();
+  expect(view.defaults.find(d=>d.usage==='speech')!.configId).toBe(view.localConfigs![0]!.id);
+ });
  it('download does not change defaults; use is explicit and device remains frozen in saved config',async()=>{
   const port=new BrowserModels();render(<ModelPanel port={port}/>);
   const card=await screen.findByRole('region',{name:'本地语音模型'});

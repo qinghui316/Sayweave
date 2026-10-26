@@ -402,11 +402,51 @@ mod tests {
             runs.push(serde_json::json!({"turn":turn,"updates":updates,"firstTextMs":first.unwrap(),"finalizeMs":final_at.unwrap().elapsed().as_secs_f64()*1000.0,"elapsedMs":began.elapsed().as_secs_f64()*1000.0,"full":text,"progressMs":progress}));
             drop(session);
         }
+        // Exercise the production dispatcher with queued PCM at cooperative
+        // cancellation, then reuse the same model/runtime for the next turn.
+        // This runs AFTER timing samples and cannot warm their first decode.
+        let cancel_began = Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let mut old = RecognitionSession::open_for_turn(
+                &config,
+                &task,
+                rounds + 1,
+                &uuid::Uuid::new_v4().to_string(),
+                &[],
+            )
+            .await
+            .unwrap();
+            for chunk in pcm.chunks(1600).take(16) {
+                old.send_pcm(chunk).await.unwrap();
+            }
+            assert!(matches!(old.next_event().await.unwrap(), Event::Update(_)));
+            for chunk in pcm.chunks(1600).take(16) {
+                old.send_pcm(chunk).await.unwrap();
+            }
+            drop(old);
+            let mut next = RecognitionSession::open_for_turn(
+                &config,
+                &task,
+                rounds + 2,
+                &uuid::Uuid::new_v4().to_string(),
+                &[],
+            )
+            .await
+            .unwrap();
+            for chunk in pcm.chunks(1600).take(16) {
+                next.send_pcm(chunk).await.unwrap();
+            }
+            next.finish().await.unwrap();
+            while !matches!(next.next_event().await.unwrap(), Event::Finished) {}
+        })
+        .await
+        .unwrap();
+        let cancellation_ms = cancel_began.elapsed().as_secs_f64() * 1000.0;
         drop(config);
         let memory = runtime.process_memory().await;
         runtime.shutdown().await.unwrap();
         let worker_sha = format!("{:x}", Sha256::digest(std::fs::read(program).unwrap()));
-        let report = serde_json::json!({"kind":"main-recognition-real-worker-fixed-audio","audioFile":audio,"audioSha256":format!("{:x}", Sha256::digest(std::fs::read(&audio).unwrap())),"durationSeconds":audio_seconds,"syntheticAudio":audio.file_name().is_some_and(|n|n.to_string_lossy().contains("sapi")),"requestedDevice":requested,"prepared":metadata,"prepareMs":prepare_ms,"workerSha256":worker_sha,"testDriverSha256":format!("{:x}", Sha256::digest(std::fs::read(std::env::current_exe().unwrap()).unwrap())),"runtimeManifest":manifest,"modelSha256":model_assets::MODEL_SHA256,"processMemory":memory,"runs":runs,"processAndComputeClosed":true});
+        let report = serde_json::json!({"kind":"main-recognition-real-worker-fixed-audio","audioFile":audio,"audioSha256":format!("{:x}", Sha256::digest(std::fs::read(&audio).unwrap())),"durationSeconds":audio_seconds,"syntheticAudio":audio.file_name().is_some_and(|n|n.to_string_lossy().contains("sapi")),"requestedDevice":requested,"prepared":metadata,"prepareMs":prepare_ms,"workerSha256":worker_sha,"testDriverSha256":format!("{:x}", Sha256::digest(std::fs::read(std::env::current_exe().unwrap()).unwrap())),"runtimeManifest":manifest,"modelSha256":model_assets::MODEL_SHA256,"processMemory":memory,"runs":runs,"cancellationBacklogNextTurnPassed":true,"cancellationRecoveryMs":cancellation_ms,"processAndComputeClosed":true});
         std::fs::write(output, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
 }

@@ -47,6 +47,14 @@ fn cancel_current(current: &Cancellation, id: Option<&RunId>) {
 fn valid_id(id: &RunId) -> bool {
     id.is_valid()
 }
+fn idle_command(frame: Frame) -> Result<Command, (Option<RunId>, &'static str)> {
+    // Cooperative cancellation can finish before the reader queue is drained.
+    // Retired PCM remains owned by its original run, never by the next stream.
+    match frame {
+        Frame::Audio { id, .. } => Err((Some(id), "localStaleOperation")),
+        frame => decode_json(frame).map_err(|_| (None, "localProtocol")),
+    }
+}
 fn prepare(
     path: String,
     sha256: String,
@@ -226,10 +234,10 @@ fn main() {
     let mut hello = false;
     let mut retired = VecDeque::new();
     while let Ok(frame) = rx.recv() {
-        let command = match decode_json::<Command>(frame) {
+        let command = match idle_command(frame) {
             Ok(command) => command,
-            Err(_) => {
-                fail(&out, None, "localStaleOperation");
+            Err((id, code)) => {
+                fail(&out, id, code);
                 continue;
             }
         };
@@ -382,5 +390,53 @@ fn main() {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    #[test]
+    fn cancelled_pcm_backlog_keeps_its_run_identity_before_next_start() {
+        let old = RunId {
+            task: "same-task".into(),
+            turn: 1,
+            request: "old-request".into(),
+        };
+        let next = RunId {
+            turn: 2,
+            request: "next-request".into(),
+            ..old.clone()
+        };
+        let mut queue = VecDeque::new();
+        for sequence in 1..=4 {
+            queue.push_back(Frame::Audio {
+                id: old.clone(),
+                sequence,
+                pcm: vec![1; 1600],
+            });
+        }
+        queue.push_back(Frame::Json(
+            serde_json::to_vec(&Command::Cancel { id: old.clone() }).unwrap(),
+        ));
+        queue.push_back(Frame::Json(
+            serde_json::to_vec(&Command::Start {
+                id: next.clone(),
+                language: "auto".into(),
+                right_context: 6,
+            })
+            .unwrap(),
+        ));
+        for _ in 0..4 {
+            let (id, code) = idle_command(queue.pop_front().unwrap()).unwrap_err();
+            assert_eq!(id, Some(old.clone()));
+            assert_eq!(code, "localStaleOperation");
+        }
+        assert!(
+            matches!(idle_command(queue.pop_front().unwrap()).unwrap(),Command::Cancel{id} if id==old)
+        );
+        assert!(
+            matches!(idle_command(queue.pop_front().unwrap()).unwrap(),Command::Start{id,..} if id==next)
+        );
     }
 }

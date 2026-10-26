@@ -222,7 +222,7 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
   </footer>
   <Dialog confirmation open={leaving} onOpenChange={open => {if(!open) continueEditing();}} restoreFocus={()=>form.current?.querySelector<HTMLElement>('[aria-invalid="true"]')??null} title="有未保存的修改" description="保存后继续，或取消并返回编辑。"><div className={s.actions}><Button variant="primary" disabled={saving} onClick={()=>void saveAndLeave()}>保存</Button><Button disabled={saving} onClick={continueEditing}>取消</Button></div></Dialog>
   <Dialog confirmation open={!!confirmation} onOpenChange={open => {if(!open && !saving) setConfirmation(null);}} title={'删除“'+(confirmation?.record.name ?? '')+'”？'} description="删除后无法撤销。">
-   {confirmation?.expectation.replacements.map(r => {const target = view?.configs.find(c => c.id === r.configId); return <p className={s.replacement} key={r.usage}>{label(r.usage)}将{target ? <>改用 <strong>{target.name}</strong><br/>{target.modelId}<br/>{target.baseUrl}</> : '清空，请重新选择模型。'}</p>;})}
+   {confirmation?.expectation.replacements.map(r => {const target = view?.configs.find(c => c.id === r.configId)??view?.localConfigs?.find(c=>c.id===r.configId); return <p className={s.replacement} key={r.usage}>{label(r.usage)}将{target ? <>改用 <strong>{target.name}</strong>{'baseUrl' in target&&<><br/>{target.modelId}<br/>{target.baseUrl}</>}</> : '清空，请重新选择模型。'}</p>;})}
    <div className={s.actions}><Button disabled={saving} onClick={() => setConfirmation(null)}>取消</Button><Button variant="primary" loading={saving} onClick={() => void remove()}>确认删除</Button></div>
   </Dialog>
  </Tabs>;
