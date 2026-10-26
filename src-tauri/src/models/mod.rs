@@ -2,6 +2,8 @@ pub mod commands;
 mod local;
 pub use local::{LocalConfiguration, SpeechConfiguration};
 mod credentials;
+#[cfg(all(test, windows))]
+mod developer_profile_acceptance;
 #[cfg(feature = "desktop-acceptance")]
 pub(crate) mod language_actor_acceptance;
 mod latency;

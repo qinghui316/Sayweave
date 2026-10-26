@@ -43,6 +43,7 @@ pub(crate) async fn learned_term_followup(
 #[tokio::test]
 #[ignore = "Explicit authorized ASR hotword comparison, synthetic audio only"]
 async fn selected_hotword_comparison() {
+    crate::tls::initialize();
     assert_eq!(
         std::env::var("SAYWEAVE_HOTWORDS_ACCEPTANCE").as_deref(),
         Ok("synthetic-only")

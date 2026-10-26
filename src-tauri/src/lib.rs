@@ -699,13 +699,14 @@ pub fn run() {
                 }
                 _ => base,
             };
-            let root = data::profile_root(&base, cfg!(debug_assertions));
+            let development_profile = build_info::development_profile();
+            let root = data::profile_root(&base, development_profile);
             #[cfg(feature = "desktop-acceptance")]
             println!("SAYWEAVE_DATA_DIRECTORY {}", root.display());
             let namespace = format!(
                 "{}.{}",
                 env!("SAYWEAVE_BUILD_IDENTIFIER"),
-                if cfg!(debug_assertions) {
+                if development_profile {
                     "dev"
                 } else {
                     "release"

@@ -16,7 +16,9 @@
 
 ## 文件位置与进程锁
 
-Tauri app_data_dir 下：普通发布版 `data/dictionary.sqlite`，开发版 `data-dev/dictionary.sqlite`。只有专用验收构建打印数据目录；普通诊断日志不记录绝对用户路径。Windows 当前应用标识为 `local.sayweave.skeleton`，不要直接改名而丢失数据入口。数据库不在项目源码、安装目录或浏览器存储中。
+Tauri app_data_dir 下：普通发布版 `data/dictionary.sqlite`，开发版 `data-dev/dictionary.sqlite`。本地识别实施分支按编译渠道隔离：优化构建的 development 渠道也使用 `data-dev` 和独立的 dev 凭据空间；stable 渠道仍使用 `data` 和 release 凭据空间。调试构建沿用开发资料。只有专用验收构建打印数据目录；普通诊断日志不记录绝对用户路径。Windows 当前应用标识为 `local.sayweave.skeleton`，不要直接改名而丢失数据入口。数据库不在项目源码、安装目录或浏览器存储中。
+
+本轮经用户确认，首次开发试用从只读正式资料复制模型配置、词典和设置，不复制语音历史、音频和待分析观察；凭据复制到独立的 dev 空间。该离线交付入口只编译进显式测试驱动，拒绝覆盖已有开发资料，普通应用不自动复制或迁移正式资料。正式版0.1.18的库保持schema10，可继续使用；新开发资料独立升级为schema11。
 
 每个目录用 `instance.lock` 的操作系统锁保护，文件存在不代表锁已占用。第二个同目录实例提示已运行后退出，不写库、不执行迁移。锁由数据线程持有，进程退出释放。初始目录不可写时不阻止演示窗口；恢复权限后可重试初始化。
 
