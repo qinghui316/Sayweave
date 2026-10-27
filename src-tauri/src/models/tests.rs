@@ -6,7 +6,7 @@ use credentials::Credentials;
 #[ignore = "cleanup only explicit credentials from a UUID-scoped native acceptance profile"]
 async fn model_desktop_cleanup() {
     let id = std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID").unwrap();
-    uuid::Uuid::parse_str(&id).unwrap();
+    let id = uuid::Uuid::parse_str(&id).unwrap().to_string();
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../.local/data-acceptance")
         .join(&id);
@@ -53,7 +53,7 @@ async fn model_desktop_cleanup() {
 #[ignore = "explicit isolated native HTTPS fixture generation"]
 fn model_desktop_fixture() {
     let id = std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID").unwrap();
-    uuid::Uuid::parse_str(&id).unwrap();
+    let id = uuid::Uuid::parse_str(&id).unwrap().to_string();
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../.local/data-acceptance")
         .join(id)
