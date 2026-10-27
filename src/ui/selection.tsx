@@ -7,7 +7,7 @@ import {body,runSelectionSpring,settle} from './selection-motion';
 import {RubberIndicator,useRubberSelection} from './RubberSelection';
 
 /** Highlight geometry follows actual rows, including wrapping and viewport scrolling. */
-export function useSelectionHighlight() {
+export function useSelectionHighlight(rowSelector='[role="option"]') {
   const {ref:motionRef,available,active}=useMotion<HTMLDivElement>();
   const [root,setRoot]=useState<HTMLDivElement|null>(null);
   const ref=useCallback((node:HTMLDivElement|null)=>{motionRef.current=node;setRoot(node);},[motionRef]);
@@ -17,11 +17,11 @@ export function useSelectionHighlight() {
     let frame = 0;
     let hovered: HTMLElement | null = null;
     let initialized = false;
-    const rowSelector = '[role="option"]';
     const paint = () => {
       frame = 0;
       const focused = document.activeElement instanceof HTMLElement && root.contains(document.activeElement) ? document.activeElement.closest<HTMLElement>(rowSelector) : null;
-      const row = hovered?.isConnected ? hovered : focused ?? root.querySelector<HTMLElement>('[data-highlighted], [aria-selected="true"], [data-state="checked"]');
+      const marked=Array.from(root.querySelectorAll<HTMLElement>(rowSelector)).find(row=>row.matches('[data-highlighted], [aria-selected="true"], [data-state="checked"]'));
+      const row = hovered?.isConnected&&hovered.matches(rowSelector) ? hovered : focused ?? marked;
       layer.style.opacity = row ? '1' : '0';
       if (!row) return;
       // Layout offsets are unaffected by the menu's reveal transform.
@@ -40,14 +40,15 @@ export function useSelectionHighlight() {
     const pointer = (event: Event) => { const row=event.target instanceof HTMLElement?event.target.closest<HTMLElement>(rowSelector):null;if(row)hovered=row;schedule(); };
     const focus = (event: Event) => {
       // Radix focuses the container when the pointer leaves an item; preserve browsing there.
-      if (event.type === 'keydown' || event.target instanceof HTMLElement && event.target.closest(rowSelector)) hovered = null;
+      const row=event.target instanceof HTMLElement?event.target.closest<HTMLElement>(rowSelector):null;
+      if (event.type === 'keydown' || row&&row!==hovered) hovered = null;
       schedule();
     };
     const leave = () => { schedule(); }; // Remember the last browsed row until keyboard/focus takes over.
     const resize = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(schedule);
     const observeRows=()=>{resize?.disconnect();resize?.observe(root);root.querySelectorAll(rowSelector).forEach(row=>resize?.observe(row));};
     const observer = new MutationObserver(changes=>{if(changes.some(change=>change.type==='childList'))observeRows();schedule();});
-    observer.observe(root, {subtree: true, childList: true, characterData:true, attributes: true, attributeFilter: ['data-highlighted', 'data-state', 'aria-selected']});
+    observer.observe(root, {subtree: true, childList: true, characterData:true, attributes: true, attributeFilter: ['data-highlighted', 'data-state', 'aria-selected','data-disabled']});
     observeRows();
     root.addEventListener('pointermove', pointer);
     root.addEventListener('pointerleave', leave);
@@ -57,7 +58,7 @@ export function useSelectionHighlight() {
     window.addEventListener('resize', schedule);
     paint();
     return () => { cancelAnimationFrame(frame); observer.disconnect(); resize?.disconnect(); root.removeEventListener('pointermove', pointer); root.removeEventListener('pointerleave', leave); root.removeEventListener('focusin', focus); root.removeEventListener('keydown', focus); root.removeEventListener('scroll', schedule, true); window.removeEventListener('resize', schedule); };
-  }, [available, active, root]);
+  }, [available, active, root,rowSelector]);
   return {ref,available,active};
 }
 export function SelectionHighlight() { return <span className={s.selectionHighlight} data-selection-highlight="" aria-hidden="true"/>; }

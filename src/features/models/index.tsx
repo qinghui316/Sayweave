@@ -1,5 +1,7 @@
 import {localAsrMessages} from '../../contracts/local-asr';
 import {LocalModelCard} from './LocalModelCard';
+import {ModelCard} from './ModelCard';
+import {RubberIndicator,useRubberSelection} from '../../ui/RubberSelection';
 import {useCallback, useEffect, useId, useRef, useState,type ReactNode} from 'react';
 import {Button, Dialog, Field, TextInput, PasswordInput, Select, InlineMessage, AsyncStatusFeedback, Tabs} from '../../ui';
 import {modelError, modelExecutable, modelExpectation, modelSameOrigin, type ModelConfigPort, type ModelOverview, type ModelInput, type ModelRecord, type ModelDraft, type ModelExpectation, type ModelTestResult, type ModelErrorCode, type ModelUsage} from '../../contracts/models';
@@ -36,6 +38,7 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
  const [loading, setLoading] = useState(true), [saving, setSaving] = useState(false);
  const [error, setError] = useState<{text:string; field?:string; conflict?:boolean}|null>(null);
  const [notice, setNotice] = useState('');
+ const [pendingModel,setPendingModel]=useState<string|null>(null);
  const [network, setNetwork] = useState<'test'|null>(null);
  const [tested, setTested] = useState<ModelTestResult|null>(null);
  const [networkError, setNetworkError] = useState<string|null>(null);
@@ -151,49 +154,55 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
   } catch(e) {if(alive.current) report(e, usage);return false;} finally {saveFlight.current=false;if(alive.current) setSaving(false);}
  }
  async function remove() {
-  if(!confirmation || saving) return;
+  if(!confirmation || saveFlight.current) return;
+  saveFlight.current=true;
   setSaving(true); setError(null);
   try {
    const result = await port.remove({id:confirmation.record.id, revision:confirmation.record.revision, expectation:confirmation.expectation});
    if(!alive.current) return;
    setView(result); setEditor((recordsFor(result, usage).length || (usage==='speech'&&result.localConfigs?.length)) ? null : newEditor(usage)); setConfirmation(null); onChanged?.();
    setNotice(result.cleanupPending ? '已删除，密钥清理稍后重试。' : '已删除。');
-  } catch(e) {if(alive.current) {setConfirmation(null); report(e);}} finally {if(alive.current) setSaving(false);}
+  } catch(e) {if(alive.current) {setConfirmation(null); report(e);}} finally {saveFlight.current=false;if(alive.current) setSaving(false);}
+ }
+ async function mutateModel(action:()=>Promise<void>){
+  if(saveFlight.current)throw {code:'busy'};
+  saveFlight.current=true;setSaving(true);
+  try {await action();}finally{saveFlight.current=false;if(alive.current)setSaving(false);}
  }
  async function selectModel(id:string) {
-  if(!view || saving) return;
-  setSaving(true); setError(null); setNotice('');
+  if(!view || saveFlight.current || view.defaults.find(d=>d.usage===usage)?.configId===id) return;
+  setError(null); setNotice('');setPendingModel(id);
   try {
-   const current = view.defaults.find(d => d.usage === usage)!;
-   const result = await port.setDefault({usage, configId:id, revision:current.revision});
-   if(alive.current) {setView(result); setNotice('当前模型已更新。'); onChanged?.();}
-  } catch(e) {if(alive.current) report(e);} finally {if(alive.current) setSaving(false);}
+   await mutateModel(async()=>{
+    const current = view.defaults.find(d => d.usage === usage)!;
+    const result = await port.setDefault({usage, configId:id, revision:current.revision});
+    if(alive.current) {setView(result);onChanged?.();}
+   });
+  } catch(e) {if(alive.current) report(e);}finally{if(alive.current)setPendingModel(null);}
  }
  function continueEditing() {setLeaving(false); nextAction.current = null;}
 
  const originChanged = !!editor?.record && (editor.record.protocol !== editor.input.protocol || !modelSameOrigin(editor.record.baseUrl, editor.input.baseUrl));
  const fieldError = (key:string) => error?.field === key ? error.text : undefined;
  const selected = view?.defaults.find(d => d.usage === usage)?.configId;
+ const {ref:modelList}=useRubberSelection(selected??'',false,{selector:'[data-model-card][data-selected="true"]',clipRows:'[data-model-card]'});
  const current = view?.configs.find(c => c.id === selected && modelExecutable(c, usage));
  const currentLocal=view?.localConfigs?.find(c=>c.id===selected);
  const records = view ? recordsFor(view, usage) : [];
  const addressField = editor && <Field label="服务地址（URL）" error={fieldError('baseUrl')}>{props => <TextInput {...props} value={editor.input.baseUrl} autoComplete="off" spellCheck={false} onBlur={()=>{if(usage==='text')void discovery.sync();}} onChange={e => modify({baseUrl:e.target.value})}/>}</Field>;
  const speechOptions = speechPresets.map(p => ({value:p.modelId as string, label:p.label as string}));
  if(editor && !speechOptions.some(p => p.value === editor.input.modelId)) speechOptions.unshift({value:editor.input.modelId, label:'当前自定义模型 · '+editor.input.modelId});
+ const localCard=view&&usage==='speech'&&port.local&&!changed?<LocalModelCard port={port} view={view} disabled={saving} mutate={mutateModel} onChanged={next=>{setView(next);setEditor(current=>current&&(current.key!==''||JSON.stringify(current.input)!==JSON.stringify(current.initial))?current:null);onChanged?.();}}/>:null;
  return <Tabs activationMode="manual" className={s.panel} contentClassName={s.tabContent} value={usage} onValueChange={switchUsage} disabled={saving || loading} label="模型类别" options={[{value:'speech', label:'语音识别'}, {value:'text', label:'文字处理'}]}>
   <div className={s.scroll} data-testid="model-scroll">
    {usage==='text'&&!editor&&extraContent}
    {loading && <p role="status">正在读取模型…</p>}
    {!view && !loading && <Button onClick={() => void load(true)}>重新读取</Button>}
    {view?.cleanupPending && <InlineMessage>密钥清理尚未完成。<Button disabled={saving} onClick={() => guard(() => void load(true))}>重试清理</Button></InlineMessage>}
-   {view && !editor && <>
-    <div className={s.listHeader}><h3>已保存模型</h3><Button disabled={saving} onClick={() => open(null)}>添加模型</Button></div>
-    {!current && !currentLocal && <p className={s.meta}>请选择用于{label(usage)}的模型。</p>}
-    <div className={s.list}>{[...records].sort((a,b) => Number(b.id === selected) - Number(a.id === selected)).map(c => <article className={s.summary} key={c.id}>
-     <div className={s.summaryCopy}><div className={s.name}><strong>{c.name}</strong>{c.id === selected && <span className={s.current}>当前使用</span>}</div>{c.name!==c.modelId&&<p>{c.modelId}</p>}<small>{new URL(c.baseUrl).host}{c.credentialStatus !== 'present' ? ' · 请重新填写密钥' : ''}</small></div>
-     {!modelExecutable(c, usage) && <p className={s.meta}>此前保存的语音配置，可以继续编辑或删除。实时识别请在“语音识别”中选择模型。</p>}
-     <div className={s.rowActions}>{c.id !== selected && modelExecutable(c, usage) && <Button disabled={saving} onClick={() => void selectModel(c.id)}>使用此模型</Button>}<Button variant="quiet" disabled={saving} onClick={() => open(c)}>编辑</Button><Button variant="quiet" disabled={saving} onClick={() => guard(() => {setConfirmation({record:c, expectation:modelExpectation(view,c.id,[])}); setError(null);})}>删除</Button></div>
-    </article>)}</div>
+   {view && <>
+    {!editor&&<div className={s.listHeader}><h3>已保存模型</h3><Button disabled={saving} onClick={() => open(null)}>添加模型</Button></div>}
+    {!editor&&!current && !currentLocal && <p className={s.meta}>请选择用于{label(usage)}的模型。</p>}
+    <div ref={modelList} data-rubber="" className={s.list} role="group" aria-label={label(usage)+'模型'}><RubberIndicator/>{!editor&&records.map(c => <ModelCard key={c.id} name={c.name} subtitle={[c.name!==c.modelId?c.modelId:null,new URL(c.baseUrl).host].filter(Boolean).join(' · ')} selected={c.id===selected} pending={pendingModel===c.id} disabled={saving||!modelExecutable(c,usage)||c.credentialStatus!=='present'} status={!modelExecutable(c,usage)?'需要配置':c.credentialStatus!=='present'?'需要密钥':undefined} onSelect={()=>void selectModel(c.id)} items={[{label:'编辑',disabled:saving,onSelect:()=>open(c)},{label:'删除',disabled:saving,onSelect:()=>guard(()=>{setConfirmation({record:c,expectation:modelExpectation(view,c.id,[])});setError(null);})}]}/>)}{localCard}</div>
    </>}
    {editor && <form id={formId} ref={form} className={s.form} onSubmit={e => {e.preventDefault(); void save();}}>
     {usage === 'speech' && view?.configs.some(c => c.id === selected && !modelExecutable(c,'speech')) && <p className={s.meta}>此前的语音配置仍在“文字处理”中保留。选择模型并填写密钥后，即可试说。</p>}
@@ -211,11 +220,10 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
      </div>}
     </fieldset>
    </form>}
-   {view && usage==='speech' && port.local && !changed && <LocalModelCard port={port} view={view} onChanged={next=>{setView(next);setEditor(current=>current&&(current.key!==''||JSON.stringify(current.input)!==JSON.stringify(current.initial))?current:null);onChanged?.();}}/>}
   </div>
   <footer className={s.footer}>
    {error && <div><InlineMessage status="error">{error.text}</InlineMessage>{error.conflict && <Button disabled={saving} onClick={() => guard(() => void load(true))}>重新加载</Button>}</div>}
-   {notice && <InlineMessage>{notice}</InlineMessage>}
+   {notice && (editor?<InlineMessage>{notice}</InlineMessage>:<span className={s.srOnly} role="status">{notice}</span>)}
    {editor && usage === 'text' && (network || networkError || tested) && <AsyncStatusFeedback status={network ? 'pending' : networkError ? 'error' : 'success'} message={network ? '正在测试连接…' : networkError ?? (port.mode === 'native' ? '连接成功' : '模拟连接成功')}/>}
    {editor && usage === 'text' && <p className={s.meta}>{port.mode === 'native' ? '测试会发送一条短请求，可能产生少量费用。' : '浏览器测试为模拟结果。'}</p>}
    <div className={s.actions}>{editor ? <><Button type="submit" form={formId} variant="primary" loading={saving}>保存</Button>{usage === 'text' && <Button disabled={saving || network !== null} loading={network !== null} onClick={() => void check()}>测试连接</Button>}{network && <Button variant="quiet" onClick={() => {cancel(); setNetworkError('请求已取消。');}}>取消请求</Button>}<Button disabled={saving} onClick={()=>{cancel();setEditor(null);resetFeedback();}}>取消编辑</Button></> : usage === 'speech' && (current||currentLocal) && onSpeech && <Button variant="primary" disabled={saving || (!!current && current.credentialStatus !== 'present')} onClick={() => guard(onSpeech)}>去首页试说</Button>}</div>

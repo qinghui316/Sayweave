@@ -6,9 +6,12 @@
 .iconButton { background: transparent; display: inline-flex; align-items: center; justify-content: center; width: var(--control-height); height: var(--control-height); border-radius: var(--radius-control); flex: none; }
 .iconButton:hover { background: var(--surface-hover); }
 .iconButton:disabled { opacity: .64; cursor: not-allowed; }
-.actionMenu { z-index: 100; min-width: 144px; max-height: var(--radix-dropdown-menu-content-available-height); overflow: auto; background: var(--surface-content); color:var(--text-primary); border-radius: var(--radius-control); padding: 6px; box-shadow: var(--shadow-menu); }
-.menuItem { padding: 8px 12px; font-size: var(--text-small); line-height: var(--line-small); border-radius: 6px; cursor: pointer; outline: none; }
-.menuItem[data-highlighted] { background: var(--surface-sidebar); }
+.actionMenu { position:relative; isolation:isolate; transform-origin:var(--radix-dropdown-menu-content-transform-origin); z-index: 100; min-width: 144px; max-height: var(--radix-dropdown-menu-content-available-height); overflow: auto; background: var(--surface-content); color:var(--text-primary); border-radius: var(--radius-control); padding: 6px; box-shadow: var(--shadow-menu); }
+.actionMenu[data-motion="active"][data-state="open"] { animation:select-enter var(--duration-select-enter) cubic-bezier(.2,.8,.2,1); }
+.actionMenu[data-motion="active"][data-state="closed"] { animation:select-exit var(--duration-select-exit) ease-in; }
+.actionMenu[data-state="closed"] { pointer-events:none; }
+.menuItem { position:relative; z-index:1; padding: 8px 12px; font-size: var(--text-small); line-height: var(--line-small); border-radius: 6px; cursor: pointer; outline: none; }
+.menuItem[data-highlighted] { background:transparent; }
 .menuItem[data-disabled] { opacity:1; color:var(--text-secondary); cursor: not-allowed; }
 .icon { display: inline-block; flex: none; background: var(--text-primary); mask: var(--icon-url) center / contain no-repeat; }
 .signal { background: var(--selected-icon); }
@@ -71,7 +74,7 @@
 .tab { min-height:36px; font-size:var(--text-small); transition:background 160ms ease,color 160ms ease; }
 @keyframes select-enter { from { opacity:0; transform:translateY(-8px) scale(.88,.8); } to { opacity:1; transform:none; } }
 @keyframes select-exit { to { opacity:0; transform:translateY(-5px) scale(.94,.88); } }
-@media (prefers-reduced-motion:reduce) { .selectionHighlight,.selectChevron,.tab,.thumb { transition:none !important; } .selectContent { animation:none !important; } }
+@media (prefers-reduced-motion:reduce) { .selectionHighlight,.selectChevron,.tab,.thumb { transition:none !important; } .selectContent,.actionMenu { animation:none !important; } }
 
 .tabs .tab {position:relative;background:transparent;} .tabFace {position:absolute;inset:0;pointer-events:none;border-radius:inherit;background:var(--surface-canvas);} .tabFace[data-current="true"] {background:var(--selected-bg);} .tabLabel {position:relative;pointer-events:none;}
 

@@ -61,9 +61,9 @@ describe('task-based model settings',()=>{
   const p=new BrowserModels();await panel(p);fillText();
   fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
   expect((await p.overview()).defaults.find(d=>d.usage==='speech')?.configId).toBeNull();
-  fireEvent.click(screen.getByRole('button',{name:'编辑'}));
+  await modelAction('编辑');
   expect(screen.getByLabelText('API 密钥')).toHaveValue('');expect(screen.getByLabelText('API 密钥')).toHaveAttribute('placeholder','密钥已保存');
-  fireEvent.click(screen.getByRole('button',{name:'取消编辑'}));fireEvent.click(screen.getByRole('button',{name:'删除'}));
+  fireEvent.click(screen.getByRole('button',{name:'取消编辑'}));await modelAction('删除');
   const confirm=screen.getByRole('alertdialog');expect(confirm).toHaveTextContent('文字处理将清空');
   fireEvent.click(within(confirm).getByRole('button',{name:'确认删除'}));await screen.findByText('已删除。');expect((await p.overview()).configs).toHaveLength(0);
  });
@@ -103,14 +103,14 @@ describe('task-based model settings',()=>{
  });
  it('preserves legacy multi-use record usages and custom names during edits',async()=>{
   const p=new BrowserModels();await p.save({id:null,revision:null,expectation:null,key:{action:'replace',value:'fixture-key'},input:{name:'原有名称',protocol:'openai-chat',baseUrl:'https://example.invalid/v1',modelId:'legacy-model',usages:['speech','text']}});
-  await panel(p);textTab();fireEvent.click(screen.getByRole('button',{name:'编辑'}));
+  await panel(p);textTab();await modelAction('编辑');
   manualModel();fireEvent.change(screen.getByLabelText('模型'),{target:{value:'changed-model'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
   expect((await p.overview()).configs[0]).toMatchObject({name:'原有名称',usages:['speech','text'],modelId:'changed-model'});
  });
  it('keeps a legacy speech-only Chat record accessible without promoting its capabilities',async()=>{
   const p=new BrowserModels();await p.save({id:null,revision:null,expectation:null,key:{action:'replace',value:'fixture-key'},input:{name:'此前语音配置',protocol:'openai-chat',baseUrl:'https://example.invalid/v1',modelId:'legacy-model',usages:['speech']}});
   await panel(p);textTab();expect(screen.getByText('此前语音配置')).toBeInTheDocument();expect(screen.queryByRole('button',{name:'使用此模型'})).not.toBeInTheDocument();
-  fireEvent.click(screen.getByRole('button',{name:'编辑'}));manualModel();fireEvent.change(screen.getByLabelText('模型'),{target:{value:'changed-model'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
+  await modelAction('编辑');manualModel();fireEvent.change(screen.getByLabelText('模型'),{target:{value:'changed-model'}});fireEvent.click(screen.getByRole('button',{name:'保存'}));await screen.findByText('已保存。');
   expect((await p.overview()).configs[0]).toMatchObject({name:'此前语音配置',usages:['speech'],modelId:'changed-model'});
  });
  it('shows only the three required text fields and derives the saved name from the model',async()=>{
@@ -127,7 +127,7 @@ describe('task-based model settings',()=>{
  it('keeps a custom speech model and stored key when explicitly switching to a built-in',async()=>{
   const p=new BrowserModels();await p.save({id:null,revision:null,expectation:null,key:{action:'replace',value:'fixture-key'},input:{name:'我的语音',protocol:'qwen-audio-streaming',baseUrl:'https://workspace.example.invalid',modelId:'custom-streaming-id',usages:['speech']}});
   const before=(await p.overview()).configs[0]!;
-  render(<ModelPanel port={p}/>);await screen.findByText('我的语音');fireEvent.click(screen.getByRole('button',{name:'编辑'}));
+  render(<ModelPanel port={p}/>);await screen.findByText('我的语音');await modelAction('编辑');
   const select=screen.getByRole('combobox',{name:'模型'});
   expect(select).toHaveTextContent('当前自定义模型 · custom-streaming-id');
   const user=userEvent.setup();select.focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('option',{name:'Qwen Audio 3.0 · 实时识别'}));
@@ -164,4 +164,49 @@ it('cancels obsolete list requests and preserves the selection on refresh failur
  await act(async()=>oldResolve(['old-model']));expect(cancel).toHaveBeenCalled();
  fireEvent.click(screen.getByLabelText('模型'));await screen.findByRole('option',{name:'new-model'});expect(screen.queryByRole('option',{name:'old-model'})).not.toBeInTheDocument();fireEvent.click(screen.getByRole('option',{name:'new-model'}));
  fireEvent.click(screen.getByLabelText('模型'));await waitFor(()=>expect(screen.getByRole('button',{name:'刷新'})).toBeEnabled());fireEvent.click(screen.getByRole('button',{name:'刷新'}));await screen.findByText('无法连接服务，请检查网络和地址。');expect(screen.getByRole('option',{name:/new-model/})).toHaveAttribute('aria-selected','true');
+});
+
+async function modelAction(label:string){
+ await userEvent.click((await screen.findAllByRole('button',{name:/^更多操作 /u}))[0]!);
+ await userEvent.click(await screen.findByRole('menuitem',{name:label}));
+}
+
+describe('model-card selection',()=>{
+ async function pair(){
+  const port=new BrowserModels();
+  for(const name of ['云端 A','云端 B'])await port.save({id:null,revision:null,expectation:null,key:{action:'replace',value:'fixture-key'},input:{name,protocol:'qwen-audio-streaming',baseUrl:'https://example.com',modelId:name,usages:['speech']}});
+  await port.local.download();
+  render(<ModelPanel port={port}/>);
+  const first=await screen.findByRole('button',{name:'云端 A'}),second=screen.getByRole('button',{name:'云端 B'});
+  await waitFor(()=>expect(screen.getByRole('button',{name:'Nemotron 3.5 · 本地流式识别'})).toBeEnabled());
+  return {port,first,second};
+ }
+ it('waits for the accepted default and serializes cloud/local clicks without reordering',async()=>{
+  const {port,first,second}=await pair(),real=port.setDefault.bind(port);
+  const order=screen.getAllByRole('button',{name:/云端 [AB]$/u}).filter(el=>el.hasAttribute('aria-pressed'));
+  let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});
+  const set=vi.spyOn(port,'setDefault').mockImplementation(async request=>{await gate;return real(request);});
+  await userEvent.click(second);await userEvent.click(second);
+  expect(first).toHaveAttribute('aria-pressed','true');expect(second).toHaveAttribute('aria-pressed','false');
+  expect(second).toHaveAttribute('aria-busy','true');expect(first).not.toHaveAttribute('aria-busy');
+  expect(screen.getByRole('button',{name:'Nemotron 3.5 · 本地流式识别'})).toBeDisabled();expect(set).toHaveBeenCalledTimes(1);
+  await act(async()=>release());await waitFor(()=>expect(second).toHaveAttribute('aria-pressed','true'));
+  expect(second).not.toHaveAttribute('aria-busy');
+  expect(screen.getAllByRole('button',{name:/云端 [AB]$/u}).filter(el=>el.hasAttribute('aria-pressed'))).toEqual(order);
+  await userEvent.click(second);expect(set).toHaveBeenCalledTimes(1);
+  expect(screen.queryByRole('button',{name:'使用此模型'})).not.toBeInTheDocument();expect(screen.queryByText('当前使用')).not.toBeInTheDocument();
+ });
+ it('keeps the old selection when the service rejects the switch',async()=>{
+  const {port,first,second}=await pair();vi.spyOn(port,'setDefault').mockRejectedValue({code:'conflict'});
+  await userEvent.click(second);await screen.findByRole('alert');
+  expect(first).toHaveAttribute('aria-pressed','true');expect(second).toHaveAttribute('aria-pressed','false');expect(second).toBeEnabled();
+  expect(second).not.toHaveAttribute('aria-busy');
+ });
+ it('opens management without selecting or testing the model',async()=>{
+  const {port}=await pair(),set=vi.spyOn(port,'setDefault'),test=vi.spyOn(port,'testTextModel');
+  await userEvent.click(screen.getByRole('button',{name:'更多操作 云端 B'}));
+  expect(screen.getByRole('menuitem',{name:'编辑'})).toBeVisible();expect(set).not.toHaveBeenCalled();
+  await userEvent.click(screen.getByRole('menuitem',{name:'编辑'}));
+  expect(screen.getByLabelText('API 密钥')).toHaveValue('');expect(set).not.toHaveBeenCalled();expect(test).not.toHaveBeenCalled();
+ });
 });
