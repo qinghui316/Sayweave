@@ -421,6 +421,26 @@ mod tests {
     }
 
     #[test]
+    fn trace_metadata_is_separate_from_the_strict_native_protocol() {
+        let mut raw = serde_json::to_value(event(1, "周三开会", false, false)).unwrap();
+        raw["elapsedMs"] = serde_json::json!(123.5);
+        assert!(serde_json::from_value::<Event>(raw.clone()).is_err());
+        let decoded = trace_event(&raw);
+        assert!(matches!(decoded, Event::Update { revision: 1, .. }));
+        assert_eq!(raw["elapsedMs"], 123.5);
+    }
+
+    fn trace_event(raw: &serde_json::Value) -> Event {
+        let mut frame = raw.clone();
+        frame
+            .as_object_mut()
+            .unwrap()
+            .remove("elapsedMs")
+            .expect("capture metadata must be explicit");
+        serde_json::from_value(frame).unwrap()
+    }
+
+    #[test]
     #[ignore = "explicit saved CPU/Vulkan worker traces; records raw and projected text together"]
     fn saved_real_worker_updates_preserve_processing_and_display_contracts() {
         use sha2::{Digest, Sha256};
@@ -445,7 +465,7 @@ mod tests {
                     if raw["kind"] != "update" {
                         continue;
                     }
-                    let event: Event = serde_json::from_value(raw.clone()).unwrap();
+                    let event = trace_event(raw);
                     let Event::Update { id, .. } = &event else {
                         unreachable!()
                     };
