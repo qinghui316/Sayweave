@@ -50,6 +50,35 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Emitter, LogicalPosition, LogicalSize, Manager, State, WebviewWindow};
 struct Runtime(Mutex<Snapshot>);
+// Synthetic TLS, database and cleanup use one UUID-owned directory in every channel.
+// Ordinary builds never compile this override.
+#[cfg(any(test, feature = "desktop-acceptance"))]
+fn acceptance_profile_root(normal: &std::path::Path, id: Option<&str>) -> std::path::PathBuf {
+    id.and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .map(|id| {
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../.local/data-acceptance")
+                .join(id.to_string())
+                .join("data")
+        })
+        .unwrap_or_else(|| normal.to_path_buf())
+}
+#[cfg(test)]
+#[test]
+fn acceptance_profile_keeps_fixture_tls_database_and_cleanup_together_without_changing_daily_roots()
+{
+    let normal = std::path::Path::new("ordinary/data-dev");
+    assert_eq!(acceptance_profile_root(normal, None), normal);
+    assert_eq!(acceptance_profile_root(normal, Some("../data")), normal);
+    let id = "00000000-0000-4000-8000-000000000001";
+    let root = acceptance_profile_root(normal, Some(id));
+    assert!(root.ends_with(format!("{id}/data")));
+    assert!(root.to_string_lossy().contains(".local"));
+    assert_eq!(
+        crate::data::profile_root(std::path::Path::new("ordinary"), true),
+        normal
+    );
+}
 #[cfg(feature = "desktop-acceptance")]
 pub fn input_acceptance(fixture: &std::path::Path) -> Result<(), String> {
     windows_input::native_checks(fixture)
@@ -691,16 +720,12 @@ pub fn run() {
             }
             let base = app.path().app_data_dir()?;
             #[cfg(feature = "desktop-acceptance")]
-            let base = match std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID") {
-                Ok(id) if uuid::Uuid::parse_str(&id).is_ok() => {
-                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("../.local/data-acceptance")
-                        .join(id)
-                }
-                _ => base,
-            };
+            let acceptance_id = std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID").ok()
+                .and_then(|id| uuid::Uuid::parse_str(&id).ok()).map(|id| id.to_string());
             let development_profile = build_info::development_profile();
             let root = data::profile_root(&base, development_profile);
+            #[cfg(feature = "desktop-acceptance")]
+            let root = acceptance_profile_root(&root, acceptance_id.as_deref());
             #[cfg(feature = "desktop-acceptance")]
             println!("SAYWEAVE_DATA_DIRECTORY {}", root.display());
             let namespace = format!(
@@ -713,8 +738,8 @@ pub fn run() {
                 }
             );
             #[cfg(feature = "desktop-acceptance")]
-            let namespace = match std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID") {
-                Ok(id) if uuid::Uuid::parse_str(&id).is_ok() => {
+            let namespace = match acceptance_id {
+                Some(id) => {
                     format!("local.sayweave.skeleton.acceptance.{id}")
                 }
                 _ => namespace,

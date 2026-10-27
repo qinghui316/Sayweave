@@ -7,28 +7,46 @@ use credentials::Credentials;
 async fn model_desktop_cleanup() {
     let id = std::env::var("SAYWEAVE_DATA_ACCEPTANCE_ID").unwrap();
     uuid::Uuid::parse_str(&id).unwrap();
-    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../.local/data-acceptance")
-        .join(&id)
-        .join("data/dictionary.sqlite");
-    if !file.exists() {
-        return;
+        .join(&id);
+    let mut refs = std::collections::BTreeSet::new();
+    // Retire remnants from the earlier internal-channel fixture layout as well.
+    for profile in ["data", "data-dev"] {
+        let file = root.join(profile).join("dictionary.sqlite");
+        if !file.exists() {
+            continue;
+        }
+        let c =
+            rusqlite::Connection::open_with_flags(file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let mut q = c.prepare("SELECT credential_ref FROM model_configs WHERE credential_ref IS NOT NULL UNION SELECT credential_ref FROM credential_operations").unwrap();
+        for reference in q.query_map([], |r| r.get::<_, String>(0)).unwrap() {
+            let reference = reference.unwrap();
+            uuid::Uuid::parse_str(&reference).unwrap();
+            refs.insert(reference);
+        }
     }
-    let c = rusqlite::Connection::open_with_flags(file, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .unwrap();
-    let mut q = c.prepare("SELECT credential_ref FROM model_configs WHERE credential_ref IS NOT NULL UNION SELECT credential_ref FROM credential_operations").unwrap();
-    let refs = q
-        .query_map([], |r| r.get::<_, String>(0))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
     let vault = Vault::new(WindowsCredentials::new(format!(
         "local.sayweave.skeleton.acceptance.{id}"
     )));
+    let count = refs.len();
+    let mut failures = Vec::new();
     for reference in refs {
-        uuid::Uuid::parse_str(&reference).unwrap();
-        vault.delete(reference).await.unwrap();
+        if let Err(error) = vault.delete(reference.clone()).await {
+            failures.push(error.code);
+            continue;
+        }
+        match vault.get(reference).await {
+            Err(error) if error.code == "credentialMissing" => {}
+            _ => failures.push("credentialCleanupUnconfirmed".into()),
+        }
     }
+    assert!(
+        failures.is_empty(),
+        "fixture credential cleanup failed: {failures:?}"
+    );
+    eprintln!("SAYWEAVE_FIXTURE_CREDENTIAL_CLEANUP checked={count} missing_verified={count}");
 }
 
 #[test]
