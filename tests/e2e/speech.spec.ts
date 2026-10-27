@@ -18,7 +18,7 @@ test('speech presets select concrete models and keep text fields independent',as
  await expect(dialog.getByRole('combobox',{name:'模型'})).toContainText('Qwen Audio 3.1 · 实时识别');await dialog.getByRole('combobox',{name:'模型'}).click();await page.getByRole('option',{name:'Qwen Audio 3.0 · 实时识别'}).click();await expect(dialog.getByRole('button',{name:'测试连接'})).toHaveCount(0);
  await dialog.getByRole('button',{name:'更多设置'}).click();await expect(dialog.getByRole('combobox',{name:'模型'})).toContainText('Qwen Audio 3.0 · 实时识别');
  await dialog.getByLabel('服务地址（URL）',{exact:true}).fill('https://workspace.cn-beijing.maas.aliyuncs.com');await dialog.getByLabel('API 密钥',{exact:true}).fill('fixture-key');await dialog.getByRole('button',{name:'保存',exact:true}).click();
- await expect(dialog.getByText('当前使用',{exact:true})).toBeVisible();await dialog.getByRole('tab',{name:'文字处理'}).click();await expect(dialog.getByLabel('API 密钥',{exact:true})).toHaveValue('');
+ await expect(dialog.getByRole('button',{name:'Qwen Audio 3.0 · 实时识别',exact:true})).toHaveAttribute('aria-pressed','true');await dialog.getByRole('tab',{name:'文字处理'}).click();await expect(dialog.getByLabel('API 密钥',{exact:true})).toHaveValue('');
 });
 test('default development overlay follows speech state and speech actions together',async({page})=>{
  await page.goto('/?surface=overlay');await page.getByRole('button',{name:'开始录音',exact:true}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();await page.getByRole('button',{name:'结束录音',exact:true}).click();await expect(page.locator('[data-phase="completed"]')).toBeVisible();

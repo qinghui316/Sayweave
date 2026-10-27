@@ -56,6 +56,6 @@ export function useRubberSelection<T extends HTMLElement=HTMLDivElement>(value:s
   children?.observe(root,{subtree:true,childList:true});
   return()=>{stop?.();resize?.disconnect();children?.disconnect();};
  },[value,active,disabled,root,selector,clipRows]);
- return {ref};
+ return {ref,active};
 }
 export function RubberIndicator(){return <span data-rubber-indicator="" aria-hidden="true"/>;}

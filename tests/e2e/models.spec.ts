@@ -173,7 +173,7 @@ for(const theme of ['light','graphite'])for(const width of [1120,960])test(`mode
  const local=dialog.getByRole('region',{name:'本地语音模型'}),chooseLocal=local.getByRole('button',{name:'Nemotron 3.5 · 本地流式识别',exact:true});
  await local.getByRole('button',{name:'下载',exact:true}).click();await expect(chooseLocal).toBeEnabled();await expect(chooseLocal).toHaveAttribute('aria-pressed','false');
  const cards=dialog.locator('[data-model-card]');await expect(cards).toHaveCount(3);
- const modelPlate=dialog.getByRole('group',{name:'语音识别模型',exact:true}).locator(':scope > [data-rubber-indicator]');
+ const modelGroup=dialog.getByRole('group',{name:'语音识别模型',exact:true}),modelPlate=modelGroup.locator(':scope > [data-rubber-indicator]');
  const plateAligned=()=>expect.poll(async()=>{const a=await modelPlate.boundingBox(),b=await chooseLocal.locator('..').boundingBox();return !!a&&!!b&&Math.abs(a.y-b.y)<.1&&Math.abs(a.height-b.height)<.1;}).toBe(true);
  const boxes=()=>cards.evaluateAll(elements=>elements.map(el=>{const r=el.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height};}));
  const before=await boxes();for(const box of before){expect(box.height).toBe(80);expect(box.width).toBe(before[0]!.width);}
@@ -208,7 +208,7 @@ for(const theme of ['light','graphite'])for(const width of [1120,960])test(`mode
  await first.click();await expect(first).toHaveAttribute('aria-pressed','true');await expect(first).toBeEnabled();expect(await boxes()).toEqual(before);expect(await homeButton.boundingBox()).toEqual(footerBefore);
  await chooseLocal.click();await expect(chooseLocal).toHaveAttribute('aria-pressed','true');await expect(chooseLocal).toBeEnabled();await plateAligned();
  await page.screenshot({path:`.local/model-selection-motion/visuals/${theme}-${width}-selected.png`});
- await page.emulateMedia({reducedMotion:'reduce'});await expect(cards.first()).toHaveAttribute('data-motion','static');await first.click();await expect(first).toHaveAttribute('aria-pressed','true');await expect(first).toBeEnabled();
+ await page.emulateMedia({reducedMotion:'reduce'});await expect(modelGroup).toHaveAttribute('data-motion','static');await first.click();await expect(first).toHaveAttribute('aria-pressed','true');await expect(first).toBeEnabled();
  const reducedPlate=await modelPlate.boundingBox(),reducedCard=await first.locator('..').boundingBox();expect(reducedPlate?.y).toBe(reducedCard?.y);expect(reducedPlate?.height).toBe(80);expect(await boxes()).toEqual(before);expect(await homeButton.boundingBox()).toEqual(footerBefore);
  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
 });

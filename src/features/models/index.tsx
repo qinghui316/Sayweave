@@ -185,7 +185,7 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
  const originChanged = !!editor?.record && (editor.record.protocol !== editor.input.protocol || !modelSameOrigin(editor.record.baseUrl, editor.input.baseUrl));
  const fieldError = (key:string) => error?.field === key ? error.text : undefined;
  const selected = view?.defaults.find(d => d.usage === usage)?.configId;
- const {ref:modelList}=useRubberSelection(selected??'',false,{selector:'[data-model-card][data-selected="true"]',clipRows:'[data-model-card]'});
+ const {ref:modelList,active:modelMotion}=useRubberSelection(selected??'',false,{selector:'[data-model-card][data-selected="true"]',clipRows:'[data-model-card]'});
  const current = view?.configs.find(c => c.id === selected && modelExecutable(c, usage));
  const currentLocal=view?.localConfigs?.find(c=>c.id===selected);
  const records = view ? recordsFor(view, usage) : [];
@@ -202,7 +202,7 @@ export function ModelPanel({port, onSpeech, onHelp, onGuardChange, onChanged,ext
    {view && <>
     {!editor&&<div className={s.listHeader}><h3>已保存模型</h3><Button disabled={saving} onClick={() => open(null)}>添加模型</Button></div>}
     {!editor&&!current && !currentLocal && <p className={s.meta}>请选择用于{label(usage)}的模型。</p>}
-    <div ref={modelList} data-rubber="" className={s.list} role="group" aria-label={label(usage)+'模型'}><RubberIndicator/>{!editor&&records.map(c => <ModelCard key={c.id} name={c.name} subtitle={[c.name!==c.modelId?c.modelId:null,new URL(c.baseUrl).host].filter(Boolean).join(' · ')} selected={c.id===selected} pending={pendingModel===c.id} disabled={saving||!modelExecutable(c,usage)||c.credentialStatus!=='present'} status={!modelExecutable(c,usage)?'需要配置':c.credentialStatus!=='present'?'需要密钥':undefined} onSelect={()=>void selectModel(c.id)} items={[{label:'编辑',disabled:saving,onSelect:()=>open(c)},{label:'删除',disabled:saving,onSelect:()=>guard(()=>{setConfirmation({record:c,expectation:modelExpectation(view,c.id,[])});setError(null);})}]}/>)}{localCard}</div>
+    <div ref={modelList} data-rubber="" data-motion={modelMotion?'active':'static'} className={s.list} role="group" aria-label={label(usage)+'模型'}><RubberIndicator/>{!editor&&records.map(c => <ModelCard key={c.id} name={c.name} subtitle={[c.name!==c.modelId?c.modelId:null,new URL(c.baseUrl).host].filter(Boolean).join(' · ')} selected={c.id===selected} pending={pendingModel===c.id} disabled={saving||!modelExecutable(c,usage)||c.credentialStatus!=='present'} status={!modelExecutable(c,usage)?'需要配置':c.credentialStatus!=='present'?'需要密钥':undefined} onSelect={()=>void selectModel(c.id)} items={[{label:'编辑',disabled:saving,onSelect:()=>open(c)},{label:'删除',disabled:saving,onSelect:()=>guard(()=>{setConfirmation({record:c,expectation:modelExpectation(view,c.id,[])});setError(null);})}]}/>)}{localCard}</div>
    </>}
    {editor && <form id={formId} ref={form} className={s.form} onSubmit={e => {e.preventDefault(); void save();}}>
     {usage === 'speech' && view?.configs.some(c => c.id === selected && !modelExecutable(c,'speech')) && <p className={s.meta}>此前的语音配置仍在“文字处理”中保留。选择模型并填写密钥后，即可试说。</p>}
