@@ -208,7 +208,7 @@ for(const theme of ['light','graphite'])for(const width of [1120,960])test(`mode
  await first.click();await expect(first).toHaveAttribute('aria-pressed','true');await expect(first).toBeEnabled();expect(await boxes()).toEqual(before);expect(await homeButton.boundingBox()).toEqual(footerBefore);
  await chooseLocal.click();await expect(chooseLocal).toHaveAttribute('aria-pressed','true');await expect(chooseLocal).toBeEnabled();await plateAligned();
  await page.screenshot({path:`.local/model-selection-motion/visuals/${theme}-${width}-selected.png`});
- await page.emulateMedia({reducedMotion:'reduce'});await expect(modelGroup).toHaveAttribute('data-motion','static');await first.click();await expect(first).toHaveAttribute('aria-pressed','true');await expect(first).toBeEnabled();
+ await page.emulateMedia({reducedMotion:'reduce'});await expect(modelGroup).toHaveAttribute('data-motion','static');await expect(modelPlate).toHaveCSS('transition-property','none');await first.click();await expect(first).toHaveAttribute('aria-pressed','true');await expect(first).toBeEnabled();
  const reducedPlate=await modelPlate.boundingBox(),reducedCard=await first.locator('..').boundingBox();expect(reducedPlate?.y).toBe(reducedCard?.y);expect(reducedPlate?.height).toBe(80);expect(await boxes()).toEqual(before);expect(await homeButton.boundingBox()).toEqual(footerBefore);
  expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
 });
