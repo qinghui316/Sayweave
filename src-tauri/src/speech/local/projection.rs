@@ -419,4 +419,80 @@ mod tests {
         }
         assert!(p.update(e).is_err());
     }
+
+    #[test]
+    #[ignore = "explicit saved CPU/Vulkan worker traces; records raw and projected text together"]
+    fn saved_real_worker_updates_preserve_processing_and_display_contracts() {
+        use sha2::{Digest, Sha256};
+        use std::{collections::HashMap, path::Path};
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(".local/local-asr/reports");
+        let output = root.join("alignment-raw-projection-pairs.json");
+        assert!(!output.exists(), "Preserve the first replay result");
+        let mut reports = Vec::new();
+        for device in ["cpu", "auto"] {
+            for fixture in ["short-zh", "mixed", "english", "long-zh"] {
+                let file = root.join(format!("alignment-raw-{device}-{fixture}.json"));
+                let bytes = std::fs::read(&file).unwrap();
+                let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(report["passed"], true);
+                assert_eq!(report["resourcesClosed"], true);
+                let mut streams = HashMap::<String, Projection>::new();
+                let mut pairs = Vec::new();
+                for raw in report["trace"].as_array().unwrap() {
+                    if raw["kind"] != "update" {
+                        continue;
+                    }
+                    let event: Event = serde_json::from_value(raw.clone()).unwrap();
+                    let Event::Update { id, .. } = &event else {
+                        unreachable!()
+                    };
+                    let projection = streams.entry(id.request.clone()).or_default();
+                    let previous = projection.confirmed.clone();
+                    let text = projection.update(event).unwrap();
+                    assert!(text.confirmed_text.starts_with(&previous));
+                    assert_eq!(
+                        text.segments
+                            .iter()
+                            .map(|s| s.text.as_str())
+                            .collect::<String>(),
+                        text.text
+                    );
+                    assert_eq!(
+                        text.segments
+                            .iter()
+                            .take_while(|s| s.confirmed)
+                            .map(|s| s.text.as_str())
+                            .collect::<String>(),
+                        text.confirmed_text
+                    );
+                    pairs.push(serde_json::json!({
+                        "raw": raw,
+                        "full": text.text,
+                        "processingConfirmed": text.confirmed_text,
+                        "segments": text.segments,
+                    }));
+                }
+                assert_eq!(streams.len(), 2);
+                assert!(streams.values().all(|p| p.final_seen));
+                reports.push(serde_json::json!({
+                    "device": device, "fixture": fixture, "input": file,
+                    "inputSha256": format!("{:x}", Sha256::digest(bytes)),
+                    "workerSha256": report["workerSha256"], "pairs": pairs,
+                }));
+            }
+        }
+        std::fs::write(
+            output,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "source": crate::build_info::current().commit,
+                "purpose": "replay exact worker updates through the production Projection; no host or microphone claim",
+                "reports": reports, "passed": true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
 }
