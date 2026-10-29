@@ -467,7 +467,6 @@ impl Draft {
             receiver,
         )
     }
-    #[cfg(any(test, feature = "desktop-acceptance"))]
     pub async fn begin(
         task: String,
         turn: u64,

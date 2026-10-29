@@ -1,7 +1,10 @@
 //! An owned blank Win32 editor for opt-in input acceptance. No personal application is reused.
 use std::{
     io::{self, BufRead, Write},
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
 };
 use windows::{
@@ -11,7 +14,25 @@ use windows::{
     },
     core::{BOOL, w},
 };
+static MENU_LOOP_ACTIVE: AtomicBool = AtomicBool::new(false);
+static MENU_COMMAND_ABORTED: AtomicBool = AtomicBool::new(false);
 unsafe extern "system" fn fixture_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    if m == WM_ENTERMENULOOP || m == WM_EXITMENULOOP {
+        MENU_LOOP_ACTIVE.store(m == WM_ENTERMENULOOP, Ordering::Relaxed);
+        eprintln!("owned fixture native menu active={}", m == WM_ENTERMENULOOP);
+    }
+    if m == WM_APP + 7 && MENU_LOOP_ACTIVE.load(Ordering::Relaxed) {
+        // The modal menu loop dispatched a command that belongs to the outer
+        // acceptance loop. Abort this failed scenario, then let normal teardown
+        // release only this fixture's outstanding injected keys and TSF state.
+        MENU_COMMAND_ABORTED.store(true, Ordering::Relaxed);
+        unsafe {
+            let ended = EndMenu();
+            eprintln!("owned fixture command trapped in native menu; aborting; endMenu={ended:?}");
+            PostQuitMessage(1);
+        }
+        return LRESULT(0);
+    }
     if m == WM_RENDERFORMAT {
         std::thread::sleep(std::time::Duration::from_millis(1200));
         unsafe {
@@ -1114,6 +1135,7 @@ fn main() {
         io::stdout().flush().unwrap();
         let mut msg = MSG::default();
         let mut injected_keys = Vec::new();
+        let mut shift_up_sequence = 0u64;
         let mut auxiliary = HWND::default();
         let mut auxiliary_editor = HWND::default();
         let mut sibling = HWND::default();
@@ -1514,8 +1536,12 @@ fn main() {
                 if value["action"] == "fixture-key" {
                     let mut pid = 0;
                     GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
-                    let key = match value["key"].as_str() {
+                    let parse_key = |name: &str| match Some(name) {
                         Some("AltRight") => Some(VK_RMENU),
+                        Some("AltLeft") => Some(VK_LMENU),
+                        Some("F8") => Some(VK_F8),
+                        Some("F9") => Some(VK_F9),
+                        Some("F12") => Some(VK_F12),
                         Some("Process") => Some(VK_PROCESSKEY),
                         Some("Backspace") => Some(VK_BACK),
                         Some("Delete") => Some(VK_DELETE),
@@ -1534,44 +1560,78 @@ fn main() {
                             .map(|key| VIRTUAL_KEY(*key as u16)),
                         _ => None,
                     };
-                    if let Some(key) = key {
+                    let names = value["keys"].as_array().map_or_else(
+                        || value["key"].as_str().map(|key| vec![key]),
+                        |keys| {
+                            keys.iter()
+                                .map(|key| key.as_str())
+                                .collect::<Option<Vec<_>>>()
+                        },
+                    );
+                    let keys = names.and_then(|names| {
+                        if names.is_empty() || names.len() > 4 {
+                            return None;
+                        }
+                        let keys = names
+                            .into_iter()
+                            .map(parse_key)
+                            .collect::<Option<Vec<_>>>()?;
+                        if keys
+                            .iter()
+                            .enumerate()
+                            .any(|(index, key)| keys[..index].contains(key))
+                        {
+                            return None;
+                        }
+                        Some(keys)
+                    });
+                    if let Some(keys) = keys {
                         let down = value["down"].as_bool() == Some(true);
                         let allowed = if down {
                             value["process"].as_u64() == Some(pid as u64)
                         } else {
-                            injected_keys.contains(&key)
+                            keys.iter().all(|key| injected_keys.contains(key))
                         };
-                        let flags = if value["down"].as_bool() == Some(true) {
-                            KEYBD_EVENT_FLAGS(0)
+                        let events = keys
+                            .iter()
+                            .map(|key| {
+                                let flags = if value["down"].as_bool() == Some(true) {
+                                    KEYBD_EVENT_FLAGS(0)
+                                } else {
+                                    KEYEVENTF_KEYUP
+                                } | if *key == VK_RMENU
+                                    || *key == VK_DELETE
+                                    || *key == VK_LEFT
+                                    || *key == VK_END
+                                {
+                                    KEYEVENTF_EXTENDEDKEY
+                                } else {
+                                    KEYBD_EVENT_FLAGS(0)
+                                };
+                                INPUT {
+                                    r#type: INPUT_KEYBOARD,
+                                    Anonymous: INPUT_0 {
+                                        ki: KEYBDINPUT {
+                                            wVk: *key,
+                                            wScan: MapVirtualKeyW(key.0 as u32, MAPVK_VK_TO_VSC)
+                                                as u16,
+                                            dwFlags: flags,
+                                            dwExtraInfo: 0x53595754,
+                                            ..Default::default()
+                                        },
+                                    },
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        let sent = if allowed {
+                            SendInput(&events, std::mem::size_of::<INPUT>() as i32) as usize
                         } else {
-                            KEYEVENTF_KEYUP
-                        } | if key == VK_RMENU
-                            || key == VK_DELETE
-                            || key == VK_LEFT
-                            || key == VK_END
-                        {
-                            KEYEVENTF_EXTENDEDKEY
-                        } else {
-                            KEYBD_EVENT_FLAGS(0)
+                            0
                         };
-                        let event = INPUT {
-                            r#type: INPUT_KEYBOARD,
-                            Anonymous: INPUT_0 {
-                                ki: KEYBDINPUT {
-                                    wVk: key,
-                                    wScan: MapVirtualKeyW(key.0 as u32, MAPVK_VK_TO_VSC) as u16,
-                                    dwFlags: flags,
-                                    dwExtraInfo: 0x53595754,
-                                    ..Default::default()
-                                },
-                            },
-                        };
-                        let sent = allowed
-                            && SendInput(&[event], std::mem::size_of::<INPUT>() as i32) == 1;
                         key_result = Some(
-                            serde_json::json!({"accepted":sent,"process":pid,"key":key.0,"down":down}),
+                            serde_json::json!({"accepted":sent == keys.len(),"process":pid,"key":keys[0].0,"keys":keys.iter().map(|key| key.0).collect::<Vec<_>>(),"sent":sent,"down":down}),
                         );
-                        if sent {
+                        for key in keys.into_iter().take(sent) {
                             if down && !injected_keys.contains(&key) {
                                 injected_keys.push(key);
                             }
@@ -1652,6 +1712,7 @@ fn main() {
                 let mut clicked = None;
                 let mut click_check = None;
                 let mut overlay_window = None;
+                let mut overlay_rect = None;
                 if value["action"] == "inspect-overlay" {
                     let mut target = ProcessWindow {
                         process: value["process"].as_u64().unwrap_or(0) as u32,
@@ -1662,6 +1723,10 @@ fn main() {
                         EnumWindows(Some(process_window), LPARAM(&mut target as *mut _ as isize));
                     if !target.window.0.is_null() {
                         overlay_window = Some(target.window.0 as usize);
+                        let mut rect = RECT::default();
+                        if GetWindowRect(target.window, &mut rect).is_ok() {
+                            overlay_rect = Some([rect.left, rect.top, rect.right, rect.bottom]);
+                        }
                     }
                 }
                 if value["action"] == "click-window" {
@@ -1717,15 +1782,57 @@ fn main() {
                         serde_json::json!({"window":sibling.0 as usize,"focused":GetFocus()==sibling,"text":String::from_utf16_lossy(&text[..size])}),
                     )
                 };
+                let modifiers_down: Vec<u16> = [
+                    VK_LMENU.0,
+                    VK_RMENU.0,
+                    VK_LSHIFT.0,
+                    VK_RSHIFT.0,
+                    VK_LCONTROL.0,
+                    VK_RCONTROL.0,
+                ]
+                .into_iter()
+                .filter(|key| GetAsyncKeyState(*key as i32) < 0)
+                .collect();
+                let mut gui = GUITHREADINFO {
+                    cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+                    ..Default::default()
+                };
+                let gui_read = GetGUIThreadInfo(0, &mut gui).is_ok();
+                let ime = {
+                    use windows::Win32::UI::Input::Ime::*;
+                    let context = ImmGetContext(editor);
+                    if context.0.is_null() {
+                        None
+                    } else {
+                        let mut conversion = IME_CONVERSION_MODE::default();
+                        let mut sentence = IME_SENTENCE_MODE::default();
+                        let read = ImmGetConversionStatus(
+                            context,
+                            Some(&mut conversion),
+                            Some(&mut sentence),
+                        )
+                        .as_bool();
+                        let open = ImmGetOpenStatus(context).as_bool();
+                        let _ = ImmReleaseContext(editor, context);
+                        Some(
+                            serde_json::json!({"read":read,"open":open,"conversion":conversion.0,"sentence":sentence.0}),
+                        )
+                    }
+                };
                 println!(
                     "{}",
-                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"foregroundWindow":GetForegroundWindow().0 as usize,"foregroundClient":[foreground_client.right,foreground_client.bottom],"nativeFocus":GetFocus().0 as usize,"sibling":sibling_value,"desktopWindow":GetShellWindow().0 as usize,"clipboardSequence":windows::Win32::System::DataExchange::GetClipboardSequenceNumber(),"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window,"controlledEdit":controlled_edit,"controlledEditSteps":controlled_edit_steps,"auxiliary":auxiliary_result,"keyResult":key_result})
+                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"foregroundWindow":GetForegroundWindow().0 as usize,"modifiersDown":modifiers_down,"keyboardLayout":GetKeyboardLayout(0).0 as usize,"ime":ime,"shiftUpSequence":shift_up_sequence,"menuActive":gui_read && gui.flags.0 & GUI_INMENUMODE.0 != 0,"foregroundClient":[foreground_client.right,foreground_client.bottom],"nativeFocus":GetFocus().0 as usize,"sibling":sibling_value,"desktopWindow":GetShellWindow().0 as usize,"clipboardSequence":windows::Win32::System::DataExchange::GetClipboardSequenceNumber(),"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window,"overlayRect":overlay_rect,"controlledEdit":controlled_edit,"controlledEditSteps":controlled_edit_steps,"auxiliary":auxiliary_result,"keyResult":key_result})
                 );
                 io::stdout().flush().unwrap();
                 let _ = ok.send(());
             }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+            if [WM_KEYUP, WM_SYSKEYUP].contains(&msg.message)
+                && [VK_SHIFT.0 as usize, VK_RSHIFT.0 as usize].contains(&msg.wParam.0)
+            {
+                shift_up_sequence += 1;
+            }
         }
         let mut release_failed = false;
         for key in injected_keys {
@@ -1740,12 +1847,15 @@ fn main() {
                             } else {
                                 KEYBD_EVENT_FLAGS(0)
                             },
-                        dwExtraInfo: 0x53595754,
+                        // Teardown must not complete a pending shortcut gesture.
+                        dwExtraInfo: 0x53595756,
                         ..Default::default()
                     },
                 },
             };
-            if SendInput(&[event], std::mem::size_of::<INPUT>() as i32) != 1 {
+            let released = SendInput(&[event], std::mem::size_of::<INPUT>() as i32) == 1;
+            eprintln!("owned fixture cleanup key={} released={released}", key.0);
+            if !released {
                 eprintln!("owned fixture key release failed");
                 release_failed = true;
             }
@@ -1760,7 +1870,7 @@ fn main() {
         drop(retained_range);
         drop(origin_range);
         CoUninitialize();
-        if release_failed {
+        if release_failed || MENU_COMMAND_ABORTED.load(Ordering::Relaxed) {
             std::process::exit(1);
         }
     }

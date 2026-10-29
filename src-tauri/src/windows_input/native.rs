@@ -253,7 +253,7 @@ impl PendingFocus {
 }
 /// Physical pointer evidence shares the same task-window lease as WinEvent evidence.
 /// WebView descendants can live in another process; process identity is not ownership.
-pub(super) fn observe_pointer(window: usize, event_tick: u32) {
+pub(super) fn observe_pointer(window: usize, event_tick: u32) -> bool {
     let watch = WATCH.lock().ok();
     let active = watch.as_ref().and_then(|w| w.as_ref());
     let own = active
@@ -265,6 +265,7 @@ pub(super) fn observe_pointer(window: usize, event_tick: u32) {
     if !own {
         crate::input_state::edited();
     }
+    own
 }
 #[derive(Debug, PartialEq, Eq)]
 enum EventDecision {
@@ -933,6 +934,90 @@ pub(super) fn text_bytes(text: &str) -> Vec<u8> {
         .flat_map(u16::to_ne_bytes)
         .collect()
 }
+struct FinalTarget {
+    id: String,
+    element: IUIAutomationElement,
+    selection: IUIAutomationTextRange,
+    text: String,
+}
+impl FinalTarget {
+    fn capture(
+        id: &str,
+        anchor: &Anchor,
+        automation: &Option<IUIAutomation>,
+    ) -> Result<Self, Error> {
+        capture(anchor.clone(), automation)?;
+        let auto = automation
+            .as_ref()
+            .ok_or_else(|| err("targetProbeFailed"))?;
+        unsafe {
+            let element = probe!(auto.GetFocusedElement()).map_err(|_| err("targetProbeFailed"))?;
+            let pattern =
+                probe!(element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId))
+                    .map_err(|_| err("targetProbeFailed"))?;
+            let ranges = probe!(pattern.GetSelection()).map_err(|_| err("targetProbeFailed"))?;
+            if probe!(ranges.Length()).map_err(|_| err("targetProbeFailed"))? != 1 {
+                return Err(err("targetProbeFailed"));
+            }
+            let selection = probe!(ranges.GetElement(0)).map_err(|_| err("targetProbeFailed"))?;
+            let document = probe!(pattern.DocumentRange()).map_err(|_| err("targetProbeFailed"))?;
+            let text = probe!(document.GetText(262_145))
+                .map_err(|_| err("targetProbeFailed"))?
+                .to_string();
+            if text.encode_utf16().count() >= 262_145 {
+                return Err(err("targetProbeFailed"));
+            }
+            composition_begin_target(id, anchor)?;
+            Ok(Self {
+                id: id.into(),
+                element,
+                selection,
+                text,
+            })
+        }
+    }
+    fn verify(
+        self,
+        id: &str,
+        anchor: &Anchor,
+        automation: &Option<IUIAutomation>,
+    ) -> Result<(), Error> {
+        if self.id != id {
+            return Err(err("staleSession"));
+        }
+        composition_begin_target(id, anchor)?;
+        let current = Self::capture(id, anchor, automation)?;
+        let auto = automation
+            .as_ref()
+            .ok_or_else(|| err("targetProbeFailed"))?;
+        unsafe {
+            if !probe!(auto.CompareElements(&self.element, &current.element))
+                .map_err(|_| err("targetChanged"))?
+                .as_bool()
+                || self.text != current.text
+                || probe!(self.selection.CompareEndpoints(
+                    TextPatternRangeEndpoint_Start,
+                    &current.selection,
+                    TextPatternRangeEndpoint_Start
+                ))
+                .map_err(|_| err("targetChanged"))?
+                    != 0
+                || probe!(self.selection.CompareEndpoints(
+                    TextPatternRangeEndpoint_End,
+                    &current.selection,
+                    TextPatternRangeEndpoint_End
+                ))
+                .map_err(|_| err("targetChanged"))?
+                    != 0
+            {
+                return Err(err("targetChanged"));
+            }
+        }
+        // Last COM call can reenter the host. The original event/physical fence
+        // must still hold; equal text alone never reacquires a changed target.
+        composition_begin_target(id, anchor)
+    }
+}
 pub(super) fn worker(
     receiver: mpsc::Receiver<Envelope>,
     owner: Arc<AtomicUsize>,
@@ -952,6 +1037,7 @@ pub(super) fn worker(
             let _ = a2.SetTransactionTimeout(50);
         }
     }
+    let mut final_target: Option<FinalTarget> = None;
     while let Ok(envelope) = receiver.recv() {
         let request = envelope.request;
         if matches!(request, Request::Stop) {
@@ -960,7 +1046,9 @@ pub(super) fn worker(
         busy.store(true, Ordering::Release);
         if stopping.load(Ordering::Acquire) {
             match request {
-                Request::Capture(_, _, r) | Request::Copy(_, _, r) => {
+                Request::Capture(_, _, r)
+                | Request::Copy(_, _, r)
+                | Request::FinalTarget(_, _, _, r) => {
                     let _ = r.send(Err(err("stopping")));
                 }
                 _ => {}
@@ -971,6 +1059,20 @@ pub(super) fn worker(
             break;
         }
         match request {
+            Request::FinalTarget(id, anchor, verify, response) => {
+                deadline(500);
+                let result = if verify {
+                    final_target
+                        .take()
+                        .ok_or_else(|| err("targetChanged"))
+                        .and_then(|target| target.verify(&id, &anchor, &automation))
+                } else {
+                    final_target = None;
+                    FinalTarget::capture(&id, &anchor, &automation)
+                        .map(|target| final_target = Some(target))
+                };
+                let _ = response.send(result);
+            }
             Request::Capture(id, anchor, response) => {
                 deadline(500);
                 let at = Instant::now();
@@ -989,6 +1091,9 @@ pub(super) fn worker(
                 let _ = response.send(result);
             }
             Request::Forget(id) => {
+                if final_target.as_ref().is_some_and(|target| target.id == id) {
+                    final_target = None;
+                }
                 release_watch(&id);
             }
             Request::Stop => break,

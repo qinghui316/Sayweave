@@ -169,6 +169,7 @@ impl std::ops::Deref for NativeTerminal {
     }
 }
 pub struct NativeStart {
+    pub purpose: crate::contracts::translation::Purpose,
     pub id: String,
     pub source: Source,
     pub expected_task: Option<String>,
@@ -547,6 +548,8 @@ impl SpeechService {
             return Err(Error::new("stopping"));
         }
         let attempt = Attempt {
+            purpose: context.as_ref().map_or_default(|c| c.purpose),
+            target_language: None,
             config_revision: cfg.revision(),
             id: attempt_id.clone(),
             record_id: record_id.clone(),
@@ -579,13 +582,13 @@ impl SpeechService {
             archive.enqueue(
                 "prepare".into(),
                 crate::data::Operation::History(if retry_id.is_some() {
-                    DbOperation::Retry(attempt)
+                    DbOperation::Retry(Box::new(attempt))
                 } else {
-                    DbOperation::Prepare(Prepare {
+                    DbOperation::Prepare(Box::new(Prepare {
                         record_id: record_id.clone(),
                         attempt,
                         audio: audio.clone(),
-                    })
+                    }))
                 }),
             );
         }

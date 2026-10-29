@@ -405,10 +405,12 @@ mod tests {
     fn prepared(repo: &mut Repository) -> (String, String) {
         let id = uuid::Uuid::new_v4().to_string();
         let attempt = uuid::Uuid::new_v4().to_string();
-        repo.history_operation(history::DbOperation::Prepare(Prepare {
+        repo.history_operation(history::DbOperation::Prepare(Box::new(Prepare {
             record_id: id.clone(),
             audio: None,
             attempt: Attempt {
+                purpose: crate::contracts::translation::Purpose::Dictation,
+                target_language: None,
                 id: attempt.clone(),
                 record_id: id.clone(),
                 kind: "live".into(),
@@ -425,7 +427,7 @@ mod tests {
                 error_code: None,
                 elapsed_ms: 0,
             },
-        }))
+        })))
         .unwrap();
         repo.history_operation(history::DbOperation::Finish {
             attempt_id: attempt.clone(),

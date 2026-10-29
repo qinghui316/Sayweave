@@ -190,3 +190,16 @@ it('seeks forward when the first page is emptied and shows empty only after the 
  expect(store.getSnapshot().page).toBe(2);await f.port.remove('record-0',1);store.remove('record-0');await store.refresh();
  expect(store.getSnapshot().records).toHaveLength(0);expect(store.getSnapshot().total).toBe(0);expect(store.getSnapshot().cursor).toBeNull();
 });
+
+it.each(['service','emptyText'])('shows translation error %s while retaining the recognized original',async errorCode=>{
+ const r=record(1,'今天下午三点开会');r.attempts[0]!.purpose='translation';r.attempts[0]!.targetLanguage='en-US';
+ r.processing=[{id:'failed-translation',attemptId:r.currentAttempt!,configName:'文字模型',modelId:'fixture',state:'failed',text:'',revision:1,errorCode,units:[]}];
+ const f=fixture([r]),user=userEvent.setup();
+ render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
+ await screen.findByRole('listitem');screen.getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');await user.click(await screen.findByRole('menuitem',{name:'识别版本'}));
+ const versions=await screen.findByRole('combobox',{name:'识别版本'});versions.focus();await user.keyboard('{Enter}');
+ await user.click(await screen.findByRole('option',{name:'译文 · 文字模型'}));
+ const body=screen.getByRole('region',{name:'历史识别文字'});expect(body).not.toHaveTextContent('未识别到文字');expect(body).toHaveTextContent(errorCode==='emptyText'?'未生成译文。':'翻译未完成。');
+ versions.focus();await user.keyboard('{Enter}');await user.click(await screen.findByRole('option',{name:/原文/}));
+ expect(body).toHaveTextContent('今天下午三点开会');
+});

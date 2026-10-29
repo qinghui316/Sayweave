@@ -115,6 +115,10 @@ pub(super) fn superseded_output(op: &Operation) -> Result<super::Output, DataErr
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 enum Fact {
+    Translation {
+        attempt_id: String,
+        target: String,
+    },
     Delivery {
         task: String,
         attempt: String,
@@ -170,6 +174,12 @@ struct Entry {
 impl Fact {
     fn capture(op: &Operation) -> Option<Self> {
         Some(match op {
+            Operation::History(h::DbOperation::Translation { attempt_id, target }) => {
+                Self::Translation {
+                    attempt_id: attempt_id.clone(),
+                    target: target.clone(),
+                }
+            }
             Operation::History(h::DbOperation::Delivery {
                 task,
                 attempt,
@@ -182,10 +192,10 @@ impl Fact {
                 error: error.clone(),
             },
             Operation::History(h::DbOperation::Prepare(value)) => Self::Prepare {
-                value: value.clone(),
+                value: value.as_ref().clone(),
                 audio_key: value.audio.as_ref().map(|a| a.file_key.clone()),
             },
-            Operation::History(h::DbOperation::Retry(a)) => Self::Retry(a.clone()),
+            Operation::History(h::DbOperation::Retry(a)) => Self::Retry(a.as_ref().clone()),
             Operation::History(h::DbOperation::Stage { attempt_id, status }) => Self::Stage {
                 attempt_id: attempt_id.clone(),
                 status: status.clone(),
@@ -238,7 +248,8 @@ impl Fact {
             (Self::Draft(a), Self::Draft(b)) => {
                 a.run_id == b.run_id && a.source.block == b.source.block && a.order == b.order
             }
-            (Self::Prepare { .. }, Self::Prepare { .. })
+            (Self::Translation { .. }, Self::Translation { .. })
+            | (Self::Prepare { .. }, Self::Prepare { .. })
             | (Self::Retry(_), Self::Retry(_))
             | (Self::Run(_), Self::Run(_))
             | (Self::Finish { .. }, Self::Finish { .. })
@@ -274,6 +285,7 @@ impl Fact {
     }
     fn identity(&self) -> (&str, u8) {
         match self {
+            Self::Translation { attempt_id, .. } => (attempt_id, 10),
             Self::Delivery { task, .. } => (task, 8),
             Self::Prepare { value, .. } => (&value.attempt.id, 0),
             Self::Retry(a) => (&a.id, 0),
@@ -289,6 +301,9 @@ impl Fact {
     }
     fn operation(self) -> Operation {
         match self {
+            Self::Translation { attempt_id, target } => {
+                Operation::History(h::DbOperation::Translation { attempt_id, target })
+            }
             Self::Delivery {
                 task,
                 attempt,
@@ -307,9 +322,9 @@ impl Fact {
                 if let Some(a) = &mut value.audio {
                     a.file_key = audio_key.unwrap_or_default();
                 }
-                Operation::History(h::DbOperation::Prepare(value))
+                Operation::History(h::DbOperation::Prepare(Box::new(value)))
             }
-            Self::Retry(a) => Operation::History(h::DbOperation::Retry(a)),
+            Self::Retry(a) => Operation::History(h::DbOperation::Retry(Box::new(a))),
             Self::Stage { attempt_id, status } => {
                 Operation::History(h::DbOperation::Stage { attempt_id, status })
             }
@@ -663,6 +678,7 @@ fn entries(root: &Path) -> Result<Vec<(PathBuf, Vec<u8>, Entry)>, DataError> {
 }
 fn record_owner(repo: &Repository, op: &Operation) -> Result<Option<String>, DataError> {
     Ok(match op {
+        Operation::History(h::DbOperation::Translation { attempt_id, .. }) => repo.connection.query_row("SELECT record_id FROM speech_attempts WHERE id=?1", [attempt_id], |r|r.get::<_,String>(0)).optional().map_err(db_error)?,
         Operation::History(h::DbOperation::Delivery { attempt, .. }) => repo.connection.query_row("SELECT record_id FROM speech_attempts WHERE id=?1", [attempt], |r| r.get::<_, String>(0)).optional().map_err(db_error)?,
         Operation::History(h::DbOperation::Prepare(v)) => Some(v.record_id.clone()),
         Operation::History(h::DbOperation::Retry(a)) => Some(a.record_id.clone()),
@@ -1061,6 +1077,7 @@ impl Bindings {
             Fact::Delivery { attempt, .. } => self.attempts.contains(attempt),
             Fact::Audio { id, .. } => self.audio.contains(id),
             Fact::Stage { attempt_id, .. }
+            | Fact::Translation { attempt_id, .. }
             | Fact::Checkpoint { attempt_id, .. }
             | Fact::Finish { attempt_id, .. } => self.attempts.contains(attempt_id),
         }
@@ -1133,7 +1150,7 @@ mod tests {
         prepared.attempt.record_id = prepared.record_id.clone();
         apply(
             &mut repo,
-            Operation::History(h::DbOperation::Prepare(prepared.clone())),
+            Operation::History(h::DbOperation::Prepare(Box::new(prepared.clone()))),
         )
         .unwrap();
         let native = uuid::Uuid::new_v4().to_string();
@@ -1227,7 +1244,7 @@ mod tests {
         let mut repo = Repository::open(temp.path()).unwrap();
         apply(
             &mut repo,
-            Operation::History(h::DbOperation::Prepare(prepared.clone())),
+            Operation::History(h::DbOperation::Prepare(Box::new(prepared.clone()))),
         )
         .unwrap();
         drop(repo);
@@ -1267,7 +1284,7 @@ mod tests {
         prepared.attempt.record_id = prepared.record_id.clone();
         apply(
             &mut repo,
-            Operation::History(h::DbOperation::Prepare(prepared.clone())),
+            Operation::History(h::DbOperation::Prepare(Box::new(prepared.clone()))),
         )
         .unwrap();
         let run = uuid::Uuid::from_u128(1).to_string();
@@ -1362,6 +1379,8 @@ mod tests {
         h::Prepare {
             record_id: id(),
             attempt: h::Attempt {
+                purpose: crate::contracts::translation::Purpose::Dictation,
+                target_language: None,
                 id: id(),
                 record_id: String::new(),
                 kind: "live".into(),
@@ -1387,7 +1406,7 @@ mod tests {
         let mut repo = Repository::open(temp.path()).unwrap();
         let mut p = prepare();
         p.attempt.record_id = p.record_id.clone();
-        let op = Operation::History(h::DbOperation::Prepare(p.clone()));
+        let op = Operation::History(h::DbOperation::Prepare(Box::new(p.clone())));
         stage(temp.path(), &op).unwrap();
         apply(&mut repo, op).unwrap();
         let end = Operation::History(h::DbOperation::Finish {
@@ -1425,7 +1444,7 @@ mod tests {
         prepared.attempt.record_id = prepared.record_id.clone();
         apply(
             &mut repo,
-            Operation::History(h::DbOperation::Prepare(prepared.clone())),
+            Operation::History(h::DbOperation::Prepare(Box::new(prepared.clone()))),
         )
         .unwrap();
         let run = uuid::Uuid::new_v4().to_string();
@@ -1478,7 +1497,7 @@ mod tests {
         let mut repo = Repository::open(temp.path()).unwrap();
         let mut p = prepare();
         p.attempt.record_id = p.record_id.clone();
-        let op = Operation::History(h::DbOperation::Prepare(p.clone()));
+        let op = Operation::History(h::DbOperation::Prepare(Box::new(p.clone())));
         apply(&mut repo, op.clone()).unwrap();
         stage(temp.path(), &op).unwrap();
         let end = Operation::History(h::DbOperation::Finish {
@@ -1565,13 +1584,13 @@ mod tests {
         });
         apply(
             &mut repo,
-            Operation::History(h::DbOperation::Prepare(p.clone())),
+            Operation::History(h::DbOperation::Prepare(Box::new(p.clone()))),
         )
         .unwrap();
         let mut attempt = p.attempt.clone();
         attempt.id = uuid::Uuid::new_v4().to_string();
         attempt.kind = "retry".into();
-        let op = Operation::History(h::DbOperation::Retry(attempt));
+        let op = Operation::History(h::DbOperation::Retry(Box::new(attempt)));
         stage(temp.path(), &op).unwrap();
         apply(&mut repo, op.clone()).unwrap();
         apply(&mut repo, op).unwrap();
@@ -1630,7 +1649,7 @@ mod tests {
         p.attempt.record_id = p.record_id.clone();
         apply(
             &mut repo,
-            Operation::History(h::DbOperation::Prepare(p.clone())),
+            Operation::History(h::DbOperation::Prepare(Box::new(p.clone()))),
         )
         .unwrap();
         let run = uuid::Uuid::new_v4().to_string();
@@ -1706,7 +1725,11 @@ mod tests {
             let mut p = prepare();
             p.attempt.id = format!("ffffffff-0000-4000-8000-{n:012}");
             p.attempt.record_id = p.record_id.clone();
-            stage(temp.path(), &Operation::History(h::DbOperation::Prepare(p))).unwrap();
+            stage(
+                temp.path(),
+                &Operation::History(h::DbOperation::Prepare(Box::new(p))),
+            )
+            .unwrap();
         }
         for _ in 0..12 {
             replay_batch(&mut repo, temp.path(), true, std::time::Duration::ZERO, 64).unwrap();
@@ -1729,7 +1752,7 @@ mod tests {
         p.attempt.record_id = p.record_id.clone();
         apply(
             &mut repo,
-            Operation::History(h::DbOperation::Prepare(p.clone())),
+            Operation::History(h::DbOperation::Prepare(Box::new(p.clone()))),
         )
         .unwrap();
         let old = Operation::History(h::DbOperation::Checkpoint {
@@ -1773,7 +1796,7 @@ mod tests {
             p.attempt.record_id = p.record_id.clone();
             apply(
                 &mut repo,
-                Operation::History(h::DbOperation::Prepare(p.clone())),
+                Operation::History(h::DbOperation::Prepare(Box::new(p.clone()))),
             )
             .unwrap();
             let run = uuid::Uuid::new_v4().to_string();

@@ -180,11 +180,16 @@ impl DeliveryGate {
         }
     }
 }
-pub(crate) fn observe_pointer(window: usize, event_tick: u32) {
+pub(crate) fn observe_pointer(window: usize, event_tick: u32) -> bool {
     #[cfg(windows)]
-    native::observe_pointer(window, event_tick);
+    {
+        native::observe_pointer(window, event_tick)
+    }
     #[cfg(not(windows))]
-    let _ = (window, event_tick);
+    {
+        let _ = (window, event_tick);
+        false
+    }
 }
 pub(crate) fn observe(event: u32, window: usize, object: i32, event_tick: u32) {
     #[cfg(windows)]
@@ -195,6 +200,7 @@ fn event_after_capture(event_tick: u32, captured_tick: u32) -> bool {
 }
 enum Request {
     Capture(String, Anchor, oneshot::Sender<Result<(), Error>>),
+    FinalTarget(String, Anchor, bool, oneshot::Sender<Result<(), Error>>),
     Copy(
         String,
         Option<Arc<DeliveryGate>>,
@@ -253,7 +259,7 @@ impl WindowsInputService {
             std::thread::spawn(move || {
                 while let Ok(envelope) = receiver.recv() {
                     match envelope.request {
-                        Request::Capture(_, _, r) => {
+                        Request::Capture(_, _, r) | Request::FinalTarget(_, _, _, r) => {
                             let _ = r.send(Err(Error::new("targetUnsupported")));
                         }
                         Request::Copy(_, _, r) => {
@@ -330,6 +336,18 @@ impl WindowsInputService {
     pub async fn capture(&self, id: String, anchor: Anchor) -> Result<(), Error> {
         let (tx, rx) = oneshot::channel();
         self.send(Request::Capture(id, anchor, tx))?;
+        rx.await.map_err(|_| Error::new("targetProbeFailed"))?
+    }
+    /// Capture/consume read-only evidence for a final-only task. No native
+    /// composition or external edit exists until the completed result is ready.
+    pub(crate) async fn final_target(
+        &self,
+        id: String,
+        anchor: Anchor,
+        verify: bool,
+    ) -> Result<(), Error> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Request::FinalTarget(id, anchor, verify, tx))?;
         rx.await.map_err(|_| Error::new("targetProbeFailed"))?
     }
     pub async fn copy(&self, text: String) -> Result<(), Error> {

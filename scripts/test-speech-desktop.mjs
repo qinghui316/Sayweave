@@ -21,7 +21,7 @@ const polishOnly=process.argv.includes('--polish')||Boolean(polishCase);
 const report={id,passed:false,checks:[],connections:[],handshakes:[],polishRequests:[]},delay=ms=>new Promise(r=>setTimeout(r,ms));
 report.controllerSha256=createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex');
 let app,browser,server,mode='normal',expectedProtocol='qwen',expectedModel='qwen-audio-3.1-asr-flash-streaming';const sockets=new Set(),polishReleases=new Map(),polishChannels=[],copyReleases=new Map();
-const restartChannels=[],readinessChannels=[];
+const restartChannels=[],readinessChannels=[],translationRequests=[],translationReleases=new Map();
 async function command(args,extraEnv={}){
  const fixture=args[0]==='test'&&args.includes('--lib')?args.find(value=>['model_desktop_fixture','model_desktop_cleanup'].includes(value)):null;
  const retained=fixture&&report.reusedBuild?.fixtureTest;
@@ -87,6 +87,33 @@ async function modelFixture(req,res){
  if(req.url!=='/v1/chat/completions'||req.headers.authorization!=='Bearer '+key){res.writeHead(401);res.end('{}');return;}
  let bytes=0;const chunks=[];for await(const chunk of req){bytes+=chunk.length;if(bytes>16*1024){res.writeHead(413);res.end();return;}chunks.push(chunk);}
  const request=JSON.parse(Buffer.concat(chunks).toString('utf8')),data=JSON.parse(request.messages[1].content);
+ if(report.scope==='translation'&&(Array.isArray(data.observations)||typeof data.before==='string')){
+  expect(request.model).toBe('translation-fixture');
+  const profile=Array.isArray(data.observations);
+  expect(request.messages[0].content).toContain(profile?'更新表达偏好':'真实修改');
+  if(profile){expect(typeof data.scope).toBe('string');expect(Array.isArray(data.current)).toBe(true);const translated=new Set((report.translation?.rounds??[]).filter(r=>r.case!=='ordinary-after-translation').map(r=>r.taskId));for(const observation of [...data.observations,...(data.prior_support??[])])expect(translated.has(observation.session)).toBe(false);}
+  else expect(typeof data.after).toBe('string');
+  report.translationLearningRequests??=[];report.translationLearningRequests.push({kind:profile?'profile':'edit',mode,at:performance.now(),request:structuredClone(request)});
+  const output=JSON.stringify(profile?{outcome:'unchanged',preferences:[],candidates:[],evidence:[],reason:'受控服务保留现有偏好'}:{class:'uncertain',original:null,term:null,summary:null});
+  if(request.stream){res.writeHead(200,{'Content-Type':'text/event-stream'});res.end('data: '+JSON.stringify({choices:[{index:0,delta:{role:'assistant',content:output},finish_reason:null}]})+'\n\ndata: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n');}
+  else{res.writeHead(200,{'Content-Type':'application/json'});res.end(JSON.stringify({choices:[{index:0,message:{role:'assistant',content:output},finish_reason:'stop'}]}));}
+  return;
+ }
+ if(report.scope==='translation'&&mode==='normal'){
+  expect(request.stream).toBe(true);expect(request.model).toBe('translation-fixture');expect(typeof data.input_text).toBe('string');
+  report.ordinaryTranslationRegressionRequests??=[];report.ordinaryTranslationRegressionRequests.push(structuredClone(request));
+  res.writeHead(200,{'Content-Type':'text/event-stream'});
+  res.end('data: '+JSON.stringify({choices:[{index:0,delta:{role:'assistant',content:data.input_text},finish_reason:null}]})+'\n\ndata: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n');return;
+ }
+ if(mode.startsWith('translation-')){
+  expect(request.stream).toBe(true);expect(request.model).toBe('translation-fixture');
+  const receipt={mode,request:structuredClone(request),at:performance.now(),source:data.source_text};translationRequests.push(receipt);
+  await new Promise(resolve=>{const timer=setTimeout(resolve,15000);const release=()=>{clearTimeout(timer);resolve();};translationReleases.set(receipt,release);res.once('close',release);});
+  translationReleases.delete(receipt);if(res.destroyed){receipt.aborted=true;return;}
+  if(receipt.mode==='translation-failure'){res.writeHead(500);res.end('{}');return;}
+  res.writeHead(200,{'Content-Type':'text/event-stream'});
+  res.end('data: '+JSON.stringify({choices:[{index:0,delta:{role:'assistant',content:'午後3時に会議です。'},finish_reason:null}]})+'\n\ndata: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n');receipt.responded=true;return;
+ }
  if(mode.startsWith('learning-restart-')){
   report.restartModelRequests??=[];
   report.restartModelRequests.push({mode,stream:request.stream,input:data.input_text??null,at:performance.now()});
@@ -107,6 +134,204 @@ async function modelFixture(req,res){
  const chunk=JSON.stringify({choices:[{index:0,delta:{role:'assistant',content:output},finish_reason:null}]});
  const wire=Buffer.from('data: '+chunk+'\r\n\r\ndata: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n');
  for(let n=0;n<wire.length;n+=7){res.write(wire.subarray(n,n+7));}res.end();
+}
+// Same production coordinator, actual microphone and owned native target. Only supplier replies are controlled.
+async function translationScenario(page,base){
+ await invoke(page,'model_save',{request:{id:null,revision:null,expectation:null,input:{name:'隔离翻译文字',protocol:'openai-chat',baseUrl:base+'/v1',modelId:'translation-fixture',usages:['text']},key:{action:'replace',value:key}}});
+ const keys=await invoke(page,'shortcut_status');await invoke(page,'shortcut_save',{config:{...keys.saved,binding:'AltRight',translationBinding:'AltRight+ShiftRight',mode:'toggle'}});
+ const tapConfig=(await invoke(page,'shortcut_status')).saved;
+ expect((await rejected(page,'shortcut_save',{config:{...tapConfig,mode:'hold'}})).code).toBe('shortcutHoldConflict');
+ expect((await invoke(page,'shortcut_status')).saved).toEqual(tapConfig);
+ const configuration=await invoke(page,'translation_settings');
+ expect(configuration.settings.targets).toEqual(['en-US','ja','ko','fr','zh-Hans']);
+ const editor=await ownedEditor(),overlay=await overlayPage();
+ // Native focus loss is part of recording ownership; Playwright enables
+ // synthetic always-focused pages by default, masking actual window blur.
+ const captureCdp=await page.context().newCDPSession(page);
+ await captureCdp.send('Emulation.setFocusEmulationEnabled',{enabled:false});
+ try {
+ await invoke(page,'shortcut_save',{config:{...(await invoke(page,'shortcut_status')).saved,translationBinding:'F8'}});
+ await invoke(page,'runtime_window',{surface:'main',action:'show'});
+ await editor.command({action:'focus-process',process:app.pid});
+ await page.getByRole('button',{name:'设置',exact:true}).click();
+ await page.getByRole('button',{name:'更改翻译快捷键',exact:true}).click();
+ await expect.poll(async()=>(await invoke(page,'shortcut_status')).capturing).toBe(true);
+ report.captureProbe={before:await invoke(page,'shortcut_status'),cases:[]};
+ await page.evaluate(()=>{window.__captureEdges=[];for(const type of ['keydown','keyup'])window.addEventListener(type,e=>window.__captureEdges.push({type,code:e.code,trusted:e.isTrusted}),true);});
+ const keyEvent=async(key,down)=>{const value=await editor.command({action:'fixture-key',process:app.pid,...(Array.isArray(key)?{keys:key}:{key}),down});expect(value.keyResult?.accepted).toBe(true);};
+ const beginCapture=async(field='translationBinding')=>{
+  await page.getByRole('button',{name:field==='binding'?'更改快捷键':'更改翻译快捷键',exact:true}).click();
+  await expect.poll(async()=>(await invoke(page,'shortcut_status')).capturing).toBe(true);
+  return (await invoke(page,'shortcut_status')).captureToken;
+ };
+ const finishKeys=async(events,expected,label,field='translationBinding')=>{
+  const before=await invoke(page,'shortcut_status');
+  for(const [key,down] of events)await keyEvent(key,down);
+  await expect.poll(async()=>(await invoke(page,'shortcut_status')).capturing,{timeout:4000}).toBe(false);
+  await expect.poll(async()=>(await invoke(page,'shortcut_status')).saved[field],{timeout:4000}).toBe(expected);
+  const after=await invoke(page,'shortcut_status');expect(after.active[field]).toBe(expected);
+  report.captureProbe.cases.push({label,events,before,after});
+ };
+ // F8 was already registered before entering the editor: its Down must now reach capture.
+ await finishKeys([['F8',true],['F8',false]],'F8','registered F8');
+ for(const reason of ['button','outside','escape','blur']){
+  const before=await invoke(page,'shortcut_status'),token=await beginCapture();
+  if(reason==='button')await page.getByRole('button',{name:'取消录入',exact:true}).click();
+  if(reason==='outside')await page.getByText('口述与翻译',{exact:true}).click();
+  if(reason==='escape'){await keyEvent('Escape',true);await keyEvent('Escape',false);}
+  if(reason==='blur'){const focus=await editor.command({action:'focus',text:'',start:0,end:0});report.captureProbe.blurTransition={focus};expect(focus.foregroundProcess).toBe(editor.pid);await expect.poll(()=>page.evaluate(()=>document.hasFocus())).toBe(false);}
+  await expect.poll(async()=>(await invoke(page,'shortcut_status')).capturing).toBe(false);
+  const after=await invoke(page,'shortcut_status');expect(after.saved).toEqual(before.saved);expect(after.active).toEqual(before.active);
+  report.captureProbe.cases.push({label:'cancel '+reason,token,before,after});
+  if(reason==='blur'){await editor.command({action:'focus-process',process:app.pid});await expect.poll(()=>page.evaluate(()=>document.hasFocus())).toBe(true);}
+ }
+ const stale=await beginCapture();await page.getByRole('button',{name:'取消录入',exact:true}).click();
+ await expect.poll(async()=>(await invoke(page,'shortcut_status')).capturing).toBe(false);
+ const fresh=await beginCapture();
+ expect(await invoke(page,'shortcut_capture_candidate',{token:stale,binding:'F9'})).toMatchObject({capturing:true,captureToken:fresh});
+ expect(await invoke(page,'shortcut_capture',{begin:false,token:stale})).toMatchObject({capturing:true,captureToken:fresh});
+ await finishKeys([['ControlLeft',true],['F8',true],['ControlLeft',false],['F8',false]],'Control+F8','Control+F8 releases modifier first');
+ const stable=await invoke(page,'shortcut_status');
+ expect((await invoke(page,'shortcut_capture_candidate',{token:fresh,binding:'F9'})).saved).toEqual(stable.saved);
+ await beginCapture();
+ await finishKeys([['ControlLeft',true],['F8',true],['F8',false],['ControlLeft',false]],'Control+F8','registered chord re-recorded');
+ for(const [events,message,label] of [
+  [[['F12',true],['F12',false]],'此快捷键已保留供系统使用。','reserved F12'],
+  [[['AltLeft',true],['AltLeft',false]],'此快捷键已保留供系统使用。','reserved left Alt'],
+  [[['AltRight',true],['AltRight',false]],'此快捷键已被占用，请换一个。','other purpose conflict']
+ ]){
+  const before=await invoke(page,'shortcut_status');await beginCapture();
+  for(const [key,down] of events)await keyEvent(key,down);
+  await expect(page.getByRole('alert').filter({hasText:message})).toBeVisible();
+  await expect(page.getByRole('button',{name:'更改翻译快捷键',exact:true})).toHaveAttribute('aria-invalid','true');
+  const after=await invoke(page,'shortcut_status');expect(after.saved).toEqual(before.saved);expect(after.active).toEqual(before.active);expect(after.capturing).toBe(false);
+  report.captureProbe.cases.push({label,events,message,before,after});
+ }
+ await beginCapture('binding');
+ await finishKeys([['F9',true],['F9',false]],'F9','ordinary binding captured','binding');
+ await beginCapture('binding');
+ await finishKeys([['AltRight',true],['AltRight',false]],'AltRight','ordinary binding restored by capture','binding');
+ for(const [events,label] of [
+  [[['AltRight',true],['ShiftRight',true],['ShiftRight',false],['AltRight',false]],'Alt then Shift'],
+  [[[['AltRight','ShiftRight'],true],['AltRight',false],['ShiftRight',false]],'simultaneous chord']
+ ]){await beginCapture();await finishKeys(events,'AltRight+ShiftRight',label);}
+ report.captureProbe.after=await invoke(page,'shortcut_status');report.captureProbe.dom=await page.evaluate(()=>window.__captureEdges);
+ await page.getByRole('button',{name:'关闭',exact:true}).click();
+ await invoke(page,'runtime_window',{surface:'main',action:'hide'});
+ } catch(error) { const value=await invoke(page,'shortcut_status');report.captureProbe??={};report.captureProbe.failureStatus=value;report.captureProbe.dom=await page.evaluate(()=>window.__captureEdges??[]);await rejected(page,'shortcut_capture',{begin:false,token:value.captureToken}); await editor.close(); throw error; }
+ const pointerEvents=[];await overlay.exposeFunction('__translationPointer',event=>pointerEvents.push(event));
+ await overlay.evaluate(()=>{
+  for(const type of ['pointerdown','pointerup','click'])document.addEventListener(type,event=>{const item=event.target.closest?.('[role="menuitemradio"],button');void window.__translationPointer({type,text:item?.textContent,role:item?.getAttribute('role'),x:event.clientX,y:event.clientY});},true);
+ });
+ report.translation={requests:translationRequests,rounds:[],gestures:[],menuGeometry:[],pointerEvents,supplier:'isolated TLS fixture',microphone:'actual default device',target:'owned native TSF control'};
+ const body=async()=>{const value=await editor.command({action:'read'});expect(value.foregroundProcess,'Only the authorized native target may own foreground').toBe(editor.pid);return value.text;};
+ let gestureIndex=0;
+ const translateTap=async()=>{
+  const order=['AltRight','ShiftRight'];
+  const sameBatch=gestureIndex%4>=2;
+  const releaseOrder=gestureIndex%2?[...order]:[...order].reverse();
+  const original=await invoke(page,'dictation_snapshot'),before=await editor.command({action:'read'});
+  if(sameBatch){const value=await editor.command({action:'fixture-key',process:editor.pid,keys:order,down:true});expect(value.keyResult).toMatchObject({accepted:true,keys:[165,161],sent:2});}
+  else for(const key of order){const value=await editor.command({action:'fixture-key',process:editor.pid,key,down:true});expect(value.keyResult?.accepted).toBe(true);}
+  const held=await invoke(page,'dictation_snapshot');expect(held.taskId).toBe(original.taskId);expect(held.stage).toBe(original.stage);
+  for(const key of releaseOrder){const value=await editor.command({action:'fixture-key',process:editor.pid,key,down:false});expect(value.keyResult?.accepted).toBe(true);}
+  await expect.poll(async()=>(await editor.command({action:'read'})).modifiersDown,{timeout:2000}).toEqual([]);
+  const after=await editor.command({action:'read'});expect(after.keyboardLayout).toBe(before.keyboardLayout);expect(after.menuActive).toBe(false);
+  report.translation.gestures.push({order,sameBatch,releaseOrder,before:before.keyboardLayout,after:after.keyboardLayout,imeBefore:before.ime,imeAfter:after.ime,shiftUpBefore:before.shiftUpSequence,shiftUpAfter:after.shiftUpSequence,menuActive:after.menuActive,modifiersDown:after.modifiersDown});
+  if(before.ime?.read&&after.ime?.read)expect(after.ime).toEqual(before.ime);
+  gestureIndex++;
+ };
+ const settle=async task=>{
+  await expect.poll(async()=>{const snapshot=await invoke(page,'dictation_snapshot');return snapshot.taskId===task&&snapshot.stage==='result'&&snapshot.delivery!==null&&!['recognizing','delivering','recording'].includes(snapshot.presentation);},{timeout:20000}).toBe(true);
+  return invoke(page,'dictation_snapshot');
+ };
+ let failure;
+ try{
+  for(const name of ['success','same-batch','failure','cancel','target-change','hold']){
+   mode='translation-'+name;
+   if(name==='hold')await invoke(page,'shortcut_save',{config:{...(await invoke(page,'shortcut_status')).saved,translationBinding:'F8',mode:'hold'}});
+   await editor.command({action:'focus',text:'前后',start:1,end:1});
+   const beforeRequests=translationRequests.length;
+   if(name==='hold'){const down=await editor.command({action:'fixture-key',process:editor.pid,key:'F8',down:true});expect(down.keyResult?.accepted).toBe(true);}else await translateTap();
+   await waitPhase(page,'recording');
+   const active=await invoke(page,'dictation_snapshot');expect(active.purpose).toBe('translation');
+   await expect.poll(async()=>(await invoke(page,'speech_snapshot')).text,{timeout:8000}).toBe('正在识别');
+   expect(await body()).toBe('前后');expect(translationRequests).toHaveLength(beforeRequests);
+   if(name==='success'){
+    const initialWindow=await editor.command({action:'inspect-overlay',process:app.pid});
+    for(let toggle=0;toggle<6;toggle++){
+     await nativeOverlayClick(overlay,editor,'翻译目标语言');await expect(overlay.getByRole('menu')).toBeVisible();
+     const open=await editor.command({action:'inspect-overlay',process:app.pid});expect(open.overlayRect).toEqual(initialWindow.overlayRect);expect(open.foregroundProcess).toBe(editor.pid);
+     await nativeOverlayClick(overlay,editor,'翻译目标语言');await expect(overlay.getByRole('menu')).toHaveCount(0);
+     const closed=await editor.command({action:'inspect-overlay',process:app.pid});expect(closed.overlayRect).toEqual(initialWindow.overlayRect);expect(closed.foregroundProcess).toBe(editor.pid);
+     report.translation.menuGeometry.push({open:open.overlayRect,closed:closed.overlayRect,foreground:closed.foregroundProcess});
+    }
+    await nativeOverlayClick(overlay,editor,'翻译目标语言');
+    await expect(overlay.getByRole('menuitemradio',{name:'日语',exact:true})).toBeVisible();
+    expect(await body()).toBe('前后');
+    await nativeOverlayClick(overlay,editor,'日语','menuitemradio');
+    await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).targetLanguage).toBe('ja');
+    expect(await body()).toBe('前后');
+    await expect(overlay.getByRole('menu')).toHaveCount(0);await nativeOverlayClick(overlay,editor,'翻译目标语言');await expect(overlay.getByRole('menu')).toBeVisible();
+    const blank=await editor.command({action:'click-window',process:app.pid,window:initialWindow.overlayWindow,x:2,y:2});
+    report.translation.transparentArea={pointRootMatches:blank.clickCheck.pointRootMatches,clicked:blank.clicked};
+    if(blank.clickCheck.pointRootMatches){
+     await expect(overlay.getByRole('menu')).toHaveCount(0);expect(await body()).toBe('前后');
+     await nativeOverlayClick(overlay,editor,'翻译目标语言');await expect(overlay.getByRole('menu')).toBeVisible();
+     await nativeOverlayClick(overlay,editor,'日语','menuitemradio');await expect(overlay.getByRole('menu')).toHaveCount(0);
+     expect((await invoke(page,'dictation_snapshot')).targetLanguage).toBe('ja');
+    }
+   }
+   if(name==='hold'){const up=await editor.command({action:'fixture-key',process:editor.pid,key:'F8',down:false});expect(up.keyResult?.accepted).toBe(true);}else await translateTap();
+   await expect.poll(()=>translationRequests.length,{timeout:12000}).toBe(beforeRequests+1);
+   const request=translationRequests.at(-1);expect(request.source).toBe('原生受控识别完成。');expect(request.request.messages[0].content).toContain('Japanese');
+   const frozen=await invoke(page,'dictation_snapshot');expect(frozen.translationSelectable).toBe(false);expect(await body()).toBe('前后');
+   expect((await rejected(page,'translation_select',{taskId:active.taskId,code:'en-US'})).code).toBeTruthy();
+   if(name==='target-change'){await editor.command({action:'selection',start:0,end:0});const selection=await editor.command({action:'read'});expect([selection.start,selection.end]).toEqual([0,0]);}
+   if(name==='cancel')await invoke(page,'dictation_control',{taskId:active.taskId,action:'cancel'});
+   translationReleases.get(request)?.();
+   const result=await settle(active.taskId),actual=await body();
+   const expected=['success','same-batch','hold'].includes(name)?'前午後3時に会議です。后':'前后';expect(actual).toBe(expected);
+   expect(result.translationComplete).toBe(!['failure','cancel'].includes(name));
+   expect(result.delivery.restoreError).toBe(false);
+   if(['success','same-batch','hold'].includes(name)){expect(result.delivery.submission).toBe('submitted');expect(result.error).toBeNull();}
+   else expect(result.delivery.submission).toBe('notSubmitted');
+   if(name==='target-change')expect(result.delivery.error).toBe('targetChanged');
+   if(['failure','cancel'].includes(name)){expect(result.error).toBe(name==='cancel'?'cancelled':'service');expect(result.text).toBe('原生受控识别完成。');}
+   const speech=await invoke(page,'speech_snapshot');
+   const history=await invoke(page,'history_detail',{id:speech.recordId});
+   expect(history.attempts[0]).toMatchObject({purpose:'translation',targetLanguage:'ja',text:'原生受控识别完成。'});
+   expect(history.processing).toHaveLength(1);expect(history.processing[0].units).toHaveLength(1);
+   expect(history.processing[0].units[0].sourceText).toBe('原生受控识别完成。');
+   expect(history.processing[0].units[0].generationState).toBe(name==='failure'?'failed':name==='cancel'?'interrupted':'success');
+   expect(history.processing[0].units[0].applicationState).toBe(['success','same-batch','hold'].includes(name)?'applied':'notApplied');
+   expect(translationRequests).toHaveLength(beforeRequests+1);
+   report.translation.rounds.push({case:name,taskId:active.taskId,before:'前后',during:'前后',actual,expected,result,historyPurpose:history.attempts[0].purpose,target:history.attempts[0].targetLanguage,audioFrames:report.connections.at(-1).frames});
+   if(result.presentationId)await dismiss(page,{taskId:active.taskId,presentationId:result.presentationId});
+  }
+  expect(report.translationLearningRequests??[]).toHaveLength(0);
+  await invoke(page,'shortcut_save',{config:{...(await invoke(page,'shortcut_status')).saved,translationBinding:'AltRight+ShiftRight',mode:'toggle'}});
+  for(let round=0;round<2;round++){
+   mode='normal';const beforeOrdinary=report.ordinaryTranslationRegressionRequests?.length??0;await editor.command({action:'focus',text:'',start:0,end:0});
+   const result=await externalRound(page,async()=>{await expect.poll(body,{timeout:8000}).toBe('正在识别');},undefined,false,async()=>{
+    for(const down of [true,false]){const event=await editor.command({action:'fixture-key',process:editor.pid,key:'AltRight',down});expect(event.keyResult?.accepted).toBe(true);}
+    return waitPhase(page,'recording');
+   });
+   expect(await body()).toBe('原生受控识别完成。');expect(result.dictation.purpose).toBe('dictation');expect(report.ordinaryTranslationRegressionRequests.length).toBeGreaterThan(beforeOrdinary);expect(report.modelError).toBeUndefined();
+   report.translation.rounds.push({case:'ordinary-after-translation',round,actual:await body(),result:result.dictation});
+   if(result.dictation.presentationId)await dismiss(page,{taskId:result.dictation.taskId,presentationId:result.dictation.presentationId});
+  }
+  report.checks.push('production translation transaction: final ASR tail, no raw insertion, actual nonactivating language click, freeze, one request/write, failure/cancel/target-change, hold release, history and two ordinary rounds');
+ }catch(error){
+  report.translation.firstFailure={message:String(error),stack:error.stack};
+  failure=error;
+ }finally{
+  const clean=async(label,action)=>{try{await action();}catch(error){report.translation.cleanupFailures??=[];report.translation.cleanupFailures.push({label,error:String(error)});failure??=error;}};
+  await clean('task',async()=>{const active=await invoke(page,'dictation_snapshot');if(active?.taskId)await rejected(page,'dictation_control',{taskId:active.taskId,action:'cancel'});});
+  await clean('supplier',async()=>{for(const release of translationReleases.values())release();});
+  await clean('editor',()=>editor.close());
+ }
+ if(failure)throw failure;
 }
 async function polishScenario(page,base){
  const overview=await readModels(page);
@@ -253,13 +478,21 @@ async function stop(page,graceful=true){
 }
 async function ownedEditor(composition=true){
  const child=spawn(path.join(root,'src-tauri/target/debug/input-fixture.exe'),composition?['composition']:[],{cwd:root,windowsHide:true,env:{...process.env,SAYWEAVE_INPUT_ACCEPTANCE:'1'},stdio:['pipe','pipe','pipe']});
- let buffer='',queue=[],waiting=[];child.stdout.on('data',data=>{buffer+=data.toString('utf8');let at;while((at=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,at);buffer=buffer.slice(at+1);const value=JSON.parse(line);if(waiting.length)waiting.shift()(value);else queue.push(value);}});
- const next=()=>queue.length?Promise.resolve(queue.shift()):Promise.race([new Promise(resolve=>waiting.push(resolve)),delay(3000).then(()=>{throw Error('Owned editor response timeout');})]);
- await next();return {pid:child.pid,command:async value=>{child.stdin.write(JSON.stringify(value)+'\n');const result=await next();if(['focus','focus-process'].includes(value.action))await delay(80);return result;},close:async()=>{if(child.exitCode===null){child.stdin.write('{"action":"exit"}\n');for(let n=0;n<20&&child.exitCode===null;n++)await delay(50);if(child.exitCode===null)child.kill();}expect(child.exitCode,'Owned fixture cleanup must finish successfully').toBe(0);}};
+ const trace={pid:child.pid,commands:[],stderr:'',exit:null};report.ownedEditors??=[];report.ownedEditors.push(trace);
+ child.stderr.on('data',chunk=>{trace.stderr=(trace.stderr+chunk.toString('utf8')).slice(-4096);});
+ let buffer='',queue=[],waiting=[],channelFailure;
+ const exited=new Promise(resolve=>child.once('exit',(code,signal)=>{trace.exit={code,signal};channelFailure??=Error('Owned editor exited before response');for(const waiter of waiting.splice(0))waiter.reject(channelFailure);resolve();}));
+ child.stdout.on('data',data=>{buffer+=data.toString('utf8');let at;while((at=buffer.indexOf('\n'))>=0){const line=buffer.slice(0,at);buffer=buffer.slice(at+1);const value=JSON.parse(line);if(channelFailure)continue;if(waiting.length)waiting.shift().resolve(value);else queue.push(value);}});
+ const next=()=>channelFailure?Promise.reject(channelFailure):queue.length?Promise.resolve(queue.shift()):new Promise((resolve,reject)=>{
+  const waiter={resolve:value=>{clearTimeout(timer);resolve(value);},reject:error=>{clearTimeout(timer);reject(error);}};
+  const timer=setTimeout(()=>{waiting=waiting.filter(value=>value!==waiter);channelFailure=Error('Owned editor response timeout');reject(channelFailure);},3000);waiting.push(waiter);
+ });
+ await next();return {pid:child.pid,command:async value=>{if(channelFailure)throw channelFailure;const entry={request:structuredClone(value),at:performance.now()};trace.commands.push(entry);child.stdin.write(JSON.stringify(value)+'\n');const result=await next();entry.response=result;entry.completedAt=performance.now();if(['focus','focus-process'].includes(value.action))await delay(80);return result;},close:async()=>{if(child.exitCode===null){child.stdin.write('{"action":"exit"}\n');await Promise.race([exited,delay(3000)]);}expect(child.exitCode,'Owned fixture cleanup must finish successfully; unresolved resources remain retained').toBe(0);}};
 }
-async function nativeOverlayClick(view,editor,name){
+async function nativeOverlayClick(view,editor,name,role='button'){
  const owned=await editor.command({action:'inspect-overlay',process:app.pid});expect(owned.overlayWindow).toBeGreaterThan(0);
- const box=await view.getByRole('button',{name,exact:true}).boundingBox();expect(box).not.toBeNull();
+ const item=view.getByRole(role,{name,exact:true});await item.click({trial:true});
+ const box=await item.boundingBox();expect(box).not.toBeNull();
  const scale=await view.evaluate(()=>devicePixelRatio);
  const click=await editor.command({action:'click-window',process:app.pid,window:owned.overlayWindow,x:Math.round((box.x+box.width/2)*scale),y:Math.round((box.y+box.height/2)*scale)});
  expect(click.clickCheck.pointRootMatches).toBe(true);expect(click.clicked).toBe(2);return click;
@@ -787,7 +1020,7 @@ async function run(){try{
  // A reviewed controller retry can retain exact already-built product bytes.
  const retained=process.env.SAYWEAVE_SPEECH_REUSE_PREPARED;
  if(retained){
-  expect(['learning-restart','tab-startup','readiness']).toContain(process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE);
+  expect(['learning-restart','tab-startup','readiness','translation']).toContain(process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE);
   const proof=JSON.parse(readFileSync(retained,'utf8').replace(/^\uFEFF/,''));
   expect(execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim()).toBe(proof.source??proof.controllerSource);
   if(proof.sourceSnapshot){
@@ -813,11 +1046,18 @@ async function run(){try{
  }
  report.targetGroup=process.env.SAYWEAVE_INPUT_TARGET_GROUP??'all';
  await command(['test','--manifest-path','src-tauri/Cargo.toml','--lib','model_desktop_fixture','--','--ignored']);server=createServer({cert:readFileSync(path.join(data,'fixture-ca.pem')),key:readFileSync(path.join(data,'fixture-key.pem'))});server.on('upgrade',websocket);server.on('request',(req,res)=>void modelFixture(req,res).catch(error=>{report.modelError=String(error);res.destroy();}));await new Promise(r=>server.listen(0,'127.0.0.1',r));const base='https://localhost:'+server.address().port;
- let page=await start(1);await expect(page.getByRole('link',{name:'组件展示'})).toHaveCount(0);await page.getByRole('button',{name:'配置模型',exact:true}).click();const dialog=page.getByRole('dialog');await delay(250);await page.screenshot({path:path.join(directory,'settings-speech-native.png')});await dialog.getByRole('button',{name:'更多设置'}).click();await dialog.getByLabel('名称',{exact:true}).fill('隔离语音验收');await dialog.getByLabel('服务地址（URL）',{exact:true}).fill(base);await dialog.getByLabel('API 密钥',{exact:true}).fill(key);await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(dialog.getByText('已保存。')).toBeVisible();await dialog.getByRole('button',{name:'关闭',exact:true}).click();await expect(dialog).toHaveCount(0);
+ let page=await start(1);
+ if(process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE==='translation'){
+  await readModels(page);
+  await invoke(page,'model_save',{request:{id:null,revision:null,expectation:null,input:{name:'隔离翻译识别',protocol:'qwen-audio-streaming',baseUrl:base,modelId:expectedModel,usages:['speech']},key:{action:'replace',value:key}}});
+  report.scope='translation';await translationScenario(page,base);report.passed=true;return;
+ }
+ await expect(page.getByRole('link',{name:'组件展示'})).toHaveCount(0);await page.getByRole('button',{name:'配置模型',exact:true}).click();const dialog=page.getByRole('dialog');await delay(250);await page.screenshot({path:path.join(directory,'settings-speech-native.png')});await dialog.getByRole('button',{name:'更多设置'}).click();await dialog.getByLabel('名称',{exact:true}).fill('隔离语音验收');await dialog.getByLabel('服务地址（URL）',{exact:true}).fill(base);await dialog.getByLabel('API 密钥',{exact:true}).fill(key);await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(dialog.getByText('已保存。')).toBeVisible();await dialog.getByRole('button',{name:'关闭',exact:true}).click();await expect(dialog).toHaveCount(0);
  if(polishOnly){await polishScenario(page,base);await stop(page);if(polishCase==='no-history'){page=await start(2);expect((await invoke(page,'history_browse',{query:{search:'',cursor:null}})).total).toBe(0);await stop(page);report.checks.push('restart after history-disabled cancellation recovers without a stale cancellation intent');}report.passed=true;return;}
 
  const devices=await invoke(page,'speech_devices');report.microphoneCount=devices.length;expect(devices.some(d=>d.isDefault)).toBe(true);
  report.scope=process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE??'all';
+ if(report.scope==='translation'){await translationScenario(page,base);report.passed=true;return;}
  if(report.scope==='result-only'){await resultOnlyScenario(page);report.passed=true;return;}
   if(report.scope==='home-trial'){await homeTrialIsolation(page);report.passed=true;return;}
   if(report.scope==='learning-restart'){await learningRestartScenario(page,base);report.passed=true;return;}
@@ -1081,7 +1321,7 @@ for(const r of (await invoke(page,'history_list',{query:{search:'',page:1}})).re
  if(browser){const page=browser.contexts().flatMap(c=>c.pages()).find(p=>!p.url().includes('surface=overlay'));await stop(page).catch(()=>stop(null,false));}else await stop(null,false);for(const socket of sockets)socket.destroy();if(server)await new Promise(r=>server.close(r));
  try{await command(['test','--manifest-path','src-tauri/Cargo.toml','--lib','model_desktop_cleanup','--','--ignored']);report.credentialCleanup=true;}catch{report.credentialCleanup=false;report.passed=false;process.exitCode=1;}
  for(const name of ['fixture-ca.der','fixture-ca.pem','fixture-key.pem'])if(existsSync(path.join(data,name)))unlinkSync(path.join(data,name));writeFileSync(path.join(directory,'report.json'),JSON.stringify(report,null,2));writeFileSync(path.join(root,'.local','speech-desktop-report.json'),JSON.stringify(report,null,2));
- report.storage=finishValidation(root,storageContext,report,{processesClosed:!app,credentialsCleared:report.credentialCleanup===true});
+ report.storage=finishValidation(root,storageContext,report,{processesClosed:!app&&(report.ownedEditors??[]).every(editor=>editor.exit!==null),credentialsCleared:report.credentialCleanup===true});
 }
 }
 await run();

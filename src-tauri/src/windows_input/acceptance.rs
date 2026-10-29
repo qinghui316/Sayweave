@@ -269,6 +269,119 @@ fn observer_restart_samples(
     Ok(())
 }
 
+// Production read-only proof and one-shot composition, against the owned editor.
+// These controlled events establish native behavior, not microphone acceptance.
+fn final_translation_samples(
+    fixture: &mut Fixture,
+    runtime: &tokio::runtime::Runtime,
+    input: &WindowsInputService,
+) -> Result<(), String> {
+    use super::composition::{Draft, Finish};
+    for case in [
+        "insert",
+        "selection",
+        "text",
+        "other-field",
+        "after-verify",
+        "cancel-after-begin",
+    ] {
+        fixture.command(serde_json::json!({"action":"focus","text":"前后","start":1,"end":1}))?;
+        thread::sleep(Duration::from_millis(60));
+        let id = uuid::Uuid::new_v4().to_string();
+        let anchor = WindowsInputService::anchor().ok_or("translation fixture not foreground")?;
+        runtime
+            .block_on(input.capture(id.clone(), anchor.clone()))
+            .map_err(|e| format!("translation {case} capture {}", e.code))?;
+        runtime
+            .block_on(input.final_target(id.clone(), anchor.clone(), false))
+            .map_err(|e| format!("translation {case} retain {}", e.code))?;
+        if fixture.command(serde_json::json!({"action":"read"}))?["text"] != "前后" {
+            return Err("translation preparation mutated body".into());
+        }
+        match case {
+            "selection" => {
+                fixture.command(serde_json::json!({"action":"selection","start":0,"end":0}))?;
+            }
+            "text" => {
+                fixture.command(
+                    serde_json::json!({"action":"focus","text":"外来正文","start":1,"end":1}),
+                )?;
+            }
+            "other-field" => {
+                fixture.command(serde_json::json!({"action":"focus-sibling"}))?;
+            }
+            _ => {}
+        }
+        let verified = runtime.block_on(input.final_target(id.clone(), anchor.clone(), true));
+        if ["selection", "text", "other-field"].contains(&case) {
+            if verified.is_ok() {
+                return Err(format!(
+                    "translation {case} incorrectly retained permission"
+                ));
+            }
+            println!(
+                "SAYWEAVE_TRANSLATION_TARGET case={case} rejected={} no_write=true",
+                verified.unwrap_err().code
+            );
+        } else {
+            verified.map_err(|e| format!("translation {case} verify {}", e.code))?;
+            if case == "after-verify" {
+                fixture.command(serde_json::json!({"action":"focus-sibling"}))?;
+                thread::sleep(Duration::from_millis(60));
+            }
+            let gate = Arc::new(DeliveryGate::default());
+            let draft = runtime.block_on(Draft::begin(id.clone(), 1, anchor, gate.clone()));
+            if case == "after-verify" {
+                if let Ok(draft) = draft {
+                    let _ = runtime.block_on(draft.finish(String::new(), Finish::Abort));
+                    return Err("changed target accepted after verification".into());
+                }
+                println!("SAYWEAVE_TRANSLATION_TARGET case={case} rejected=true no_write=true");
+            } else {
+                let draft = draft.map_err(|e| format!("translation {case} begin {}", e.code))?;
+                if case == "cancel-after-begin" {
+                    gate.cancel();
+                }
+                let receipt =
+                    runtime.block_on(draft.finish("Meeting at three.".into(), Finish::Commit));
+                let expected = if case == "insert" {
+                    "前Meeting at three.后"
+                } else {
+                    "前后"
+                };
+                let until = Instant::now() + Duration::from_secs(2);
+                loop {
+                    let actual = fixture.command(serde_json::json!({"action":"read"}))?;
+                    if actual["text"].as_str() == Some(expected) {
+                        break;
+                    }
+                    if Instant::now() >= until {
+                        return Err(format!(
+                            "translation {case} body={actual} receipt={:?}",
+                            receipt.error
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let expected_submission = if case == "insert" {
+                    Submission::Submitted
+                } else {
+                    Submission::NotSubmitted
+                };
+                if receipt.submission != expected_submission {
+                    return Err(format!("translation {case} submission {:?}", receipt.error));
+                }
+                println!(
+                    "SAYWEAVE_TRANSLATION_TARGET case={case} body={expected} submission={:?}",
+                    receipt.submission
+                );
+            }
+        }
+        input.forget(id.clone());
+        release_watch(&id);
+    }
+    Ok(())
+}
 pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
     use super::composition::{Draft, Finish};
     let input = WindowsInputService::new();
@@ -316,6 +429,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         return Err("owned initialization changed body, selection or foreground".into());
     }
     println!("SAYWEAVE_EDITOR_INITIALIZATION body_selection_unchanged=true");
+    final_translation_samples(&mut fixture, &runtime, &input)?;
     observer_restart_samples(&mut fixture, &runtime)?;
     for (start, end) in [(1, 1), (1, 3)] {
         for mode in [

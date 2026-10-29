@@ -54,7 +54,7 @@ async fn seed(
             r.get(0)
         })
         .map_err(|_| "profile-schema")?;
-    if source_schema != 10 && source_schema != 11 {
+    if source_schema != 10 && source_schema != 11 && source_schema != 12 && source_schema != 13 {
         return Err("profile-schema");
     }
     let source_history = count(&source, "speech_records")?;
@@ -112,7 +112,7 @@ async fn seed(
     drop(data);
     if ready.is_err()
         || drained.is_err()
-        || !status.is_ok_and(|s| s.state == "ready" && s.schema_version == 11)
+        || !status.is_ok_and(|s| s.state == "ready" && s.schema_version == 13)
     {
         return Err("profile-migration");
     }
@@ -136,7 +136,7 @@ async fn seed(
             r.get(0)
         })
         .map_err(|_| "profile-verification")?;
-    if target_schema != 11 {
+    if target_schema != 13 {
         return Err("profile-migration");
     }
     let refs = target
@@ -322,7 +322,7 @@ async fn developer_seed_preserves_settings_and_words_without_history_or_shared_c
     assert_eq!(receipt.source_history, 1);
     assert_eq!(receipt.preserved["dictionary_terms"], 1);
     assert_eq!(receipt.preserved["model_configs"], 2);
-    assert_eq!(receipt.target_schema, 11);
+    assert_eq!(receipt.target_schema, 13);
     let copied = Connection::open_with_flags(
         dest.join("dictionary.sqlite"),
         OpenFlags::SQLITE_OPEN_READ_ONLY,

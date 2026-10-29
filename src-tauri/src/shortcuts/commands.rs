@@ -24,7 +24,7 @@ pub async fn shortcut_save(
     service.save(&app, config).await
 }
 #[tauri::command]
-pub fn shortcut_capture(
+pub async fn shortcut_capture(
     app: tauri::AppHandle,
     window: WebviewWindow,
     service: State<'_, ShortcutService>,
@@ -33,16 +33,36 @@ pub fn shortcut_capture(
 ) -> Result<Status, Error> {
     let _admission = crate::lifecycle::mutation(&window)?;
     crate::data::model::authorize(window.label())?;
-    let status = service.capture_owned(&app, begin, token)?;
-    let generation = service.capture_generation();
+    let status = service.capture_owned(&app, begin, token).await?;
+    let capture_token = status.capture_token.clone();
     if begin {
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            if app.state::<ShortcutService>().capture_generation() == generation {
-                app.state::<ShortcutService>().capture(&app, false).ok();
-            }
+            app.state::<ShortcutService>()
+                .finish_capture(&app, capture_token, None, None)
+                .await
+                .ok();
         });
     }
     Ok(status)
 }
 use tauri::Manager;
+
+#[tauri::command]
+pub async fn shortcut_capture_candidate(
+    app: tauri::AppHandle,
+    window: WebviewWindow,
+    service: State<'_, ShortcutService>,
+    token: String,
+    binding: String,
+) -> Result<Status, Error> {
+    let _admission = crate::lifecycle::mutation(&window)?;
+    crate::data::model::authorize(window.label())?;
+    uuid::Uuid::parse_str(&token).map_err(|_| Error::new("invalidShortcut"))?;
+    if !window.is_focused().unwrap_or(false) {
+        return Err(Error::new("unavailable"));
+    }
+    service
+        .finish_capture(&app, Some(token), None, Some(binding))
+        .await
+}

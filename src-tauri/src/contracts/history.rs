@@ -73,6 +73,10 @@ pub struct Feed {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Attempt {
+    #[serde(default)]
+    pub purpose: crate::contracts::translation::Purpose,
+    #[serde(default)]
+    pub target_language: Option<String>,
     pub id: String,
     pub record_id: String,
     pub kind: String,
@@ -161,6 +165,10 @@ pub struct Prepare {
 }
 #[derive(Clone, Debug)]
 pub enum DbOperation {
+    Translation {
+        attempt_id: String,
+        target: String,
+    },
     PruneCancelled {
         attempt_id: String,
         text: String,
@@ -186,8 +194,8 @@ pub enum DbOperation {
     Browse(BrowseQuery),
     Detail(String),
     Usage,
-    Prepare(Prepare),
-    Retry(Attempt),
+    Prepare(Box<Prepare>),
+    Retry(Box<Attempt>),
     Checkpoint {
         attempt_id: String,
         text: String,

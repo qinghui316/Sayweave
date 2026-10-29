@@ -1,4 +1,5 @@
 use super::types::{Binding, Config};
+use crate::contracts::translation::Purpose;
 use crate::{
     history::types::Error,
     windows_input::{Anchor, WindowsInputService},
@@ -40,18 +41,23 @@ pub enum Event {
         epoch: u64,
         generation: u64,
         revision: i64,
+        purpose: Purpose,
         pressed: bool,
         anchor: Result<Option<Anchor>, Error>,
         task: TaskStamp,
     },
+    OutsidePointer(TaskStamp),
     Captured(String, u64),
     Cancel(Option<String>, u64),
-    Interrupt(Option<String>),
+    Interrupt(Option<String>, u64),
 }
 struct Bridge {
     sender: Sender<Event>,
     config: Config,
     binding: Binding,
+    translation_binding: Binding,
+    translation_enabled: bool,
+    held_purpose: Purpose,
     pressed: HashSet<u16>,
     held: Option<u64>,
     epoch: u64,
@@ -64,6 +70,13 @@ struct Bridge {
     generation: u64,
     altgr: bool,
     consumed: HashSet<u16>,
+    deferred: Option<DeferredTap>,
+}
+struct DeferredTap {
+    purpose: Option<Purpose>,
+    keys: Vec<u16>,
+    task: TaskStamp,
+    anchor: Result<Option<Anchor>, Error>,
 }
 static BRIDGE: OnceLock<Mutex<Option<Bridge>>> = OnceLock::new();
 fn state() -> &'static Mutex<Option<Bridge>> {
@@ -84,6 +97,9 @@ fn vk(key: &str) -> u16 {
         "End" => VK_END.0,
         "PageUp" => VK_PRIOR.0,
         "PageDown" => VK_NEXT.0,
+        "Tab" => VK_TAB.0,
+        "Escape" => VK_ESCAPE.0,
+        "Delete" => VK_DELETE.0,
         value if value.starts_with("Key") => {
             value.as_bytes().get(3).copied().unwrap_or_default() as u16
         }
@@ -112,6 +128,9 @@ fn code(value: u16) -> Option<String> {
         "End",
         "PageUp",
         "PageDown",
+        "Tab",
+        "Escape",
+        "Delete",
     ] {
         if vk(name) == value {
             return Some(name.into());
@@ -137,33 +156,52 @@ fn down(keys: &HashSet<u16>, modifier: &str) -> bool {
     }
 }
 fn matches(b: &Bridge) -> bool {
-    if b.binding.key == "AltRight" && b.altgr {
+    matches_binding(b, &b.binding)
+}
+fn held_matches(b: &Bridge) -> bool {
+    matches_binding(
+        b,
+        if b.held_purpose == Purpose::Translation {
+            &b.translation_binding
+        } else {
+            &b.binding
+        },
+    )
+}
+fn matches_binding(b: &Bridge, binding: &Binding) -> bool {
+    if binding.modifier_pair() {
+        return !b.altgr
+            && b.pressed.len() == 2
+            && b.pressed.contains(&VK_RMENU.0)
+            && b.pressed.contains(&VK_RSHIFT.0);
+    }
+    if binding.key == "AltRight" && b.altgr {
         return false;
     }
-    b.pressed.contains(&vk(&b.binding.key))
-        && b.binding.modifiers.iter().all(|m| down(&b.pressed, m))
+    b.pressed.contains(&vk(&binding.key))
+        && binding.modifiers.iter().all(|m| down(&b.pressed, m))
         && ["Control", "Alt", "Shift", "Super"].iter().all(|m| {
-            b.binding.modifiers.iter().any(|v| v == m)
+            binding.modifiers.iter().any(|v| v == m)
                 || !down(&b.pressed, m)
-                || b.binding.single_modifier()
-                    && vk(&b.binding.key)
+                || binding.single_modifier()
+                    && vk(&binding.key)
                         == match *m {
                             "Control" => {
-                                if b.binding.key.ends_with("Right") {
+                                if binding.key.ends_with("Right") {
                                     VK_RCONTROL.0
                                 } else {
                                     VK_LCONTROL.0
                                 }
                             }
                             "Alt" => {
-                                if b.binding.key.ends_with("Right") {
+                                if binding.key.ends_with("Right") {
                                     VK_RMENU.0
                                 } else {
                                     VK_LMENU.0
                                 }
                             }
                             "Shift" => {
-                                if b.binding.key.ends_with("Right") {
+                                if binding.key.ends_with("Right") {
                                     VK_RSHIFT.0
                                 } else {
                                     VK_LSHIFT.0
@@ -173,11 +211,145 @@ fn matches(b: &Bridge) -> bool {
                         }
         })
 }
+// Nondeferred translation is admitted at the physical key-down boundary. A
+// later WM_HOTKEY notification must not depend on the key still being down.
+fn hook_purpose(b: &Bridge, value: u16) -> Option<Purpose> {
+    if b.capturing || !b.armed || b.held.is_some() {
+        return None;
+    }
+    if b.translation_enabled
+        && !b.translation_binding.modifier_pair()
+        && value == vk(&b.translation_binding.key)
+        && matches_binding(b, &b.translation_binding)
+    {
+        Some(Purpose::Translation)
+    } else if b.binding.single_modifier() && value == vk(&b.binding.key) && matches(b) {
+        Some(Purpose::Dictation)
+    } else {
+        None
+    }
+}
+fn queue_press(b: &mut Bridge, purpose: Purpose, anchor: Result<Option<Anchor>, Error>) {
+    queue_press_at(b, purpose, anchor, stamp(b));
+}
+fn queue_press_at(
+    b: &mut Bridge,
+    purpose: Purpose,
+    anchor: Result<Option<Anchor>, Error>,
+    task: TaskStamp,
+) {
+    b.held_purpose = purpose;
+    b.epoch += 1;
+    b.held = Some(b.epoch);
+    send(
+        b,
+        Event::Key {
+            epoch: b.epoch,
+            generation: b.generation,
+            revision: b.config.revision,
+            purpose,
+            pressed: true,
+            anchor,
+            task,
+        },
+    );
+}
+// Resolve modifier-only taps from witnessed physical events. A shared prefix
+// never starts a task while it can still become the other configured gesture.
+fn deferred_key(
+    b: &mut Bridge,
+    value: u16,
+    pressed: bool,
+    released: bool,
+    mut capture: impl FnMut() -> Result<Option<Anchor>, Error>,
+) -> bool {
+    if b.capturing || b.config.mode != super::types::Mode::Toggle {
+        return false;
+    }
+    if pressed && b.armed && b.held.is_none() {
+        let pairs = [
+            (b.binding.clone(), Purpose::Dictation, true),
+            (
+                b.translation_binding.clone(),
+                Purpose::Translation,
+                b.translation_enabled,
+            ),
+        ];
+        for (pair, purpose, enabled) in &pairs {
+            if *enabled && pair.modifier_pair() && matches_binding(b, pair) && b.pressed.len() == 2
+            {
+                let mut pending = b.deferred.take().unwrap_or_else(|| DeferredTap {
+                    purpose: Some(*purpose),
+                    keys: vec![],
+                    task: stamp(b),
+                    anchor: capture(),
+                });
+                pending.purpose = Some(*purpose);
+                pending.keys = vec![VK_RMENU.0, VK_RSHIFT.0];
+                // Own the completing key's full pair. When Shift arrived first,
+                // its down/up remain with the OS; Alt must never reach the host
+                // menu. An Alt-first prefix was already reserved below.
+                b.consumed.insert(value);
+                b.deferred = Some(pending);
+                return true;
+            }
+        }
+        if b.deferred.is_some() {
+            b.deferred = None;
+            b.armed = false;
+            return false;
+        }
+        if !b.altgr
+            && b.pressed.len() == 1
+            && value == VK_RMENU.0
+            && pairs
+                .iter()
+                .any(|(pair, _, enabled)| *enabled && pair.modifier_pair())
+        {
+            // A configured modifier pair reserves right Alt even when no
+            // standalone action is assigned. Releasing that prefix alone then
+            // starts nothing, rather than leaking a bare Alt to the host menu.
+            let purpose = pairs.iter().find_map(|(binding, purpose, enabled)| {
+                (*enabled && binding.single_modifier() && matches_binding(b, binding))
+                    .then_some(*purpose)
+            });
+            b.deferred = Some(DeferredTap {
+                purpose,
+                keys: vec![value],
+                task: stamp(b),
+                anchor: capture(),
+            });
+            b.consumed.insert(value);
+            return true;
+        }
+    }
+    if released && b.deferred.as_ref().is_some_and(|p| p.keys.contains(&value)) {
+        let pending = b.deferred.take().unwrap();
+        if b.armed
+            && pending.task == stamp(b)
+            && let Some(purpose) = pending.purpose
+        {
+            queue_press_at(b, purpose, pending.anchor, pending.task);
+            release(b);
+        }
+        b.armed = b.pressed.is_empty();
+        return true;
+    }
+    false
+}
+fn plugin_binding(b: &Bridge, binding: &str) -> bool {
+    // Translation is already handled by the hook. Registering a normal chord
+    // it still reserves the key and detects conflicts; it is not another trigger.
+    b.config.binding == binding
+}
 fn edits_target(b: &Bridge, value: u16) -> bool {
     !b.capturing
         && !matches!(value, 0xa0..=0xa5 | 0x5b..=0x5c)
         && !(value == VK_ESCAPE.0 && b.task_active.is_some())
         && !(value == vk(&b.binding.key) && matches(b))
+        && !(b.translation_enabled
+            && value == vk(&b.translation_binding.key)
+            && matches_binding(b, &b.translation_binding))
 }
 fn send(b: &Bridge, event: Event) {
     if b.sender.try_send(event).is_err()
@@ -186,8 +358,9 @@ fn send(b: &Bridge, event: Event) {
         let sender = b.sender.clone();
         let overflow = b.overflow.clone();
         let task = b.task_active.clone();
+        let generation = b.generation;
         tauri::async_runtime::spawn(async move {
-            let _ = sender.send(Event::Interrupt(task)).await;
+            let _ = sender.send(Event::Interrupt(task, generation)).await;
             overflow.store(false, std::sync::atomic::Ordering::Release);
         });
     }
@@ -200,6 +373,7 @@ fn release(b: &mut Bridge) {
                 epoch,
                 generation: b.generation,
                 revision: b.config.revision,
+                purpose: b.held_purpose,
                 pressed: false,
                 anchor: Ok(None),
                 task: stamp(b),
@@ -231,7 +405,7 @@ fn reconcile_keys(b: &mut Bridge, mut is_down: impl FnMut(u16) -> bool) {
         }
         retained
     });
-    if b.held.is_some() && !matches(b) {
+    if b.held.is_some() && !held_matches(b) {
         release(b);
         b.armed = b.pressed.is_empty();
     }
@@ -328,6 +502,20 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                     unsafe { CallNextHookEx(None, n, w, l) }
                 };
             }
+            let deferred = deferred_key(
+                b,
+                value,
+                pressed,
+                released,
+                WindowsInputService::start_target,
+            );
+            if deferred {
+                return if consumed_release || b.consumed.contains(&value) {
+                    LRESULT(1)
+                } else {
+                    unsafe { CallNextHookEx(None, n, w, l) }
+                };
+            }
             if b.capturing {
                 let mut pid = 0;
                 unsafe {
@@ -344,7 +532,7 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                     };
                 }
 
-                if value == VK_ESCAPE.0 && pressed {
+                if value == VK_ESCAPE.0 && pressed && b.pressed.len() == 1 {
                     send(b, Event::Cancel(b.task_active.clone(), b.generation));
                 } else if pressed && let Some(name) = code(value) {
                     let mut mods = vec![];
@@ -364,16 +552,24 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                             }
                         }
                     }
-                    let value = mods
-                        .into_iter()
-                        .chain(std::iter::once(name.as_str()))
-                        .collect::<Vec<_>>()
-                        .join("+");
+                    let value = if b.pressed.contains(&VK_RMENU.0)
+                        && b.pressed.contains(&VK_RSHIFT.0)
+                        && b.pressed.len() == 2
+                    {
+                        "AltRight+ShiftRight".into()
+                    } else if b.pressed.contains(&VK_LMENU.0)
+                        && b.pressed.contains(&VK_LSHIFT.0)
+                        && b.pressed.len() == 2
+                    {
+                        "AltLeft+ShiftLeft".into()
+                    } else {
+                        mods.into_iter()
+                            .chain(std::iter::once(name.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("+")
+                    };
                     b.capture_key = Some(value);
-                } else if released
-                    && let Some(value) = b.capture_key.take()
-                    && Binding::parse(&value).is_ok()
-                {
+                } else if released && let Some(value) = b.capture_key.take() {
                     send(b, Event::Captured(value, b.generation));
                 }
                 let mut pid = 0;
@@ -390,33 +586,16 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                     b.consumed.insert(value);
                     return LRESULT(1);
                 }
-                if b.held.is_some() && !matches(b) {
+                if b.held.is_some() && !held_matches(b) {
                     release(b);
                     b.armed = false;
                 }
                 if b.pressed.is_empty() {
                     b.armed = true;
                 }
-                if pressed
-                    && b.armed
-                    && b.binding.single_modifier()
-                    && value == vk(&b.binding.key)
-                    && matches(b)
-                {
-                    b.epoch += 1;
-                    b.held = Some(b.epoch);
+                if pressed && let Some(purpose) = hook_purpose(b, value) {
                     b.consumed.insert(value);
-                    send(
-                        b,
-                        Event::Key {
-                            epoch: b.epoch,
-                            generation: b.generation,
-                            revision: b.config.revision,
-                            pressed: true,
-                            anchor: WindowsInputService::start_target(),
-                            task: stamp(b),
-                        },
-                    );
+                    queue_press(b, purpose, WindowsInputService::start_target());
                     unsafe {
                         SetTimer(None, 1, 50, None);
                     }
@@ -472,10 +651,20 @@ unsafe extern "system" fn mouse_hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                 eprintln!("operation=owned_pointer_probe flags={}", event.flags);
             }
             crate::input_state::observation_pointer();
-            crate::windows_input::observe_pointer(
+            let own = crate::windows_input::observe_pointer(
                 unsafe { WindowFromPoint(event.pt) }.0 as usize,
                 event.time,
             );
+            if !own
+                && let Ok(mut bridge) = state().lock()
+                && let Some(b) = bridge.as_mut()
+            {
+                b.deferred = None;
+                if !b.pressed.is_empty() {
+                    b.armed = false;
+                }
+                send(b, Event::OutsidePointer(stamp(b)));
+            }
         }
     }
     unsafe { CallNextHookEx(None, n, w, l) }
@@ -487,10 +676,11 @@ pub struct Backend {
 fn interrupt(b: &mut Bridge) {
     crate::input_state::reset_edit_keys();
     crate::input_state::edited();
-    send(b, Event::Interrupt(b.task_active.clone()));
     b.generation += 1;
+    send(b, Event::Interrupt(b.task_active.clone(), b.generation));
     b.pressed.clear();
     b.held = None;
+    b.deferred = None;
     b.armed = false;
     b.altgr = false;
     unsafe {
@@ -543,6 +733,9 @@ impl Backend {
                 let config = Config::default();
                 *state().lock().unwrap() = Some(Bridge {
                     binding: Binding::parse(&config.binding).unwrap(),
+                    translation_binding: Binding::parse(&config.translation_binding).unwrap(),
+                    translation_enabled: false,
+                    held_purpose: Purpose::Dictation,
                     config,
                     sender,
                     pressed: HashSet::new(),
@@ -557,6 +750,7 @@ impl Backend {
                     generation: 0,
                     altgr: false,
                     consumed: HashSet::new(),
+                    deferred: None,
                 });
                 let mut message = MSG::default();
                 let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
@@ -670,16 +864,19 @@ impl Backend {
             thread: rx.recv().map_err(|_| Error::new("shortcutUnavailable"))??,
         })
     }
-    pub fn configure(&self, config: Config, capturing: bool) {
+    pub fn configure(&self, config: Config, capturing: bool, translation_enabled: bool) {
         if let Ok(mut state) = state().lock()
             && let Some(b) = state.as_mut()
         {
             b.generation += 1;
             b.binding = Binding::parse(&config.binding).unwrap();
+            b.translation_binding = Binding::parse(&config.translation_binding).unwrap();
+            b.translation_enabled = translation_enabled;
             b.config = config;
             b.capturing = capturing;
             b.capture_key = None;
             b.held = None;
+            b.deferred = None;
             b.armed = b.pressed.is_empty();
         }
     }
@@ -710,24 +907,12 @@ impl Backend {
         if let Ok(mut state) = state().lock()
             && let Some(b) = state.as_mut()
             && !b.capturing
-            && b.config.binding == binding
+            && plugin_binding(b, binding)
             && b.held.is_none()
             && b.armed
             && matches(b)
         {
-            b.epoch += 1;
-            b.held = Some(b.epoch);
-            send(
-                b,
-                Event::Key {
-                    epoch: b.epoch,
-                    generation: b.generation,
-                    revision: b.config.revision,
-                    pressed: true,
-                    anchor: WindowsInputService::start_target(),
-                    task: stamp(b),
-                },
-            );
+            queue_press(b, Purpose::Dictation, WindowsInputService::start_target());
             unsafe {
                 let _ = PostThreadMessageW(self.thread, WM_APP + 1, WPARAM(0), LPARAM(0));
             }
@@ -749,6 +934,9 @@ mod tests {
                 sender,
                 config: Config::default(),
                 binding: Binding::parse("AltRight").unwrap(),
+                translation_binding: Binding::parse("F8").unwrap(),
+                translation_enabled: true,
+                held_purpose: Purpose::Dictation,
                 pressed: HashSet::new(),
                 held: None,
                 epoch: 0,
@@ -760,10 +948,251 @@ mod tests {
                 generation: 0,
                 altgr: false,
                 consumed: HashSet::new(),
+                deferred: None,
                 overflow: Default::default(),
             },
             receiver,
         )
+    }
+    #[test]
+    fn shared_modifier_taps_resolve_on_release_in_both_orders_without_prefix_start() {
+        for order in [[VK_RMENU.0, VK_RSHIFT.0], [VK_RSHIFT.0, VK_RMENU.0]] {
+            for release_order in [order, [order[1], order[0]]] {
+                let (mut b, mut events) = bridge();
+                b.translation_binding = Binding::parse("AltRight+ShiftRight").unwrap();
+                for key in order {
+                    track_key(&mut b, key, true, false);
+                    deferred_key(&mut b, key, true, false, || Ok(None));
+                    assert!(events.try_recv().is_err());
+                }
+                for key in release_order {
+                    track_key(&mut b, key, false, true);
+                    deferred_key(&mut b, key, false, true, || Ok(None));
+                }
+                for pressed in [true, false] {
+                    assert!(
+                        matches!(events.try_recv(),Ok(Event::Key{purpose:Purpose::Translation,pressed:actual,..}) if actual==pressed)
+                    );
+                }
+                assert!(events.try_recv().is_err());
+            }
+        }
+        let (mut b, mut events) = bridge();
+        b.translation_binding = Binding::parse("AltRight+ShiftRight").unwrap();
+        track_key(&mut b, VK_RMENU.0, true, false);
+        assert!(deferred_key(&mut b, VK_RMENU.0, true, false, || Ok(None)));
+        assert!(events.try_recv().is_err());
+        track_key(&mut b, VK_RMENU.0, false, true);
+        deferred_key(&mut b, VK_RMENU.0, false, true, || Ok(None));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Key {
+                purpose: Purpose::Dictation,
+                pressed: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Key {
+                purpose: Purpose::Dictation,
+                pressed: false,
+                ..
+            })
+        ));
+    }
+    #[test]
+    fn modifier_tap_owns_alt_without_leaving_an_unmatched_os_modifier() {
+        for ordinary in ["AltRight", "F8"] {
+            for active in [false, true] {
+                for order in [[VK_RMENU.0, VK_RSHIFT.0], [VK_RSHIFT.0, VK_RMENU.0]] {
+                    for release_order in [order, [order[1], order[0]]] {
+                        let (mut b, _events) = bridge();
+                        b.binding = Binding::parse(ordinary).unwrap();
+                        b.translation_binding = Binding::parse("AltRight+ShiftRight").unwrap();
+                        if active {
+                            set_task(&mut b, Some("recording".into()));
+                        }
+                        let mut visible = Vec::new();
+                        for (key, pressed) in order
+                            .into_iter()
+                            .map(|key| (key, true))
+                            .chain(release_order.into_iter().map(|key| (key, false)))
+                        {
+                            let (_, consumed_release) = track_key(&mut b, key, pressed, !pressed);
+                            deferred_key(&mut b, key, pressed, !pressed, || Ok(None));
+                            if !consumed_release && !b.consumed.contains(&key) {
+                                visible.push((key, pressed));
+                            }
+                        }
+                        let expected = if order[0] == VK_RSHIFT.0 {
+                            vec![(VK_RSHIFT.0, true), (VK_RSHIFT.0, false)]
+                        } else {
+                            vec![]
+                        };
+                        assert_eq!(
+                            visible, expected,
+                            "active={active} order={order:?} release={release_order:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn standalone_pair_prefix_starts_nothing_and_disabled_pair_does_not_own_it() {
+        for enabled in [true, false] {
+            let (mut b, mut events) = bridge();
+            b.binding = Binding::parse("F8").unwrap();
+            b.translation_binding = Binding::parse("AltRight+ShiftRight").unwrap();
+            b.translation_enabled = enabled;
+            track_key(&mut b, VK_RMENU.0, true, false);
+            assert_eq!(
+                deferred_key(&mut b, VK_RMENU.0, true, false, || Ok(None)),
+                enabled
+            );
+            assert_eq!(b.consumed.contains(&VK_RMENU.0), enabled);
+            track_key(&mut b, VK_RMENU.0, false, true);
+            deferred_key(&mut b, VK_RMENU.0, false, true, || Ok(None));
+            assert!(events.try_recv().is_err());
+        }
+    }
+    #[test]
+    fn a_larger_chord_or_changed_task_cannot_complete_a_pending_modifier_tap() {
+        for extra in [Some(VK_TAB.0), Some(VK_F4.0), None] {
+            let (mut b, mut events) = bridge();
+            b.translation_binding = Binding::parse("AltRight+ShiftRight").unwrap();
+            for key in [VK_RMENU.0, VK_RSHIFT.0] {
+                track_key(&mut b, key, true, false);
+                deferred_key(&mut b, key, true, false, || Ok(None));
+            }
+            if let Some(key) = extra {
+                track_key(&mut b, key, true, false);
+                deferred_key(&mut b, key, true, false, || Ok(None));
+            } else {
+                set_task(&mut b, Some("new-task".into()));
+            }
+            for key in [VK_RMENU.0, VK_RSHIFT.0] {
+                track_key(&mut b, key, false, true);
+                deferred_key(&mut b, key, false, true, || Ok(None));
+            }
+            assert!(events.try_recv().is_err());
+        }
+    }
+    #[test]
+    fn independent_translation_and_dictation_keep_distinct_physical_transactions() {
+        let (mut b, mut events) = bridge();
+        for (key, purpose, epoch) in [
+            (VK_F8.0, Purpose::Translation, 1),
+            (VK_RMENU.0, Purpose::Dictation, 2),
+            (VK_F8.0, Purpose::Translation, 3),
+        ] {
+            track_key(&mut b, key, true, false);
+            assert_eq!(hook_purpose(&b, key), Some(purpose));
+            queue_press(&mut b, purpose, Ok(None));
+            assert!(hook_purpose(&b, key).is_none());
+            track_key(&mut b, key, false, true);
+            assert!(!held_matches(&b));
+            release(&mut b);
+            for pressed in [true, false] {
+                let Event::Key {
+                    purpose: actual,
+                    epoch: actual_epoch,
+                    pressed: actual_pressed,
+                    ..
+                } = events.try_recv().unwrap()
+                else {
+                    panic!("not a key event")
+                };
+                assert_eq!(
+                    (actual, actual_epoch, actual_pressed),
+                    (purpose, epoch, pressed)
+                );
+            }
+            assert!(events.try_recv().is_err());
+        }
+        track_key(&mut b, VK_LCONTROL.0, true, false);
+        track_key(&mut b, VK_RMENU.0, true, false);
+        assert!(hook_purpose(&b, VK_RMENU.0).is_none());
+        track_key(&mut b, VK_LMENU.0, true, false);
+        assert!(hook_purpose(&b, VK_LMENU.0).is_none());
+    }
+    #[test]
+    fn translation_tap_is_owned_before_key_up_and_delayed_plugin_cannot_restart_it() {
+        let (mut b, mut events) = bridge();
+        track_key(&mut b, VK_F8.0, true, false);
+        let purpose = hook_purpose(&b, VK_F8.0).unwrap();
+        assert_eq!(purpose, Purpose::Translation);
+        queue_press(&mut b, purpose, Ok(None));
+        assert!(hook_purpose(&b, VK_F8.0).is_none());
+        track_key(&mut b, VK_F8.0, false, true);
+        assert!(!held_matches(&b));
+        release(&mut b);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Key {
+                purpose: Purpose::Translation,
+                pressed: true,
+                epoch: 1,
+                ..
+            })
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Key {
+                purpose: Purpose::Translation,
+                pressed: false,
+                epoch: 1,
+                ..
+            })
+        ));
+        assert!(!plugin_binding(&b, "F8"));
+        assert!(events.try_recv().is_err());
+        // Another quick tap creates a new transaction, with no sleep or callback precondition.
+        track_key(&mut b, VK_F8.0, true, false);
+        let purpose = hook_purpose(&b, VK_F8.0).unwrap();
+        queue_press(&mut b, purpose, Ok(None));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Key {
+                epoch: 2,
+                pressed: true,
+                ..
+            })
+        ));
+    }
+    #[test]
+    fn unavailable_translation_key_remains_an_external_edit_key() {
+        let (mut b, _events) = bridge();
+        b.pressed.insert(VK_F8.0);
+        b.translation_enabled = true;
+        assert!(!edits_target(&b, vk("F8")));
+        b.translation_enabled = false;
+        assert!(edits_target(&b, vk("F8")));
+    }
+    #[test]
+    fn translation_release_uses_its_own_key_and_carries_purpose_once() {
+        let (mut b, mut events) = bridge();
+        b.pressed.insert(VK_F8.0);
+        b.held = Some(9);
+        b.held_purpose = Purpose::Translation;
+        assert!(held_matches(&b));
+        assert!(!edits_target(&b, VK_F8.0));
+        b.pressed.insert(VK_RMENU.0);
+        assert!(!held_matches(&b));
+        b.pressed.clear();
+        release(&mut b);
+        release(&mut b);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Event::Key {
+                purpose: Purpose::Translation,
+                epoch: 9,
+                pressed: false,
+                ..
+            })
+        ));
+        assert!(events.try_recv().is_err());
     }
     #[test]
     fn a_configured_combo_main_key_is_still_an_edit_when_modifiers_do_not_match() {
@@ -899,13 +1328,14 @@ mod tests {
         let queued_generation = b.generation;
         interrupt(&mut b);
         b.task_active = Some("new-task".into());
-        let Event::Interrupt(task) = receiver.try_recv().unwrap() else {
+        let Event::Interrupt(task, interrupted_generation) = receiver.try_recv().unwrap() else {
             panic!()
         };
         assert_eq!(task.as_deref(), Some("old-task"));
         assert!(b.held.is_none() && b.pressed.is_empty() && !b.armed);
         assert!(!b.altgr);
         assert_ne!(b.generation, queued_generation);
+        assert_eq!(interrupted_generation, b.generation);
         release(&mut b);
         assert!(receiver.try_recv().is_err());
         rearm(&mut b, HashSet::from([VK_RMENU.0]));

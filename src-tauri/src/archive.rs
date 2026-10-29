@@ -384,9 +384,11 @@ mod tests {
         data.request_admitted(Operation::Retry).await.unwrap();
         let record = uuid::Uuid::new_v4().to_string();
         let attempt = uuid::Uuid::new_v4().to_string();
-        data.request_archive(Operation::History(H::Prepare(Prepare {
+        data.request_archive(Operation::History(H::Prepare(Box::new(Prepare {
             record_id: record.clone(),
             attempt: Attempt {
+                purpose: crate::contracts::translation::Purpose::Dictation,
+                target_language: None,
                 id: attempt.clone(),
                 record_id: record.clone(),
                 kind: "live".into(),
@@ -404,7 +406,7 @@ mod tests {
                 elapsed_ms: 0,
             },
             audio: None,
-        })))
+        }))))
         .await
         .unwrap();
         let held = Arc::new(Notify::new());

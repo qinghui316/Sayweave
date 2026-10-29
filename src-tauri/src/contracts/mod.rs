@@ -7,3 +7,4 @@ pub mod models;
 pub mod processing;
 pub mod shortcuts;
 pub mod speech;
+pub mod translation;

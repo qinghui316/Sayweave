@@ -77,6 +77,8 @@ pub async fn acceptance_update_seed(
         let record = uuid::Uuid::new_v4().to_string();
         let task = uuid::Uuid::new_v4().to_string();
         let attempt = Attempt {
+            purpose: crate::contracts::translation::Purpose::Dictation,
+            target_language: None,
             id: id.clone(),
             record_id: record.clone(),
             kind: "live".into(),
@@ -95,11 +97,11 @@ pub async fn acceptance_update_seed(
         };
         db(
             &app,
-            Operation::History(H::Prepare(Prepare {
+            Operation::History(H::Prepare(Box::new(Prepare {
                 record_id: record,
                 attempt,
                 audio: None,
-            })),
+            }))),
         )
         .await?;
         db(

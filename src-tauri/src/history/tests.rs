@@ -310,13 +310,13 @@ fn summaries_bind_full_versions_and_keep_success_after_failed_retry() {
     finish(&mut repo, &first, "success", &text);
     let mut second = attempt(&rid, "retry");
     second.created_at = first.created_at + 1;
-    repo.history_operation(DbOperation::Retry(second.clone()))
+    repo.history_operation(DbOperation::Retry(Box::new(second.clone())))
         .unwrap();
     finish(&mut repo, &second, "success", "新的完整文字");
     let revision = record(&mut repo, &rid).revision;
     let mut failed = attempt(&rid, "retry");
     failed.created_at = second.created_at + 1;
-    repo.history_operation(DbOperation::Retry(failed.clone()))
+    repo.history_operation(DbOperation::Retry(Box::new(failed.clone())))
         .unwrap();
     repo.history_operation(DbOperation::Finish {
         attempt_id: failed.id.clone(),
@@ -381,11 +381,11 @@ fn cursor_survives_deleted_anchor_without_duplicate_or_missing_rows() {
         let rid = id();
         let mut a = attempt(&rid, "live");
         a.created_at = 1000 + i / 3;
-        repo.history_operation(DbOperation::Prepare(Prepare {
+        repo.history_operation(DbOperation::Prepare(Box::new(Prepare {
             record_id: rid,
             attempt: a.clone(),
             audio: None,
-        }))
+        })))
         .unwrap();
         finish(&mut repo, &a, "success", "你好");
     }
@@ -517,6 +517,8 @@ fn migration_v4_to_v5_preserves_configs_defaults_history_and_constraints() {
 }
 fn attempt(record: &str, kind: &str) -> Attempt {
     Attempt {
+        purpose: crate::contracts::translation::Purpose::Dictation,
+        target_language: None,
         id: id(),
         record_id: record.into(),
         kind: kind.into(),
@@ -545,11 +547,11 @@ fn prepare(repo: &mut Repository, audio: bool) -> (String, Attempt, Option<Audio
         bytes: 0,
         expires_at: Some(1),
     });
-    repo.history_operation(DbOperation::Prepare(Prepare {
+    repo.history_operation(DbOperation::Prepare(Box::new(Prepare {
         record_id: record.clone(),
         attempt: a.clone(),
         audio: resource.clone(),
-    }))
+    })))
     .unwrap();
     (record, a, resource)
 }
@@ -589,13 +591,13 @@ fn retry_versions_preserve_success_and_do_not_double_count() {
     finish(&mut repo, &a, "success", "原结果");
     for state in ["failed", "cancelled"] {
         let b = attempt(&r, "retry");
-        repo.history_operation(DbOperation::Retry(b.clone()))
+        repo.history_operation(DbOperation::Retry(Box::new(b.clone())))
             .unwrap();
         finish(&mut repo, &b, state, "暂定文字");
         assert_eq!(current(&record(&mut repo, &r)), "原结果");
     }
     let b = attempt(&r, "retry");
-    repo.history_operation(DbOperation::Retry(b.clone()))
+    repo.history_operation(DbOperation::Retry(Box::new(b.clone())))
         .unwrap();
     finish(&mut repo, &b, "success", "新结果");
     assert_eq!(current(&record(&mut repo, &r)), "新结果");

@@ -13,7 +13,7 @@ for(const size of [{width:1120,height:760,scale:1},{width:960,height:640,scale:1
  await page.goto('/');await page.getByRole('button',{name:'设置',exact:true}).click();
  const dialog=page.getByRole('dialog',{name:'设置',exact:true});
  await expect(dialog.getByRole('combobox',{name:'录音设备'})).toBeEnabled();await page.evaluate(()=>document.fonts.ready);
- const rows=dialog.locator('[data-settings-row]');await expect(rows).toHaveCount(3);
+ const rows=dialog.locator('[data-settings-row]');await expect(rows).toHaveCount(4);
  const geometry=await rows.evaluateAll(nodes=>nodes.map(node=>{const children=Array.from(node.children).slice(0,2).map(el=>{const r=el.getBoundingClientRect();return {x:r.x,right:r.right,y:r.y,bottom:r.bottom};});return {copy:children[0]!,control:children[1]!};}));
  for(const row of geometry){expect(Math.abs(row.copy.x-geometry[0]!.copy.x)).toBeLessThan(1);expect(Math.abs(row.control.right-geometry[0]!.control.right)).toBeLessThan(1);expect(row.control.x).toBeGreaterThan(row.copy.x);}
  await settled(page);await page.screenshot({path:`.local/search-settings/device-${size.width}.png`});

@@ -41,16 +41,42 @@ use std::sync::{
 use tauri::{Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use types::*;
+// Register only new keys; a failed explicit change rolls back every addition.
+fn register_additions(
+    new: &[Shortcut],
+    previous: &[Shortcut],
+    optional: Option<Shortcut>,
+    mut register: impl FnMut(Shortcut) -> Result<(), ()>,
+    mut unregister: impl FnMut(Shortcut),
+) -> Result<(Vec<Shortcut>, bool), Error> {
+    let mut added = Vec::new();
+    let mut translation_conflict = false;
+    for key in new.iter().filter(|key| !previous.contains(key)) {
+        if register(*key).is_err() {
+            if Some(*key) == optional {
+                translation_conflict = true;
+                continue;
+            }
+            for key in added {
+                unregister(key);
+            }
+            return Err(Error::new("shortcutConflict"));
+        }
+        added.push(*key);
+    }
+    Ok((added, translation_conflict))
+}
 pub struct ShortcutService {
     data: DataWorker,
     state: Mutex<Status>,
     gate: tokio::sync::Mutex<()>,
     registration: Mutex<()>,
+    registered: Mutex<Vec<Shortcut>>,
+    capture_registrations: Mutex<Option<Vec<Shortcut>>>,
     stopping: AtomicBool,
     changing: AtomicBool,
     capturing: AtomicBool,
     backend: Mutex<Option<backend::Backend>>,
-    capture_generation: std::sync::atomic::AtomicU64,
 }
 impl ShortcutService {
     pub fn task_is_current(&self, task: &TaskStamp) -> bool {
@@ -75,11 +101,12 @@ impl ShortcutService {
             }),
             gate: tokio::sync::Mutex::new(()),
             registration: Mutex::new(()),
+            registered: Mutex::new(Vec::new()),
+            capture_registrations: Mutex::new(None),
             stopping: AtomicBool::new(false),
             changing: AtomicBool::new(false),
             capturing: AtomicBool::new(false),
             backend: Mutex::new(None),
-            capture_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
     pub fn block_triggers(&self, value: bool) {
@@ -130,47 +157,73 @@ impl ShortcutService {
         if self.stopping.load(Ordering::Acquire) {
             return Err(Error::new("stopping"));
         }
-        let binding = Binding::parse(&config.binding)?;
+        let config = config.validate()?;
         let old = self.status()?.active;
-        let new = if binding.single_modifier() {
-            None
-        } else {
-            Some(
-                config
-                    .binding
-                    .parse::<Shortcut>()
-                    .map_err(|_| Error::new("invalidShortcut"))?,
-            )
+        let registered = |config: &Config| -> Result<Vec<Shortcut>, Error> {
+            [&config.binding, &config.translation_binding]
+                .into_iter()
+                .filter(|value| {
+                    !Binding::parse(value).is_ok_and(|b| b.single_modifier() || b.modifier_pair())
+                })
+                .map(|value| {
+                    value
+                        .parse::<Shortcut>()
+                        .map_err(|_| Error::new("invalidShortcut"))
+                })
+                .collect()
         };
-        let old_shortcut = old
-            .as_ref()
-            .filter(|c| !Binding::parse(&c.binding).is_ok_and(|b| b.single_modifier()))
-            .and_then(|c| c.binding.parse::<Shortcut>().ok());
-        if old.as_ref().is_none_or(|c| c.binding != config.binding) {
-            if let Some(new) = new {
-                app.global_shortcut()
-                    .register(new)
-                    .map_err(|_| Error::new("shortcutConflict"))?;
-            }
-            if let Some(old) = old_shortcut
-                && app.global_shortcut().unregister(old).is_err()
-            {
-                if let Some(new) = new {
-                    let _ = app.global_shortcut().unregister(new);
+        let mut new = registered(&config)?;
+        let previous = self
+            .registered
+            .lock()
+            .map_err(|_| Error::new("unavailable"))?
+            .clone();
+        // On initial registration a newly introduced translation shortcut may
+        // conflict with another program. Keep the original dictation available.
+        // Explicit setting changes remain atomic and preserve the prior config.
+        let optional = old
+            .is_none()
+            .then(|| config.translation_binding.parse::<Shortcut>().ok())
+            .flatten();
+        let (added, translation_conflict) = register_additions(
+            &new,
+            &previous,
+            optional,
+            |key| app.global_shortcut().register(key).map_err(|_| ()),
+            |key| {
+                let _ = app.global_shortcut().unregister(key);
+            },
+        )?;
+        if translation_conflict {
+            new.retain(|key| Some(*key) != optional);
+        }
+        let mut removed = Vec::new();
+        for shortcut in previous.iter().filter(|key| !new.contains(key)) {
+            if app.global_shortcut().unregister(*shortcut).is_err() {
+                for key in removed {
+                    let _ = app.global_shortcut().register(key);
+                }
+                for key in added {
+                    let _ = app.global_shortcut().unregister(key);
                 }
                 return Err(Error::new("shortcutUnavailable"));
             }
+            removed.push(*shortcut);
         }
         self.backend
             .lock()
             .map_err(|_| Error::new("unavailable"))?
             .as_ref()
             .ok_or_else(|| Error::new("shortcutUnavailable"))?
-            .configure(config.clone(), false);
+            .configure(config.clone(), false, !translation_conflict);
         let mut state = self.state.lock().map_err(|_| Error::new("unavailable"))?;
+        *self
+            .registered
+            .lock()
+            .map_err(|_| Error::new("unavailable"))? = new;
         state.active = Some(config);
         state.pending = false;
-        state.error = None;
+        state.error = translation_conflict.then(|| "translationShortcutConflict".into());
         Ok(())
     }
     pub async fn initialize(&self, app: &tauri::AppHandle) -> Result<(), Error> {
@@ -210,31 +263,42 @@ impl ShortcutService {
                     break;
                 }
                 match event {
+                    backend::Event::OutsidePointer(task) => {
+                        if service.task_is_current(&task)
+                            && let Some(id) = task.id
+                        {
+                            let _ = app
+                                .state::<crate::dictation::DictationCoordinator>()
+                                .translation_menu(&app, &id, false);
+                        }
+                    }
+
                     backend::Event::Captured(binding, generation) => {
-                        if !service.current_event(generation) {
-                            continue;
-                        }
-                        if let Ok(mut state) = service.state.lock() {
-                            state.captured_binding = Some(binding);
-                        }
-                        service.capture(&app, false).ok();
+                        service
+                            .finish_capture(&app, None, Some(generation), Some(binding))
+                            .await
+                            .ok();
                     }
                     backend::Event::Cancel(task, generation) => {
                         if !service.current_event(generation) {
                             continue;
                         }
-                        if service.status().is_ok_and(|s| s.capturing) {
-                            service.capture(&app, false).ok();
+                        if service.is_capturing() {
+                            service
+                                .finish_capture(&app, None, Some(generation), None)
+                                .await
+                                .ok();
                         } else {
                             app.state::<crate::dictation::DictationCoordinator>()
                                 .cancel_bound(task.as_deref())
                                 .ok();
                         }
                     }
-                    backend::Event::Interrupt(task) => {
-                        if service.status().is_ok_and(|s| s.capturing) {
-                            service.capture(&app, false).ok();
-                        }
+                    backend::Event::Interrupt(task, generation) => {
+                        service
+                            .finish_capture(&app, None, Some(generation), None)
+                            .await
+                            .ok();
                         app.state::<crate::dictation::DictationCoordinator>()
                             .interrupt_bound(task.as_deref());
                     }
@@ -242,6 +306,7 @@ impl ShortcutService {
                         epoch,
                         generation,
                         revision,
+                        purpose,
                         pressed,
                         anchor,
                         task,
@@ -256,11 +321,14 @@ impl ShortcutService {
                         {
                             app.state::<crate::dictation::DictationCoordinator>().key(
                                 &app,
-                                epoch,
-                                pressed,
-                                config.mode,
-                                anchor,
-                                task,
+                                crate::dictation::ShortcutInput {
+                                    epoch,
+                                    pressed,
+                                    mode: config.mode,
+                                    purpose,
+                                    anchor,
+                                    task,
+                                },
                             );
                         }
                     }
@@ -327,10 +395,72 @@ impl ShortcutService {
         self.publish(app);
         self.status()
     }
-    pub fn capture(&self, app: &tauri::AppHandle, begin: bool) -> Result<Status, Error> {
-        self.capture_owned(app, begin, None)
+    // This transaction runs off the UI thread. No status/Bridge lock crosses
+    // a plugin registration call, which may dispatch synchronously to the UI.
+    fn suspend_capture_registration(&self, app: &tauri::AppHandle) -> Result<(), Error> {
+        let _registration = self
+            .registration
+            .lock()
+            .map_err(|_| Error::new("unavailable"))?;
+        let previous = self
+            .registered
+            .lock()
+            .map_err(|_| Error::new("unavailable"))?
+            .clone();
+        *self
+            .capture_registrations
+            .lock()
+            .map_err(|_| Error::new("unavailable"))? = Some(previous.clone());
+        for key in previous {
+            if app.global_shortcut().unregister(key).is_err() {
+                return Err(Error::new("shortcutUnavailable"));
+            }
+            self.registered
+                .lock()
+                .map_err(|_| Error::new("unavailable"))?
+                .retain(|k| *k != key);
+        }
+        Ok(())
     }
-    pub fn capture_owned(
+    fn restore_capture_registration(&self, app: &tauri::AppHandle) -> Result<(), Error> {
+        let _registration = self
+            .registration
+            .lock()
+            .map_err(|_| Error::new("unavailable"))?;
+        let previous = self
+            .capture_registrations
+            .lock()
+            .map_err(|_| Error::new("unavailable"))?
+            .take();
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(Error::new("stopping"));
+        }
+        let mut failed = false;
+        for key in previous.unwrap_or_default() {
+            if self
+                .registered
+                .lock()
+                .map_err(|_| Error::new("unavailable"))?
+                .contains(&key)
+            {
+                continue;
+            }
+            if app.global_shortcut().register(key).is_err() {
+                failed = true;
+            } else {
+                self.registered
+                    .lock()
+                    .map_err(|_| Error::new("unavailable"))?
+                    .push(key);
+            }
+        }
+        if failed {
+            Err(Error::new("shortcutUnavailable"))
+        } else {
+            Ok(())
+        }
+    }
+    pub async fn capture_owned(
         &self,
         app: &tauri::AppHandle,
         begin: bool,
@@ -339,45 +469,112 @@ impl ShortcutService {
         if let Some(token) = &token {
             uuid::Uuid::parse_str(token).map_err(|_| Error::new("invalidShortcut"))?;
         }
-        if begin && self.stopping.load(Ordering::Acquire) {
+        if !begin {
+            return self.finish_capture(app, token, None, None).await;
+        }
+        let _gate = self.gate.lock().await;
+        if self.stopping.load(Ordering::Acquire) {
             return Err(Error::new("stopping"));
         }
-        if begin && self.changing.load(Ordering::Acquire) {
+        if self.changing.load(Ordering::Acquire) {
             return Err(Error::new("busy"));
         }
+        let current = self.status()?;
+        if current.capturing {
+            return if token.is_none() || current.capture_token == token {
+                Ok(current)
+            } else {
+                Err(Error::new("busy"))
+            };
+        }
         app.state::<crate::dictation::DictationCoordinator>()
-            .configure_capture(begin, || {
-                if begin
-                    && (self.changing.load(Ordering::Acquire)
-                        || self.stopping.load(Ordering::Acquire))
-                {
-                    return Err(Error::new("busy"));
+            .configure_capture(true, || {
+                if self.stopping.load(Ordering::Acquire) {
+                    return Err(Error::new("stopping"));
                 }
                 let mut s = self.state.lock().map_err(|_| Error::new("unavailable"))?;
-                if s.capturing == begin {
-                    if begin && token.is_some() && s.capture_token != token {
-                        return Err(Error::new("busy"));
-                    }
-                    return Ok(s.clone());
-                }
-                s.capturing = begin;
-                self.capturing.store(begin, Ordering::Release);
-                self.capture_generation.fetch_add(1, Ordering::AcqRel);
-                if begin {
-                    s.capture_token =
-                        Some(token.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
-                    s.captured_binding = None;
-                }
+                s.capturing = true;
+                s.capture_token = Some(token.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
+                s.captured_binding = None;
+                self.capturing.store(true, Ordering::Release);
                 if let Some(b) = self.backend.lock().ok().and_then(|b| b.clone()) {
-                    b.configure(s.active.clone().unwrap_or_else(|| s.saved.clone()), begin);
+                    b.configure(
+                        s.active.clone().unwrap_or_else(|| s.saved.clone()),
+                        true,
+                        s.error.as_deref() != Some("translationShortcutConflict"),
+                    );
                 }
-                drop(s);
-                self.publish(app);
-                self.status()
-            })
+                Ok(())
+            })?;
+        if let Err(e) = self.suspend_capture_registration(app) {
+            let restored = self.restore_capture_registration(app);
+            self.complete_capture(None, restored.err().or(Some(e.clone())))?;
+            self.publish(app);
+            return Err(e);
+        }
+        self.publish(app);
+        self.status()
     }
-    pub fn capture_generation(&self) -> u64 {
-        self.capture_generation.load(Ordering::Acquire)
+    pub async fn finish_capture(
+        &self,
+        app: &tauri::AppHandle,
+        token: Option<String>,
+        generation: Option<u64>,
+        binding: Option<String>,
+    ) -> Result<Status, Error> {
+        let _gate = self.gate.lock().await;
+        let current = self.status()?;
+        if !current.capturing
+            || (token.is_none() && generation.is_none())
+            || token
+                .as_ref()
+                .is_some_and(|t| current.capture_token.as_ref() != Some(t))
+            || generation.is_some_and(|g| !self.current_event(g))
+        {
+            return Ok(current);
+        }
+        // Keep rejected/reserved candidates visible in the existing save editor.
+        // Recording a candidate never makes it an active binding.
+        if binding
+            .as_ref()
+            .is_some_and(|b| b.is_empty() || b.len() > 128)
+        {
+            return Err(Error::new("invalidShortcut"));
+        }
+        let restored = self.restore_capture_registration(app);
+        // Registration may pump UI messages. A focus change or native
+        // invalidation during restoration cannot publish the earlier candidate.
+        let still_current = generation.is_none_or(|g| self.current_event(g))
+            && (binding.is_none()
+                || app
+                    .get_webview_window("main")
+                    .is_some_and(|w| w.is_focused().unwrap_or(false)));
+        self.complete_capture(if still_current { binding } else { None }, restored.err())?;
+        self.publish(app);
+        self.status()
+    }
+    fn complete_capture(&self, binding: Option<String>, error: Option<Error>) -> Result<(), Error> {
+        let mut s = self.state.lock().map_err(|_| Error::new("unavailable"))?;
+        let stopping = self.stopping.load(Ordering::Acquire);
+        s.capturing = false;
+        s.captured_binding = if error.is_none() && !stopping {
+            binding
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            s.active = None;
+            s.error = Some(error.code);
+        }
+        if !stopping && let Some(b) = self.backend.lock().ok().and_then(|b| b.clone()) {
+            b.configure(
+                s.active.clone().unwrap_or_else(|| s.saved.clone()),
+                false,
+                s.active.is_some() && s.error.as_deref() != Some("translationShortcutConflict"),
+            );
+        }
+        self.capturing.store(false, Ordering::Release);
+        Ok(())
     }
     pub fn active_task(&self, value: Option<String>) {
         if let Ok(b) = self.backend.lock()
@@ -402,14 +599,23 @@ impl ShortcutService {
             self.publish(app);
         }
     }
-    pub fn plugin_event(&self, event: ShortcutState) {
-        if event == ShortcutState::Pressed
+    pub fn plugin_event(&self, shortcut: &Shortcut, event: ShortcutState) {
+        if !self.triggers_paused()
+            && !self.stopping.load(Ordering::Acquire)
+            && event == ShortcutState::Pressed
             && let Ok(s) = self.status()
             && let Some(active) = s.active
             && let Ok(b) = self.backend.lock()
             && let Some(b) = b.as_ref()
         {
-            b.combo_pressed(&active.binding);
+            for binding in [&active.binding, &active.translation_binding] {
+                if binding
+                    .parse::<Shortcut>()
+                    .is_ok_and(|key| key == *shortcut)
+                {
+                    b.combo_pressed(binding);
+                }
+            }
         }
     }
     pub fn shutdown(&self, _app: &tauri::AppHandle) {

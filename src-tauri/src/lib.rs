@@ -26,6 +26,7 @@ mod speech_projection;
 mod task_stop;
 mod text_service;
 mod tls;
+mod translation;
 mod update;
 #[cfg(feature = "desktop-acceptance")]
 mod update_acceptance;
@@ -163,20 +164,33 @@ fn voice_view(
         snapshot.presentation,
     ))
 }
-fn voice_layout(app: &tauri::AppHandle, phase: Phase) -> VoiceLayout {
-    let view = app
-        .try_state::<dictation::DictationCoordinator>()
-        .and_then(|c| c.snapshot().ok())
-        .and_then(voice_view);
-    let size = if let Some((_, _, presentation)) = &view {
+fn voice_size(task: Option<&dictation::Snapshot>, phase: Phase) -> (f64, f64) {
+    if let Some(presentation) = task
+        .filter(|t| t.source == "external" && t.presentation != Presentation::Idle)
+        .map(|t| &t.presentation)
+    {
         match presentation {
             Presentation::Result => (384.0, 232.0),
             Presentation::Error => (384.0, 112.0),
+            _ if task
+                .is_some_and(|t| t.purpose == contracts::translation::Purpose::Translation) =>
+            {
+                // Reserve the popup canvas once, before recording. Menu toggles
+                // must not resize/reposition the WebView under its pointer.
+                (280.0, 300.0)
+            }
             _ => (160.0, 88.0),
         }
     } else {
         overlay_size(phase)
-    };
+    }
+}
+fn voice_layout(app: &tauri::AppHandle, phase: Phase) -> VoiceLayout {
+    let task = app
+        .try_state::<dictation::DictationCoordinator>()
+        .and_then(|c| c.snapshot().ok());
+    let view = task.clone().and_then(voice_view);
+    let size = voice_size(task.as_ref(), phase);
     let instance = app
         .get_webview_window("voice-overlay")
         .and_then(|w| voice_window::instance(&w));
@@ -194,6 +208,27 @@ fn refresh_voice(app: &tauri::AppHandle) {
 #[cfg(test)]
 mod voice_layout_tests {
     use super::*;
+    #[test]
+    fn translation_menu_does_not_resize_recording_or_processing_canvas() {
+        let mut snapshot = dictation::Snapshot {
+            source: "external".into(),
+            purpose: contracts::translation::Purpose::Translation,
+            presentation: Presentation::Recording,
+            ..Default::default()
+        };
+        for presentation in [Presentation::Recording, Presentation::Recognizing] {
+            snapshot.presentation = presentation;
+            snapshot.translation_menu = false;
+            let closed = voice_size(Some(&snapshot), Phase::Idle);
+            snapshot.translation_menu = true;
+            assert_eq!(closed, (280.0, 300.0));
+            assert_eq!(voice_size(Some(&snapshot), Phase::Idle), closed);
+        }
+        snapshot.purpose = contracts::translation::Purpose::Dictation;
+        assert_eq!(voice_size(Some(&snapshot), Phase::Idle), (160.0, 88.0));
+        snapshot.presentation = Presentation::Result;
+        assert_eq!(voice_size(Some(&snapshot), Phase::Idle), (384.0, 232.0));
+    }
     #[test]
     fn content_keeps_layout_identity_but_new_task_or_presentation_invalidates_delay() {
         let mut snapshot = dictation::Snapshot {
@@ -604,9 +639,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, _shortcut, event| {
+                .with_handler(|app, shortcut, event| {
                     if let Some(service) = app.try_state::<shortcuts::ShortcutService>() {
-                        service.plugin_event(event.state);
+                        service.plugin_event(shortcut, event.state);
                     }
                 })
                 .build(),
@@ -632,7 +667,12 @@ pub fn run() {
                     .app_handle()
                     .try_state::<shortcuts::ShortcutService>()
             {
-                let _ = service.capture(webview.app_handle(), false);
+                let token = service.status().ok().and_then(|s| s.capture_token);
+                let app = webview.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    app.state::<shortcuts::ShortcutService>()
+                        .finish_capture(&app, token, None, None).await.ok();
+                });
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -656,7 +696,12 @@ pub fn run() {
             processing_commands::processing_save,
             shortcut_status,
             shortcut_save,
+            translation::translation_settings,
+            translation::translation_save,
+            translation::translation_select,
+            translation::translation_menu,
             shortcut_capture,
+            shortcut_capture_candidate,
             text_service_status,
             text_service_action,
             dictation_snapshot,

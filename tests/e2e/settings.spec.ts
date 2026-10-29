@@ -3,7 +3,7 @@ test.use({deviceScaleFactor:1.5});
 test('planned modes, concise product pages and history settings have truthful destinations',async({page})=>{
  for(const [width,height] of [[1120,760],[960,640]] as const){
   await page.setViewportSize({width,height});await page.goto('/');
-  for(const title of ['翻译','编辑']){
+  for(const title of ['编辑']){
    const row=page.getByRole('heading',{name:title,exact:true}).locator('..').locator('..');
    await expect(row.getByText('规划中')).toBeVisible();await expect(row.getByRole('button')).toHaveCount(0);
   }
@@ -15,7 +15,7 @@ test('planned modes, concise product pages and history settings have truthful de
   await page.getByRole('button',{name:'外观',exact:true}).click();
   await expect(page.getByRole('heading',{name:'外观',exact:true})).toBeVisible();
   await expect(page.getByRole('button',{name:'打开历史保存设置'})).toHaveCount(0);
-  await expect(page.getByRole('button',{name:'语言与翻译'})).toHaveCount(0);
+  await expect(page.getByRole('button',{name:'语言与翻译'})).toBeVisible();
   await page.getByRole('button',{name:'关于',exact:true}).last().click();
   await expect(page.getByText('待确定')).toHaveCount(0);await expect(page.getByText('此构建使用开发渠道')).toHaveCount(0);
   await page.screenshot({path:'.local/settlement-ui/about-'+width+'.png'});
@@ -26,7 +26,7 @@ test('planned modes, concise product pages and history settings have truthful de
   await page.screenshot({path:'.local/settlement-ui/personalization-'+width+'.png'});
   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
  }
- for(const [path,title] of [['translation','翻译规划中'],['edit','编辑规划中'],['unknown','页面未找到']]){
+ for(const [path,title] of [['edit','编辑规划中'],['unknown','页面未找到']]){
   await page.goto('/#/'+path);await expect(page.getByRole('heading',{name:title})).toBeVisible();
   await expect(page.getByRole('heading',{name:'历史记录',exact:true})).toHaveCount(0);
   await page.getByRole('button',{name:'返回首页'}).click();await expect(page.getByRole('heading',{level:1})).toBeVisible();

@@ -33,6 +33,7 @@ pub enum Operation {
     Shortcuts(crate::contracts::shortcuts::DbOperation),
     Processing(crate::contracts::processing::DbOperation),
     Language(crate::contracts::language::DbOperation),
+    Translation(crate::contracts::translation::DbOperation),
     Drain,
 }
 #[derive(Debug)]
@@ -46,6 +47,7 @@ pub enum Output {
     Shortcuts(crate::contracts::shortcuts::DbOutput),
     Processing(crate::contracts::processing::DbOutput),
     Language(crate::contracts::language::DbOutput),
+    Translation(crate::contracts::translation::DbOutput),
 }
 struct Request {
     operation: Operation,
@@ -140,6 +142,7 @@ impl DataWorker {
                         Operation::Shortcuts(_) => "shortcuts",
                         Operation::Processing(_) => "processing",
                         Operation::Language(_) => "language",
+                        Operation::Translation(_) => "translation",
                         Operation::Drain => "drain",
                     };
                     let result = if matches!(request.operation, Operation::Retry) {
@@ -235,6 +238,7 @@ impl DataWorker {
                                         repo.shortcut_operation(op).map(Output::Shortcuts)
                                     }
                                     Operation::Language(op) => repo.language_operation(op).map(Output::Language),
+                                    Operation::Translation(op) => repo.translation_operation(op).map(Output::Translation),
                                     Operation::Processing(op) => {
                                         if matches!(
                                             op,

@@ -1,3 +1,4 @@
+use crate::contracts::translation::{Purpose, Target as TranslationTarget};
 use crate::{
     coordinator::Phase,
     history::types::{DbOperation, Error},
@@ -40,6 +41,12 @@ pub enum Admission {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Snapshot {
+    pub purpose: Purpose,
+    pub target_language: Option<String>,
+    pub translation_complete: bool,
+    pub translation_selectable: bool,
+    pub translation_targets: Vec<String>,
+    pub translation_menu: bool,
     pub input_route: InputRoute,
     pub admission: Admission,
     pub sequence: u64,
@@ -55,6 +62,12 @@ pub struct Snapshot {
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
+            purpose: Purpose::Dictation,
+            target_language: None,
+            translation_complete: false,
+            translation_selectable: false,
+            translation_targets: vec![],
+            translation_menu: false,
             input_route: InputRoute::None,
             admission: Admission::Pending,
             sequence: 1,
@@ -69,8 +82,19 @@ impl Default for Snapshot {
         }
     }
 }
+pub struct ShortcutInput {
+    pub epoch: u64,
+    pub pressed: bool,
+    pub mode: Mode,
+    pub purpose: Purpose,
+    pub anchor: Result<Option<Anchor>, Error>,
+    pub task: TaskStamp,
+}
 #[derive(Clone)]
 struct Active {
+    purpose: Purpose,
+    translation_target: Option<TranslationTarget>,
+    translation_targets: Vec<String>,
     id: String,
     source: String,
     epoch: u64,
@@ -86,12 +110,14 @@ struct Active {
     draft: Option<Arc<drafts::SessionDraft>>,
 }
 struct Reservation {
+    purpose: Purpose,
     id: String,
     expected_task: Option<String>,
     cancel: watch::Sender<u8>,
     gate: Arc<DeliveryGate>,
 }
 pub struct DictationCoordinator {
+    pub(crate) translation_selection: tokio::sync::Mutex<()>,
     active: Mutex<Option<Active>>,
     snapshot: Mutex<Snapshot>,
     stopping: AtomicBool,
@@ -129,6 +155,7 @@ mod maintenance_tests {
 impl Default for DictationCoordinator {
     fn default() -> Self {
         Self {
+            translation_selection: tokio::sync::Mutex::new(()),
             active: Mutex::new(None),
             snapshot: Mutex::new(Snapshot::default()),
             stopping: AtomicBool::new(false),
@@ -159,10 +186,178 @@ impl DictationCoordinator {
         source: SpeechSource,
     ) -> Result<SpeechSnapshot, Error> {
         let source = source.retry_source().as_str();
-        let mut reserved = self.reserve(&app, source, 0, None, None)?;
+        let mut reserved = self.reserve(&app, source, 0, Purpose::Dictation, None, None)?;
         reserved.expected_task = Some(task);
         self.start_reserved(app, source, Ok(None), Some(record), None, reserved)
             .await
+    }
+    pub fn select_translation_target(
+        &self,
+        app: &tauri::AppHandle,
+        id: &str,
+        code: String,
+    ) -> Result<(), Error> {
+        let mut active = self.active.lock().map_err(|_| Error::new("unavailable"))?;
+        let task = active
+            .as_mut()
+            .filter(|task| {
+                task.id == id && task.purpose == Purpose::Translation && !task.gate.cancelled()
+            })
+            .ok_or_else(|| Error::new("staleSession"))?;
+        if *task.cancel.borrow() != 0
+            || !app
+                .state::<SpeechService>()
+                .snapshot()
+                .is_ok_and(|s| s.task_id.as_deref() == Some(id) && s.phase == Phase::Recording)
+        {
+            return Err(Error::new("staleSession"));
+        }
+        task.translation_target
+            .as_mut()
+            .ok_or_else(|| Error::new("staleSession"))?
+            .select(code.clone(), &task.translation_targets)?;
+        self.update(app, id, |snapshot| snapshot.target_language = Some(code));
+        drop(active);
+        Ok(())
+    }
+
+    pub fn translation_menu(
+        &self,
+        app: &tauri::AppHandle,
+        id: &str,
+        open: bool,
+    ) -> Result<(), Error> {
+        let active = self.active.lock().map_err(|_| Error::new("unavailable"))?;
+        let task = active
+            .as_ref()
+            .filter(|t| t.id == id && t.purpose == Purpose::Translation && !t.gate.cancelled())
+            .ok_or_else(|| Error::new("staleSession"))?;
+        if open
+            && (*task.cancel.borrow() != 0
+                || task.translation_target.as_ref().is_none_or(|t| t.frozen()))
+        {
+            return Err(Error::new("staleSession"));
+        }
+        self.update(app, id, |s| {
+            s.translation_menu = open && s.translation_selectable
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_translation(
+        &self,
+        app: &tauri::AppHandle,
+        id: &str,
+        context: &crate::translation::Context,
+        terminal: &crate::speech::NativeTerminal,
+        anchor: Option<Anchor>,
+        target_ready: bool,
+        stop: watch::Receiver<u8>,
+        gate: Arc<DeliveryGate>,
+    ) {
+        let target = self.active.lock().ok().and_then(|mut active| {
+            active
+                .as_mut()
+                .filter(|task| task.id == id && task.purpose == Purpose::Translation)
+                .and_then(|task| {
+                    task.translation_target
+                        .as_mut()
+                        .map(|target| target.freeze().to_owned())
+                })
+        });
+        self.update(app, id, |s| {
+            s.translation_selectable = false;
+            s.translation_menu = false;
+            s.presentation = Presentation::Recognizing;
+        });
+        let result = if gate.cancelled() {
+            Err(Error::new("cancelled"))
+        } else if terminal.phase != Phase::Completed {
+            Err(Error::new(
+                terminal.error.as_deref().unwrap_or("recognitionFailed"),
+            ))
+        } else if let Some(target) = &target {
+            context.generate(&terminal.text, target, stop).await
+        } else {
+            Err(Error::new("staleSession"))
+        };
+        let (text, generation_error) = match &result {
+            Ok(generated) => (generated.text.clone(), None),
+            Err(error) => (terminal.text.clone(), Some(error.code.clone())),
+        };
+        let delivery = if gate.cancelled() {
+            Delivery::not_submitted("cancelled")
+        } else if let Some(code) = &generation_error {
+            Delivery::not_submitted(code)
+        } else if !target_ready {
+            Delivery::result_only()
+        } else if let Some(anchor) = anchor {
+            self.update(app, id, |s| s.presentation = Presentation::Delivering);
+            let verified = app
+                .state::<WindowsInputService>()
+                .final_target(id.into(), anchor.clone(), true)
+                .await;
+            if let Err(error) = verified {
+                Delivery::not_submitted(&error.code)
+            } else if gate.cancelled() {
+                Delivery::not_submitted("cancelled")
+            } else {
+                // This is a new, short delivery preparation, not a renewed
+                // recording/source lease. Begin still validates the original anchor.
+                gate.set_preparation_budget(std::time::Duration::from_secs(15));
+                #[cfg(windows)]
+                {
+                    match Draft::begin(id.into(), 1, anchor, gate.clone()).await {
+                        Ok(draft) => draft.finish(text.clone(), Finish::Commit).await,
+                        Err(error) => Delivery::not_submitted(&error.code),
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    Delivery::result_only()
+                }
+            }
+        } else {
+            Delivery::result_only()
+        };
+        self.update(app, id, |s| {
+            s.text = text.clone();
+            s.translation_complete = result.is_ok();
+            s.error = if gate.cancelled() {
+                Some("cancelled".into())
+            } else {
+                generation_error.clone()
+            };
+            s.input_route = if delivery.submission == crate::windows_input::Submission::Submitted {
+                InputRoute::Live
+            } else {
+                InputRoute::ResultOnly
+            };
+            s.delivery = Some(delivery.clone());
+            s.stage = "result".into();
+        });
+        if terminal.persistent
+            && let (Some(attempt), Some(target)) = (&terminal.attempt_id, target)
+        {
+            let archived = context
+                .archive(
+                    app,
+                    id,
+                    attempt,
+                    &target,
+                    &terminal.text,
+                    result.as_ref().ok(),
+                    generation_error,
+                    &delivery,
+                )
+                .await;
+            if archived.is_err() {
+                self.update(app, id, |s| {
+                    s.error.get_or_insert_with(|| "saveFailed".into());
+                });
+            }
+        }
     }
     pub fn busy(&self) -> bool {
         self.component_maintenance.load(Ordering::Acquire)
@@ -253,6 +448,15 @@ impl DictationCoordinator {
             return None;
         }
         let layout = next != current.presentation;
+        if next != Presentation::Recording {
+            current.translation_menu = false;
+        }
+        current.translation_selectable = task.purpose == Purpose::Translation
+            && next == Presentation::Recording
+            && task
+                .translation_target
+                .as_ref()
+                .is_some_and(|t| !t.frozen());
         current.presentation = next;
         if result_only {
             current.input_route = InputRoute::ResultOnly;
@@ -278,15 +482,15 @@ impl DictationCoordinator {
             Self::publish_snapshot(app, &snapshot, layout);
         }
     }
-    pub fn key(
-        &self,
-        app: &tauri::AppHandle,
-        epoch: u64,
-        pressed: bool,
-        mode: Mode,
-        anchor: Result<Option<Anchor>, Error>,
-        task: TaskStamp,
-    ) {
+    pub fn key(&self, app: &tauri::AppHandle, input: ShortcutInput) {
+        let ShortcutInput {
+            epoch,
+            pressed,
+            mode,
+            purpose,
+            anchor,
+            task,
+        } = input;
         let active = {
             let Ok(active) = self.active.lock() else {
                 return;
@@ -332,6 +536,7 @@ impl DictationCoordinator {
             app,
             "external",
             epoch,
+            purpose,
             Some(&task),
             anchor.as_ref().ok().and_then(Option::as_ref),
         ) else {
@@ -370,6 +575,7 @@ impl DictationCoordinator {
             &app,
             source,
             epoch,
+            Purpose::Dictation,
             None,
             anchor.as_ref().ok().and_then(Option::as_ref),
         )?;
@@ -389,6 +595,7 @@ impl DictationCoordinator {
         app: &tauri::AppHandle,
         source: &str,
         epoch: u64,
+        purpose: Purpose,
         event: Option<&TaskStamp>,
         anchor: Option<&Anchor>,
     ) -> Result<Reservation, Error> {
@@ -424,6 +631,9 @@ impl DictationCoordinator {
             }
             self.invalidate_copy()?;
             *a = Some(Active {
+                purpose,
+                translation_target: None,
+                translation_targets: Vec::new(),
                 id: id.clone(),
                 source: source.into(),
                 epoch,
@@ -447,6 +657,7 @@ impl DictationCoordinator {
             .snapshot
             .lock()
             .map_err(|_| Error::new("unavailable"))? = Snapshot {
+            purpose,
             task_id: Some(id.clone()),
             source: source.into(),
             sequence,
@@ -469,6 +680,7 @@ impl DictationCoordinator {
             log::info!(target:"sayweave","operation=dictation_phase task_id={} phase=preparing elapsed_ms=0",id);
         }
         Ok(Reservation {
+            purpose,
             id,
             expected_task: None,
             cancel: tx,
@@ -486,6 +698,7 @@ impl DictationCoordinator {
     ) -> Result<SpeechSnapshot, Error> {
         let speech_source = SpeechSource::try_from(source)?;
         let Reservation {
+            purpose,
             id,
             expected_task,
             cancel: tx,
@@ -553,7 +766,7 @@ impl DictationCoordinator {
             Arc::new(crate::processing::prompt::DictionaryIndex::new(vec![]))
         });
             let application = crate::windows_input::application_context(anchor.clone()).await;
-            let language = if source == "external" {
+            let language = if source == "external" && purpose == Purpose::Dictation {
                 crate::language_learning::snapshot(
                     &app.state::<crate::data::DataWorker>(),
                     application,
@@ -589,12 +802,12 @@ impl DictationCoordinator {
         };
         let hotwords = dictionary.hotwords();
         #[cfg(windows)]
-        let processing = if source == "external" {
+        let processing = if source == "external" && purpose == Purpose::Dictation {
             match processing_context::Context::prepare(
                 &app,
                 tx.subscribe(),
                 &id,
-                dictionary,
+                dictionary.clone(),
                 language.clone(),
                 preparation_deadline,
             )
@@ -610,6 +823,54 @@ impl DictationCoordinator {
                 Err(error) => {
                     log::info!(target:"sayweave","operation=processing_prepare task_id={} result=original error={}",id,error.code);
                     None
+                }
+            }
+        } else {
+            None
+        };
+        let translation = if purpose == Purpose::Translation {
+            let prepare = async {
+                let settings = crate::translation::settings(
+                    &app.state::<crate::data::DataWorker>(),
+                    crate::contracts::translation::DbOperation::Load,
+                )
+                .await?;
+                let context =
+                    crate::translation::Context::prepare(&app, dictionary.clone()).await?;
+                Ok::<_, Error>((settings, context))
+            };
+            let prepared = crate::task_stop::optional_read(
+                prepare,
+                tx.subscribe(),
+                std::time::Duration::from_secs(15),
+            )
+            .await;
+            match prepared {
+                crate::task_stop::OptionalRead::Ready(Ok((settings, context)))
+                    if !gate.cancelled() =>
+                {
+                    if let Ok(mut active) = self.active.lock()
+                        && let Some(task) = active.as_mut().filter(|task| task.id == id)
+                    {
+                        task.translation_target =
+                            Some(TranslationTarget::new(settings.active_target.clone())?);
+                        task.translation_targets = settings.targets.clone();
+                    }
+                    self.update(&app, &id, |snapshot| {
+                        snapshot.target_language = Some(settings.active_target);
+                        snapshot.translation_targets = settings.targets;
+                    });
+                    Some(context)
+                }
+                result => {
+                    let error = match result {
+                        crate::task_stop::OptionalRead::Ready(Err(error)) => error,
+                        crate::task_stop::OptionalRead::Unavailable => Error::new("timeout"),
+                        _ => Error::new("cancelled"),
+                    };
+                    self.reject_preparation(&app, &id, speech_source, &error, &gate)
+                        .await;
+                    return Err(error);
                 }
             }
         } else {
@@ -644,8 +905,18 @@ impl DictationCoordinator {
                 return Err(error);
             }
         }
+        let translation_target_ready = if purpose == Purpose::Translation {
+            if let Some(target) = anchor.clone() {
+                input.final_target(id.clone(), target, false).await.is_ok()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         #[cfg(windows)]
         let raw_draft = if source == "external"
+            && purpose == Purpose::Dictation
             && let Some(target) = anchor.clone()
         {
             match Draft::prepare(id.clone(), 1, target, gate.clone()).await {
@@ -691,7 +962,10 @@ impl DictationCoordinator {
                 ))
                 .await;
         }
-        let continuous = (source == "external" && anchor.is_some()).then(|| {
+        let continuous = (source == "external"
+            && purpose == Purpose::Dictation
+            && anchor.is_some())
+        .then(|| {
             let flow =
                 crate::speech::continuous::Control::new(crate::input_state::activity_evidence());
             flow.resume(1, anchor.as_ref().unwrap().activity);
@@ -724,6 +998,7 @@ impl DictationCoordinator {
                 retry,
                 expected,
                 NativeStart {
+                    purpose,
                     id: id.clone(),
                     source: speech_source,
                     expected_task,
@@ -763,6 +1038,12 @@ impl DictationCoordinator {
         let source = source.to_string();
         tauri::async_runtime::spawn(async move {
             let coordinator = app.state::<Self>();
+            #[cfg(windows)]
+            let _translation_record = if purpose == Purpose::Translation {
+                shared_record.clone()
+            } else {
+                None
+            };
             let journal_queue = crate::archive::Archive::new(
                 app.state::<crate::data::DataWorker>().inner().clone(),
                 id.clone(),
@@ -872,7 +1153,24 @@ impl DictationCoordinator {
                     s.error = s.error.take().or_else(|| terminal.error.clone());
                     s.presentation = Presentation::Recognizing;
                 });
-                if source == "external" && !terminal.text.is_empty() {
+                if let Some(context) = &translation {
+                    coordinator
+                        .finish_translation(
+                            &app,
+                            &id,
+                            context,
+                            &terminal,
+                            session_anchor.clone(),
+                            translation_target_ready,
+                            session_cancel.subscribe(),
+                            gate.clone(),
+                        )
+                        .await;
+                }
+                if purpose == Purpose::Dictation
+                    && source == "external"
+                    && !terminal.text.is_empty()
+                {
                     #[cfg(windows)]
                     let inline = match &draft {
                         Some(draft) => {
@@ -1384,13 +1682,16 @@ impl DictationCoordinator {
         Ok((snapshot.text, gate))
     }
     pub fn finish_bound(&self, app: &tauri::AppHandle, id: &str) -> Result<(), Error> {
-        let active = self.active.lock().map_err(|_| Error::new("unavailable"))?;
+        let mut active = self.active.lock().map_err(|_| Error::new("unavailable"))?;
         let a = active
-            .as_ref()
+            .as_mut()
             .filter(|a| a.id == id)
             .ok_or_else(|| Error::new("staleSession"))?;
         // Task identity is the authority. Editing/resuming can temporarily
         // change the speech phase while this same gesture is still active.
+        if let Some(target) = &mut a.translation_target {
+            target.freeze();
+        }
         a.explicit_end.store(true, Ordering::Release);
         if let Some(flow) = &a.continuous {
             flow.request_finish();
@@ -1401,6 +1702,8 @@ impl DictationCoordinator {
         let elapsed = a.began.elapsed().as_millis();
         drop(active);
         self.update(app, id, |s| {
+            s.translation_selectable = false;
+            s.translation_menu = false;
             s.presentation = s.presentation.finish_requested()
         });
         log::info!(target:"sayweave","operation=dictation_phase task_id={} phase=finish_requested elapsed_ms={}",id,elapsed);
@@ -1510,6 +1813,9 @@ mod tests {
         let coordinator = DictationCoordinator::default();
         let (cancel, _) = watch::channel(0);
         *coordinator.active.lock().unwrap() = Some(Active {
+            purpose: Purpose::Dictation,
+            translation_target: None,
+            translation_targets: vec![],
             id: "recording-task".into(),
             source: "external".into(),
             epoch: 1,

@@ -7,7 +7,7 @@ import type { Phase } from '../../contracts/runtime';
 import { zh } from '../../locales/zh-CN';
 import s from './home.module.css';
 import {useUsageTilt} from './use-usage-tilt';
-export function Home({ onShortcuts, onModels, phase, start, cancel, finish, motionEnabled = true,speech,level,meterSource,usage,copy,retryCurrent,readyModel,readyDevice,shortcut,startDisabled=false,failure,quietTerminal=false }: { onShortcuts: () => void; onModels: () => void; phase: Phase; start: () => void; cancel: () => void; finish: () => void; motionEnabled?: boolean;speech?:SpeechSnapshot;level?:number;meterSource?:SpeechMeterSource;usage?:Usage|null;copy?:(text:string)=>Promise<void>;simulation?:boolean;retryCurrent?:()=>void;readyModel?:string|null;readyDevice?:string|null;shortcut?:string;startDisabled?:boolean;failure?:string;quietTerminal?:boolean }) {
+export function Home({ onShortcuts, onModels, phase, start, cancel, finish, motionEnabled = true,speech,level,meterSource,usage,copy,retryCurrent,readyModel,readyDevice,shortcut,translationShortcut,startDisabled=false,failure,quietTerminal=false }: { onShortcuts: () => void; onModels: () => void; phase: Phase; start: () => void; cancel: () => void; finish: () => void; motionEnabled?: boolean;speech?:SpeechSnapshot;level?:number;meterSource?:SpeechMeterSource;usage?:Usage|null;copy?:(text:string)=>Promise<void>;simulation?:boolean;retryCurrent?:()=>void;readyModel?:string|null;readyDevice?:string|null;shortcut?:string;translationShortcut?:string;startDisabled?:boolean;failure?:string;quietTerminal?:boolean }) {
   const h = zh.home;
   const {area:tiltAreaRef,card:tiltCardRef}=useUsageTilt(motionEnabled);
   const quiet=quietTerminal||!!speech&&isQuietLiveTerminal(speech);
@@ -20,7 +20,7 @@ export function Home({ onShortcuts, onModels, phase, start, cancel, finish, moti
       <section className={s.shortcuts} aria-labelledby="shortcuts-title">
         <div className={s.shortcutHeader}><h2 id="shortcuts-title">{h.shortcuts}</h2><p>{h.globalKeys}</p></div>
         <ModeRow icon="mic" title={h.dictation} description={h.dictationDescription} buttonLabel={shortcut||h.setKey} onClick={onShortcuts}/>
-        <ModeRow icon="languages" title={h.translation} description={h.translationDescription} planned/>
+        <ModeRow icon="languages" title={h.translation} description={h.translationDescription} buttonLabel={translationShortcut||h.setKey} onClick={onShortcuts}/>
         <ModeRow icon="square-pen" title={h.edit} description={h.editDescription} planned/>
       </section>
       <section ref={tiltAreaRef} className={s.usageOffset} aria-labelledby="usage-title"><div className={s.backing}/><div ref={tiltCardRef} className={s.usage}>

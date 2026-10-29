@@ -8,6 +8,37 @@ import {parseDeliveryReports} from '../src/contracts/history';
 import {ShortcutSettings} from '../src/features/settings/ShortcutSettings';
 import {VoiceSurface} from '../src/features/voice';
 describe('dictation contracts',()=>{
+ it('rejects another generic Alt chord beside the modifier pair without saving',async()=>{
+  for(const key of ['Alt+F8','Control+Alt+F8'])for(const reverse of [false,true]){
+   const port=new BrowserShortcuts(),before=await port.status();
+   await expect(port.save({...before.saved,binding:reverse?'AltRight+ShiftRight':key,translationBinding:reverse?key:'AltRight+ShiftRight'})).rejects.toMatchObject({code:'shortcutConflict'});
+   expect((await port.status()).saved).toEqual(before.saved);
+  }
+ });
+ it('cancels a pending modifier without saving it and preserves independent hold keys',async()=>{
+  const port=new BrowserShortcuts(),before=await port.status();
+  await port.capture(true,crypto.randomUUID());
+  fireEvent.keyDown(window,{key:'Control',code:'ControlRight',ctrlKey:true});
+  fireEvent.keyDown(window,{key:'Escape',code:'Escape'});
+  fireEvent.keyUp(window,{key:'Control',code:'ControlRight'});
+  const cancelled=await port.status();expect(cancelled.capturing).toBe(false);expect(cancelled.capturedBinding).toBeNull();expect(cancelled.saved).toEqual(before.saved);
+  await expect(port.save({...before.saved,mode:'hold'})).rejects.toMatchObject({code:'shortcutHoldConflict'});
+  expect((await port.status()).saved).toEqual(before.saved);
+  expect((await port.save({...before.saved,translationBinding:'F9',mode:'hold'})).saved.mode).toBe('hold');
+  const first=crypto.randomUUID(),second=crypto.randomUUID();
+  await port.capture(true,first);await port.capture(false,first);await port.capture(true,second);
+  expect(await port.capture(false,first)).toMatchObject({capturing:true,captureToken:second});
+  await port.capture(false,second);
+ });
+ it('captures the modifier chord in either order only on release',async()=>{
+  for(const order of [['AltRight','ShiftRight'],['ShiftRight','AltRight']]){
+   const port=new BrowserShortcuts();await port.capture(true,crypto.randomUUID());
+   for(const code of order)fireEvent.keyDown(window,{key:code.startsWith('Alt')?'Alt':'Shift',code});
+   expect((await port.status()).capturing).toBe(true);
+   fireEvent.keyUp(window,{key:'Alt',code:'AltRight'});
+   expect(await port.status()).toMatchObject({capturing:false,capturedBinding:'AltRight+ShiftRight'});
+  }
+ });
  it('rejects malformed state and exposes no native target identity',()=>{
   expect(parseDictation(initialDictation()).source).toBe('trial');
   expect(()=>parseDictation({...initialDictation(),delivery:{state:'submitted',error:null,restoreError:false,elapsedMs:1}})).toThrow();
@@ -28,7 +59,7 @@ describe('shortcut settings',()=>{
   const base=new BrowserShortcuts(),save=vi.spyOn(base,'save');let attach!:()=>void;
   const port:ShortcutConfigPort={mode:'simulation',status:()=>base.status(),save:value=>base.save(value),subscribe:()=>new Promise(resolve=>{attach=()=>resolve(()=>{});}),capture:async(begin,token)=>{const value=await base.capture(begin,token);return begin?{...value,capturing:false,capturedBinding:'Control+KeyD',sequence:value.sequence+1}:value;}};
   const user=userEvent.setup(),view=render(<ShortcutSettings port={port} settings={shortcutSettings(port)}/>);await screen.findByText('已启用：右 Alt');await user.click(screen.getByRole('button',{name:'更改快捷键'}));
-  await waitFor(()=>expect(save).toHaveBeenCalledWith({binding:'Control+KeyD',mode:'toggle',revision:1}));view.unmount();await act(async()=>attach());
+  await waitFor(()=>expect(save).toHaveBeenCalledWith({binding:'Control+KeyD',translationBinding:'AltRight+ShiftRight',mode:'toggle',revision:1}));view.unmount();await act(async()=>attach());
  });
  it('keeps the current capture owned when an unrelated initial read arrives before capture starts',async()=>{
   const base=new BrowserShortcuts();let resolveRead!:(value:ShortcutStatus)=>void,startCapture!:(()=>Promise<void>);
@@ -63,6 +94,7 @@ describe('shortcut settings',()=>{
  });
  it('records a key, saves its mode, and releases capture on unmount',async()=>{
   const port=new BrowserShortcuts(),capture=vi.spyOn(port,'capture');
+  await port.save({...((await port.status()).saved),translationBinding:'F9'});
   const user=userEvent.setup();const view=render(<ShortcutSettings settings={shortcutSettings(port)} port={port}/>);
   await screen.findByText('已启用：右 Alt');
   await user.click(screen.getByRole('button',{name:'更改快捷键'}));

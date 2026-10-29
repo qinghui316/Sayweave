@@ -4,6 +4,182 @@ use super::{
 };
 use rusqlite::{Connection, params};
 use std::time::{Duration, Instant};
+#[test]
+fn translation_defaults_upgrade_only_untouched_settings_and_keep_schema12_checksum() {
+    for (binding, shortcut_revision, targets, target_revision, expected_key, expand) in [
+        (
+            "AltRight",
+            1,
+            r#"["en-US"]"#,
+            1,
+            "AltRight+ShiftRight",
+            true,
+        ),
+        ("AltLeft", 1, r#"["en-US"]"#, 1, "F8", true),
+        ("Control+Alt+KeyT", 1, r#"["en-US"]"#, 1, "F8", true),
+        ("AltRight", 2, r#"["en-US","ja"]"#, 3, "F8", false),
+        ("AltRight", 2, r#"["en-US"]"#, 2, "F8", false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut c = Connection::open(root.path().join("dictionary.sqlite")).unwrap();
+        configure(&c).unwrap();
+        migrate(&mut c, root.path(), &MIGRATIONS[..12]).unwrap();
+        c.execute(
+            "UPDATE shortcut_settings SET binding=?1,revision=?2",
+            params![binding, shortcut_revision],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE translation_settings SET targets=?1,revision=?2",
+            params![targets, target_revision],
+        )
+        .unwrap();
+        let checksum: String = c
+            .query_row(
+                "SELECT checksum FROM schema_migrations WHERE version=12",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        migrate(&mut c, root.path(), MIGRATIONS).unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT checksum FROM schema_migrations WHERE version=12",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            checksum
+        );
+        assert!(migrate(&mut c, root.path(), &MIGRATIONS[..12]).is_err());
+        let (actual, revision): (String, i64) = c
+            .query_row(
+                "SELECT targets,revision FROM translation_settings",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            actual,
+            if expand {
+                r#"["en-US","ja","ko","fr","zh-Hans"]"#
+            } else {
+                targets
+            }
+        );
+        assert_eq!(revision, target_revision + i64::from(expand));
+        let (ordinary, translation): (String, String) = c
+            .query_row(
+                "SELECT binding,translation_binding FROM shortcut_settings",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ordinary, binding);
+        assert_eq!(translation, expected_key);
+    }
+}
+#[test]
+fn translation_migration_preserves_schema11_and_rejects_downgrade() {
+    use crate::contracts::translation::{DbOperation as T, DbOutput as O, Settings};
+    let root = tempfile::tempdir().unwrap();
+    let mut connection = Connection::open(root.path().join("dictionary.sqlite")).unwrap();
+    configure(&connection).unwrap();
+    migrate(&mut connection, root.path(), &MIGRATIONS[..11]).unwrap();
+    connection
+        .execute(
+            "UPDATE shortcut_settings SET binding='Control+Space',mode='hold',revision=7",
+            [],
+        )
+        .unwrap();
+    let old: Vec<(i64, String)> = connection
+        .prepare("SELECT version,checksum FROM schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    migrate(&mut connection, root.path(), MIGRATIONS).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT binding,translation_binding,mode,revision FROM shortcut_settings",
+                [],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?
+                ))
+            )
+            .unwrap(),
+        ("Control+Space".into(), "F8".into(), "hold".into(), 7)
+    );
+    let retained: Vec<(i64, String)> = connection
+        .prepare(
+            "SELECT version,checksum FROM schema_migrations WHERE version<=11 ORDER BY version",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(retained, old);
+    assert!(migrate(&mut connection, root.path(), &MIGRATIONS[..11]).is_err());
+    drop(connection);
+    let mut repo = repository::Repository::open(root.path()).unwrap();
+    let O::Settings(initial) = repo.translation_operation(T::Load).unwrap();
+    assert_eq!(initial.targets, Settings::default().targets);
+    assert_eq!(initial.active_target, Settings::default().active_target);
+    let O::Settings(saved) = repo
+        .translation_operation(T::Save(Settings {
+            targets: crate::contracts::translation::LANGUAGES
+                .iter()
+                .map(|language| language.code.into())
+                .collect(),
+            active_target: "ja".into(),
+            ..initial.clone()
+        }))
+        .unwrap();
+    assert_eq!(saved.revision, initial.revision + 1);
+    assert_eq!(
+        saved.targets.len(),
+        crate::contracts::translation::LANGUAGES.len()
+    );
+    assert_eq!(
+        repo.translation_operation(T::Save(initial))
+            .unwrap_err()
+            .code,
+        "conflict"
+    );
+    drop(repo);
+    let O::Settings(reopened) = repository::Repository::open(root.path())
+        .unwrap()
+        .translation_operation(T::Load)
+        .unwrap();
+    assert_eq!(reopened, saved);
+}
+#[test]
+fn translation_migration_preserves_an_existing_f8_binding() {
+    for binding in ["F8", "Control+F8"] {
+        let root = tempfile::tempdir().unwrap();
+        let mut connection = Connection::open(root.path().join("dictionary.sqlite")).unwrap();
+        configure(&connection).unwrap();
+        migrate(&mut connection, root.path(), &MIGRATIONS[..11]).unwrap();
+        connection
+            .execute("UPDATE shortcut_settings SET binding=?1", [binding])
+            .unwrap();
+        migrate(&mut connection, root.path(), MIGRATIONS).unwrap();
+        drop(connection);
+        let mut repo = repository::Repository::open(root.path()).unwrap();
+        let crate::contracts::shortcuts::DbOutput::Config(config) = repo
+            .shortcut_operation(crate::contracts::shortcuts::DbOperation::Load)
+            .unwrap();
+        assert_eq!(config.binding, binding);
+        assert_eq!(config.translation_binding, "F9");
+        assert!(config.validate().is_ok());
+    }
+}
 fn term(value: &str) -> Input {
     Input {
         kind: Kind::Term,

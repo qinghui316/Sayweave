@@ -5,6 +5,11 @@ import {speechMessages} from '../locales/speech';
 
 /** Only the native owner of this presentation can supply its terminal error. */
 export function dictationFeedback(value:DictationSnapshot,speech:SpeechSnapshot):string|undefined {
+ if(value.purpose==='translation'&&value.source==='external'&&value.presentation==='result') {
+  if(!value.translationComplete)return value.error==='emptyText'?'未识别到文字。':'翻译未完成，已保留识别原文。';
+  if(value.delivery?.submission==='uncertain')return '填入结果无法确认，请检查原输入框，避免重复粘贴。';
+  if(value.delivery?.error)return '输入位置已变化或无法核验，请复制译文。';
+ }
  if(value.source==='external'&&value.presentation==='result')return value.error==='copyFailed'?speechMessages.copyFailed:undefined;
  if(value.source!=='external'||value.presentation!=='error')return undefined;
  const delivery=value.delivery;

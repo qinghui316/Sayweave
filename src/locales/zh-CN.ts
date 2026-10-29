@@ -31,7 +31,7 @@ export const zh = {
   voice: { start: '开始预设演示', cancel: '取消演示', finish: '完成演示', retry: '重试演示', hide: '隐藏悬浮窗', statuses: { idle: '待机', connecting: '连接中', recording: '录音展示', processing: '处理中', completed: '完成', cancelled: '已取消', failed: '演示失败' }, liveStatuses: { idle: '待机', connecting: '连接中', recording: '录音中', processing: '识别中', completed: '识别完成', cancelled: '已取消', failed: '识别失败' }, liveHints: { idle:'点击麦克风开始录音', connecting:'正在连接语音服务', recording:'左侧取消，右侧结束录音', processing:'正在等待最终结果', completed:'识别完成', cancelled:'已取消，可重新开始', failed:'录音可用时，可以重识别' } },
   settings: {
     title: '设置', close: '关闭设置', description: '调整设备、模型和应用偏好。',
-    tabs: { device: '设备与快捷键', models: '模型', appearance: '外观', about: '关于' },
+    tabs: { device: '设备与快捷键', models: '模型', language: '语言与翻译', appearance: '外观', about: '关于' },
     notImplemented: '规划中',
     deviceHeading: '设备与快捷键', microphone: '麦克风', microphoneHelp: '选择录音使用的麦克风。', notConfigured: '未配置',
     modelsHeading: '模型', modelsBody: '在这里选择和配置使用的模型。',

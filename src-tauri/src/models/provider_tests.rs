@@ -17,6 +17,10 @@ pub(crate) struct Reply {
     split_bytes: usize,
 }
 impl Reply {
+    pub(crate) fn delayed(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
     pub(crate) fn json(status: u16, body: &str) -> Self {
         Self {
             status,

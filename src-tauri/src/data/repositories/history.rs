@@ -23,7 +23,7 @@ fn assets(c: &Connection, filter: &str, at: i64) -> Result<Vec<Audio>, Error> {
 }
 fn detail(c: &Connection, id: &str) -> Result<Record, Error> {
     let mut record=c.query_row("SELECT id,created_at,ended_at,duration_ms,status,current_attempt,revision FROM speech_records WHERE id=?1",[id],|r|Ok(Record{id:r.get(0)?,created_at:r.get(1)?,ended_at:r.get(2)?,duration_ms:r.get::<_,i64>(3)? as u64,status:r.get(4)?,current_attempt:r.get(5)?,revision:r.get(6)?,attempts:vec![],audio:None,processing:vec![]})).optional().map_err(db_error)?.ok_or(Error::new("notFound"))?;
-    record.attempts=c.prepare("SELECT id,record_id,kind,config_id,config_name,model_id,service_host,created_at,ended_at,status,text,error_code,elapsed_ms,config_revision,source_kind,asset_id,engine FROM speech_attempts WHERE record_id=?1 ORDER BY created_at DESC,id ASC").map_err(db_error)?.query_map([id],|r|Ok(Attempt{id:r.get(0)?,record_id:r.get(1)?,kind:r.get(2)?,config_id:r.get(3)?,config_name:r.get(4)?,model_id:r.get(5)?,service_host:r.get(6)?,created_at:r.get(7)?,ended_at:r.get(8)?,status:r.get(9)?,text:r.get(10)?,error_code:r.get(11)?,elapsed_ms:r.get::<_,i64>(12)? as u64,config_revision:r.get(13)?,source:if r.get::<_,String>(14)?=="local" {RecognitionSource::Local{asset_id:r.get(15)?,engine:r.get(16)?}}else{RecognitionSource::Cloud}})).map_err(db_error)?.collect::<Result<Vec<_>,_>>().map_err(db_error)?;
+    record.attempts=c.prepare("SELECT id,record_id,kind,config_id,config_name,model_id,service_host,created_at,ended_at,status,text,error_code,elapsed_ms,config_revision,source_kind,asset_id,engine,purpose,target_language FROM speech_attempts WHERE record_id=?1 ORDER BY created_at DESC,id ASC").map_err(db_error)?.query_map([id],|r|Ok(Attempt{purpose:if r.get::<_,String>(17)?=="translation" {crate::contracts::translation::Purpose::Translation}else{crate::contracts::translation::Purpose::Dictation},target_language:r.get(18)?,id:r.get(0)?,record_id:r.get(1)?,kind:r.get(2)?,config_id:r.get(3)?,config_name:r.get(4)?,model_id:r.get(5)?,service_host:r.get(6)?,created_at:r.get(7)?,ended_at:r.get(8)?,status:r.get(9)?,text:r.get(10)?,error_code:r.get(11)?,elapsed_ms:r.get::<_,i64>(12)? as u64,config_revision:r.get(13)?,source:if r.get::<_,String>(14)?=="local" {RecognitionSource::Local{asset_id:r.get(15)?,engine:r.get(16)?}}else{RecognitionSource::Cloud}})).map_err(db_error)?.collect::<Result<Vec<_>,_>>().map_err(db_error)?;
     record.audio=c.query_row("SELECT id,record_id,file_key,status,bytes,expires_at FROM audio_assets WHERE record_id=?1",[id],audio).optional().map_err(db_error)?;
     record.processing = super::processing::read_runs(c, id)?;
     Ok(record)
@@ -33,12 +33,18 @@ fn insert_attempt(c: &Connection, a: &Attempt) -> Result<(), Error> {
         RecognitionSource::Cloud => ("cloud", None, None),
         RecognitionSource::Local { asset_id, engine } => ("local", Some(asset_id), Some(engine)),
     };
-    c.execute("INSERT INTO speech_attempts(id,record_id,kind,config_id,config_name,model_id,service_host,created_at,config_revision,status,source_kind,asset_id,engine) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'preparing',?10,?11,?12)",params![a.id,a.record_id,a.kind,a.config_id,a.config_name,a.model_id,a.service_host,a.created_at,a.config_revision,kind,asset,engine]).map_err(db_error)?;
+    c.execute("INSERT INTO speech_attempts(id,record_id,kind,config_id,config_name,model_id,service_host,created_at,config_revision,status,source_kind,asset_id,engine,purpose,target_language) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'preparing',?10,?11,?12,?13,?14)",params![a.id,a.record_id,a.kind,a.config_id,a.config_name,a.model_id,a.service_host,a.created_at,a.config_revision,kind,asset,engine,match a.purpose { crate::contracts::translation::Purpose::Dictation => "dictation", crate::contracts::translation::Purpose::Translation => "translation" },a.target_language]).map_err(db_error)?;
     Ok(())
 }
 impl Repository {
     pub fn history_operation(&mut self, op: DbOperation) -> Result<DbOutput, Error> {
         match op {
+            DbOperation::Translation { attempt_id, target } => {
+                if crate::contracts::translation::language(&target).is_none() { return Err(Error::new("invalid")); }
+                let changed = self.connection.execute("UPDATE speech_attempts SET purpose='translation',target_language=?2 WHERE id=?1 AND purpose='translation' AND (target_language IS NULL OR target_language=?2)", params![attempt_id,target]).map_err(db_error)?;
+                if changed != 1 { return Err(Error::new("conflict")); }
+                Ok(DbOutput::Done)
+            },
             DbOperation::PruneCancelled {attempt_id,text}=>{
                 if text.len()>1024*1024 {return Err(Error::new("invalid"));}
                 let tx=self.connection.transaction().map_err(db_error)?;
