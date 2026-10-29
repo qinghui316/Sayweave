@@ -7,7 +7,7 @@ const roots = new Set(['.gitattributes', '.gitignore', 'README.md', 'LICENSE', '
   'CONTRIBUTING.md', 'SECURITY.md', 'CHANGELOG.md', 'package.json', 'package-lock.json',
   'eslint.config.js', 'index.html', 'playwright.config.ts', 'rust-toolchain.toml',
   'tsconfig.json', 'vite.config.ts']);
-const docs = new Set(['architecture.md', 'revisable-draft.md', 'development.md', 'design.md', 'testing.md', 'local-data.md', 'motion.md', 'models.md', 'speech.md', 'history.md', 'dictation.md', 'personalization.md', 'release.md','storage.md']);
+const docs = new Set(['architecture.md', 'revisable-draft.md', 'development.md', 'design.md', 'testing.md', 'local-data.md', 'motion.md', 'models.md', 'speech.md', 'history.md', 'dictation.md', 'personalization.md', 'release.md','storage.md','translation.md']);
 const readmeMedia = new Set([
   'brand-light.svg', 'brand-dark.svg',
   'hero.gif', 'comparison.gif', 'cleanup.gif', 'handoff.gif', 'dictionary.gif', 'personalization.gif',
