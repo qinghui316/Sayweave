@@ -163,7 +163,8 @@ impl ShortcutService {
             [&config.binding, &config.translation_binding]
                 .into_iter()
                 .filter(|value| {
-                    !Binding::parse(value).is_ok_and(|b| b.single_modifier() || b.modifier_pair())
+                    !Binding::parse(value)
+                        .is_ok_and(|b| b.single_modifier() || b.modifier_pair() || b.mouse())
                 })
                 .map(|value| {
                     value

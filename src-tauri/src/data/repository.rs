@@ -57,6 +57,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "translation_defaults_v1",
         include_str!("migrations/013_translation_defaults.sql"),
     ),
+    (
+        "shortcut_provenance_v1",
+        include_str!("migrations/014_shortcut_provenance.sql"),
+    ),
 ];
 pub fn now() -> i64 {
     SystemTime::now()
@@ -178,11 +182,28 @@ pub fn migrate(
     let tx = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(db_error)?;
+    // Capture before frozen migration013 can rewrite an existing schema12 key.
+    // Global shortcut revision does not tell us whether translation was customized.
+    let entering_translation: Option<String> = if (12..14).contains(&applied.len()) {
+        Some(
+            tx.query_row(
+                "SELECT translation_binding FROM shortcut_settings WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_error)?,
+        )
+    } else {
+        None
+    };
     if !ledger {
         tx.execute_batch("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY NOT NULL,name TEXT NOT NULL,checksum TEXT NOT NULL,applied_at INTEGER NOT NULL) STRICT;").map_err(db_error)?;
     }
     for (i, (name, sql)) in migrations.iter().enumerate().skip(applied.len()) {
         tx.execute_batch(sql).map_err(db_error)?;
+        if *name == "shortcut_provenance_v1" {
+            settle_translation_default(&tx, entering_translation.as_deref())?;
+        }
         tx.execute(
             "INSERT INTO schema_migrations VALUES(?1,?2,?3,?4)",
             params![i as u32 + 1, name, migration_checksum(sql), now()],
@@ -222,6 +243,38 @@ pub fn migrate(
             fs::remove_file(old).map_err(|_| DataError::new("unavailable"))?;
         }
     }
+    Ok(())
+}
+
+fn settle_translation_default(
+    connection: &Connection,
+    entering: Option<&str>,
+) -> Result<(), DataError> {
+    use crate::contracts::shortcuts::{Config, Mode};
+    let current = connection.query_row(
+        "SELECT binding,translation_binding,mode,revision FROM shortcut_settings WHERE singleton=1", [],
+        |r| Ok(Config { binding:r.get(0)?, translation_binding:r.get(1)?,
+            mode:if r.get::<_,String>(2)? == "hold" { Mode::Hold } else { Mode::Toggle }, revision:r.get(3)? }),
+    ).map_err(db_error)?;
+    let (binding, source) = if let Some(original) = entering {
+        (original.to_owned(), "legacyUnknown")
+    } else {
+        let candidate = Config {
+            translation_binding: "AltRight+ShiftRight".into(),
+            ..current.clone()
+        };
+        (
+            candidate
+                .validate()
+                .map(|v| v.translation_binding)
+                .unwrap_or(current.translation_binding.clone()),
+            "default",
+        )
+    };
+    connection.execute(
+        "UPDATE shortcut_settings SET translation_binding=?1,translation_binding_source=?2,revision=revision+CASE WHEN translation_binding<>?1 THEN 1 ELSE 0 END WHERE singleton=1",
+        params![binding, source],
+    ).map_err(db_error)?;
     Ok(())
 }
 pub struct Repository {

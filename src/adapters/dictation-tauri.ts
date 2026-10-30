@@ -2,7 +2,7 @@ import {invoke,isTauri} from '@tauri-apps/api/core';
 import {listen} from '@tauri-apps/api/event';
 import {parseSpeech} from '../contracts/speech';
 import {parseTextService,type TextServicePort,type TextServiceAction,type TextServiceStatus} from '../contracts/text-service';
-import {parseDictation,parseShortcut,shortcutIssue,initialDictation,type DictationPort,type DictationSnapshot,type ShortcutConfigPort,type ShortcutConfig,type ShortcutStatus} from '../contracts/dictation';
+import {parseDictation,parseShortcut,shortcutIssue,mouseShortcut,initialDictation,type DictationPort,type DictationSnapshot,type ShortcutConfigPort,type ShortcutConfig,type ShortcutStatus} from '../contracts/dictation';
 class NativeShortcuts implements ShortcutConfigPort {
  readonly mode='native' as const;
  async status(){return parseShortcut(await invoke('shortcut_status'));}
@@ -26,10 +26,14 @@ export class BrowserShortcuts implements ShortcutConfigPort {
  private value:ShortcutStatus={sequence:1,captureToken:null,saved:{binding:'AltRight',translationBinding:'AltRight+ShiftRight',mode:'toggle',revision:1},active:{binding:'AltRight',translationBinding:'AltRight+ShiftRight',mode:'toggle',revision:1},capturing:false,pending:false,error:null,capturedBinding:null};
  private listeners=new Set<(s:ShortcutStatus)=>void>();
  private captureKeys=new Set<string>();
- private finishCapture(binding:string){this.value={...this.value,capturedBinding:binding,capturing:false};window.removeEventListener('keydown',this.key,true);window.removeEventListener('keyup',this.key,true);this.captureKeys.clear();this.emit();}
+ private mouseRecording:{button:number;candidate:string}|null=null;
+ private mouse=(event:MouseEvent)=>{const name=mouseShortcut(event.button);if(!this.value.capturing||!name)return;event.preventDefault();if(event.type==='mouseup'){if(this.mouseRecording?.button===event.button)this.finishCapture(this.mouseRecording.candidate);return;}const mods=[event.ctrlKey?'Control':'',event.altKey?'Alt':'',event.shiftKey?'Shift':'',event.metaKey?'Super':''].filter(Boolean);if(this.mouseRecording)mods.push('Unsupported');this.mouseRecording={button:this.mouseRecording?.button??event.button,candidate:[...mods,name].join('+')};};
+ private stopMouse(){window.removeEventListener('mousedown',this.mouse,true);window.removeEventListener('mouseup',this.mouse,true);}
+ private finishCapture(binding:string){this.stopMouse();this.value={...this.value,capturedBinding:binding,capturing:false};window.removeEventListener('keydown',this.key,true);window.removeEventListener('keyup',this.key,true);this.captureKeys.clear();this.emit();}
  private key=(e:KeyboardEvent)=>{
   if(!this.value.capturing)return;e.preventDefault();
   if(e.key==='Escape'&&!e.ctrlKey&&!e.altKey&&!e.shiftKey&&!e.metaKey){void this.capture(false);return;}if(e.repeat)return;
+  if(this.mouseRecording){if(e.type==='keydown')this.mouseRecording.candidate=[e.code,this.mouseRecording.candidate].join('+');return;}
   if(e.type==='keyup'){if(this.value.capturedBinding)this.finishCapture(this.value.capturedBinding);return;}
   this.captureKeys.add(e.code);
   const pair=this.captureKeys.has('AltRight')&&this.captureKeys.has('ShiftRight')?'AltRight+ShiftRight':this.captureKeys.has('AltLeft')&&this.captureKeys.has('ShiftLeft')?'AltLeft+ShiftLeft':null;
@@ -42,7 +46,7 @@ export class BrowserShortcuts implements ShortcutConfigPort {
  async status(){this.value.sequence++;return structuredClone(this.value);}
  async subscribe(listener:(s:ShortcutStatus)=>void){this.listeners.add(listener);return()=>{this.listeners.delete(listener);};}
  async save(config:ShortcutConfig){const issue=shortcutIssue(config);if(issue)throw {code:issue};if(config.revision!==this.value.saved.revision)throw {code:'conflict'};const saved={...config,revision:config.revision+1};this.value={...this.value,saved,active:saved};this.emit();return this.status();}
- async capture(begin:boolean,token?:string){if(!begin&&token&&token!==this.value.captureToken)return this.status();this.value={...this.value,capturing:begin,captureToken:begin?(token??crypto.randomUUID()):this.value.captureToken,capturedBinding:null};this.captureKeys.clear();window.removeEventListener('keydown',this.key,true);window.removeEventListener('keyup',this.key,true);if(begin){window.addEventListener('keydown',this.key,true);window.addEventListener('keyup',this.key,true);}this.emit();return this.status();}
+ async capture(begin:boolean,token?:string){if(!begin&&token&&token!==this.value.captureToken)return this.status();this.value={...this.value,capturing:begin,captureToken:begin?(token??crypto.randomUUID()):this.value.captureToken,capturedBinding:null};this.captureKeys.clear();this.mouseRecording=null;this.stopMouse();window.removeEventListener('keydown',this.key,true);window.removeEventListener('keyup',this.key,true);if(begin){window.addEventListener('mousedown',this.mouse,true);window.addEventListener('mouseup',this.mouse,true);window.addEventListener('keydown',this.key,true);window.addEventListener('keyup',this.key,true);}this.emit();return this.status();}
 }
 class NativeTextService implements TextServicePort {
  readonly mode='native' as const;

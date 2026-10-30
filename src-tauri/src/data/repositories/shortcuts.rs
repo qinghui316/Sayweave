@@ -28,7 +28,7 @@ impl Repository {
                 .map_err(db_error),
             DbOperation::Save(config) => {
                 let config = config.validate().map_err(|_| DataError::new("invalid"))?;
-                let changed=self.connection.execute("UPDATE shortcut_settings SET binding=?1,mode=?2,translation_binding=?4,revision=revision+1 WHERE singleton=1 AND revision=?3",params![config.binding,if config.mode==Mode::Hold{"hold"}else{"toggle"},config.revision,config.translation_binding]).map_err(db_error)?;
+                let changed=self.connection.execute("UPDATE shortcut_settings SET binding=?1,mode=?2,translation_binding_source=CASE WHEN translation_binding<>?4 THEN 'custom' ELSE translation_binding_source END,translation_binding=?4,revision=revision+1 WHERE singleton=1 AND revision=?3",params![config.binding,if config.mode==Mode::Hold{"hold"}else{"toggle"},config.revision,config.translation_binding]).map_err(db_error)?;
                 if changed != 1 {
                     return Err(DataError::new("conflict"));
                 }

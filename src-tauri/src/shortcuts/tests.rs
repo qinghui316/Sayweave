@@ -1,6 +1,49 @@
 use super::types::*;
 use crate::data::repository::Repository;
 #[test]
+fn mouse_buttons_are_single_native_bindings_with_existing_conflict_and_revision_rules() {
+    for key in ["MouseMiddle", "MouseX1", "MouseX2"] {
+        assert!(Binding::parse(key).unwrap().mouse());
+        for mode in [Mode::Toggle, Mode::Hold] {
+            for reverse in [false, true] {
+                let mut config = Config {
+                    mode,
+                    translation_binding: "F9".into(),
+                    ..Config::default()
+                };
+                if reverse {
+                    config.translation_binding = key.into();
+                } else {
+                    config.binding = key.into();
+                }
+                assert!(config.validate().is_ok());
+            }
+        }
+        assert_eq!(
+            Config {
+                binding: key.into(),
+                translation_binding: key.into(),
+                ..Config::default()
+            }
+            .validate()
+            .unwrap_err()
+            .code,
+            "shortcutConflict"
+        );
+        for modifier in ["Control", "Alt", "Shift", "Super"] {
+            assert_eq!(
+                Binding::parse(&format!("{modifier}+{key}"))
+                    .unwrap_err()
+                    .code,
+                "shortcutMouseCombination"
+            );
+        }
+    }
+    for unsupported in ["MouseLeft", "MouseRight", "WheelUp", "MouseX3"] {
+        assert!(Binding::parse(unsupported).is_err());
+    }
+}
+#[test]
 fn defaults_share_a_tap_prefix_but_hold_and_reserved_keys_are_rejected() {
     let base = Config::default();
     assert_eq!(

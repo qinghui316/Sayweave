@@ -74,6 +74,13 @@ impl Binding {
             return Err(Error::new("shortcutSystemReserved"));
         }
         let raw = parts.last().unwrap();
+        if parts
+            .iter()
+            .any(|part| matches!(*part, "MouseMiddle" | "MouseX1" | "MouseX2"))
+            && parts.len() != 1
+        {
+            return Err(Error::new("shortcutMouseCombination"));
+        }
         let key = raw
             .strip_prefix('F')
             .and_then(|v| v.parse::<u8>().ok())
@@ -103,7 +110,7 @@ impl Binding {
                         | "Escape"
                         | "Delete"
                 );
-        if !side && !ordinary {
+        if !side && !ordinary && !matches!(key.as_str(), "MouseMiddle" | "MouseX1" | "MouseX2") {
             return Err(Error::new("invalidShortcut"));
         }
         let mut modifiers = Vec::new();
@@ -148,6 +155,9 @@ impl Binding {
     }
     pub fn modifier_pair(&self) -> bool {
         self.key == "ShiftRight" && self.modifiers == ["AltRight"]
+    }
+    pub fn mouse(&self) -> bool {
+        matches!(self.key.as_str(), "MouseMiddle" | "MouseX1" | "MouseX2")
     }
     pub fn system_reserved(&self) -> bool {
         self.modifiers.iter().any(|m| m == "Super")

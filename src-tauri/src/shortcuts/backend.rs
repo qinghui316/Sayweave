@@ -64,6 +64,7 @@ struct Bridge {
     capturing: bool,
     overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
     capture_key: Option<String>,
+    capture_mouse: Option<u16>,
     armed: bool,
     task_active: Option<String>,
     task_sequence: u64,
@@ -100,6 +101,9 @@ fn vk(key: &str) -> u16 {
         "Tab" => VK_TAB.0,
         "Escape" => VK_ESCAPE.0,
         "Delete" => VK_DELETE.0,
+        "MouseMiddle" => VK_MBUTTON.0,
+        "MouseX1" => VK_XBUTTON1.0,
+        "MouseX2" => VK_XBUTTON2.0,
         value if value.starts_with("Key") => {
             value.as_bytes().get(3).copied().unwrap_or_default() as u16
         }
@@ -223,7 +227,10 @@ fn hook_purpose(b: &Bridge, value: u16) -> Option<Purpose> {
         && matches_binding(b, &b.translation_binding)
     {
         Some(Purpose::Translation)
-    } else if b.binding.single_modifier() && value == vk(&b.binding.key) && matches(b) {
+    } else if (b.binding.single_modifier() || b.binding.mouse())
+        && value == vk(&b.binding.key)
+        && matches(b)
+    {
         Some(Purpose::Dictation)
     } else {
         None
@@ -410,6 +417,24 @@ fn reconcile_keys(b: &mut Bridge, mut is_down: impl FnMut(u16) -> bool) {
         b.armed = b.pressed.is_empty();
     }
 }
+fn cancel_capture_key(b: &mut Bridge, value: u16, pressed: bool) -> bool {
+    if !b.capturing
+        || !pressed
+        || value != VK_ESCAPE.0
+        || ["Control", "Alt", "Shift", "Super"]
+            .iter()
+            .any(|modifier| down(&b.pressed, modifier))
+    {
+        return false;
+    }
+    // Revoke this candidate synchronously. Its mouse up may precede the
+    // asynchronous cancellation command, but cannot publish a captured value.
+    b.capturing = false;
+    b.capture_key = None;
+    b.capture_mouse = None;
+    send(b, Event::Cancel(b.task_active.clone(), b.generation));
+    true
+}
 unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if n >= 0 {
         let key = unsafe { &*(l.0 as *const KBDLLHOOKSTRUCT) };
@@ -455,6 +480,10 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
             let pressed = [WM_KEYDOWN, WM_SYSKEYDOWN].contains(&(w.0 as u32));
             let released = [WM_KEYUP, WM_SYSKEYUP].contains(&(w.0 as u32));
             let value = key.vkCode as u16;
+            // Mouse bindings are witnessed only by WH_MOUSE_LL, never a keyboard VK.
+            if [VK_MBUTTON.0, VK_XBUTTON1.0, VK_XBUTTON2.0].contains(&value) {
+                return unsafe { CallNextHookEx(None, n, w, l) };
+            }
             let (repeated, consumed_release) = track_key(b, value, pressed, released);
             if pressed
                 && crate::input_state::reversal_key(
@@ -532,8 +561,16 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                     };
                 }
 
-                if value == VK_ESCAPE.0 && pressed && b.pressed.len() == 1 {
-                    send(b, Event::Cancel(b.task_active.clone(), b.generation));
+                if cancel_capture_key(b, value, pressed) {
+                    // The common pair settlement below still owns Escape up.
+                } else if pressed && b.capture_mouse.is_some() {
+                    // Once a mouse gesture starts, a keyboard event cannot finish
+                    // it or erase its modifiers. Keep a rejected mixed candidate.
+                    b.capture_key = Some(format!(
+                        "{}+{}",
+                        code(value).unwrap_or_else(|| "Unsupported".into()),
+                        b.capture_key.as_deref().unwrap_or("Unsupported")
+                    ));
                 } else if pressed && let Some(name) = code(value) {
                     let mut mods = vec![];
                     if ![
@@ -569,7 +606,10 @@ unsafe extern "system" fn hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
                             .join("+")
                     };
                     b.capture_key = Some(value);
-                } else if released && let Some(value) = b.capture_key.take() {
+                } else if released
+                    && b.capture_mouse.is_none()
+                    && let Some(value) = b.capture_key.take()
+                {
                     send(b, Event::Captured(value, b.generation));
                 }
                 let mut pid = 0;
@@ -622,8 +662,92 @@ unsafe extern "system" fn input_event(
 ) {
     crate::windows_input::observe(event, window.0 as usize, object, event_tick);
 }
+fn mouse_name(value: u16) -> Option<&'static str> {
+    match value {
+        v if v == VK_MBUTTON.0 => Some("MouseMiddle"),
+        v if v == VK_XBUTTON1.0 => Some("MouseX1"),
+        v if v == VK_XBUTTON2.0 => Some("MouseX2"),
+        _ => None,
+    }
+}
+fn mouse_button(message: u32, data: u32) -> Option<(u16, bool)> {
+    match message {
+        WM_MBUTTONDOWN | WM_MBUTTONUP => Some((VK_MBUTTON.0, message == WM_MBUTTONDOWN)),
+        WM_XBUTTONDOWN | WM_XBUTTONUP => {
+            let value = match data >> 16 {
+                1 => VK_XBUTTON1.0,
+                2 => VK_XBUTTON2.0,
+                _ => return None,
+            };
+            Some((value, message == WM_XBUTTONDOWN))
+        }
+        _ => None,
+    }
+}
+// Same Bridge/task/generation/epoch contract as keyboard activation. Returning
+// true owns this physical event, so it cannot also become an editing pointer.
+fn mouse_key(
+    b: &mut Bridge,
+    value: u16,
+    pressed: bool,
+    own: bool,
+    mut capture: impl FnMut() -> Result<Option<Anchor>, Error>,
+) -> bool {
+    let (repeated, consumed_release) = track_key(b, value, pressed, !pressed);
+    if repeated {
+        return b.consumed.contains(&value);
+    }
+    if b.capturing {
+        if !own {
+            b.capture_key = None;
+            b.capture_mouse = None;
+            send(b, Event::Cancel(b.task_active.clone(), b.generation));
+            return consumed_release;
+        }
+        if pressed {
+            b.consumed.insert(value);
+            // A second mouse button is a combination too, not a new candidate.
+            let name = mouse_name(value).unwrap();
+            let mut parts: Vec<String> = ["Control", "Alt", "Shift", "Super"]
+                .into_iter()
+                .filter(|modifier| down(&b.pressed, modifier))
+                .map(str::to_owned)
+                .collect();
+            if b.pressed
+                .iter()
+                .any(|key| *key != value && !matches!(*key, 0xa0..=0xa5 | 0x5b..=0x5c))
+            {
+                parts.push("Unsupported".into());
+            }
+            parts.push(name.into());
+            b.capture_key = Some(parts.join("+"));
+            b.capture_mouse.get_or_insert(value);
+        } else if b.capture_mouse == Some(value) {
+            b.capture_mouse = None;
+            if let Some(candidate) = b.capture_key.take() {
+                send(b, Event::Captured(candidate, b.generation));
+            }
+        }
+    } else {
+        if b.held.is_some() && !held_matches(b) {
+            release(b);
+            b.armed = false;
+        }
+        if b.pressed.is_empty() {
+            b.armed = true;
+        }
+        if pressed && let Some(purpose) = hook_purpose(b, value) {
+            b.consumed.insert(value);
+            queue_press(b, purpose, capture());
+            unsafe {
+                SetTimer(None, 1, 50, None);
+            }
+        }
+    }
+    consumed_release || pressed && b.consumed.contains(&value)
+}
 unsafe extern "system" fn mouse_hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if n >= 0 && [WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN].contains(&(w.0 as u32)) {
+    if n >= 0 {
         let event = unsafe { &*(l.0 as *const MSLLHOOKSTRUCT) };
         // Owned acceptance input must traverse the same pre-dispatch pointer
         // evidence as a real click, rather than stamp an edit after the click.
@@ -646,6 +770,34 @@ unsafe extern "system" fn mouse_hook(n: i32, w: WPARAM, l: LPARAM) -> LRESULT {
         #[cfg(not(test))]
         let fixture_event = false;
         if event.flags & 1 == 0 || fixture_event {
+            if let Some((value, pressed)) = mouse_button(w.0 as u32, event.mouseData) {
+                let mut pid = 0;
+                unsafe {
+                    GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid));
+                }
+                if let Ok(mut bridge) = state().lock()
+                    && let Some(b) = bridge.as_mut()
+                    && mouse_key(
+                        b,
+                        value,
+                        pressed,
+                        pid == std::process::id(),
+                        WindowsInputService::start_target,
+                    )
+                {
+                    return LRESULT(1);
+                }
+            }
+            if ![
+                WM_LBUTTONDOWN,
+                WM_RBUTTONDOWN,
+                WM_MBUTTONDOWN,
+                WM_XBUTTONDOWN,
+            ]
+            .contains(&(w.0 as u32))
+            {
+                return unsafe { CallNextHookEx(None, n, w, l) };
+            }
             #[cfg(test)]
             if fixture_event {
                 eprintln!("operation=owned_pointer_probe flags={}", event.flags);
@@ -744,6 +896,7 @@ impl Backend {
                     capturing: false,
                     overflow: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     capture_key: None,
+                    capture_mouse: None,
                     armed: true,
                     task_active: None,
                     task_sequence: 0,
@@ -875,6 +1028,7 @@ impl Backend {
             b.config = config;
             b.capturing = capturing;
             b.capture_key = None;
+            b.capture_mouse = None;
             b.held = None;
             b.deferred = None;
             b.armed = b.pressed.is_empty();
@@ -927,6 +1081,142 @@ impl Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mouse_message_mapping_requires_real_mouse_message_and_valid_xbutton() {
+        for (message, data, expected) in [
+            (WM_MBUTTONDOWN, 0, Some((VK_MBUTTON.0, true))),
+            (WM_MBUTTONUP, 0, Some((VK_MBUTTON.0, false))),
+            (WM_XBUTTONDOWN, 1 << 16, Some((VK_XBUTTON1.0, true))),
+            (WM_XBUTTONUP, 2 << 16, Some((VK_XBUTTON2.0, false))),
+            (WM_XBUTTONDOWN, 3 << 16, None),
+            (WM_KEYDOWN, 0, None),
+            (WM_MOUSEWHEEL, 0, None),
+            (WM_LBUTTONDOWN, 0, None),
+        ] {
+            assert_eq!(mouse_button(message, data), expected);
+        }
+    }
+    #[test]
+    fn escape_cancels_a_held_mouse_candidate_before_its_release() {
+        for name in ["MouseMiddle", "MouseX1", "MouseX2"] {
+            let (mut b, mut events) = bridge();
+            b.capturing = true;
+            assert!(mouse_key(&mut b, vk(name), true, true, || panic!()));
+            track_key(&mut b, VK_ESCAPE.0, true, false);
+            assert!(cancel_capture_key(&mut b, VK_ESCAPE.0, true));
+            assert!(matches!(events.try_recv(), Ok(Event::Cancel(..))));
+            assert!(mouse_key(&mut b, vk(name), false, true, || panic!()));
+            assert!(events.try_recv().is_err());
+            assert!(b.capture_key.is_none());
+        }
+        let (mut b, _events) = bridge();
+        b.capturing = true;
+        track_key(&mut b, VK_LCONTROL.0, true, false);
+        assert!(!cancel_capture_key(&mut b, VK_ESCAPE.0, true));
+    }
+    #[test]
+    fn each_mouse_button_settles_once_for_each_purpose_and_mode_without_pointer_side_effects() {
+        for name in ["MouseMiddle", "MouseX1", "MouseX2"] {
+            for mode in [
+                super::super::types::Mode::Toggle,
+                super::super::types::Mode::Hold,
+            ] {
+                for purpose in [Purpose::Dictation, Purpose::Translation] {
+                    let (mut b, mut events) = bridge();
+                    b.config.mode = mode;
+                    if purpose == Purpose::Dictation {
+                        b.binding = Binding::parse(name).unwrap();
+                    } else {
+                        b.translation_binding = Binding::parse(name).unwrap();
+                    }
+                    let key = vk(name);
+                    assert!(mouse_key(&mut b, key, true, false, || Ok(None)));
+                    assert!(mouse_key(&mut b, key, true, false, || panic!(
+                        "repeat captured a target"
+                    )));
+                    reconcile_keys(&mut b, |_| false); // swallowed down is not async state
+                    assert!(b.held.is_some());
+                    assert!(mouse_key(&mut b, key, false, false, || panic!(
+                        "up captured a target"
+                    )));
+                    for pressed in [true, false] {
+                        assert!(
+                            matches!(events.try_recv(),Ok(Event::Key{purpose:p,pressed:actual,..}) if p==purpose&&actual==pressed)
+                        );
+                    }
+                    assert!(events.try_recv().is_err());
+                    assert!(b.pressed.is_empty());
+                    assert!(b.consumed.is_empty());
+                    assert!(b.held.is_none());
+                    assert!(!mouse_key(&mut b, key, false, false, || Ok(None)));
+                    assert!(events.try_recv().is_err());
+                }
+            }
+        }
+    }
+    #[test]
+    fn mouse_capture_has_one_release_owner_and_keeps_mixed_candidates_rejected() {
+        for name in ["MouseMiddle", "MouseX1", "MouseX2"] {
+            for modifier in [
+                None,
+                Some(VK_LCONTROL.0),
+                Some(VK_RMENU.0),
+                Some(VK_RSHIFT.0),
+            ] {
+                let (mut b, mut events) = bridge();
+                b.capturing = true;
+                b.generation = 17;
+                if let Some(key) = modifier {
+                    track_key(&mut b, key, true, false);
+                }
+                assert!(mouse_key(&mut b, vk(name), true, true, || panic!(
+                    "capture grants no target"
+                )));
+                assert!(events.try_recv().is_err());
+                assert!(
+                    !mouse_key(&mut b, VK_XBUTTON2.0, false, true, || Ok(None))
+                        || name == "MouseX2"
+                );
+                if name != "MouseX2" {
+                    assert!(events.try_recv().is_err());
+                    assert!(mouse_key(&mut b, vk(name), false, true, || Ok(None)));
+                }
+                let Ok(Event::Captured(value, 17)) = events.try_recv() else {
+                    panic!("no current captured candidate")
+                };
+                if modifier.is_none() {
+                    assert_eq!(value, name);
+                } else {
+                    assert_eq!(
+                        Binding::parse(&value).unwrap_err().code,
+                        "shortcutMouseCombination"
+                    );
+                }
+                assert!(events.try_recv().is_err());
+            }
+        }
+    }
+    #[test]
+    fn mouse_focus_cancel_interrupt_and_disabled_translation_never_create_a_late_press() {
+        let (mut b, mut events) = bridge();
+        b.capturing = true;
+        assert!(!mouse_key(&mut b, VK_XBUTTON1.0, true, false, || panic!()));
+        assert!(matches!(events.try_recv(), Ok(Event::Cancel(..))));
+        assert!(events.try_recv().is_err());
+        let (mut b, mut events) = bridge();
+        b.translation_binding = Binding::parse("MouseX1").unwrap();
+        b.translation_enabled = false;
+        assert!(!mouse_key(&mut b, VK_XBUTTON1.0, true, false, || panic!()));
+        assert!(!mouse_key(&mut b, VK_XBUTTON1.0, false, false, || panic!()));
+        assert!(events.try_recv().is_err());
+        b.translation_enabled = true;
+        assert!(mouse_key(&mut b, VK_XBUTTON1.0, true, false, || Ok(None)));
+        let _ = events.try_recv();
+        interrupt(&mut b);
+        let _ = events.try_recv();
+        assert!(mouse_key(&mut b, VK_XBUTTON1.0, false, false, || panic!()));
+        assert!(events.try_recv().is_err());
+    }
     fn bridge() -> (Bridge, tokio::sync::mpsc::Receiver<Event>) {
         let (sender, receiver) = tokio::sync::mpsc::channel(8);
         (
@@ -942,6 +1232,7 @@ mod tests {
                 epoch: 0,
                 capturing: false,
                 capture_key: None,
+                capture_mouse: None,
                 armed: true,
                 task_active: None,
                 task_sequence: 0,

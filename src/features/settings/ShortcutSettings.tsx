@@ -4,7 +4,7 @@ import {inputMessage,shortcutLabel,type ShortcutConfigPort,type ShortcutConfig,t
 import type {SettingStore} from '../../settings/store';
 import {useSetting} from '../../settings/use-setting';
 import s from './settings.module.css';
-import {ShortcutRecording} from './shortcut-recording';
+import {ShortcutRecording,mouseShortcut} from './shortcut-recording';
 export function ShortcutSettings({port,settings}:{port:ShortcutConfigPort;settings:SettingStore<ShortcutConfig>}){
  const state=useSetting(settings),draft=state.value;
  const [status,setStatus]=useState<ShortcutStatus|null>(null),[starting,setStarting]=useState(false),[error,setError]=useState('');
@@ -25,7 +25,7 @@ export function ShortcutSettings({port,settings}:{port:ShortcutConfigPort;settin
  },[port,settings]);
  useEffect(()=>{
   if(!status?.capturing)return;
-  const cancel=(event:PointerEvent)=>{if(!recorder.current?.contains(event.target as Node)){const token=captureToken.current;captureToken.current=null;void port.capture(false,token??undefined).catch(()=>{});}};
+  const cancel=(event:PointerEvent)=>{if(!mouseShortcut(event.button)&&!recorder.current?.contains(event.target as Node)){const token=captureToken.current;captureToken.current=null;void port.capture(false,token??undefined).catch(()=>{});}};
   document.addEventListener('pointerdown',cancel);return()=>document.removeEventListener('pointerdown',cancel);
  },[port,status?.capturing]);
  // The focused settings page owns recording, not global activation. Native
@@ -34,6 +34,12 @@ export function ShortcutSettings({port,settings}:{port:ShortcutConfigPort;settin
   const token=captureToken.current,submit=port.submitCapture;
   if(!submit||!status?.capturing||status.captureToken!==token||!token)return;
   const recording=new ShortcutRecording();let submitted=false;
+  const complete=(candidate:string)=>{
+   submitted=true;
+   void submit.call(port,token,candidate).then(value=>acceptStatus.current(value)).catch(()=>{
+    if(captureToken.current===token){captureToken.current=null;setError('暂时无法录入，请重试。');void port.capture(false,token).catch(()=>{});}
+   });
+  };
   const key=(event:KeyboardEvent)=>{
    if(submitted||captureToken.current!==token||!document.hasFocus()||!event.isTrusted)return;
    event.preventDefault();event.stopPropagation();
@@ -42,13 +48,16 @@ export function ShortcutSettings({port,settings}:{port:ShortcutConfigPort;settin
    }
    const candidate=recording.accept(event);
    if(!candidate)return;
-   submitted=true;
-   void submit.call(port,token,candidate).then(value=>acceptStatus.current(value)).catch(()=>{
-    if(captureToken.current===token){captureToken.current=null;setError('暂时无法录入，请重试。');void port.capture(false,token).catch(()=>{});}
-   });
+   complete(candidate);
+  };
+  const mouse=(event:MouseEvent)=>{
+   if(submitted||captureToken.current!==token||!document.hasFocus()||!event.isTrusted||!mouseShortcut(event.button))return;
+   event.preventDefault();event.stopPropagation();
+   const candidate=recording.acceptMouse(event);if(candidate)complete(candidate);
   };
   window.addEventListener('keydown',key,true);window.addEventListener('keyup',key,true);
-  return()=>{window.removeEventListener('keydown',key,true);window.removeEventListener('keyup',key,true);};
+  window.addEventListener('mousedown',mouse,true);window.addEventListener('mouseup',mouse,true);
+  return()=>{window.removeEventListener('keydown',key,true);window.removeEventListener('keyup',key,true);window.removeEventListener('mousedown',mouse,true);window.removeEventListener('mouseup',mouse,true);};
  },[port,status?.capturing,status?.captureToken]);
  useEffect(()=>{
   const stop=()=>{const token=captureToken.current;captureToken.current=null;if(token)void port.capture(false,token).catch(()=>{});};

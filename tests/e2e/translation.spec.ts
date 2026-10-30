@@ -78,3 +78,16 @@ test('reserved shortcut stays local to its key field and preserves the effective
   await dialog.getByRole('button',{name:'重新读取'}).click();await expect(key).toHaveAttribute('aria-invalid','false');
  }
 });
+
+test('mouse shortcut recording saves a single middle button and cancellation preserves it',async({page})=>{
+ await page.goto('/');await page.getByRole('button',{name:'设置',exact:true}).click();
+ const dialog=page.getByRole('dialog',{name:'设置'}),ordinary=dialog.getByRole('button',{name:'更改快捷键',exact:true}),translation=dialog.getByRole('button',{name:'更改翻译快捷键',exact:true});
+ await ordinary.click();await expect(ordinary).toContainText('按下快捷键');
+ await ordinary.click({button:'middle'});await expect(ordinary).toContainText('鼠标中键');await expect(dialog.getByText('已启用：鼠标中键',{exact:true})).toBeVisible();
+ await translation.click();await translation.click({button:'middle'});await expect(translation).toHaveAttribute('aria-invalid','true');await expect(dialog.getByText('此快捷键已被占用，请换一个。',{exact:true})).toBeVisible();
+ await dialog.getByRole('button',{name:'重新读取'}).click();await expect(translation).toContainText('右 Shift');
+ await translation.click();await dialog.getByRole('button',{name:'取消录入',exact:true}).click();await expect(translation).toContainText('右 Shift');
+ await translation.click();await page.mouse.click(3,3);await expect(dialog).toHaveCount(0);
+ await page.getByRole('button',{name:'设置',exact:true}).click();await expect(translation).toContainText('右 Shift');
+ await expect(ordinary).toContainText('鼠标中键');
+});

@@ -1,4 +1,5 @@
 import {shortcutSettings} from './settings-fixtures';
+import {shortcutIssue} from '../src/contracts/dictation';
 import {act,render,screen,waitFor,fireEvent} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import {describe,it,expect,vi} from 'vitest';
@@ -8,6 +9,25 @@ import {parseDeliveryReports} from '../src/contracts/history';
 import {ShortcutSettings} from '../src/features/settings/ShortcutSettings';
 import {VoiceSurface} from '../src/features/voice';
 describe('dictation contracts',()=>{
+ it.each([[1,'MouseMiddle','鼠标中键'],[3,'MouseX1','鼠标侧键1'],[4,'MouseX2','鼠标侧键2']])('captures and persists mouse %s in either shortcut slot',async(button,binding,label)=>{
+  for(const field of ['binding','translationBinding'] as const){
+   const port=new BrowserShortcuts(),before=await port.status(),token=crypto.randomUUID();
+   await port.capture(true,token);fireEvent.mouseDown(window,{button});
+   expect((await port.status()).capturing).toBe(true);fireEvent.mouseUp(window,{button});
+   expect(await port.status()).toMatchObject({capturing:false,captureToken:token,capturedBinding:binding});
+   const saved=await port.save({...before.saved,[field]:binding});expect(saved.saved[field]).toBe(binding);expect(shortcutLabel(binding)).toBe(label);
+   await expect(port.save({...saved.saved,binding,translationBinding:binding})).rejects.toMatchObject({code:'shortcutConflict'});
+   expect((await port.status()).saved).toEqual(saved.saved);
+   expect(shortcutIssue({...saved.saved,[field]:`Control+${binding}`})).toBe('shortcutMouseCombination');
+  }
+ });
+ it('does not save a cancelled mouse capture or consume the next token from an old cancel',async()=>{
+  const port=new BrowserShortcuts(),before=await port.status(),old=crypto.randomUUID(),next=crypto.randomUUID();
+  await port.capture(true,old);fireEvent.mouseDown(window,{button:3});await port.capture(false,old);
+  fireEvent.mouseUp(window,{button:3});expect((await port.status()).saved).toEqual(before.saved);expect((await port.status()).capturedBinding).toBeNull();
+  await port.capture(true,next);await port.capture(false,old);fireEvent.mouseDown(window,{button:4,shiftKey:true});fireEvent.mouseUp(window,{button:4});
+  expect((await port.status()).capturedBinding).toBe('Shift+MouseX2');await port.capture(false,next);
+ });
  it('rejects another generic Alt chord beside the modifier pair without saving',async()=>{
   for(const key of ['Alt+F8','Control+Alt+F8'])for(const reverse of [false,true]){
    const port=new BrowserShortcuts(),before=await port.status();
