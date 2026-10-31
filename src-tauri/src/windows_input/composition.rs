@@ -60,6 +60,8 @@ pub(crate) enum Command {
     ObserveFieldFixture(Arc<ObservationSink>, oneshot::Sender<bool>),
     #[cfg(test)]
     InspectFixture(oneshot::Sender<Result<Reply, Error>>),
+    #[cfg(feature = "desktop-acceptance")]
+    RetireFailureFixture(oneshot::Sender<Result<(), Error>>),
     EndInput(oneshot::Sender<Result<bool, Error>>),
     Begin(u64, Anchor, oneshot::Sender<Result<(), Error>>),
     Finish(
@@ -127,7 +129,12 @@ struct SourceReceipt {
 }
 static RETAINED: Mutex<Option<Arc<Connection>>> = Mutex::new(None);
 pub(crate) fn retain_failed(connection: &Arc<Connection>) {
-    if let Ok(mut slot) = RETAINED.lock() {
+    retain_unreleased(&RETAINED, connection);
+}
+fn retain_unreleased(slot: &Mutex<Option<Arc<Connection>>>, connection: &Arc<Connection>) {
+    if let Ok(mut slot) = slot.lock()
+        && !connection.retirement.resources_released()
+    {
         slot.get_or_insert_with(|| connection.clone());
     }
 }
@@ -142,9 +149,25 @@ async fn stop_observer_for(gate: Option<&DeliveryGate>) -> Result<(), Error> {
     if let Some(old) = old {
         let began = Instant::now();
         let result = wait_retirement(&old, gate).await;
-        log::info!(target:"sayweave","operation=observation_retire task_id={} turn={} result={} error={} elapsed_ms={}",old.retirement.task,old.retirement.turn,if result.is_ok(){"complete"}else{"failed"},result.as_ref().err().map_or("none",|e|e.code.as_str()),began.elapsed().as_millis());
-        result?;
-        clear_retained(&RETAINED, &old.retirement);
+        let released = old.retirement.resources_released();
+        log::info!(target:"sayweave","operation=observation_retire task_id={} turn={} result={} error={} resources_released={} next_admission={} elapsed_ms={}",old.retirement.task,old.retirement.turn,if result.is_ok(){"complete"}else{"failed"},result.as_ref().err().map_or("none",|e|e.code.as_str()),released,gate.is_some(),began.elapsed().as_millis());
+        if released {
+            clear_retained(&RETAINED, &old.retirement);
+        }
+        if !released {
+            return result.and(Err(Error::new("compositionWorker")));
+        }
+        if gate.is_none() {
+            result?;
+        }
+        if let Some(gate) = gate {
+            if gate.cancelled() {
+                return Err(Error::new("cancelled"));
+            }
+            if unsafe { GetTickCount64() } >= gate.preparation_deadline() {
+                return Err(Error::new("compositionTimeout"));
+            }
+        }
     }
     Ok(())
 }
@@ -522,8 +545,8 @@ impl Draft {
                     Ok(host) => host,
                     Err(error) => {
                         log::info!(target:"sayweave", "operation=draft_admission task_id={} turn={} result=rejected error={} elapsed_ms={}", diagnostic_task,turn,error.code,began.elapsed().as_millis());
-                        let _ = ready.send(Err(error));
-                        completion.finish(Err(Error::new("compositionWorker")), "openFailed");
+                        let _ = ready.send(Err(error.clone()));
+                        completion.unconfirmed(Err(error), "openFailed");
                         return;
                     }
                 };
@@ -557,6 +580,15 @@ impl Draft {
                         Ok(Command::ObserveFieldFixture(sink,reply))=>{host.supports_observation=false;let ready=host.observe(sink);let _=reply.send(ready);},
                         #[cfg(test)]
                         Ok(Command::InspectFixture(reply))=>{let _=reply.send(host.exchange_reply(Action::Inspect,"",None,true,None));},
+                        #[cfg(feature = "desktop-acceptance")]
+                        Ok(Command::RetireFailureFixture(reply))=>{
+                            // Controlled business failure after real native cleanup.
+                            // This does not simulate the unknown pipe-disconnect trigger.
+                            let mut cleanup=host.close();
+                            cleanup.result=cleanup.result.and(Err(Error::new("compositionDisconnected")));
+                            let result=host.complete_retirement(&mut completion,"failureFixture",cleanup);
+                            let _=reply.send(result);return;
+                        },
                         Ok(Command::EndInput(reply))=>{
                             if host.range_open || host.block.is_some() {
                                 let _=reply.send(Err(Error::new("compositionCleanup")));
@@ -778,6 +810,23 @@ impl Draft {
         self.finish_range(String::new(), Finish::Handoff("editing".into()), true)
             .await
     }
+    #[cfg(feature = "desktop-acceptance")]
+    pub(super) async fn retire_failure_fixture(&self) -> Result<(), Error> {
+        let (send, reply) = oneshot::channel();
+        self.connection
+            .sender
+            .try_send(Command::RetireFailureFixture(send))
+            .map_err(|_| Error::new("compositionWorker"))?;
+        let result = reply.await.map_err(|_| Error::new("compositionWorker"))?;
+        // Exercise the coordinator's late retain as well as the old waiter.
+        retain_failed(&self.connection);
+        let original = self.connection.close().await;
+        assert_eq!(
+            result.as_ref().err().map(|e| &e.code),
+            original.as_ref().err().map(|e| &e.code)
+        );
+        original
+    }
     async fn finish_range(&self, text: String, mode: Finish, keep: bool) -> FinishOutcome {
         self.finish_range_source(text, mode, None, keep).await
     }
@@ -945,10 +994,22 @@ impl Host {
         completion: &mut WorkerCompletion,
         reason: &'static str,
     ) -> Result<(), Error> {
-        let result = self.close();
+        let cleanup = self.close();
+        self.complete_retirement(completion, reason, cleanup)
+    }
+    fn complete_retirement(
+        self,
+        completion: &mut WorkerCompletion,
+        reason: &'static str,
+        cleanup: HostCleanup,
+    ) -> Result<(), Error> {
         drop(self);
-        completion.finish(result.clone(), reason);
-        result
+        if cleanup.activation_released {
+            completion.finish(cleanup.result.clone(), reason);
+        } else {
+            completion.unconfirmed(cleanup.result.clone(), reason);
+        }
+        cleanup.result
     }
     fn remember_tail(&mut self, raw: Option<String>) {
         if let Some(raw) = &raw {
@@ -1159,8 +1220,14 @@ impl Host {
         let capability = uuid::Uuid::new_v4().to_string();
         let lease = registration::host_capability(std::process::id(), &capability)
             .map_err(|_| Error::new("compositionBusy"))?;
-        crate::text_service::require_ready()?;
-        let profile = (|| {
+        preparation_step(
+            &task,
+            turn,
+            "componentStatus",
+            crate::text_service::require_ready,
+        )?;
+        let profile = preparation_step(&task, turn, "activation", || {
+            (|| {
             let (activation, language) = client::speech_activation()?;
             if activation == SpeechActivation::Own {
                 let keyboard = keyboard_profile()?;
@@ -1184,23 +1251,28 @@ impl Host {
         .map_err(|error| {
             log::info!(target:"sayweave", "operation=draft_activation task_id={} turn={} hresult={:08x}", task, turn, error.code().0 as u32);
             Error::new("compositionActivationFailed")
+        })
         })?;
         if gate.cancelled() {
             return Err(Error::new("cancelled"));
         }
-        let (pid, thread) = editor_endpoint(&anchor)?;
+        let (pid, thread) =
+            preparation_step(&task, turn, "editorEndpoint", || editor_endpoint(&anchor))?;
         let started = Instant::now();
-        let pipe = loop {
-            target_ready(&task, &anchor, &gate)?;
-            if let Ok(pipe) = Pipe::client(pid, thread) {
-                break pipe;
+        let pipe = preparation_step(&task, turn, "targetPipe", || {
+            loop {
+                target_ready(&task, &anchor, &gate)?;
+                if let Ok(pipe) = Pipe::client(pid, thread) {
+                    break Ok(pipe);
+                }
+                if started.elapsed() > Duration::from_millis(500) {
+                    return Err(Error::new("compositionUnavailable"));
+                }
+                pump();
+                std::thread::sleep(Duration::from_millis(5));
             }
-            if started.elapsed() > Duration::from_millis(500) {
-                return Err(Error::new("compositionUnavailable"));
-            }
-            pump();
-            std::thread::sleep(Duration::from_millis(5));
-        };
+        })?;
+        let diagnostic_task = task.clone();
         let mut host = Self {
             supports_observation: false,
             abandoned_optional: Vec::new(),
@@ -1240,10 +1312,12 @@ impl Host {
             _lease: lease,
             _apartment: apartment,
         };
-        host.prepare_engine()?;
+        preparation_step(&diagnostic_task, turn, "prepareEngine", || {
+            host.prepare_engine()
+        })?;
         // Inspect the component executing in this target, not the registered file.
         // An old loaded DLL rejects v2 before any edit; there is no downgrade.
-        host.exchange(Action::Inspect, "", false).map_err(|error| {
+        preparation_step(&diagnostic_task, turn, "inspectRuntime", || host.exchange(Action::Inspect, "", false)).map_err(|error| {
             log::info!(target:"sayweave", "operation=draft_runtime task_id={} turn={} result=rejected error={}", host.task,host.turn,error.code);
             if matches!(error.code.as_str(), "compositionDisconnected" | "compositionTimeout" | "compositionProtocol") {
                 Error::new("compositionRuntimeUnavailable")
@@ -1282,7 +1356,7 @@ impl Host {
                 // This is the only refused Begin that can admit recording
                 // without a target. Check activation/pipe cleanup explicitly;
                 // Drop alone cannot report a failed profile release.
-                host.close()?;
+                host.close().result?;
             }
             return Err(error);
         }
@@ -1378,6 +1452,9 @@ impl Host {
             self.pipe
                 .send(&serde_json::to_vec(&request).map_err(|_| Error::new("compositionProtocol"))?)
                 .map_err(|_| Error::new("compositionRuntimeUnavailable"))?;
+            if operation == 1 {
+                log::info!(target:"sayweave","operation=engine_prepare task_id={} turn={} operation_id={} stage=requestSent",self.task,self.turn,operation);
+            }
             let reply = loop {
                 pump();
                 target_ready(&self.task, &self.anchor, &self.gate)?;
@@ -1394,6 +1471,9 @@ impl Host {
                         || reply.operation != operation
                     {
                         return Err(Error::new("compositionProtocol"));
+                    }
+                    if operation == 1 || reply.ready || reply.code != "engineBusy" {
+                        log::info!(target:"sayweave","operation=engine_prepare task_id={} turn={} operation_id={} stage=reply ready={} code={}",self.task,self.turn,operation,reply.ready,reply.code);
                     }
                     break reply;
                 }
@@ -2115,8 +2195,9 @@ impl Host {
         }
         result
     }
-    fn close(&mut self) -> Result<(), Error> {
+    fn close(&mut self) -> HostCleanup {
         let receipt = self.acknowledge_receipt();
+        cleanup_result(&self.task, self.turn, "receiptAck", &receipt);
         let block = if let Some(snapshot) = self.block.clone() {
             let command = BlockCommand {
                 id: snapshot.id,
@@ -2139,6 +2220,7 @@ impl Host {
         } else {
             Ok(())
         };
+        cleanup_result(&self.task, self.turn, "blockRelease", &block);
         self.stop_observation();
         if let Some(observer) = self.field_observer.take() {
             observer.stop(true);
@@ -2149,8 +2231,31 @@ impl Host {
                 .close()
                 .map_err(|_| Error::new("compositionCleanup"))
         });
-        receipt.and(block).and(closed)
+        cleanup_result(&self.task, self.turn, "ownedActivation", &closed);
+        HostCleanup {
+            activation_released: closed.is_ok(),
+            result: receipt.and(block).and(closed),
+        }
     }
+}
+struct HostCleanup {
+    result: Result<(), Error>,
+    activation_released: bool,
+}
+fn preparation_step<T>(
+    task: &str,
+    turn: u64,
+    stage: &'static str,
+    action: impl FnOnce() -> Result<T, Error>,
+) -> Result<T, Error> {
+    let began = Instant::now();
+    log::info!(target:"sayweave", "operation=draft_prepare_step task_id={} turn={} stage={} result=started",task,turn,stage);
+    let result = action();
+    log::info!(target:"sayweave", "operation=draft_prepare_step task_id={} turn={} stage={} result={} error={} elapsed_ms={}",task,turn,stage,if result.is_ok(){"complete"}else{"failed"},result.as_ref().err().map_or("none",|error|error.code.as_str()),began.elapsed().as_millis());
+    result
+}
+fn cleanup_result(task: &str, turn: u64, stage: &'static str, result: &Result<(), Error>) {
+    log::info!(target:"sayweave", "operation=composition_cleanup task_id={} turn={} stage={} result={} error={}",task,turn,stage,if result.is_ok(){"complete"}else{"failed"},result.as_ref().err().map_or("none",|error|error.code.as_str()));
 }
 fn keyboard_profile() -> windows::core::Result<(u32, u16, GUID, GUID, isize)> {
     unsafe {

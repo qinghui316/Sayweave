@@ -10,7 +10,12 @@ pub(super) struct Retirement {
     pub task: String,
     pub turn: u64,
     requested: AtomicBool,
-    result: watch::Sender<Option<Result<(), Error>>>,
+    result: watch::Sender<Option<RetirementOutcome>>,
+}
+#[derive(Clone)]
+struct RetirementOutcome {
+    result: Result<(), Error>,
+    resources_released: bool,
 }
 impl Retirement {
     pub fn new(task: String, turn: u64) -> Arc<Self> {
@@ -27,13 +32,19 @@ impl Retirement {
         let mut result = self.result.subscribe();
         loop {
             if let Some(value) = result.borrow_and_update().clone() {
-                return value;
+                return value.result;
             }
             result
                 .changed()
                 .await
                 .map_err(|_| Error::new("compositionWorker"))?;
         }
+    }
+    pub fn resources_released(&self) -> bool {
+        self.result
+            .borrow()
+            .as_ref()
+            .is_some_and(|value| value.resources_released)
     }
 }
 pub(super) struct WorkerCompletion {
@@ -52,14 +63,27 @@ impl WorkerCompletion {
     }
     /// Call only after Host and its activation/COM/pipe resources have dropped.
     pub fn finish(&mut self, result: Result<(), Error>, reason: &'static str) {
+        self.publish(result, true, reason);
+    }
+    pub fn unconfirmed(&mut self, result: Result<(), Error>, reason: &'static str) {
+        self.publish(result, false, reason);
+    }
+    fn publish(
+        &mut self,
+        result: Result<(), Error>,
+        resources_released: bool,
+        reason: &'static str,
+    ) {
         if self.finished {
             return;
         }
         self.finished = true;
-        log::info!(target:"sayweave","operation=composition_retired task_id={} turn={} reason={} phase=resourcesReleased result={} error={}",self.retirement.task,self.retirement.turn,reason,if result.is_ok(){"complete"}else{"failed"},result.as_ref().err().map_or("none",|e|e.code.as_str()));
-        let success = result.is_ok();
-        self.retirement.result.send_replace(Some(result));
-        if success {
+        log::info!(target:"sayweave","operation=composition_retired task_id={} turn={} reason={} phase={} result={} error={}",self.retirement.task,self.retirement.turn,reason,if resources_released{"resourcesReleased"}else{"resourcesUnconfirmed"},if result.is_ok(){"complete"}else{"failed"},result.as_ref().err().map_or("none",|e|e.code.as_str()));
+        self.retirement.result.send_replace(Some(RetirementOutcome {
+            result,
+            resources_released,
+        }));
+        if resources_released {
             clear_retained(&RETAINED, &self.retirement);
         }
     }
@@ -67,7 +91,7 @@ impl WorkerCompletion {
 impl Drop for WorkerCompletion {
     fn drop(&mut self) {
         if !self.finished {
-            self.finish(Err(Error::new("compositionWorker")), "workerUnconfirmed");
+            self.unconfirmed(Err(Error::new("compositionWorker")), "workerUnconfirmed");
         }
     }
 }
@@ -77,6 +101,7 @@ mod tests {
     use super::super::{Command, Connection};
     use super::*;
     use std::sync::{Mutex, mpsc};
+    static RETAINED_TEST: Mutex<()> = Mutex::new(());
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -129,6 +154,126 @@ mod tests {
         });
     }
     #[test]
+    fn released_cleanup_failure_does_not_reject_next_admission_or_retain_again() {
+        let _serial = RETAINED_TEST.lock().unwrap();
+        let (connection, mut worker, receiver) = connection();
+        drop(receiver);
+        worker.finish(Err(Error::new("compositionDisconnected")), "closeRequested");
+        // The old coordinator can publish its failed close after retirement.
+        super::super::retain_failed(&connection);
+        let gate = super::super::DeliveryGate::default();
+        gate.set_preparation_budget(std::time::Duration::from_secs(1));
+        runtime().block_on(async {
+            let next = super::super::stop_observer_for(Some(&gate)).await;
+            clear_retained(&RETAINED, &connection.retirement);
+            assert!(
+                next.is_ok(),
+                "released old failure rejected next task: {next:?}"
+            );
+            assert_eq!(
+                connection.close().await.unwrap_err().code,
+                "compositionDisconnected"
+            );
+        });
+    }
+    #[test]
+    fn next_admission_waits_for_release_but_old_waiters_keep_the_failure() {
+        let _serial = RETAINED_TEST.lock().unwrap();
+        let (connection, mut worker, receiver) = connection();
+        super::super::retain_failed(&connection);
+        let gate = super::super::DeliveryGate::default();
+        gate.set_preparation_budget(std::time::Duration::from_secs(1));
+        runtime().block_on(async {
+            let (next, old, ()) = tokio::join!(
+                super::super::stop_observer_for(Some(&gate)),
+                connection.close(),
+                async {
+                    tokio::task::yield_now().await;
+                    assert!(worker.requested());
+                    assert!(!connection.retirement.resources_released());
+                    drop(receiver);
+                    worker.finish(Err(Error::new("compositionDisconnected")), "closeRequested");
+                }
+            );
+            assert!(next.is_ok());
+            assert_eq!(old.unwrap_err().code, "compositionDisconnected");
+            assert_eq!(
+                connection.close().await.unwrap_err().code,
+                "compositionDisconnected"
+            );
+        });
+    }
+    #[test]
+    fn unconfirmed_completion_cannot_reopen_admission_even_after_queue_loss() {
+        let _serial = RETAINED_TEST.lock().unwrap();
+        let (connection, mut worker, receiver) = connection();
+        drop(receiver);
+        worker.unconfirmed(
+            Err(Error::new("compositionCleanup")),
+            "activationUnconfirmed",
+        );
+        super::super::retain_failed(&connection);
+        let gate = super::super::DeliveryGate::default();
+        gate.set_preparation_budget(std::time::Duration::from_secs(1));
+        runtime().block_on(async {
+            let next = super::super::stop_observer_for(Some(&gate)).await;
+            assert!(!connection.retirement.resources_released());
+            assert_eq!(next.unwrap_err().code, "compositionCleanup");
+        });
+        clear_retained(&RETAINED, &connection.retirement);
+    }
+    #[test]
+    fn simultaneous_release_does_not_override_new_admission_cancellation_or_deadline() {
+        let _serial = RETAINED_TEST.lock().unwrap();
+        for cancelled in [true, false] {
+            let (connection, mut worker, receiver) = connection();
+            super::super::retain_failed(&connection);
+            let gate = super::super::DeliveryGate::default();
+            gate.set_preparation_budget(std::time::Duration::from_secs(1));
+            runtime().block_on(async {
+                let (next, ()) =
+                    tokio::join!(super::super::stop_observer_for(Some(&gate)), async {
+                        tokio::task::yield_now().await;
+                        if cancelled {
+                            gate.cancel();
+                        } else {
+                            gate.set_preparation_budget(std::time::Duration::ZERO);
+                        }
+                        drop(receiver);
+                        worker.finish(Err(Error::new("compositionDisconnected")), "closeRequested");
+                    });
+                assert_eq!(
+                    next.unwrap_err().code,
+                    if cancelled {
+                        "cancelled"
+                    } else {
+                        "compositionTimeout"
+                    }
+                );
+                assert_eq!(
+                    connection.close().await.unwrap_err().code,
+                    "compositionDisconnected"
+                );
+            });
+            clear_retained(&RETAINED, &connection.retirement);
+        }
+    }
+    #[test]
+    fn completed_release_cannot_be_reinserted_and_cannot_clear_a_newer_connection() {
+        let (old, mut worker, receiver) = connection();
+        let (new, _new_worker, _new_receiver) = connection();
+        let slot = Mutex::new(Some(old.clone()));
+        drop(receiver);
+        worker.finish(Err(Error::new("compositionDisconnected")), "closeRequested");
+        clear_retained(&slot, &old.retirement);
+        super::super::retain_unreleased(&slot, &old);
+        assert!(slot.lock().unwrap().is_none());
+        super::super::retain_unreleased(&slot, &new);
+        clear_retained(&slot, &old.retirement);
+        super::super::retain_unreleased(&slot, &old);
+        assert!(Arc::ptr_eq(slot.lock().unwrap().as_ref().unwrap(), &new));
+    }
+    #[test]
     fn dropped_waiter_does_not_cancel_retirement_or_lose_its_result() {
         let (connection, mut worker, _receiver) = connection();
         runtime().block_on(async {
@@ -156,6 +301,7 @@ mod tests {
                     .is_err()
             );
             drop(worker);
+            assert!(!connection.retirement.resources_released());
             assert_eq!(
                 connection.close().await.unwrap_err().code,
                 "compositionWorker"
@@ -225,5 +371,6 @@ mod tests {
             assert!(released.load(Ordering::Acquire));
         });
         assert!(thread.join().is_err());
+        assert!(!connection.retirement.resources_released());
     }
 }

@@ -171,6 +171,13 @@ impl Fixture {
         self.input.flush().map_err(|e| e.to_string())?;
         self.read()
     }
+    fn anchor(&self) -> Result<Anchor, String> {
+        WindowsInputService::anchor()
+            .filter(|anchor| {
+                anchor.process == self.child.id() && anchor.editor.process == self.child.id()
+            })
+            .ok_or_else(|| "owned fixture lost foreground; no native task started".into())
+    }
 }
 /// Production host against an owned TSF editor. No clipboard reads/writes or supplier requests.
 fn observer_restart_samples(
@@ -183,7 +190,7 @@ fn observer_restart_samples(
         fixture.command(serde_json::json!({"action":"focus","text":"前后","start":1,"end":1}))?;
         thread::sleep(Duration::from_millis(60));
         let id = uuid::Uuid::new_v4().to_string();
-        let anchor = WindowsInputService::anchor().ok_or("observer fixture not foreground")?;
+        let anchor = fixture.anchor()?;
         let application = super::application::resolve(&anchor);
         bind_watch(&id, &anchor, None).map_err(|e| e.code)?;
         let old = runtime
@@ -237,7 +244,7 @@ fn observer_restart_samples(
             return Err("observer changed first body".into());
         }
         let next = uuid::Uuid::new_v4().to_string();
-        let anchor = WindowsInputService::anchor().ok_or("observer restart lost foreground")?;
+        let anchor = fixture.anchor()?;
         bind_watch(&next, &anchor, None).map_err(|e| e.code)?;
         let current = runtime
             .block_on(Draft::begin(
@@ -266,6 +273,64 @@ fn observer_restart_samples(
             fixture.child.id()
         );
     }
+    Ok(())
+}
+
+fn retirement_recovery_samples(
+    fixture: &mut Fixture,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<(), String> {
+    use super::composition::{Draft, Finish, stop_observer};
+    fixture.command(serde_json::json!({"action":"focus","text":"前后","start":1,"end":1}))?;
+    for (index, text, expected) in [
+        (1, "第一轮", "前第一轮后"),
+        (2, "第二轮", "前第一轮第二轮后"),
+        (3, "第三轮", "前第一轮第二轮第三轮后"),
+    ] {
+        let task = uuid::Uuid::new_v4().to_string();
+        let anchor = fixture.anchor()?;
+        bind_watch(&task, &anchor, None).map_err(|e| e.code)?;
+        let draft = runtime
+            .block_on(Draft::begin(
+                task.clone(),
+                1,
+                anchor,
+                Arc::new(DeliveryGate::default()),
+            ))
+            .map_err(|e| format!("recovery round {index} admission: {}", e.code))?;
+        runtime
+            .block_on(draft.replace(1, text.into()))
+            .map_err(|e| e.code)?;
+        if index == 1 {
+            let delivery = runtime.block_on(draft.handoff_receipt());
+            if !delivery.handed_off {
+                return Err("first recovery round did not hand off its actual text".into());
+            }
+            let error = runtime.block_on(draft.retire_failure_fixture()).err();
+            if error.as_ref().map(|e| e.code.as_str()) != Some("compositionDisconnected") {
+                return Err("recovery did not preserve the original controlled failure".into());
+            }
+        } else if !runtime
+            .block_on(draft.finish_receipt(text.into(), Finish::Commit))
+            .committed
+        {
+            return Err(format!("recovery round {index} did not commit"));
+        }
+        release_watch(&task);
+        let actual = fixture.command(serde_json::json!({"action":"read"}))?;
+        if actual["text"].as_str() != Some(expected) {
+            return Err(format!(
+                "recovery round {index}: expected {expected}, actual {actual}"
+            ));
+        }
+        println!(
+            "SAYWEAVE_RETIREMENT_RECOVERY_ROUND round={index} task={task} same_pid={} expected={expected} actual={} controlled_failure={} replay=false",
+            fixture.child.id(),
+            actual["text"],
+            index == 1
+        );
+    }
+    runtime.block_on(stop_observer()).map_err(|e| e.code)?;
     Ok(())
 }
 
@@ -429,6 +494,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         return Err("owned initialization changed body, selection or foreground".into());
     }
     println!("SAYWEAVE_EDITOR_INITIALIZATION body_selection_unchanged=true");
+    retirement_recovery_samples(&mut fixture, &runtime)?;
     final_translation_samples(&mut fixture, &runtime, &input)?;
     observer_restart_samples(&mut fixture, &runtime)?;
     for (start, end) in [(1, 1), (1, 3)] {

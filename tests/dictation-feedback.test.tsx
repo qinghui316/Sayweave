@@ -6,6 +6,17 @@ import {initialSpeech} from '../src/contracts/speech';
 import {VoiceSurface} from '../src/features/voice';
 import {Home} from '../src/features/home';
 
+it.each([
+ ['editing','准备期间检测到输入变化，请重新开始口述。'],
+ ['cancelled','已取消。'],
+ ['compositionTimeout','等待输入框就绪超时，请重试。'],
+ ['compositionWorker','输入服务意外中断，请退出并重新打开 Sayweave。'],
+ ['compositionDisconnected','输入组件连接中断，请重新开始口述。'],
+])('preparation error %s keeps its real cause instead of a generic component failure',(code,message)=>{
+ const value={...initialDictation(),source:'external' as const,taskId:'current',presentationId:'view',presentation:'error' as const,error:code};
+ expect(dictationFeedback(value,initialSpeech())).toBe(message);
+});
+
 it.each(['recording','completed','failed'] as const)('current external preparation ignores stale Runtime phase %s',phase=>{
  const snapshot={...initialDictation(),source:'external' as const,taskId:'new',presentationId:'new-view',stage:'recognizing' as const,presentation:'preparing' as const};
  expect(dictationPhase(snapshot,phase,{taskId:'old',text:'上一次口述'})).toBe('connecting');

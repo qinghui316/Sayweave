@@ -154,7 +154,9 @@ Begin 对空光标和非空选区统一只准备范围；首次非空更新才�
 
 普通投递 pending/delivering 记录在后台归档，不作为输入激活门禁；取消与正文恢复的安全意图仍由原生所有者处理。空结果、取消、只读以及结算安全事实不弹遮挡目标输入框的长条提示；安静投影不改变输入效果、首个错误和历史诊断。真正不确定的效果阻止后续不安全写入，终态不能由迟到准备或识别事件重新打开。
 
-Observation retirement shares one connection-owned completion between automatic expiry and explicit close. Completion is published after Host resources and the activation lease have been released; command-channel closure is not proof of either success or failure. A retained connection remains tracked through cleanup, and only its confirmed successful completion clears that exact slot. Failure stays attributable and blocks the next admission. Waiting consumes the existing preparation deadline and supports cancellation without abandoning the old cleanup.
+Observation retirement shares one connection-owned completion between automatic expiry and explicit close. Its original operation result and confirmed resource release are separate facts. Old waiters retain the original cleanup failure. Once the composition Host, pipe, exclusive lease and owned activation are released, only that matching retained connection is cleared; a late failed-retain cannot insert it again or remove a newer connection. New admission runs the original target, component, activation, engine and write checks independently. Unconfirmed cleanup, queue loss, timeout and unwinding cannot grant new admission. Waiting consumes the existing preparation deadline and supports cancellation without abandoning old cleanup. The existing read-only learning reader is signalled to stop; this does not claim that its asynchronous thread has joined. No old text or uncertain write is retried.
+
+Preparation diagnostics identify component status, activation, editor endpoint, target pipe, engine preparation and runtime inspection around the existing calls. Receipt acknowledgement, block release and owned activation cleanup keep their original results. Editing during preparation is reported as interrupted preparation rather than a damaged input component; cancellation and preparation timeout retain their own feedback.
 
 ## 启动时已有输入法组合
 
