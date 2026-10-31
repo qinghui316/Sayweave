@@ -18,18 +18,38 @@ export function proxySourceIdentity(root) {
   const files=Object.fromEntries(proxySourceFiles.map(file=>[file,sha(readFileSync(path.join(base,file),'utf8').replaceAll('\r\n','\n'))]));
   return {files,toolchain:sha(readFileSync(path.join(root,'rust-toolchain.toml'),'utf8').replaceAll('\r\n','\n'))};
 }
+export function signedProxyBaseline(manifest) {
+  const origin=manifest.schemaVersion===1?manifest.origin:manifest.baseline;
+  if(!origin||!/^v\d+\.\d+\.\d+$/.test(origin.tag??'')||! /^[a-f0-9]{40}$/.test(origin.commit??'')
+    ||! /^[a-f0-9]{64}$/.test(origin.installerSha256??'')||! /^[a-f0-9]{64}$/.test(origin.mainSha256??'')
+    ||! /^[a-f0-9]{64}$/.test(origin.helperSha256??'')||origin.repository!=='qinghui316/Sayweave'
+    ||origin.installer!==`Sayweave_${origin.tag.slice(1)}_x64-setup.exe`)
+    throw Error('Pinned proxy authenticated baseline differs');
+  return {...origin,proxy:manifest.schemaVersion===1?{sha256:manifest.sha256,size:manifest.size,mainOffset:origin.mainOffset,helperOffset:origin.helperOffset}:origin.proxy};
+}
+export const ordinaryProxyCommand=['cargo','build','--locked','--release','--manifest-path','src-tauri/text-service/Cargo.toml','--no-default-features','--features','proxy','--lib'];
 export function pinnedProxy(root, supplied) {
   const directory=path.join(root,'src-tauri/resources/fixed-proxy');
   const file=path.join(directory,'abi1.dll'),manifestFile=path.join(directory,'manifest.json');
   for(const item of [directory,file,manifestFile])if(lstatSync(item).isSymbolicLink())throw Error('Pinned proxy must not be a link');
   const manifest=JSON.parse(readFileSync(manifestFile,'utf8')),bytes=readFileSync(file),origin=manifest.origin;
-  if(manifest.schemaVersion!==1||manifest.abi!==1||manifest.platform!=='windows-x86_64-msvc'||manifest.file!=='abi1.dll'
+  if(![1,2].includes(manifest.schemaVersion)||manifest.abi!==1||manifest.platform!=='windows-x86_64-msvc'||manifest.file!=='abi1.dll'
     ||manifest.size!==bytes.length||manifest.sha256!==validateComponent(bytes,'proxy')
-    ||!/^v\d+\.\d+\.\d+$/.test(origin?.tag??'')||! /^[a-f0-9]{40}$/.test(origin?.commit??'')
-    ||! /^[a-f0-9]{64}$/.test(origin?.installerSha256??'')||! /^[a-f0-9]{64}$/.test(origin?.mainSha256??'')
-    ||! /^[a-f0-9]{64}$/.test(origin?.helperSha256??'')||origin?.repository!=='qinghui316/Sayweave'
-    ||origin?.installer!==`Sayweave_${origin.tag.slice(1)}_x64-setup.exe`)
+    )
     throw Error('Pinned proxy bytes or authenticated origin differ');
+  const baseline=signedProxyBaseline(manifest);
+  if(manifest.schemaVersion===2){
+    if(origin?.kind!=='reviewed-source-build'||origin.sourceDigest!==sha(JSON.stringify(manifest.source))
+      ||typeof origin.compiler!=='string'||!origin.compiler.startsWith('rustc ')||!origin.compiler.includes('host: x86_64-pc-windows-msvc\n')
+      ||origin.compilerSha256!==sha(origin.compiler)||JSON.stringify(origin.command)!==JSON.stringify(ordinaryProxyCommand)
+      ||JSON.stringify(origin.flags)!=='{}'||origin.sourceState!=='recorded-source-snapshot'
+      ||! /^[a-f0-9]{40}$/.test(origin.producerHead??''))throw Error('Pinned proxy source build provenance differs');
+    for(const role of ['proxy','core']){
+      const part=baseline[role];
+      if(!part||! /^[a-f0-9]{64}$/.test(part.sha256??'')||!Number.isSafeInteger(part.size)||part.size<256||part.size>32*1024*1024
+        ||!['mainOffset','helperOffset'].every(key=>Number.isSafeInteger(part[key])&&part[key]>=0))throw Error('Pinned proxy baseline component identity differs');
+    }
+  }
   if(JSON.stringify(manifest.source)!==JSON.stringify(proxySourceIdentity(root)))throw Error('Proxy source contract changed; explicit reviewed proxy upgrade required');
   if(supplied&&!readFileSync(supplied).equals(bytes))throw Error('Supplied proxy differs from pinned formal proxy');
   return {path:file,manifest};

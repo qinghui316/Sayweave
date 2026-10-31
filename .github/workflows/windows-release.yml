@@ -386,6 +386,12 @@ jobs:
         run: |
           node $env:SAYWEAVE_VERIFIER_HELPER check-tool
           if ($LASTEXITCODE -ne 0) { throw 'Preserved verifier differs; no signed package will be built.' }
+      - name: Verify authenticated baseline proxy upgrade on this disposable runner
+        if: inputs.phase != 'resume-package'
+        shell: pwsh
+        run: |
+          node scripts/test-formal-core-switch.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Ordinary proxy/core upgrade gate failed before signing.' }
       - name: Record separate installed-input acceptance boundary
         if: inputs.phase != 'resume-package'
         shell: pwsh
@@ -395,7 +401,8 @@ jobs:
             productTag = $env:SAYWEAVE_RELEASE_TAG
             productCommit = $env:SAYWEAVE_RELEASE_COMMIT
             controllerCommit = $env:SAYWEAVE_CONTROLLER_COMMIT
-            nativeInputTest = 'not-run-by-release-workflow'
+            nativeInputTest = 'disposable-runner-authenticated-baseline-upgrade'
+            nativeInputReceipt = '.local/formal-core-switch/receipt.json'
             installedHotUpdate = 'separate-owner-acceptance'
             packageChecks = 'identity-payload-signature-download-required'
           } | ConvertTo-Json | Set-Content -LiteralPath .local/release-input-boundary.json -Encoding UTF8
@@ -408,6 +415,8 @@ jobs:
           path: |
             src-tauri/resources/fixed-proxy/manifest.json
             .local/release-input-boundary.json
+            .local/formal-core-switch/*.json
+            .local/formal-core-switch/*.log
           if-no-files-found: error
       - name: Build signed NSIS package
         id: signed

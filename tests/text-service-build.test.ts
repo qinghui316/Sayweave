@@ -4,9 +4,9 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 // @ts-expect-error Native build helper is a JavaScript entrypoint.
-import {dllExports,validateComponent,componentSourceKey,pinnedProxy,selectedProxy,proxySourceIdentity,proxySourceFiles,verifyComponentEmbeddings} from '../scripts/build-text-service.mjs';
+import {dllExports,validateComponent,componentSourceKey,pinnedProxy,selectedProxy,proxySourceIdentity,proxySourceFiles,verifyComponentEmbeddings,ordinaryProxyCommand} from '../scripts/build-text-service.mjs';
 // @ts-expect-error Native gate helper is a JavaScript entrypoint.
-import {extractBaseline} from '../scripts/test-formal-core-switch.mjs';
+import {extractBaseline,validateFormalEvidence} from '../scripts/test-formal-core-switch.mjs';
 function pe(names:string[]){
  const bytes=Buffer.alloc(4096);bytes.write('MZ');bytes.writeUInt32LE(0x80,0x3c);bytes.writeUInt32LE(0x4550,0x80);
  bytes.writeUInt16LE(0x8664,0x84);bytes.writeUInt16LE(1,0x86);bytes.writeUInt16LE(240,0x94);
@@ -36,6 +36,27 @@ describe('ordinary component build identities',()=>{
  it('rejects malformed offsets and wrong platform before loading',()=>{const malformed=pe(['DllGetClassObject','DllCanUnloadNow']);malformed.writeUInt32LE(0xffffffff,0x3c);expect(()=>dllExports(malformed)).toThrow();
   const wrong=pe(['DllGetClassObject','DllCanUnloadNow']);wrong.writeUInt16LE(0x14c,0x84);expect(()=>validateComponent(wrong,'proxy')).toThrow();});
 });
+
+describe('formal proxy upgrade receipt',()=>{
+ const oldProxy='a'.repeat(64),newProxy='b'.repeat(64),oldCore='c'.repeat(64),newCore='d'.repeat(64);
+ const manifest={schemaVersion:2,sha256:newProxy,baseline:{tag:'v0.1.20',commit:'a'.repeat(40),repository:'qinghui316/Sayweave',installer:'Sayweave_0.1.20_x64-setup.exe',installerSha256:'b'.repeat(64),mainSha256:'c'.repeat(64),helperSha256:'d'.repeat(64),proxy:{sha256:oldProxy},core:{sha256:oldCore}}};
+ const record=(pid:number,proxy:string,core:string,generation:number,body:string)=>({body,runtime:{process:pid,proxy:{sha256:proxy,base:100},core:{sha256:core},engine:{proxy_instance:'instance-'+pid,engine_generation:generation}}});
+ const target=(pid:number,phase:string,records:ReturnType<typeof record>[])=>({formalTargetPassed:true,cleanupComplete:true,moduleUnloadReady:phase!=='old',pid,phase,processIdentity:{pid},sameService:true,ordinaryTransport:true,records,finalBody:records.at(-1)!.body});
+ const evidence=()=>({formalProxySwitchPassed:true,proxyUpgradePassed:true,oldTargetExited:true,newTargetExited:true,coreChanged:true,oldTarget:{...target(1,'old',[record(1,oldProxy,oldCore,1,'旧核心输入。')]),oldAdmissionRejected:'enginePrepare:80070005'},newTarget:target(2,'new',[record(2,newProxy,oldCore,1,'旧核心输入。'),record(2,newProxy,newCore,2,'旧核心输入。新核心输入。')])});
+ it('requires actual old/new process and loaded component/body identities',()=>{
+  const value=evidence();expect(()=>validateFormalEvidence(value,manifest,newCore)).not.toThrow();
+  value.newTarget.records[1]!.runtime.proxy.sha256=oldProxy;expect(()=>validateFormalEvidence(value,manifest,newCore)).toThrow('Loaded');
+ });
+ it.each(['body','exit','generation','instance','reopen','refusal','unload','cleanup'])('refuses incomplete %s proof',kind=>{
+  const v=evidence();
+  if(kind==='body')v.newTarget.finalBody='';if(kind==='exit')v.oldTargetExited=false;if(kind==='generation')v.newTarget.records[1]!.runtime.engine.engine_generation=1;if(kind==='instance')v.newTarget.records[1]!.runtime.engine.proxy_instance='different';if(kind==='reopen')v.newTarget.pid=1;if(kind==='refusal')v.oldTarget.oldAdmissionRejected='engineBusy';if(kind==='unload')v.newTarget.moduleUnloadReady=false;if(kind==='cleanup')v.newTarget.cleanupComplete=false;
+  expect(()=>validateFormalEvidence(v,manifest,newCore)).toThrow();
+ });
+ it('records unchanged-core input without pretending a generation switch occurred',()=>{
+  const v=evidence();v.coreChanged=false;v.newTarget.records.pop();v.newTarget.finalBody='旧核心输入。';
+  expect(()=>validateFormalEvidence(v,manifest,oldCore)).not.toThrow();
+ });
+});
 describe('pinned formal proxy',()=>{
  function fixture(){
   const root=mkdtempSync(join(tmpdir(),'sayweave-pinned-'));
@@ -52,6 +73,26 @@ describe('pinned formal proxy',()=>{
   const f=fixture();try{expect(pinnedProxy(f.root).manifest.sha256).toBe(f.manifest.sha256);expect(pinnedProxy(f.root).path).toBe(pinnedProxy(f.root).path);
    const other=join(f.root,'other.dll');writeFileSync(other,Buffer.from('wrong'));expect(()=>pinnedProxy(f.root,other)).toThrow('Supplied proxy');
    writeFileSync(join(f.resource,'abi1.dll'),Buffer.from('wrong'));expect(()=>pinnedProxy(f.root)).toThrow();
+  }finally{rmSync(f.root,{recursive:true,force:true});}
+ });
+ it('binds a source-built v2 proxy separately from its signed old-release baseline',()=>{
+  const f=fixture();try{
+   const digest=(value:Buffer|string)=>createHash('sha256').update(value).digest('hex');
+   const old=f.bytes,core=pe(['DllGetClassObject','DllCanUnloadNow','CreateEngineV1']);
+   const executable=Buffer.concat([Buffer.from('MZ'),old,core]);
+   const bytes=pe(['DllGetClassObject','DllCanUnloadNow','NewOrdinaryBuild']);
+   const compiler='rustc fixture\nhost: x86_64-pc-windows-msvc\n';
+   const manifest={...f.manifest,schemaVersion:2,sha256:validateComponent(bytes,'proxy'),size:bytes.length,
+    origin:{kind:'reviewed-source-build',sourceState:'recorded-source-snapshot',producerHead:'a'.repeat(40),sourceDigest:digest(JSON.stringify(f.manifest.source)),compiler,compilerSha256:digest(compiler),command:ordinaryProxyCommand,flags:{}},
+    baseline:{...f.manifest.origin,tag:'v0.1.20',installer:'Sayweave_0.1.20_x64-setup.exe',mainSha256:digest(executable),helperSha256:digest(executable),proxy:{sha256:validateComponent(old,'proxy'),size:old.length,mainOffset:2,helperOffset:2},core:{sha256:validateComponent(core,'core'),size:core.length,mainOffset:2+old.length,helperOffset:2+old.length}}};
+   const save=()=>writeFileSync(join(f.resource,'manifest.json'),JSON.stringify(manifest));
+   writeFileSync(join(f.resource,'abi1.dll'),bytes);save();
+   expect(pinnedProxy(f.root).manifest.sha256).not.toBe(manifest.baseline.proxy.sha256);
+   expect(extractBaseline(executable,executable,manifest).proxy).toEqual(old);
+   manifest.origin.compilerSha256='e'.repeat(64);save();expect(()=>pinnedProxy(f.root)).toThrow('provenance');
+   manifest.origin.compilerSha256=digest(compiler);manifest.origin.command=[...ordinaryProxyCommand,'--features','acceptance'];save();expect(()=>pinnedProxy(f.root)).toThrow('provenance');
+   manifest.origin.command=ordinaryProxyCommand;manifest.baseline.proxy.sha256='e'.repeat(64);save();expect(()=>extractBaseline(executable,executable,manifest)).toThrow('embedded component');
+   manifest.baseline.proxy.sha256=validateComponent(old,'proxy');manifest.origin.sourceDigest='e'.repeat(64);save();expect(()=>pinnedProxy(f.root)).toThrow('provenance');
   }finally{rmSync(f.root,{recursive:true,force:true});}
  });
  it('allows only a source-bound independently reviewed internal proxy and preserves the formal pin',()=>{
