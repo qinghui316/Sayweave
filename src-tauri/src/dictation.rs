@@ -615,6 +615,15 @@ impl DictationCoordinator {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, _) = watch::channel(0u8);
         let gate = Arc::new(DeliveryGate::default());
+        if let Some(data) = app.try_state::<crate::data::DataWorker>() {
+            let data = data.inner().clone();
+            gate.set_receipt_archive(Arc::new(move |offer, frame| {
+                data.preserve_native_receipt(offer, frame).map_err(|error| {
+                    log::warn!(target:"sayweave", "operation=input_receipt_archive result=failed error={}", error.code);
+                    Error::new("inputReceiptRecoveryFailed")
+                })
+            }))?;
+        }
         {
             let mut a = self.active.lock().map_err(|_| Error::new("unavailable"))?;
             if self.stopping.load(Ordering::Acquire) {

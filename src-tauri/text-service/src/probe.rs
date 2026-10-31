@@ -53,6 +53,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(feature = "acceptance")]
             Some("core-switch") => core_switch_probe::run(&args)?,
             #[cfg(feature = "acceptance")]
+            Some("receipt-recovery") => core_switch_probe::receipt_recovery(&args)?,
+            #[cfg(feature = "acceptance")]
             Some("core-switch-multi") => core_switch_probe::multi(&args)?,
             #[cfg(feature = "acceptance")]
             Some("host-identity-hold") => {

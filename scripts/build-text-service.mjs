@@ -34,6 +34,34 @@ export function pinnedProxy(root, supplied) {
   if(supplied&&!readFileSync(supplied).equals(bytes))throw Error('Supplied proxy differs from pinned formal proxy');
   return {path:file,manifest};
 }
+// An explicit, source-bound INTERNAL candidate. This does not change the formal
+// pin or invent a release origin for locally built bytes.
+export function selectedProxy(root, env, compiler) {
+  const upgrade=env.SAYWEAVE_TSF_PROXY_UPGRADE_MANIFEST;
+  if(!upgrade)return pinnedProxy(root,env.SAYWEAVE_TSF_PROXY_PAYLOAD);
+  if(env.SAYWEAVE_BUILD_CHANNEL!=='internal')throw Error('Proxy upgrade is internal-only');
+  if(lstatSync(upgrade).isSymbolicLink())throw Error('Proxy upgrade manifest must not be a link');
+  const manifest=JSON.parse(readFileSync(upgrade,'utf8'));
+  const source=proxySourceIdentity(root),sourceDigest=sha(JSON.stringify(source));
+  const pinnedDir=path.join(root,'src-tauri/resources/fixed-proxy');
+  const previous=JSON.parse(readFileSync(path.join(pinnedDir,'manifest.json'),'utf8'));
+  const previousBytes=readFileSync(path.join(pinnedDir,'abi1.dll'));
+  if(previous.sha256!==validateComponent(previousBytes,'proxy')||manifest.predecessor!==previous.sha256
+    ||manifest.schemaVersion!==1||manifest.kind!=='reviewed-development-proxy'||manifest.abi!==1
+    ||manifest.platform!=='windows-x86_64-msvc'||manifest.compilerSha256!==sha(compiler)
+    ||JSON.stringify(manifest.source)!==JSON.stringify(source)||! /^[a-f0-9]{64}$/.test(manifest.sha256??''))
+    throw Error('Proxy upgrade source or build identity differs');
+  const file=path.join(root,'.local/text-service-build',manifest.sha256,'proxy.dll');
+  for(const item of [path.dirname(file),file,manifest.reviewFile])if(lstatSync(item).isSymbolicLink())throw Error('Proxy upgrade must not use links');
+  const bytes=readFileSync(file),reviewBytes=readFileSync(manifest.reviewFile),review=JSON.parse(reviewBytes);
+  if(validateComponent(bytes,'proxy')!==manifest.sha256||manifest.size!==bytes.length
+    ||manifest.reviewSha256!==sha(reviewBytes)||review.decision!=='approved'
+    ||review.proxySha256!==manifest.sha256||review.sourceDigest!==sourceDigest
+    ||typeof review.reviewer!=='string'||!review.reviewer.trim()
+    ||(env.SAYWEAVE_TSF_PROXY_PAYLOAD&&!readFileSync(env.SAYWEAVE_TSF_PROXY_PAYLOAD).equals(bytes)))
+    throw Error('Proxy upgrade bytes or exact independent review differ');
+  return {path:file,manifest};
+}
 export function verifyComponentEmbeddings(executables, components) {
   const proxy=readFileSync(components.proxy),core=readFileSync(components.core);
   validateComponent(proxy,'proxy');validateComponent(core,'core');
@@ -100,9 +128,9 @@ export function componentSourceKey(root, role, env, toolchain) {
 export function buildTextService(root, env = process.env) {
   if (process.platform !== 'win32' || process.arch !== 'x64') throw Error('TSF currently requires Windows x64');
   // A cold cache must never turn an ordinary update into a proxy replacement.
-  const proxy=pinnedProxy(root,env.SAYWEAVE_TSF_PROXY_PAYLOAD).path;
   const compiler = spawnSync('rustc', ['-vV'], { cwd: root, env, encoding: 'utf8', windowsHide: true });
   if (compiler.status !== 0) throw Error('Cannot verify component compiler');
+  const proxy=selectedProxy(root,env,compiler.stdout).path;
   const cache = path.join(root, '.local/text-service-build'); mkdirSync(cache, { recursive: true });
   const output = path.join(root, 'src-tauri/text-service/target/release/sayweave_text_service.dll');
   function build(role, supplied) {
@@ -126,6 +154,6 @@ export function buildTextService(root, env = process.env) {
     return immutable;
   }
   const core = build('core', env.SAYWEAVE_TSF_PAYLOAD);
-  console.log(`Using pinned formal proxy ${sha(readFileSync(proxy))}`);
+  console.log(`Using ${env.SAYWEAVE_TSF_PROXY_UPGRADE_MANIFEST?'reviewed internal':'pinned formal'} proxy ${sha(readFileSync(proxy))}`);
   return { core, proxy };
 }

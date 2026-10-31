@@ -21,6 +21,7 @@ export function dictationFeedback(value:DictationSnapshot,speech:SpeechSnapshot)
  if(!code)return undefined;
  if(code==='editing')return '准备期间检测到输入变化，请重新开始口述。';
  if(code==='compositionCleanup')return '输入清理未完成，请退出并重新打开 Sayweave。';
+ if(code==='inputReceiptRecoveryFailed')return '旧输入结果暂时无法保存，请检查资料目录和可用空间后重试。';
  if(code in speechMessages)return speechMessages[code as keyof typeof speechMessages];
  return componentMessage(code);
 }

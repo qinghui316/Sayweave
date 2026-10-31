@@ -144,8 +144,33 @@ pub struct EditorEndpoint {
 pub struct DeliveryGate {
     state: AtomicU8,
     preparation_deadline: AtomicU64,
+    receipt_archive: std::sync::Mutex<Option<Arc<ReceiptArchive>>>,
 }
+type ReceiptArchive = dyn Fn(&sayweave_text_service::lifecycle::ReceiptRecovery, &[u8]) -> Result<(), Error>
+    + Send
+    + Sync;
 impl DeliveryGate {
+    pub(crate) fn set_receipt_archive(&self, archive: Arc<ReceiptArchive>) -> Result<(), Error> {
+        *self
+            .receipt_archive
+            .lock()
+            .map_err(|_| Error::new("inputReceiptRecoveryFailed"))? = Some(archive);
+        Ok(())
+    }
+    #[cfg(windows)]
+    pub(crate) fn preserve_receipt(
+        &self,
+        offer: &sayweave_text_service::lifecycle::ReceiptRecovery,
+        frame: &[u8],
+    ) -> Result<(), Error> {
+        let archive = self
+            .receipt_archive
+            .lock()
+            .map_err(|_| Error::new("inputReceiptRecoveryFailed"))?
+            .clone()
+            .ok_or_else(|| Error::new("inputReceiptRecoveryFailed"))?;
+        archive(offer, frame)
+    }
     pub fn cancel(&self) -> bool {
         self.state
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)

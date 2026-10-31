@@ -4,7 +4,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createHash} from 'node:crypto';
 // @ts-expect-error Native build helper is a JavaScript entrypoint.
-import {dllExports,validateComponent,componentSourceKey,pinnedProxy,proxySourceIdentity,proxySourceFiles,verifyComponentEmbeddings} from '../scripts/build-text-service.mjs';
+import {dllExports,validateComponent,componentSourceKey,pinnedProxy,selectedProxy,proxySourceIdentity,proxySourceFiles,verifyComponentEmbeddings} from '../scripts/build-text-service.mjs';
 // @ts-expect-error Native gate helper is a JavaScript entrypoint.
 import {extractBaseline} from '../scripts/test-formal-core-switch.mjs';
 function pe(names:string[]){
@@ -52,6 +52,27 @@ describe('pinned formal proxy',()=>{
   const f=fixture();try{expect(pinnedProxy(f.root).manifest.sha256).toBe(f.manifest.sha256);expect(pinnedProxy(f.root).path).toBe(pinnedProxy(f.root).path);
    const other=join(f.root,'other.dll');writeFileSync(other,Buffer.from('wrong'));expect(()=>pinnedProxy(f.root,other)).toThrow('Supplied proxy');
    writeFileSync(join(f.resource,'abi1.dll'),Buffer.from('wrong'));expect(()=>pinnedProxy(f.root)).toThrow();
+  }finally{rmSync(f.root,{recursive:true,force:true});}
+ });
+ it('allows only a source-bound independently reviewed internal proxy and preserves the formal pin',()=>{
+  const f=fixture();try{
+   const digest=(bytes:Buffer|string)=>createHash('sha256').update(bytes).digest('hex');
+   writeFileSync(join(f.base,'src/proxy.rs'),'reviewed new lifecycle');
+   expect(()=>selectedProxy(f.root,{},'compiler')).toThrow('source contract');
+   const bytes=pe(['DllGetClassObject','DllCanUnloadNow','ReviewedBuild']);
+   const hash=validateComponent(bytes,'proxy'),dir=join(f.root,'.local/text-service-build',hash);mkdirSync(dir,{recursive:true});writeFileSync(join(dir,'proxy.dll'),bytes);
+   const source=proxySourceIdentity(f.root),reviewFile=join(f.root,'review.json');
+   const review={decision:'approved',proxySha256:hash,sourceDigest:digest(JSON.stringify(source)),reviewer:'independent'};
+   writeFileSync(reviewFile,JSON.stringify(review));
+   const manifest={schemaVersion:1,kind:'reviewed-development-proxy',abi:1,platform:'windows-x86_64-msvc',sha256:hash,size:bytes.length,predecessor:f.manifest.sha256,source,compilerSha256:digest('compiler'),reviewFile,reviewSha256:digest(readFileSync(reviewFile))};
+   const manifestFile=join(f.root,'upgrade.json'),save=()=>writeFileSync(manifestFile,JSON.stringify(manifest));save();
+   const env={SAYWEAVE_BUILD_CHANNEL:'internal',SAYWEAVE_TSF_PROXY_UPGRADE_MANIFEST:manifestFile};
+   expect(selectedProxy(f.root,env,'compiler').path).toBe(join(dir,'proxy.dll'));
+   expect(()=>selectedProxy(f.root,{...env,SAYWEAVE_BUILD_CHANNEL:'stable'},'compiler')).toThrow('internal-only');
+   expect(()=>selectedProxy(f.root,env,'changed compiler')).toThrow('identity');
+   writeFileSync(reviewFile,JSON.stringify({...review,decision:'pending'}));expect(()=>selectedProxy(f.root,env,'compiler')).toThrow('review');
+   writeFileSync(reviewFile,JSON.stringify(review));writeFileSync(join(f.base,'src/proxy_transport.rs'),'unreviewed change');expect(()=>selectedProxy(f.root,env,'compiler')).toThrow('identity');
+   expect(readFileSync(join(f.resource,'abi1.dll'))).toEqual(f.bytes);
   }finally{rmSync(f.root,{recursive:true,force:true});}
  });
  it.each(['src/wire.rs','src/client.rs','src/settlement_boundary.rs','src/lib.rs','src/deployment/retired.rs','Cargo.lock','build.rs'])('fails closed on changed proxy dependency %s',file=>{

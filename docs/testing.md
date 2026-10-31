@@ -255,6 +255,8 @@ Current WebView2 runtimes ignore environment/HKCU browser-argument overrides for
 
 `npm run test:tsf` 保留现有输入检查，并调用 `scripts/test-core-switch.ps1`。轻量自有宿主通过同一代理 COM 对象，在同一 PID/STA 从普通核心 A→B→C 读回实际正文，核对哈希和代次、活动范围拒绝切换、旧请求隔离、候选激活失败恢复、引用保活与多 STA。普通管道回执检查覆盖 Commit 未确认、Deactivate、原控制进程重连读取与精确哈希 ACK，不重放编辑。验收代理的受控导出仅选择测试核心及生命周期故障，普通代理和核心禁止这些导出。输出保留在 `.local/core-switch/current`，不修改系统登记或日常程序。
 
+开发候选的 `tsf-probe receipt-recovery <proxy> <core>` 复用该自有空白窗口与真实管道：首轮写入后故意不确认 Commit，释放原发布，再用新 capability 接收原回执、核对原归属与原字节，并验证第二、第三轮完整正文。`shutdown` 覆盖退役时的回执事务终态；`expect-old-blocked` 只用于准确记录旧普通代理的预期拒绝。测试代理使用既有隔离端点，旧普通代理由测试进程的真实 TSF 激活，不并建同名服务器。这项证明原生传输和实际正文；DataWorker耐久保存、取消、损坏及空间失败分别通过数据所有者测试，不能用此探针冒充真实麦克风或完整主程序通过。
+
 实际 Codex 验收另行记录首次迁移重开、此后两次更新时 PID/创建身份/STA/代理保持不变、执行核心改变与实际正文。受控宿主通过或模块出现不代替实际输入；Codex 未完成时 Change 保持活动。
 
 

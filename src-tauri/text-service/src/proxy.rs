@@ -266,8 +266,15 @@ impl Core {
 // No automatic FreeLibrary: failed or outstanding retirement retains executable code.
 struct RetainedReply {
     key: crate::lifecycle::ReceiptKey,
-    owner: Option<(Identity, String)>,
+    owner: Option<ReplyOwner>,
+    receiver: Option<ReplyOwner>,
     bytes: Vec<u8>,
+}
+type ReplyOwner = (Identity, String);
+struct AcknowledgedReply {
+    key: crate::lifecycle::ReceiptKey,
+    owner: Option<ReplyOwner>,
+    receiver: Option<ReplyOwner>,
 }
 struct State {
     instance: [u8; 16],
@@ -285,10 +292,13 @@ struct State {
     shutdown: bool,
     failed: bool,
     retained_replies: Vec<RetainedReply>,
-    reply_owner: Option<(Identity, String)>,
+    reply_owners: Vec<(crate::lifecycle::ReceiptKey, ReplyOwner)>,
+    prepare_busy: Option<&'static str>,
+    handoff_fence: bool,
+    recovery_receiver: Option<ReplyOwner>,
     #[cfg(feature = "acceptance")]
     activation_fault: u32,
-    acknowledged: Vec<(crate::lifecycle::ReceiptKey, Option<(Identity, String)>)>,
+    acknowledged: Vec<AcknowledgedReply>,
     pipe: Option<Pipe>,
     peer: Option<Identity>,
     capability: Option<String>,
@@ -388,16 +398,14 @@ fn collect_inner(shared: &Shared) {
                 }
                 data.truncate(length);
                 // Malformed outcomes keep the core pending rather than pretending success.
-                let Some(key) = crate::lifecycle::ReceiptKey::from_frame(&data) else {
+                let Some(_key) = crate::lifecycle::ReceiptKey::from_frame(&data) else {
                     shared.borrow_mut().failed = true;
                     break;
                 };
-                let owner = shared.borrow().reply_owner.clone();
-                shared.borrow_mut().retained_replies.push(RetainedReply {
-                    key,
-                    owner,
-                    bytes: data,
-                });
+                if gateway::retain(shared, data).is_err() {
+                    shared.borrow_mut().failed = true;
+                    break;
+                }
             }
             unsafe {
                 let _ = (core.api.retire)(core.api.handle);
@@ -494,23 +502,62 @@ unsafe extern "system" fn validate_channel(
     .0
 }
 fn prepare(shared: &Shared, path: &Path, hash: &[u8; 32]) -> windows::core::Result<()> {
+    shared.borrow_mut().prepare_busy = None;
     if shared.borrow().failed {
-        recover(shared)?;
+        recover(shared).inspect_err(|cause| {
+            if cause.code().0 == BUSY {
+                shared.borrow_mut().prepare_busy = Some("recovery");
+            }
+        })?;
     }
     let (manager, client, generation, epoch, old) = {
         let mut state = shared.borrow_mut();
         if !state.active || state.shutdown || state.switching || state.calls.get() != 0 {
+            state.prepare_busy = Some(if !state.active {
+                "inactive"
+            } else if state.shutdown {
+                "shutdown"
+            } else if state.switching {
+                "switching"
+            } else {
+                "inCall"
+            });
             return Err(error(BUSY));
         }
         if !state.retained_replies.is_empty() {
+            state.prepare_busy = Some(
+                if state
+                    .retained_replies
+                    .iter()
+                    .any(|reply| reply.owner.is_none())
+                {
+                    "receiptOwnerUnknown"
+                } else {
+                    "retainedReceipts"
+                },
+            );
             return Err(error(BUSY));
         }
         if let Some(core) = &state.current {
             let status = core.status()?;
             if status.module_sha256 == *hash && status.active == 1 {
+                if state.handoff_fence {
+                    if !status.idle() {
+                        state.prepare_busy = Some("retiringPrevious");
+                        return Err(error(BUSY));
+                    }
+                    // No output, pending request or callback remains in the old
+                    // producer. Unanswered old headers are not text receipts.
+                    let current = state.peer.zip(state.capability.clone());
+                    state
+                        .reply_owners
+                        .retain(|(_, owner)| Some(owner) == current.as_ref());
+                    state.handoff_fence = false;
+                }
                 return Ok(());
             }
             if !status.idle() {
+                state.prepare_busy = Some("currentNotIdle");
                 return Err(error(BUSY));
             }
         }
@@ -604,6 +651,9 @@ fn prepare(shared: &Shared, path: &Path, hash: &[u8; 32]) -> windows::core::Resu
             !old_stopped
         };
         let mut state = shared.borrow_mut();
+        if cause.code().0 == BUSY {
+            state.prepare_busy.get_or_insert("activation");
+        }
         state.switching = false;
         if state.shutdown {
             if let Some(old) = old {
@@ -624,6 +674,11 @@ fn prepare(shared: &Shared, path: &Path, hash: &[u8; 32]) -> windows::core::Resu
     state.generation = generation;
     state.switching = false;
     state.failed = false;
+    state.handoff_fence = false;
+    let current = state.peer.zip(state.capability.clone());
+    state
+        .reply_owners
+        .retain(|(_, owner)| Some(owner) == current.as_ref());
     if let Some(old) = old {
         state.retired.push(old);
     }
@@ -644,13 +699,23 @@ fn finish_shutdown(shared: &Shared) -> windows::core::Result<()> {
         shared.borrow_mut().retired.push(core);
     }
     collect_inner(shared);
-    if !shared.borrow().retired.is_empty() || !shared.borrow().retained_replies.is_empty() {
+    if !shared.borrow().retired.is_empty()
+        || !shared.borrow().retained_replies.is_empty()
+        || shared.borrow().recovery_receiver.is_some()
+    {
         return Err(error(BUSY));
     }
     let window = {
         let mut state = shared.borrow_mut();
         state.manager = None;
         state.active = false;
+        // The COM service may be activated again without being destroyed.
+        // Close its settled server as well as its message window; keeping the
+        // handle would make the next FIRST_PIPE_INSTANCE creation fail.
+        state.pipe = None;
+        state.connected = false;
+        state.peer = None;
+        state.capability = None;
         std::mem::take(&mut state.window)
     };
     if !window.is_invalid() {
@@ -829,7 +894,10 @@ impl IClassFactory_Impl for Factory_Impl {
             shutdown: false,
             failed: false,
             retained_replies: Vec::new(),
-            reply_owner: None,
+            reply_owners: Vec::new(),
+            prepare_busy: None,
+            handoff_fence: false,
+            recovery_receiver: None,
             acknowledged: Vec::new(),
             #[cfg(feature = "acceptance")]
             activation_fault: 0,
@@ -948,14 +1016,33 @@ pub unsafe extern "system" fn SayweaveProxyDispatchFixture(
         {
             return Err(error(E_ACCESSDENIED.0));
         }
-        let (_call, api) = enter(&shared)?;
-        unsafe { checked((api.dispatch)(api.handle, data, length)) }
+        gateway::dispatch_owned(
+            &shared,
+            unsafe { std::slice::from_raw_parts(data, length) },
+            crate::lifecycle::InputHeader {
+                protocol: request.protocol,
+                engine: request.engine,
+                capability: request.capability,
+                task: request.task,
+                turn: request.turn,
+                operation: request.operation,
+                revision: request.revision,
+                deadline_tick: request.deadline_tick,
+            },
+        )
     })
 }
 #[cfg(feature = "acceptance")]
 #[unsafe(no_mangle)]
 pub extern "system" fn SayweaveProxyActivationFaultFixture(mode: u32) -> HRESULT {
     boundary(|| {
+        if mode == 3 {
+            return if current()?.borrow().activation_fault == 0 {
+                Ok(())
+            } else {
+                Err(error(E_UNEXPECTED.0))
+            };
+        }
         if mode > 2 {
             return Err(error(E_INVALIDARG.0));
         }
@@ -989,7 +1076,19 @@ pub unsafe extern "system" fn SayweaveProxyReadFixture(
         }
         let shared = current()?;
         let (_call, api) = enter(&shared)?;
-        unsafe { checked((api.read)(api.handle, buffer, capacity, length)) }
+        unsafe {
+            checked((api.read)(api.handle, buffer, capacity, length))?;
+        }
+        if !length.is_null() && !buffer.is_null() && unsafe { *length } > 0 {
+            let bytes = unsafe { std::slice::from_raw_parts(buffer, *length) };
+            if let Some(key) = crate::lifecycle::ReceiptKey::from_frame(bytes) {
+                shared
+                    .borrow_mut()
+                    .reply_owners
+                    .retain(|(original, _)| !original.matches(&key));
+            }
+        }
+        Ok(())
     })
 }
 #[cfg(feature = "acceptance")]

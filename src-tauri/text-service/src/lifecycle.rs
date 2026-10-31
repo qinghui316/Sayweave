@@ -66,6 +66,51 @@ pub struct ControlReply {
     pub runtime: Option<Runtime>,
     pub retired: u32,
 }
+/// A read-only offer of an old result. Its owner is never relabelled as the receiver.
+/// DrainRetired offers this manifest; ReadRetired returns the original bounded frame.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptOwner {
+    pub process: u32,
+    pub session: u32,
+    pub created: u64,
+    pub capability_sha256: String,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptRecovery {
+    pub control_protocol: u32,
+    pub task: String,
+    pub turn: u64,
+    pub operation: u64,
+    pub code: String,
+    pub receipt: ReceiptKey,
+    pub owner: ReceiptOwner,
+}
+impl ReceiptRecovery {
+    pub fn matches(&self, request: &ControlRequest) -> bool {
+        self.control_protocol == CONTROL_PROTOCOL
+            && self.task == request.task
+            && self.turn == request.turn
+            && self.operation == request.operation
+            && self.code == "receiptRecovery"
+            && self.receipt.valid()
+            && self.receipt.sha256.is_some()
+            && self.owner.process != 0
+            && self.owner.created != 0
+            && self.owner.capability_sha256.len() == 64
+            && self
+                .owner
+                .capability_sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit())
+    }
+    pub fn verifies(&self, frame: &[u8]) -> bool {
+        !frame.is_empty()
+            && frame.len() <= crate::wire::MAX_FRAME
+            && ReceiptKey::from_frame(frame).as_ref() == Some(&self.receipt)
+    }
+}
 /// Exact text-effect identity. Reading never acknowledges or replays an edit.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -165,6 +210,46 @@ impl InputHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_offer_binds_current_call_and_original_exact_bytes_separately() {
+        let frame = serde_json::to_vec(&serde_json::json!({"engine":{"proxy_instance":uuid::Uuid::new_v4().to_string(),"engine_generation":3},"task":uuid::Uuid::new_v4().to_string(),"turn":1,"operation":7,"revision":2,"text":"旧正文"})).unwrap();
+        let request = ControlRequest {
+            control_protocol: 1,
+            capability: uuid::Uuid::new_v4().to_string(),
+            task: uuid::Uuid::new_v4().to_string(),
+            turn: 2,
+            operation: 5,
+            deadline_tick: 1500,
+            action: ControlAction::DrainRetired,
+            expected_core: "a".repeat(64),
+            receipt: None,
+        };
+        let mut offer = ReceiptRecovery {
+            control_protocol: 1,
+            task: request.task.clone(),
+            turn: 2,
+            operation: 5,
+            code: "receiptRecovery".into(),
+            receipt: ReceiptKey::from_frame(&frame).unwrap(),
+            owner: ReceiptOwner {
+                process: 1,
+                session: 0,
+                created: 9,
+                capability_sha256: "b".repeat(64),
+            },
+        };
+        assert!(offer.matches(&request));
+        assert!(offer.verifies(&frame));
+        assert_ne!(offer.task, offer.receipt.task);
+        let mut changed = frame.clone();
+        changed.push(b' ');
+        assert!(!offer.verifies(&changed));
+        offer.operation += 1;
+        assert!(!offer.matches(&request));
+        offer.operation -= 1;
+        offer.owner.created = 0;
+        assert!(!offer.matches(&request));
+    }
     #[test]
     fn receipt_ack_is_exact_and_cannot_cross_task_or_generation() {
         let frame = serde_json::json!({"engine":{"proxy_instance":uuid::Uuid::new_v4().to_string(),"engine_generation":3},

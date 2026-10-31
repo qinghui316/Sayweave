@@ -3,7 +3,7 @@ use super::{Anchor, Delivery, DeliveryGate, Submission, Verification};
 use crate::history::types::Error;
 use sayweave_text_service::{
     client::{self, ProfileLease, SpeechActivation},
-    lifecycle::{ControlAction, ControlReply, ControlRequest, ReceiptKey},
+    lifecycle::{ControlAction, ControlReply, ControlRequest, ReceiptKey, ReceiptRecovery},
     registration,
     transport::Pipe,
     wire::{
@@ -1483,7 +1483,29 @@ impl Host {
                 std::thread::sleep(Duration::from_millis(5));
             };
             if !reply.ready {
-                if reply.code == "engineBusy" {
+                if reply.code == "engineBusy:retainedReceipts" {
+                    self.drain_previous_receipts(&request)?;
+                    continue;
+                }
+                if matches!(
+                    reply.code.as_str(),
+                    "engineBusy:shutdown" | "engineBusy:inactive"
+                ) {
+                    // Receipt-only settlement is legal after Deactivate. It
+                    // never reactivates a profile the user/TSF has disabled.
+                    self.drain_previous_receipts(&request)?;
+                    return Err(Error::new("compositionActivationFailed"));
+                }
+                if matches!(
+                    reply.code.as_str(),
+                    "engineBusy"
+                        | "engineBusy:inCall"
+                        | "engineBusy:switching"
+                        | "engineBusy:recovery"
+                        | "engineBusy:retiringPrevious"
+                        | "engineBusy:currentNotIdle"
+                        | "engineBusy:activation"
+                ) {
                     std::thread::sleep(Duration::from_millis(25));
                     continue;
                 }
@@ -1509,6 +1531,112 @@ impl Host {
             self.engine = binding;
             log::info!(target:"sayweave","operation=engine_prepare task_id={} result=ready process={} lifetime={} thread={} proxy_instance={} engine_generation={} core_hash={}",self.task,process,self.anchor.editor.lifetime,thread,self.engine.proxy_instance,self.engine.engine_generation,expected);
             return Ok(());
+        }
+    }
+    fn preparation_frame(&self, deadline: u64) -> Result<Vec<u8>, Error> {
+        loop {
+            pump();
+            target_ready(&self.task, &self.anchor, &self.gate)?;
+            if unsafe { GetTickCount64() } >= deadline {
+                return Err(Error::new("compositionTimeout"));
+            }
+            if let Some(bytes) = self
+                .pipe
+                .receive()
+                .map_err(|_| Error::new("compositionDisconnected"))?
+            {
+                return Ok(bytes);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    fn send_control(&self, request: &ControlRequest) -> Result<(), Error> {
+        target_ready(&self.task, &self.anchor, &self.gate)?;
+        if unsafe { GetTickCount64() } >= request.deadline_tick {
+            return Err(Error::new("compositionTimeout"));
+        }
+        self.pipe
+            .send(&serde_json::to_vec(request).map_err(|_| Error::new("compositionProtocol"))?)
+            .map_err(|_| Error::new("compositionDisconnected"))
+    }
+    fn drain_previous_receipts(&self, prepare: &ControlRequest) -> Result<(), Error> {
+        let mut drain = prepare.clone();
+        drain.action = ControlAction::DrainRetired;
+        // The proxy has at most 16 stored and 32 outstanding outcomes. This
+        // transaction also keeps the original preparation deadline/cancel gate.
+        let mut recovered = 0;
+        loop {
+            self.send_control(&drain)?;
+            let bytes = self.preparation_frame(drain.deadline_tick)?;
+            if let Ok(offer) = serde_json::from_slice::<ReceiptRecovery>(&bytes) {
+                recovered += 1;
+                if recovered > 48 {
+                    return Err(Error::new("inputReceiptRecoveryFailed"));
+                }
+                if !offer.matches(&drain) {
+                    return Err(Error::new("compositionProtocol"));
+                }
+                let read = self.receipt_request(
+                    ControlAction::ReadRetired,
+                    offer.receipt.clone(),
+                    drain.deadline_tick,
+                );
+                self.send_control(&read)?;
+                let frame = self.preparation_frame(drain.deadline_tick)?;
+                if !offer.verifies(&frame) {
+                    return Err(Error::new("compositionProtocol"));
+                }
+                // A completed file write is required. History queue acceptance
+                // is not a durable handoff, nor evidence of the old edit effect.
+                self.gate.preserve_receipt(&offer, &frame)?;
+                let ack = self.receipt_request(
+                    ControlAction::AcknowledgeRetired,
+                    offer.receipt.clone(),
+                    drain.deadline_tick,
+                );
+                self.send_control(&ack)?; // Recheck cancellation AFTER persistence.
+                let bytes = self.preparation_frame(drain.deadline_tick)?;
+                let reply: ControlReply = serde_json::from_slice(&bytes)
+                    .map_err(|_| Error::new("compositionProtocol"))?;
+                if reply.control_protocol != 1
+                    || reply.task != ack.task
+                    || reply.turn != ack.turn
+                    || reply.operation != ack.operation
+                    || !reply.ready
+                    || reply.code != "receiptAcknowledged"
+                    || reply.engine.as_ref() != Some(&offer.receipt.engine)
+                {
+                    return Err(Error::new("compositionProtocol"));
+                }
+                log::info!(target:"sayweave", "operation=receipt_recovery task_id={} original_task_id={} original_operation_id={} stage=archivedAndAcknowledged receipt_hash={}", self.task, offer.receipt.task, offer.receipt.operation, offer.receipt.sha256.as_deref().unwrap_or(""));
+                continue;
+            }
+            let reply: ControlReply =
+                serde_json::from_slice(&bytes).map_err(|_| Error::new("compositionProtocol"))?;
+            if reply.control_protocol != 1
+                || reply.task != drain.task
+                || reply.turn != drain.turn
+                || reply.operation != drain.operation
+            {
+                return Err(Error::new("compositionProtocol"));
+            }
+            if !reply.ready
+                && reply.code == "receiptsPending"
+                && reply.engine.is_none()
+                && reply.runtime.is_none()
+            {
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            return if reply.ready
+                && reply.code == "receiptsDrained"
+                && reply.engine.is_none()
+                && reply.runtime.is_none()
+            {
+                Ok(())
+            } else {
+                Err(Error::new("inputReceiptRecoveryFailed"))
+            };
         }
     }
     fn receipt_request(

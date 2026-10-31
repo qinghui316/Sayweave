@@ -158,6 +158,12 @@ Observation retirement shares one connection-owned completion between automatic 
 
 Preparation diagnostics identify component status, activation, editor endpoint, target pipe, engine preparation and runtime inspection around the existing calls. Receipt acknowledgement, block release and owned activation cleanup keep their original results. Editing during preparation is reported as interrupted preparation rather than a damaged input component; cancellation and preparation timeout retain their own feedback.
 
+### Proxy result recovery (development candidate)
+
+An old native result retains its original process creation identity, capability digest, engine and request identity. A later authenticated publication may receive that result through the existing control1 receipt channel. This is read-only result transfer: it neither replays the operation nor grants a range or write lease. The DataWorker must finish preserving the exact original bytes before the controller sends an exact-hash acknowledgement. A failed save, expired preparation or cancellation leaves the result retained. New preparation then performs the original engine/runtime/target checks and Begin independently.
+
+Receipt ownership is recorded before native dispatch and matched to the original request, including late frames. During shutdown, the receipt channel remains alive through the explicit `receiptsDrained` response; disconnect releases only that receiver's transaction hold. Native-call reentry skips transport polling rather than treating temporary BUSY as pipe disconnection. BUSY details describe the current preparation attempt; the unmodified formal proxy cannot expose those details. The original historical disconnect trigger remains unproven.
+
 ## 启动时已有输入法组合
 
 目标安全属性核验完成后，明确未执行的首次 Begin 组词拒绝可进入限时输入准备。Session 可以收音并保留同一 ASR 来源；尚未取得范围时没有可写 Draft，也不启动整理请求。现有草稿协调器保存期间的完整识别结果，在原实际编辑端点和原字段身份仍成立、原生 Begin 成功后，使用同一共享写入实现交付。等待总期限为15秒，重试和重复通知不延长。

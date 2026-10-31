@@ -13,6 +13,7 @@ it.each([
  ['compositionTimeout','等待输入框就绪超时，请重试。'],
  ['compositionWorker','输入服务意外中断，请退出并重新打开 Sayweave。'],
  ['compositionDisconnected','输入组件连接中断，请重新开始口述。'],
+ ['inputReceiptRecoveryFailed','旧输入结果暂时无法保存，请检查资料目录和可用空间后重试。'],
 ])('preparation error %s keeps its real cause instead of a generic component failure',(code,message)=>{
  const value={...initialDictation(),source:'external' as const,taskId:'current',presentationId:'view',presentation:'error' as const,error:code};
  expect(dictationFeedback(value,initialSpeech())).toBe(message);

@@ -2,6 +2,7 @@ mod archive_recovery;
 pub(crate) use archive_recovery::{Ticket as ArchiveStamp, untracked_ticket as archive_stamp};
 mod cancellation;
 pub mod model;
+mod native_receipts;
 mod repositories;
 pub mod repository;
 #[cfg(test)]
@@ -89,6 +90,22 @@ pub fn acquire(root: &Path) -> Result<File, DataError> {
     Ok(file)
 }
 impl DataWorker {
+    /// Exact old native results are saved before the proxy may release them.
+    /// Called on the composition worker, never the target's TSF apartment.
+    pub(crate) fn preserve_native_receipt(
+        &self,
+        offer: &sayweave_text_service::lifecycle::ReceiptRecovery,
+        frame: &[u8],
+    ) -> Result<(), DataError> {
+        let _guard = self
+            .journal_io
+            .try_lock()
+            .map_err(|_| DataError::new("busy"))?;
+        if !self.lease_active.load(Ordering::Acquire) || self.sealed.load(Ordering::Acquire) {
+            return Err(DataError::new("unavailable"));
+        }
+        native_receipts::preserve(&self.root, offer, frame)
+    }
     pub fn start(root: PathBuf) -> Result<Self, DataError> {
         let lease = match acquire(&root) {
             Ok(file) => Some(file),

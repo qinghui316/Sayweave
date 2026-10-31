@@ -69,6 +69,34 @@ impl Control {
         }
         Ok(status)
     }
+    fn prepare_when_idle(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let at = Instant::now();
+        loop {
+            match self.prepare(path) {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if error
+                        .downcast_ref::<windows::core::Error>()
+                        .is_some_and(|e| e.code() == HRESULT::from_win32(ERROR_BUSY.0))
+                        && at.elapsed() < Duration::from_secs(2) =>
+                {
+                    let status = self.status()?;
+                    eprintln!(
+                        "core_switch awaiting_retirement ranges={} pending={} cleanup={} observers={} callbacks={}",
+                        status.engine.ranges,
+                        status.engine.pending,
+                        status.engine.cleanup,
+                        status.engine.observers,
+                        status.engine.callbacks
+                    );
+                    // Production PrepareEngine also awaits proven native idle;
+                    // negative active-range/identity checks remain single-call.
+                    pump(Duration::from_millis(25));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
     #[allow(clippy::too_many_arguments)]
     fn send_only(
         &self,
@@ -207,6 +235,388 @@ pub(super) fn acknowledge_pipe(
     }
     Ok(())
 }
+/// Real pipe/real core, with an intentionally unacknowledged first outcome.
+/// Uses only this process's blank editor; no installed files are changed.
+pub(super) fn receipt_recovery(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    use sayweave_text_service::lifecycle::*;
+    use sha2::{Digest, Sha256};
+    let proxy = PathBuf::from(args.get(2).ok_or("proxy required")?);
+    let core = PathBuf::from(args.get(3).ok_or("core required")?);
+    let shutdown = args.iter().any(|s| s == "shutdown");
+    let expect_old = args.iter().any(|s| s == "expect-old-blocked");
+    let hash = format!("{:x}", Sha256::digest(std::fs::read(&core)?));
+    let connect = |stage: &str| -> Result<Pipe, Box<dyn std::error::Error>> {
+        eprintln!("receipt_recovery stage={stage}");
+        let at = Instant::now();
+        loop {
+            match unsafe {
+                Pipe::client(
+                    std::process::id(),
+                    windows::Win32::System::Threading::GetCurrentThreadId(),
+                )
+            } {
+                Ok(pipe) => return Ok(pipe),
+                Err(error) if at.elapsed() > Duration::from_millis(500) => {
+                    return Err(format!("{stage}: {error}").into());
+                }
+                Err(_) => pump(Duration::from_millis(5)),
+            }
+        }
+    };
+    unsafe {
+        let top = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            w!("Sayweave owned receipt recovery"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            50,
+            50,
+            540,
+            240,
+            None,
+            None,
+            None,
+            None,
+        )?;
+        let editor = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("EDIT"),
+            w!(""),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_MULTILINE as u32),
+            10,
+            10,
+            490,
+            170,
+            Some(top),
+            None,
+            None,
+            None,
+        )?;
+        let manager: ITfThreadMgr =
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
+        manager.Activate()?;
+        let _ = SetForegroundWindow(top);
+        let _ = SetFocus(Some(editor));
+        pump(Duration::from_millis(150));
+        let (activation, language) = sayweave_text_service::client::speech_activation()?;
+        if activation == sayweave_text_service::client::SpeechActivation::Own {
+            registration::deactivate(language, false)?;
+            pump(Duration::from_millis(100));
+        }
+        let (module, processor) = load_processor(&proxy)?;
+        let client = manager
+            .cast::<ITfClientId>()?
+            .GetClientId(&registration::CLASS)?;
+        let fixture = GetProcAddress(module, s!("SayweaveProxyPrepareFixture"))
+            .map(|_| Control::load(module))
+            .transpose()?;
+        if fixture.is_some() {
+            processor.Activate(&manager, client)?;
+        } else {
+            registration::activate(false)?;
+            pump(Duration::from_millis(100));
+        }
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let capability = uuid::Uuid::new_v4().to_string();
+            let lease = registration::host_capability(std::process::id(), &capability)?;
+            if let Some(control) = &fixture {
+                control.prepare(&core)?;
+            }
+            let pipe = connect("firstPipe")?;
+            let prepare = |cap: &str, task: &str, action| ControlRequest {
+                control_protocol: 1,
+                capability: cap.into(),
+                task: task.into(),
+                turn: 1,
+                operation: 1,
+                deadline_tick: windows::Win32::System::SystemInformation::GetTickCount64() + 2000,
+                action,
+                expected_core: hash.clone(),
+                receipt: None,
+            };
+            let task = uuid::Uuid::new_v4().to_string();
+            let binding = if let Some(control) = &fixture {
+                let status = control.status()?;
+                EngineBinding {
+                    proxy_instance: uuid::Uuid::from_bytes(status.instance).to_string(),
+                    engine_generation: status.generation,
+                }
+            } else {
+                pipe.send(&serde_json::to_vec(&prepare(
+                    &capability,
+                    &task,
+                    ControlAction::PrepareEngine,
+                ))?)?;
+                let ready: ControlReply = serde_json::from_slice(&receive_pipe(&pipe)?)?;
+                if !ready.ready {
+                    return Err(format!("initial prepare {}", ready.code).into());
+                }
+                ready.engine.ok_or("initial binding")?
+            };
+            let exchange = |pipe: &Pipe,
+                            cap: &str,
+                            task: &str,
+                            binding: &EngineBinding,
+                            op,
+                            revision,
+                            action,
+                            text: &str,
+                            ack: bool|
+             -> Result<ReceiptKey, Box<dyn std::error::Error>> {
+                if GetForegroundWindow() != top {
+                    return Err("owned editor lost focus; no input sent".into());
+                }
+                let request = Request {
+                    protocol: sayweave_text_service::wire::PROTOCOL,
+                    engine: binding.clone(),
+                    capability: cap.into(),
+                    task: task.into(),
+                    turn: 1,
+                    operation: op,
+                    revision,
+                    deadline_tick: windows::Win32::System::SystemInformation::GetTickCount64()
+                        + 2000,
+                    action,
+                    text: text.into(),
+                    prefix: None,
+                    revoke: None,
+                    block: None,
+                };
+                pipe.send(&serde_json::to_vec(&request)?)?;
+                let bytes = receive_pipe(pipe)?;
+                let reply: Reply = serde_json::from_slice(&bytes)?;
+                if reply.task != task
+                    || reply.operation != op
+                    || reply.engine != *binding
+                    || !reply.applied
+                {
+                    return Err(format!("native operation rejected {}", reply.code).into());
+                }
+                let key = ReceiptKey::from_frame(&bytes).ok_or("native identity")?;
+                if ack {
+                    acknowledge_pipe(pipe, cap, &key)?;
+                }
+                Ok(key)
+            };
+            exchange(
+                &pipe,
+                &capability,
+                &task,
+                &binding,
+                1,
+                0,
+                Action::Begin,
+                "",
+                true,
+            )?;
+            exchange(
+                &pipe,
+                &capability,
+                &task,
+                &binding,
+                2,
+                1,
+                Action::Update,
+                "第一轮。",
+                true,
+            )?;
+            let key = exchange(
+                &pipe,
+                &capability,
+                &task,
+                &binding,
+                3,
+                1,
+                Action::Commit,
+                "",
+                false,
+            )?;
+            let first = editor_text(editor)?;
+            if first != "第一轮。" {
+                return Err(format!("first body {first:?}").into());
+            }
+            if shutdown {
+                let _ = processor.Deactivate();
+            }
+            drop(pipe);
+            drop(lease);
+            pump(Duration::from_millis(100));
+            let next_cap = uuid::Uuid::new_v4().to_string();
+            let _next_lease = registration::host_capability(std::process::id(), &next_cap)?;
+            let pipe = connect("successorPipe")?;
+            let next_task = uuid::Uuid::new_v4().to_string();
+            if fixture.is_none() {
+                pipe.send(&serde_json::to_vec(&prepare(
+                    &next_cap,
+                    &next_task,
+                    ControlAction::PrepareEngine,
+                ))?)?;
+                let busy: ControlReply = serde_json::from_slice(&receive_pipe(&pipe)?)?;
+                if busy.ready || !busy.code.starts_with("engineBusy") {
+                    return Err(
+                        format!("old candidate did not hit receipt gate {}", busy.code).into(),
+                    );
+                }
+            }
+            let drain = prepare(&next_cap, &next_task, ControlAction::DrainRetired);
+            if !expect_old {
+                pipe.send(&serde_json::to_vec(&receipt_request(
+                    &next_cap,
+                    &key,
+                    ControlAction::ReadRetired,
+                ))?)?;
+                let refused: ControlReply = serde_json::from_slice(&receive_pipe(&pipe)?)?;
+                if refused.ready || refused.code != "receiptUnavailable" {
+                    return Err("new owner read without offer".into());
+                }
+            }
+            pipe.send(&serde_json::to_vec(&drain)?)?;
+            let bytes = receive_pipe(&pipe)?;
+            let offer = match serde_json::from_slice::<ReceiptRecovery>(&bytes) {
+                Ok(offer) => offer,
+                Err(_) if expect_old => {
+                    println!(
+                        "{}",
+                        serde_json::json!({"oldOrdinaryBlocked":true,"body":first,"proxySha256":format!("{:x}",Sha256::digest(std::fs::read(&proxy)?)),"firstDivergence":"new authenticated publication cannot receive original receipt"})
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(format!("missing recovery manifest {error}").into()),
+            };
+            if expect_old {
+                return Err("old candidate unexpectedly recovered".into());
+            }
+            if !offer.matches(&drain)
+                || offer.receipt != key
+                || offer.owner.capability_sha256
+                    != format!("{:x}", Sha256::digest(capability.as_bytes()))
+            {
+                return Err("offer changed original ownership".into());
+            }
+            pipe.send(&serde_json::to_vec(&receipt_request(
+                &next_cap,
+                &key,
+                ControlAction::ReadRetired,
+            ))?)?;
+            let raw = receive_pipe(&pipe)?;
+            if !offer.verifies(&raw) {
+                return Err("original bytes changed".into());
+            }
+            // This probe proves transport. DataWorker durability/cancel is
+            // independently verified by the main owner tests, not mocked here.
+            pipe.send(&serde_json::to_vec(&receipt_request(
+                &next_cap,
+                &key,
+                ControlAction::AcknowledgeRetired,
+            ))?)?;
+            let ack: ControlReply = serde_json::from_slice(&receive_pipe(&pipe)?)?;
+            if !ack.ready
+                || ack.engine.as_ref() != Some(&key.engine)
+                || ack.code != "receiptAcknowledged"
+            {
+                return Err("new receiver ACK rejected".into());
+            }
+            loop {
+                pipe.send(&serde_json::to_vec(&drain)?)?;
+                let terminal: ControlReply = serde_json::from_slice(&receive_pipe(&pipe)?)?;
+                if terminal.ready && terminal.code == "receiptsDrained" {
+                    break;
+                }
+                if terminal.code != "receiptsPending"
+                    || !drain.valid(windows::Win32::System::SystemInformation::GetTickCount64())
+                {
+                    return Err("recovery transaction did not settle".into());
+                }
+                pump(Duration::from_millis(25));
+            }
+            if shutdown {
+                drop(pipe);
+                pump(Duration::from_millis(50));
+                processor.Activate(&manager, client)?;
+            } else {
+                drop(pipe);
+                pump(Duration::from_millis(50));
+            }
+            let control = fixture
+                .as_ref()
+                .ok_or("new candidate fixture required for explicit isolated core identity")?;
+            control.prepare(&core)?;
+            let pipe = connect("newRoundsPipe")?;
+            let status = control.status()?;
+            let binding = EngineBinding {
+                proxy_instance: uuid::Uuid::from_bytes(status.instance).to_string(),
+                engine_generation: status.generation,
+            };
+            for (round, text, expected) in [
+                (2, "第二轮。", "第一轮。第二轮。"),
+                (3, "第三轮。", "第一轮。第二轮。第三轮。"),
+            ] {
+                let task = uuid::Uuid::new_v4().to_string();
+                exchange(
+                    &pipe,
+                    &next_cap,
+                    &task,
+                    &binding,
+                    1,
+                    0,
+                    Action::Begin,
+                    "",
+                    true,
+                )?;
+                exchange(
+                    &pipe,
+                    &next_cap,
+                    &task,
+                    &binding,
+                    2,
+                    1,
+                    Action::Update,
+                    text,
+                    true,
+                )?;
+                exchange(
+                    &pipe,
+                    &next_cap,
+                    &task,
+                    &binding,
+                    3,
+                    1,
+                    Action::Commit,
+                    "",
+                    true,
+                )?;
+                let body = editor_text(editor)?;
+                if body != expected {
+                    return Err(format!("round {round} body {body:?}").into());
+                }
+                println!("receipt_recovery round={round} body={body}");
+            }
+            println!(
+                "{}",
+                serde_json::json!({"receiptTransportRecovered":true,"shutdown":shutdown,"sameProxy":true,"originalOwnershipPreserved":true,"rawSha256":key.sha256,"body":editor_text(editor)?,"dataWorkerDurability":"separate owner tests"})
+            );
+            Ok(())
+        })();
+        if fixture.is_some() {
+            let _ = processor.Deactivate();
+        } else {
+            let _ = registration::deactivate(language, false);
+        }
+        drop(processor);
+        let _ = manager.Deactivate();
+        let _ = DestroyWindow(top);
+        pump(Duration::from_millis(80));
+        // A deliberately retained old-candidate result may keep this module
+        // loaded until this isolated probe process exits.
+        let can: unsafe extern "system" fn() -> HRESULT = std::mem::transmute(
+            GetProcAddress(module, s!("DllCanUnloadNow")).ok_or("unload export")?,
+        );
+        if can() == S_OK {
+            FreeLibrary(module)?;
+        }
+        result
+    }
+}
 pub(super) fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let proxy = PathBuf::from(args.get(2).ok_or("proxy required")?);
     let cores: Vec<PathBuf> = args.iter().skip(3).map(PathBuf::from).collect();
@@ -311,9 +721,19 @@ pub(super) fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                             .ok_or("activation fault fixture missing")?,
                     );
                     fault(1).ok()?;
-                    if control.prepare(path).is_ok() {
-                        return Err("candidate failure falsely ready".into());
+                    let failure = control
+                        .prepare_when_idle(path)
+                        .expect_err("candidate activation fault must fail");
+                    if !failure
+                        .downcast_ref::<windows::core::Error>()
+                        .is_some_and(|e| e.code() == E_FAIL)
+                    {
+                        return Err(
+                            format!("candidate fault branch was not entered: {failure}").into()
+                        );
                     }
+                    // Busy before activation must not count as injected failure.
+                    fault(3).ok()?;
                     pump(Duration::from_millis(50));
                     let restored = control.status()?;
                     if restored.ready != 1
@@ -326,7 +746,7 @@ pub(super) fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                 }
-                control.prepare(path)?;
+                control.prepare_when_idle(path)?;
                 let status = control.status()?;
                 if status.engine.module_sha256 != hashes[index]
                     || status.generation != status.engine.generation
