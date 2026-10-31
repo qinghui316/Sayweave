@@ -18,6 +18,43 @@ use windows::{
 };
 
 type Outcome<T> = Result<T, Box<dyn std::error::Error>>;
+struct DesktopMonitor(bool);
+impl DesktopMonitor {
+    fn open(phase: &str) -> Outcome<Self> {
+        let count = || {
+            sayweave_text_service::client::input_profiles().map(|profiles| {
+                profiles
+                    .into_iter()
+                    .filter(|p| p.clsid == registration::CLASS)
+                    .count()
+            })
+        };
+        let before = count();
+        // A fresh hosted desktop need not have TSF's desktop monitor running.
+        // This is the documented desktop setup API, not a TIP activation bypass.
+        checked(phase, "desktop-monitor.initialize", unsafe {
+            InitLocalMsCtfMonitor(ILMCM_LANGUAGEBAROFF)
+        })?;
+        let monitor = Self(true);
+        let after = count();
+        println!(
+            "formal_environment phase={phase} monitor_initialized=true own_profiles_before={before:?} own_profiles_after={after:?}"
+        );
+        Ok(monitor)
+    }
+    fn close(&mut self) -> windows::core::Result<()> {
+        if std::mem::replace(&mut self.0, false) {
+            unsafe { UninitLocalMsCtfMonitor() }
+        } else {
+            Ok(())
+        }
+    }
+}
+impl Drop for DesktopMonitor {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
 fn checked<T, E: std::fmt::Display>(phase: &str, call: &str, result: Result<T, E>) -> Outcome<T> {
     result.map_err(|error| format!("formal_target phase={phase} call={call}: {error}").into())
 }
@@ -215,6 +252,7 @@ fn exercise(
     language: u16,
     phase: &str,
 ) -> Outcome<serde_json::Value> {
+    let mut desktop_monitor = DesktopMonitor::open(phase)?;
     unsafe {
         let top = checked(
             phase,
@@ -413,6 +451,7 @@ fn exercise(
         let deactivated = manager.Deactivate();
         let destroyed = DestroyWindow(top);
         pump(Duration::from_millis(100));
+        let monitor_closed = desktop_monitor.close();
         let can: unsafe extern "system" fn() -> HRESULT = std::mem::transmute(
             GetProcAddress(module, s!("DllCanUnloadNow")).ok_or("unload export")?,
         );
@@ -424,6 +463,7 @@ fn exercise(
         stopped?;
         deactivated?;
         destroyed?;
+        monitor_closed?;
         if !unloaded && phase != "old" {
             return Err("proxy resources remain".into());
         }
