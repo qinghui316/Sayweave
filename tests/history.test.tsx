@@ -13,6 +13,98 @@ import {localAssetId} from '../src/contracts/models';
 function record(n=1,text='完整的识别文字'):HistoryRecord {const id=`record-${n}`,a=`attempt-${n}`;return {id,createdAt:1000+n,endedAt:2000+n,durationMs:1000,status:'success',currentAttempt:a,revision:1,audio:null,attempts:[{id:a,recordId:id,kind:'live',configId:'fixture',configName:'模型',configRevision:1,modelId:'fixture',serviceHost:'example.invalid',createdAt:1000+n,endedAt:2000+n,status:'success',text,errorCode:null,elapsedMs:1}]};}
 function fixture(records:HistoryRecord[]){const speech=new BrowserSpeech();speech.records.push(...records);return {speech,port:new BrowserHistory(speech),models:new BrowserModels()};}
 function deferred<T>(){let resolve!:(value:T)=>void;const promise=new Promise<T>(r=>resolve=r);return {promise,resolve};}
+it('automatically follows saved recordings and late processed summaries without replacing the row identity',async()=>{
+ const f=fixture([]),store=new HistoryFeedStore(f.port);await store.refresh();
+ f.speech.records.push(record(1,'第一轮原文'));await store.refresh();
+ expect(store.getSnapshot().records.map(r=>r.preview)).toEqual(['第一轮原文']);
+ const first=store.getSnapshot().records[0]!,epoch=store.getSnapshot().epoch;
+ f.speech.records[0]!.processing=[{id:'p',attemptId:first.displayAttempt!,configName:'文字模型',modelId:'fixture',state:'success',text:'第一轮整理',revision:1,errorCode:null,units:[]}];
+ await store.refresh();expect(store.getSnapshot().records[0]).toMatchObject({id:first.id,preview:'第一轮整理'});expect(store.getSnapshot().epoch).toBe(epoch);
+ f.speech.records.push(record(2,'第二轮'));await store.refresh();await store.refresh();
+ expect(store.getSnapshot().records.map(r=>r.id)).toEqual(['record-2','record-1']);
+});
+it('resumes automatically after scrolling, expanding or releasing the last reading hold',async()=>{
+ const f=fixture([record(1)]),store=new HistoryFeedStore(f.port);await store.refresh();store.setScroll(80);
+ f.speech.records.push(record(2));await store.refresh();expect(store.getSnapshot().records.map(r=>r.id)).toEqual(['record-1']);expect(store.getScroll()).toBe(80);
+ store.setScroll(0);await waitFor(()=>expect(store.getSnapshot().records[0]?.id).toBe('record-2'));
+ store.expand('record-2');f.speech.records.push(record(3));await store.refresh();
+ expect(store.getSnapshot().expandedId).toBe('record-2');expect(store.getSnapshot().records[0]?.id).toBe('record-2');
+ store.expand(null);await waitFor(()=>expect(store.getSnapshot().records[0]?.id).toBe('record-3'));
+ const releaseCopy=store.hold(),releasePlayback=store.hold();f.speech.records.push(record(4));await store.refresh();releaseCopy();releaseCopy();
+ expect(store.getSnapshot().records[0]?.id).toBe('record-3');releasePlayback();
+ await waitFor(()=>expect(store.getSnapshot().records[0]?.id).toBe('record-4'));
+});
+it('rebuilds forward cursors after following resumes without duplicating or dropping records',async()=>{
+ const f=fixture(Array.from({length:41},(_,n)=>record(n))),store=new HistoryFeedStore(f.port);await store.refresh();await store.next();
+ const older=store.getSnapshot().records.map(r=>r.id);f.speech.records.push(record(100));await store.refresh();
+ expect(store.getSnapshot().records.map(r=>r.id)).toEqual(older);await store.previous();
+ await waitFor(()=>expect(store.getSnapshot().records[0]?.id).toBe('record-100'));
+ const ids:string[]=[];
+ ids.push(...store.getSnapshot().records.map(r=>r.id));while(store.getSnapshot().cursor){await store.next();ids.push(...store.getSnapshot().records.map(r=>r.id));}
+ expect(ids).toHaveLength(42);expect(new Set(ids).size).toBe(42);expect(new Set(ids)).toEqual(new Set(f.speech.records.map(r=>r.id)));
+});
+it('rechecks reading eligibility after a slow head read and preserves data across a failed refresh',async()=>{
+ const f=fixture([record(1)]),store=new HistoryFeedStore(f.port);await store.refresh();f.speech.records.push(record(2));
+ const head=await f.port.browse('',null,20),late=deferred<typeof head>(),browse=vi.spyOn(f.port,'browse').mockReturnValueOnce(late.promise);
+ const pending=store.refresh();await waitFor(()=>expect(browse).toHaveBeenCalledOnce());store.setScroll(100);late.resolve(head);await pending;
+ expect(store.getSnapshot().records[0]?.id).toBe('record-1');expect(store.getScroll()).toBe(100);
+ browse.mockRejectedValueOnce({code:'unavailable'});store.setScroll(0);await waitFor(()=>expect(store.getSnapshot().error).toBe('unavailable'));
+ expect(store.getSnapshot().records[0]?.id).toBe('record-1');expect(store.getSnapshot().loaded).toBe(true);
+ await store.retry();expect(store.getSnapshot().records[0]?.id).toBe('record-2');expect(store.getSnapshot().error).toBeNull();
+});
+it('resumes pending history when an older automatic read is superseded before returning to the top',async()=>{
+ const f=fixture([record(1)]),store=new HistoryFeedStore(f.port);await store.refresh();store.setScroll(80);
+ f.speech.records.push(record(2));await store.refresh();
+ const head=await f.port.browse('',null,20),late=deferred<typeof head>(),browse=vi.spyOn(f.port,'browse').mockReturnValueOnce(late.promise);
+ store.setScroll(0);await waitFor(()=>expect(browse).toHaveBeenCalledOnce());store.setScroll(80);
+ f.speech.records.push(record(3));await store.refresh();store.setScroll(0);
+ late.resolve(head);await waitFor(()=>expect(store.getSnapshot().records.map(r=>r.id)).toEqual(['record-3','record-2','record-1']));
+});
+it('retains a resume requested while the current automatic read is finishing a reading hold',async()=>{
+ const f=fixture([record(1)]),store=new HistoryFeedStore(f.port);await store.refresh();store.expand('record-1');
+ f.speech.records.push(record(2));await store.refresh();
+ const head=await f.port.browse('',null,20),late=deferred<typeof head>(),browse=vi.spyOn(f.port,'browse').mockReturnValueOnce(late.promise);
+ store.expand(null);await waitFor(()=>expect(browse).toHaveBeenCalledOnce());const release=store.hold();let releaseOnRead=true;
+ const unsubscribe=store.subscribe(()=>{if(releaseOnRead){releaseOnRead=false;release();}});
+ late.resolve(head);await waitFor(()=>expect(store.getSnapshot().records[0]?.id).toBe('record-2'));unsubscribe();
+});
+it('ignores a late resumed head after a newer search and preserves the current query',async()=>{
+ const f=fixture([record(1,'旧文字')]),store=new HistoryFeedStore(f.port);await store.refresh();store.setScroll(80);
+ f.speech.records.push(record(2,'新文字'));await store.refresh();
+ const head=await f.port.browse('',null,20),late=deferred<typeof head>(),browse=vi.spyOn(f.port,'browse').mockReturnValueOnce(late.promise);
+ store.setScroll(0);await waitFor(()=>expect(browse).toHaveBeenCalledOnce());store.search('新文字');await store.refresh();late.resolve(head);
+ await waitFor(()=>expect(store.getSnapshot().records.map(r=>r.id)).toEqual(['record-2']));expect(store.getSnapshot().search).toBe('新文字');
+ f.speech.records.push(record(3,'不匹配'),record(4,'新文字后续'));await store.refresh();expect(store.getSnapshot().records.map(r=>r.id)).toEqual(['record-4','record-2']);
+});
+it('renders newly archived and processed text automatically without a latest button',async()=>{
+ const f=fixture([]),props={...f,recordingSettings:recordingSettings(f.speech),snapshot:initialSpeech()};
+ const view=render(<MemoryRouter><History {...props}/></MemoryRouter>);await screen.findByText('还没有历史记录');
+ f.speech.records.push(record(1,'新口述'));view.rerender(<MemoryRouter><History {...props} contentRevision={1}/></MemoryRouter>);
+ expect(await screen.findByText('新口述')).toBeVisible();expect(screen.queryByRole('button',{name:/查看最新/})).not.toBeInTheDocument();
+ const r=f.speech.records[0]!;r.processing=[{id:'translated',attemptId:r.currentAttempt!,configName:'文字模型',modelId:'fixture',state:'success',text:'New translation',revision:1,errorCode:null,units:[]}];
+ view.rerender(<MemoryRouter><History {...props} contentRevision={2}/></MemoryRouter>);
+ expect(await screen.findByText('New translation')).toBeVisible();expect(screen.getAllByRole('listitem')).toHaveLength(1);
+});
+it('keeps a copy read bound to its row while new history arrives and resumes after copying',async()=>{
+ const f=fixture([record(1,'正在复制的文字')]),copy=vi.spyOn(f.speech,'copy').mockResolvedValue(),props={...f,recordingSettings:recordingSettings(f.speech),snapshot:initialSpeech()};
+ const view=render(<MemoryRouter><History {...props}/></MemoryRouter>);await screen.findByText('正在复制的文字');
+ const detail=deferred<HistoryRecord>();vi.spyOn(f.port,'detail').mockReturnValueOnce(detail.promise);fireEvent.click(screen.getByRole('button',{name:'复制'}));
+ f.speech.records.push(record(2,'随后完成的口述'));view.rerender(<MemoryRouter><History {...props} contentRevision={1}/></MemoryRouter>);
+ await waitFor(()=>expect(screen.getByText('2 条')).toBeVisible());expect(screen.queryByText('随后完成的口述')).not.toBeInTheDocument();
+ await act(async()=>detail.resolve(record(1,'正在复制的文字')));await waitFor(()=>expect(copy).toHaveBeenCalledWith('正在复制的文字'));
+ expect(await screen.findByText('随后完成的口述')).toBeVisible();
+});
+it('releases an obsolete copy hold when a newer copy completes or history is left',async()=>{
+ const f=fixture([record(1,'第一条'),record(2,'第二条')]),store=new HistoryFeedStore(f.port),copy=vi.spyOn(f.speech,'copy').mockResolvedValue(),props={...f,reading:store,recordingSettings:recordingSettings(f.speech),snapshot:initialSpeech()};
+ const view=render(<MemoryRouter><History {...props}/></MemoryRouter>);await screen.findByText('第二条');
+ const stale=deferred<HistoryRecord>(),detail=vi.spyOn(f.port,'detail').mockReturnValueOnce(stale.promise);
+ fireEvent.click(within(screen.getAllByRole('listitem')[1]!).getByRole('button',{name:'复制'}));
+ fireEvent.click(within(screen.getAllByRole('listitem')[0]!).getByRole('button',{name:'复制'}));await waitFor(()=>expect(copy).toHaveBeenCalledWith('第二条'));
+ f.speech.records.push(record(3,'第三条'));view.rerender(<MemoryRouter><History {...props} contentRevision={1}/></MemoryRouter>);expect(await screen.findByText('第三条')).toBeVisible();
+ const leaving=deferred<HistoryRecord>();detail.mockReturnValueOnce(leaving.promise);fireEvent.click(within(screen.getAllByRole('listitem')[0]!).getByRole('button',{name:'复制'}));view.unmount();
+ f.speech.records.push(record(4,'第四条'));render(<MemoryRouter><History {...props}/></MemoryRouter>);expect(await screen.findByText('第四条')).toBeVisible();
+ await act(async()=>{stale.resolve(record(1,'第一条'));leaving.resolve(record(3,'第三条'));});expect(copy).toHaveBeenCalledTimes(1);
+});
 it('retries retained audio with a local default without claiming a cloud upload',async()=>{
  const r=record(),f=fixture([r]);r.audio={id:'retained-audio',recordId:r.id,status:'ready',bytes:32000,expiresAt:null};
  await f.models.local.download();
@@ -69,7 +161,7 @@ it('refreshes late delivery confirmation without changing the recognition record
 });
 it('keeps 20-item reading boundaries across deletion, new records and cache eviction',async()=>{
  const f=fixture(Array.from({length:1000},(_,n)=>record(n))),store=new HistoryFeedStore(f.port);
- const reread=vi.spyOn(f.port,'reread');await store.refresh();expect(store.getSnapshot().records).toHaveLength(20);
+ const reread=vi.spyOn(f.port,'reread');await store.refresh();expect(store.getSnapshot().records).toHaveLength(20);const release=store.hold();
  const first=store.getSnapshot().records.map(r=>r.id),cursor=store.getSnapshot().cursor!;
  await f.port.remove(cursor.id,1);store.remove(cursor.id);await store.refresh();
  expect(store.getSnapshot().records).toHaveLength(19);expect(store.getSnapshot().cursor).toEqual(cursor);
@@ -77,10 +169,10 @@ it('keeps 20-item reading boundaries across deletion, new records and cache evic
  while(store.getSnapshot().cursor){await store.next();for(const r of store.getSnapshot().records){expect(seen.has(r.id)).toBe(false);seen.add(r.id);}}
  expect(seen.size).toBe(999);
  store.setScroll(720);await store.refresh();expect(store.getScroll()).toBe(720);
- f.speech.records.push(record(2000));await store.refresh();expect(store.getSnapshot().newRecords).toBe(true);
+ f.speech.records.push(record(2000));await store.refresh();expect(store.getSnapshot().records.some(r=>r.id==='record-2000')).toBe(false);
  await store.go(0);expect(reread).toHaveBeenCalledWith('',first.filter(id=>id!==cursor.id));
  expect(store.getSnapshot().records.map(r=>r.id)).toEqual(first.filter(id=>id!==cursor.id));
- await store.latest();expect(store.getSnapshot().page).toBe(1);expect(store.getSnapshot().records[0]?.id).toBe('record-2000');expect(store.getSnapshot().records).toHaveLength(20);
+ await store.latest();expect(store.getSnapshot().page).toBe(1);expect(store.getSnapshot().records[0]?.id).toBe('record-2000');expect(store.getSnapshot().records).toHaveLength(20);release();
 });
 it('discards stale searches and a late page containing a deleted row',async()=>{
  const f=fixture([record(1,'旧字'),record(2,'新字')]);const store=new HistoryFeedStore(f.port);const old=deferred<Awaited<ReturnType<BrowserHistory['browse']>>>();
@@ -94,14 +186,14 @@ it('discards stale searches and a late page containing a deleted row',async()=>{
  s2.remove('record-69');late.resolve({records:[summarizeHistory(record(69))!],total:70,nextCursor:null});await more;
  expect(s2.getSnapshot().records.some(r=>r.id==='record-69')).toBe(false);
 });
-it('keeps incoming records out of visited pages until explicit refresh',async()=>{
+it('keeps incoming records out of protected reading pages and retains explicit refresh',async()=>{
  const f=fixture(Array.from({length:21},(_,n)=>record(n))),store=new HistoryFeedStore(f.port);await store.refresh();
- const original=store.getSnapshot().records.map(r=>r.id);f.speech.records.push(...Array.from({length:60},(_,n)=>record(100+n)));
- await store.refresh();expect(store.getSnapshot().records.map(r=>r.id)).toEqual(original);expect(store.getSnapshot().newRecords).toBe(true);
+ const release=store.hold(),original=store.getSnapshot().records.map(r=>r.id);f.speech.records.push(...Array.from({length:60},(_,n)=>record(100+n)));
+ await store.refresh();expect(store.getSnapshot().records.map(r=>r.id)).toEqual(original);expect(store.getSnapshot().total).toBe(81);
  await store.next();expect(store.getSnapshot().records.map(r=>r.id)).toEqual(['record-0']);
  await f.port.remove('record-0',1);store.remove('record-0');await waitFor(()=>expect(store.getSnapshot().page).toBe(1));
  expect(store.getSnapshot().records.map(r=>r.id)).toEqual(original);
- const retry=vi.spyOn(f.port,'status');await store.latest();expect(retry).toHaveBeenLastCalledWith(true);expect(store.getSnapshot().total).toBe(80);
+ const retry=vi.spyOn(f.port,'status');await store.latest();expect(retry).toHaveBeenLastCalledWith(true);expect(store.getSnapshot().total).toBe(80);release();
 });
 it('validates bounded summaries and distinguishes a failed retry without losing success',()=>{
  const r=record(1,'当前成功');r.attempts.unshift({...r.attempts[0]!,id:'failed-retry',kind:'retry',createdAt:9000,status:'failed',text:'',errorCode:'timeout'});
@@ -157,7 +249,7 @@ it('coalesces a background notification received during navigation and handles e
  const f=fixture(Array.from({length:41},(_,n)=>record(n))),store=new HistoryFeedStore(f.port);await store.refresh();
  const page=await f.port.browse('',store.getSnapshot().cursor,20),wait=deferred<typeof page>();vi.spyOn(f.port,'browse').mockReturnValueOnce(wait.promise);
  const navigation=store.next();f.speech.records.push(record(100));await store.refresh();wait.resolve(page);await navigation;
- expect(store.getSnapshot().page).toBe(2);expect(store.getSnapshot().total).toBe(42);expect(store.getSnapshot().newRecords).toBe(true);expect(store.getSnapshot().records.some(r=>r.id==='record-100')).toBe(false);
+ expect(store.getSnapshot().page).toBe(2);expect(store.getSnapshot().total).toBe(42);expect(store.getSnapshot().records.some(r=>r.id==='record-100')).toBe(false);
 });
 it('rereads search membership by identity without filling a shrinking page',async()=>{
  const f=fixture(Array.from({length:61},(_,n)=>record(n,'匹配'))),store=new HistoryFeedStore(f.port);store.search('匹配');await store.refresh();
@@ -179,16 +271,17 @@ it('preserves navigation failure and its retry target when a pending update is r
  const f=fixture(Array.from({length:41},(_,n)=>record(n))),store=new HistoryFeedStore(f.port);await store.refresh();
  let fail!:(e:unknown)=>void;const delayed=new Promise<never>((_,reject)=>{fail=reject;});vi.spyOn(f.port,'browse').mockReturnValueOnce(delayed);
  const navigation=store.next();f.speech.records.push(record(100));await store.refresh();fail({code:'unavailable'});await navigation;
- expect(store.getSnapshot()).toMatchObject({page:1,total:42,newRecords:true,error:'unavailable'});
+ expect(store.getSnapshot()).toMatchObject({page:1,total:42,error:'unavailable'});
  await store.retry();expect(store.getSnapshot().page).toBe(2);expect(store.getSnapshot().error).toBeNull();
 });
 
 it('seeks forward when the first page is emptied and shows empty only after the remaining pages disappear',async()=>{
  const f=fixture(Array.from({length:21},(_,n)=>record(n))),store=new HistoryFeedStore(f.port);await store.refresh();
+ const release=store.hold();
  for(const row of store.getSnapshot().records){await f.port.remove(row.id,1);store.remove(row.id);}
  await store.refresh();await waitFor(()=>expect(store.getSnapshot().records.map(r=>r.id)).toEqual(['record-0']));
  expect(store.getSnapshot().page).toBe(2);await f.port.remove('record-0',1);store.remove('record-0');await store.refresh();
- expect(store.getSnapshot().records).toHaveLength(0);expect(store.getSnapshot().total).toBe(0);expect(store.getSnapshot().cursor).toBeNull();
+ expect(store.getSnapshot().records).toHaveLength(0);expect(store.getSnapshot().total).toBe(0);expect(store.getSnapshot().cursor).toBeNull();release();
 });
 
 it.each(['service','emptyText'])('shows translation error %s while retaining the recognized original',async errorCode=>{

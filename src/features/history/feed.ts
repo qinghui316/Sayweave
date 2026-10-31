@@ -1,22 +1,31 @@
 import {speechError} from '../../contracts/speech';
 import type {HistoryCursor,HistoryPort,HistorySummary} from '../../contracts/history';
-export interface ReadingState {search:string;records:HistorySummary[];total:number;cursor:HistoryCursor|null;page:number;epoch:number;loaded:boolean;loading:boolean;loadingMore:boolean;error:string|null;newRecords:boolean;expandedId:string|null;scrollTop:number}
+export interface ReadingState {search:string;records:HistorySummary[];total:number;cursor:HistoryCursor|null;page:number;epoch:number;loaded:boolean;loading:boolean;loadingMore:boolean;error:string|null;expandedId:string|null;scrollTop:number}
 interface Bookmark {ids:string[];start:HistoryCursor|null;end:HistoryCursor|null;next:HistoryCursor|null;scrollTop:number}
-const initial=():ReadingState=>({search:'',records:[],total:0,cursor:null,page:1,epoch:0,loaded:false,loading:false,loadingMore:false,error:null,newRecords:false,expandedId:null,scrollTop:0});
-/** Reading boundaries are immutable until explicit refresh/search. Payload cache is bounded. */
+const initial=():ReadingState=>({search:'',records:[],total:0,cursor:null,page:1,epoch:0,loaded:false,loading:false,loadingMore:false,error:null,expandedId:null,scrollTop:0});
+/** Follow the first-page top; keep older reading boundaries and the payload cache bounded. */
 export class HistoryFeedStore {
  private value=initial();private listeners=new Set<()=>void>();private generation=0;
  private timer:ReturnType<typeof setTimeout>|undefined;private scrollTop=0;
  private pages:Bookmark[]=[];private cache=new Map<number,HistorySummary[]>();private retryPage:number|null=null;private refreshPending=false;
+ private holds=new Set<symbol>();private latestPending=false;private resuming=false;private resumeAgain=false;
  constructor(private readonly port:HistoryPort){}
  getSnapshot=()=>this.value;
  subscribe=(listener:()=>void)=>{this.listeners.add(listener);return()=>{this.listeners.delete(listener);};};
  private set(patch:Partial<ReadingState>){this.value={...this.value,...patch};for(const fn of this.listeners)fn();}
  private cachePage(index:number,records:HistorySummary[]){this.cache.delete(index);this.cache.set(index,records);while(this.cache.size>3)this.cache.delete(this.cache.keys().next().value!);}
- setScroll(top:number){this.scrollTop=top;const page=this.pages[this.value.page-1];if(page)page.scrollTop=top;}
+ setScroll(top:number){this.scrollTop=top;const page=this.pages[this.value.page-1];if(page)page.scrollTop=top;this.resumeLatest();}
  getScroll=()=>this.scrollTop;
- expand(id:string|null){if(!this.value.loadingMore)this.set({expandedId:id});}
- private reset(search:string){clearTimeout(this.timer);this.generation++;this.pages=[];this.cache.clear();this.retryPage=null;this.refreshPending=false;this.scrollTop=0;this.set({...initial(),search,epoch:this.value.epoch+1,loading:true});}
+ expand(id:string|null){if(!this.value.loadingMore){this.set({expandedId:id});this.resumeLatest();}}
+ hold=()=>{const ticket=Symbol();this.holds.add(ticket);return()=>{if(this.holds.delete(ticket))this.resumeLatest();};};
+ private followsLatest(){return this.value.page===1&&this.scrollTop<=1&&!this.value.expandedId&&!this.holds.size&&!this.value.loadingMore&&this.retryPage===null;}
+ private resumeLatest(){
+  if(!this.latestPending||!this.followsLatest()||this.value.error)return;
+  if(this.resuming){this.resumeAgain=true;return;}
+  this.resuming=true;const refresh=this.refresh(),request=this.generation;
+  void refresh.finally(()=>{const again=this.resumeAgain||request!==this.generation;this.resuming=false;this.resumeAgain=false;if(again)this.resumeLatest();});
+ }
+ private reset(search:string){clearTimeout(this.timer);this.generation++;this.pages=[];this.cache.clear();this.retryPage=null;this.refreshPending=false;this.latestPending=false;this.scrollTop=0;this.set({...initial(),search,epoch:this.value.epoch+1,loading:true});}
  search(text:string){this.reset(text);this.timer=setTimeout(()=>void this.refresh(),text?180:0);}
  async latest(){this.reset(this.value.search);await this.refresh(undefined,true);}
  private async ready(retry=false){const status=await this.port.status(retry);if(status.state!=='ready')throw speechError({code:status.state==='preparing'?'preparing':'unavailable'});}
@@ -27,17 +36,23 @@ export class HistoryFeedStore {
   try{
    await this.ready(retry);if(token!==this.generation)return;
    const head=await this.port.browse(prior.search,null,20);if(token!==this.generation)return;
-   if(!prior.loaded){
-    const end=head.records.at(-1);this.pages=[{ids:head.records.map(r=>r.id),start:null,end:end?{id:end.id,createdAt:end.createdAt}:null,next:head.nextCursor,scrollTop:0}];
-    this.cachePage(0,head.records);this.set({records:head.records,total:head.total,cursor:head.nextCursor,loaded:true,loading:false});return;
-   }
+   if(!prior.loaded||this.followsLatest()){this.acceptHead(head);return;}
    const bookmark=this.pages[index]!;
    const page=await this.port.reread(prior.search,bookmark.ids);if(token!==this.generation)return;
    const first=this.pages[0];
-   const incoming=head.records.some(r=>!first?.end||r.createdAt>first.end.createdAt||r.createdAt===first.end.createdAt&&r.id<=first.end.id ? !first?.ids.includes(r.id) : false);
-   this.cache.clear();this.acceptPage(index,page.records);this.set({total:page.total,loading:false,newRecords:prior.newRecords||incoming});
+   this.latestPending=head.records.some(r=>!first?.ids.includes(r.id));
+   if(this.followsLatest()){this.acceptHead(head);return;}
+   this.cache.clear();this.acceptPage(index,page.records);this.set({total:page.total,loading:false});
    await this.leaveEmpty();
   }catch(e){if(token===this.generation)this.set({loading:false,error:speechError(e).code});}
+ }
+ private acceptHead(head:{records:HistorySummary[];total:number;nextCursor:HistoryCursor|null}){
+  const ids=head.records.map(r=>r.id),changed=ids.length!==this.value.records.length||ids.some((id,index)=>id!==this.value.records[index]?.id);
+  const end=head.records.at(-1);
+  // Only a changed head invalidates forward bookmarks and in-flight row identities.
+  if(changed||!this.pages.length){this.pages=[{ids,start:null,end:end?{id:end.id,createdAt:end.createdAt}:null,next:head.nextCursor,scrollTop:0}];}
+  this.cache.clear();this.cachePage(0,head.records);this.latestPending=false;this.scrollTop=0;
+  this.set({records:head.records,total:head.total,cursor:head.nextCursor,loaded:true,loading:false,scrollTop:0,epoch:this.value.epoch+(changed?1:0)});
  }
  private nextIndex(index=this.value.page-1){
   let next=index+1;
@@ -64,9 +79,9 @@ export class HistoryFeedStore {
    this.scrollTop=0;this.set({scrollTop:0,expandedId:null,total:result.total,loadingMore:false});this.acceptPage(index,result.records);this.retryPage=null;
    await this.leaveEmpty();
   }catch(e){if(token===this.generation)this.set({loadingMore:false,error:speechError(e).code});}
-  finally{if(token===this.generation&&this.refreshPending){
-   this.refreshPending=false;const error=this.value.error,expected=this.generation+1;await this.refresh();
-   if(error&&this.generation===expected)this.set({error});
+  finally{if(token===this.generation){
+   if(this.refreshPending){this.refreshPending=false;const error=this.value.error,expected=this.generation+1;await this.refresh();if(error&&this.generation===expected)this.set({error});}
+   else this.resumeLatest();
   }}
  }
  next=()=>{const index=this.nextIndex();return index===null?Promise.resolve():this.go(index);};
@@ -80,7 +95,7 @@ export class HistoryFeedStore {
   if(previous>=0){await this.go(previous);return;}
   const next=this.nextIndex();if(next!==null)await this.go(next);
  }
- async update(id:string){if(!this.pages.some(page=>page.ids.includes(id)))this.set({newRecords:true});await this.refresh();}
+ async update(){await this.refresh();}
  remove(id:string){
   this.generation++;this.retryPage=null;
   for(const page of this.pages)page.ids=page.ids.filter(item=>item!==id);
