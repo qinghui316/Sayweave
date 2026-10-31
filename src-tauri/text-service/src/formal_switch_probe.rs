@@ -21,134 +21,6 @@ type Outcome<T> = Result<T, Box<dyn std::error::Error>>;
 fn checked<T, E: std::fmt::Display>(phase: &str, call: &str, result: Result<T, E>) -> Outcome<T> {
     result.map_err(|error| format!("formal_target phase={phase} call={call}: {error}").into())
 }
-fn profile_catalog(language: u16, legacy: bool) -> windows::core::Result<Vec<String>> {
-    unsafe {
-        let profiles = registration::profiles()?;
-        let mut rows = Vec::new();
-        let mut total = 0usize;
-        if legacy {
-            let enumerator = profiles.EnumLanguageProfiles(language)?;
-            loop {
-                let mut batch = [TF_LANGUAGEPROFILE::default(); 16];
-                let mut fetched = 0;
-                enumerator.Next(&mut batch, &mut fetched)?;
-                total += fetched as usize;
-                if fetched as usize > batch.len() || total > 512 {
-                    return Err(windows::core::Error::from(E_FAIL));
-                }
-                for p in &batch[..fetched as usize] {
-                    if p.clsid == registration::CLASS {
-                        rows.push(format!(
-                            "language={} category={:?} active={} profile={:?}",
-                            p.langid, p.catid, p.fActive.0, p.guidProfile
-                        ));
-                    }
-                }
-                if fetched == 0 {
-                    return Ok(rows);
-                }
-            }
-        } else {
-            let manager: ITfInputProcessorProfileMgr = profiles.cast()?;
-            let enumerator = manager.EnumProfiles(language)?;
-            loop {
-                let mut batch = [TF_INPUTPROCESSORPROFILE::default(); 16];
-                let mut fetched = 0;
-                enumerator.Next(&mut batch, &mut fetched)?;
-                total += fetched as usize;
-                if fetched as usize > batch.len() || total > 512 {
-                    return Err(windows::core::Error::from(E_FAIL));
-                }
-                for p in &batch[..fetched as usize] {
-                    if p.clsid == registration::CLASS {
-                        rows.push(format!(
-                            "language={} category={:?} flags={} profile={:?}",
-                            p.langid, p.catid, p.dwFlags, p.guidProfile
-                        ));
-                    }
-                }
-                if fetched == 0 {
-                    return Ok(rows);
-                }
-            }
-        }
-    }
-}
-fn activate_process(phase: &str) -> Outcome<u16> {
-    // The same calls/flags as registration::activate(false), with the failing
-    // native call identified. Record pre-call ownership separately from the
-    // error-path inventory; a failed call cannot prove its pre-call state.
-    let before = checked(
-        phase,
-        "profile.preexisting",
-        sayweave_text_service::client::speech_activation(),
-    )?;
-    unsafe {
-        let profiles = checked(phase, "profile.create", registration::profiles())?;
-        let language = checked(phase, "profile.language", profiles.GetCurrentLanguage())?;
-        let manager: ITfInputProcessorProfileMgr =
-            checked(phase, "profile.manager", profiles.cast())?;
-        let result = manager.ActivateProfile(
-            TF_PROFILETYPE_INPUTPROCESSOR,
-            language,
-            &registration::CLASS,
-            &registration::PROFILE,
-            windows::Win32::UI::Input::KeyboardAndMouse::HKL::default(),
-            TF_IPPMF_FORPROCESS,
-        );
-        if result.is_err() {
-            let mut exact = TF_INPUTPROCESSORPROFILE::default();
-            let exact_result = manager.GetProfile(
-                TF_PROFILETYPE_INPUTPROCESSOR,
-                language,
-                &registration::CLASS,
-                &registration::PROFILE,
-                windows::Win32::UI::Input::KeyboardAndMouse::HKL::default(),
-                &mut exact,
-            );
-            eprintln!(
-                "formal_catalog_failure phase={phase} legacy={:?} current_language={:?} exact={exact_result:?} exact_type={} exact_language={} exact_category={:?} exact_flags={} machine={:?}",
-                profile_catalog(language, true),
-                profile_catalog(language, false),
-                exact.dwProfileType,
-                exact.langid,
-                exact.catid,
-                exact.dwFlags,
-                registration::snapshot_installer_machine()
-            );
-            let enabled = profiles.IsEnabledLanguageProfile(
-                &registration::CLASS,
-                language,
-                &registration::PROFILE,
-            );
-            let inventory = sayweave_text_service::client::input_profiles().map(|profiles| {
-                profiles
-                    .into_iter()
-                    .filter(|p| p.clsid == registration::CLASS)
-                    .map(|p| {
-                        format!(
-                            "language={} category={:?} flags={} profile={:?}",
-                            p.langid, p.catid, p.dwFlags, p.guidProfile
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            });
-            let instance: windows::core::Result<ITfTextInputProcessor> =
-                CoCreateInstance(&registration::CLASS, None, CLSCTX_INPROC_SERVER);
-            let mut session = 0;
-            let session_result = windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(
-                std::process::id(),
-                &mut session,
-            );
-            eprintln!(
-                "formal_activation_failure phase={phase} before={before:?} language={language} enabled={enabled:?} profiles={inventory:?} class_create={:?} session={session} session_result={session_result:?}",
-                instance.as_ref().map(|_| "created")
-            );
-        }
-        checked(phase, "profile.ActivateProfile", result)?;
-        Ok(language)
-    }
-}
 struct MachineLock(Pipe);
 impl Drop for MachineLock {
     fn drop(&mut self) {
@@ -338,7 +210,7 @@ fn exercise(
         let module = checked(phase, "module.load", load_fixture_module(proxy))?;
         let keyboard_before = checked(phase, "keyboard.snapshot", keyboard())?;
         let result = (|| -> Outcome<serde_json::Value> {
-            let activated = activate_process(phase)?;
+            let activated = checked(phase, "profile.activate", registration::activate(false))?;
             if activated != language
                 || !checked(
                     phase,
