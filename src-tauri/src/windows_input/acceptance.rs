@@ -334,6 +334,140 @@ fn retirement_recovery_samples(
     Ok(())
 }
 
+fn receipt_archive_recovery_sample(
+    fixture: &mut Fixture,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<(), String> {
+    use super::composition::{Draft, Finish, stop_observer};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let temp = std::env::temp_dir()
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let root = temp.join(format!("sayweave-native-receipt-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).map_err(|e| e.to_string())?;
+    let data = crate::data::DataWorker::start(root.clone()).map_err(|e| e.code)?;
+    let ready = std::time::Instant::now();
+    while data.status().map_err(|e| e.code)?.state != "ready" {
+        if ready.elapsed() > Duration::from_secs(3) {
+            return Err("receipt fixture data not ready".into());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let saved = Arc::new(AtomicUsize::new(0));
+    let mut original_task = String::new();
+    fixture.command(serde_json::json!({"action":"focus","text":"前后","start":1,"end":1}))?;
+    for (index, text, expected) in [
+        (1, "第一轮", "前第一轮后"),
+        (2, "第二轮", "前第一轮第二轮后"),
+        (3, "第三轮", "前第一轮第二轮第三轮后"),
+    ] {
+        let task = uuid::Uuid::new_v4().to_string();
+        if index == 1 {
+            original_task = task.clone();
+        }
+        let anchor = fixture.anchor()?;
+        bind_watch(&task, &anchor, None).map_err(|e| e.code)?;
+        let gate = Arc::new(DeliveryGate::default());
+        let archive = data.clone();
+        let count = saved.clone();
+        gate.set_receipt_archive(Arc::new(move |offer, frame| {
+            archive
+                .preserve_native_receipt(offer, frame)
+                .map_err(|_| Error::new("inputReceiptRecoveryFailed"))?;
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }))
+        .map_err(|e| e.code)?;
+        let draft = runtime
+            .block_on(Draft::begin(task.clone(), 1, anchor, gate))
+            .map_err(|e| format!("receipt recovery round{index} admission: {}", e.code))?;
+        if index == 2 && saved.load(Ordering::SeqCst) != 1 {
+            return Err("new admission preceded durable original receipt".into());
+        }
+        runtime
+            .block_on(draft.replace(1, text.into()))
+            .map_err(|e| e.code)?;
+        if index == 1 {
+            if runtime
+                .block_on(draft.orphan_receipt_fixture())
+                .err()
+                .is_none_or(|e| e.code != "compositionDisconnected")
+            {
+                return Err("original undelivered ACK outcome lost".into());
+            }
+        } else if !runtime
+            .block_on(draft.finish_receipt(text.into(), Finish::Commit))
+            .committed
+        {
+            return Err("receipt recovery did not commit next round".into());
+        }
+        release_watch(&task);
+        let actual = fixture.command(serde_json::json!({"action":"read"}))?;
+        if actual["text"].as_str() != Some(expected) {
+            return Err(format!("receipt round{index} body {actual}"));
+        }
+        println!(
+            "SAYWEAVE_RECEIPT_ARCHIVE_ROUND round={index} body={} expected={expected} archive_count={} original_failure={} no_replay=true",
+            actual["text"],
+            saved.load(Ordering::SeqCst),
+            index == 1
+        );
+    }
+    runtime.block_on(stop_observer()).map_err(|e| e.code)?;
+    let entries = std::fs::read_dir(root.join("native-receipt-recovery"))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    if entries.len() != 1 || saved.load(Ordering::SeqCst) != 1 {
+        return Err("receipt duplicated or not durable".into());
+    }
+    let fact: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(entries[0].path()).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    let key: sayweave_text_service::lifecycle::ReceiptKey =
+        serde_json::from_value(fact["receipt"].clone()).map_err(|e| e.to_string())?;
+    let raw: Vec<u8> = serde_json::from_value(fact["frame"].clone()).map_err(|e| e.to_string())?;
+    if key.task != original_task
+        || fact["effect"] != "unconfirmed"
+        || fact["owner"]["process"] != std::process::id()
+        || sayweave_text_service::lifecycle::ReceiptKey::from_frame(&raw).as_ref() != Some(&key)
+    {
+        return Err("durable fact lost exact original ownership/effect".into());
+    }
+    runtime
+        .block_on(data.seal_and_drain())
+        .map_err(|e| e.code)?;
+    // Drain completes admitted work; it does not drop this test's last sender
+    // or close the database thread. Release the owner, then observe its real
+    // file lease before deleting only this UUID-scoped fixture directory.
+    drop(data);
+    let release_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("instance.lock"))
+            .map_err(|e| e.to_string())?;
+        if lease.try_lock().is_ok() {
+            drop(lease);
+            break;
+        }
+        if Instant::now() >= release_deadline {
+            return Err("fixture data owner did not release its lease".into());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    let resolved = root.canonicalize().map_err(|e| e.to_string())?;
+    if !resolved.starts_with(&temp) || resolved.parent() != Some(temp.as_path()) {
+        return Err("unsafe fixture cleanup path".into());
+    }
+    std::fs::remove_dir_all(&resolved).map_err(|e| e.to_string())?;
+    println!(
+        "SAYWEAVE_RECEIPT_ARCHIVE_PASS ordinary_proxy=true production_host=true data_worker=true durable_before_ack=true three_rounds=true released=true"
+    );
+    Ok(())
+}
+
 // Production read-only proof and one-shot composition, against the owned editor.
 // These controlled events establish native behavior, not microphone acceptance.
 fn final_translation_samples(
@@ -494,6 +628,9 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         return Err("owned initialization changed body, selection or foreground".into());
     }
     println!("SAYWEAVE_EDITOR_INITIALIZATION body_selection_unchanged=true");
+    if std::env::var_os("SAYWEAVE_RECEIPT_RECOVERY_ONLY").is_some() {
+        return receipt_archive_recovery_sample(&mut fixture, &runtime);
+    }
     retirement_recovery_samples(&mut fixture, &runtime)?;
     final_translation_samples(&mut fixture, &runtime, &input)?;
     observer_restart_samples(&mut fixture, &runtime)?;

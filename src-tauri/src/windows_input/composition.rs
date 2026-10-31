@@ -62,6 +62,8 @@ pub(crate) enum Command {
     InspectFixture(oneshot::Sender<Result<Reply, Error>>),
     #[cfg(feature = "desktop-acceptance")]
     RetireFailureFixture(oneshot::Sender<Result<(), Error>>),
+    #[cfg(feature = "desktop-acceptance")]
+    OrphanReceiptFixture(oneshot::Sender<Result<(), Error>>),
     EndInput(oneshot::Sender<Result<bool, Error>>),
     Begin(u64, Anchor, oneshot::Sender<Result<(), Error>>),
     Finish(
@@ -589,6 +591,18 @@ impl Draft {
                             let result=host.complete_retirement(&mut completion,"failureFixture",cleanup);
                             let _=reply.send(result);return;
                         },
+                        #[cfg(feature = "desktop-acceptance")]
+                        Ok(Command::OrphanReceiptFixture(reply))=>{
+                            if host.retained_ack.is_some() || host.block.is_some() || host.sink.is_some() {
+                                let _=reply.send(Err(Error::new("compositionProtocol")));continue;
+                            }
+                            host.fixture_withhold_ack=true;
+                            let committed=host.exchange(Action::Commit,"",true);
+                            let mut cleanup=host.close();
+                            if let Err(error)=committed {cleanup.result=Err(error);}
+                            let result=host.complete_retirement(&mut completion,"orphanReceiptFixture",cleanup);
+                            let _=reply.send(result);return;
+                        },
                         Ok(Command::EndInput(reply))=>{
                             if host.range_open || host.block.is_some() {
                                 let _=reply.send(Err(Error::new("compositionCleanup")));
@@ -827,6 +841,22 @@ impl Draft {
         );
         original
     }
+    #[cfg(feature = "desktop-acceptance")]
+    pub(super) async fn orphan_receipt_fixture(&self) -> Result<(), Error> {
+        let (send, reply) = oneshot::channel();
+        self.connection
+            .sender
+            .try_send(Command::OrphanReceiptFixture(send))
+            .map_err(|_| Error::new("compositionWorker"))?;
+        let result = reply.await.map_err(|_| Error::new("compositionWorker"))?;
+        retain_failed(&self.connection);
+        let original = self.connection.close().await;
+        assert_eq!(
+            result.as_ref().err().map(|e| &e.code),
+            original.as_ref().err().map(|e| &e.code)
+        );
+        original
+    }
     async fn finish_range(&self, text: String, mode: Finish, keep: bool) -> FinishOutcome {
         self.finish_range_source(text, mode, None, keep).await
     }
@@ -907,6 +937,8 @@ struct Host {
     retained_ack: Option<ReceiptKey>,
     receipt_inbox: VecDeque<Vec<u8>>,
     acknowledged_receipts: VecDeque<ReceiptKey>,
+    #[cfg(feature = "desktop-acceptance")]
+    fixture_withhold_ack: bool,
     text: String,
     attempted: bool,
     visible: bool,
@@ -1300,6 +1332,8 @@ impl Host {
             retained_ack: None,
             receipt_inbox: VecDeque::new(),
             acknowledged_receipts: VecDeque::new(),
+            #[cfg(feature = "desktop-acceptance")]
+            fixture_withhold_ack: false,
             text: String::new(),
             attempted: false,
             visible: false,
@@ -1744,6 +1778,12 @@ impl Host {
         let Some(key) = self.retained_ack.clone() else {
             return Ok(());
         };
+        #[cfg(feature = "desktop-acceptance")]
+        if self.fixture_withhold_ack {
+            // Deliberately leave the real result in the ordinary proxy. Do not
+            // report a fake successful ACK or replay the native operation.
+            return Err(Error::new("compositionDisconnected"));
+        }
         let deadline = unsafe { GetTickCount64() } + 500;
         let request =
             self.receipt_request(ControlAction::AcknowledgeRetired, key.clone(), deadline);
