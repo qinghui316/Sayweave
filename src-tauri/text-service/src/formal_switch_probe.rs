@@ -18,45 +18,61 @@ use windows::{
 };
 
 type Outcome<T> = Result<T, Box<dyn std::error::Error>>;
-struct DesktopMonitor(bool);
-impl DesktopMonitor {
-    fn open(phase: &str) -> Outcome<Self> {
-        let count = || {
-            sayweave_text_service::client::input_profiles().map(|profiles| {
-                profiles
-                    .into_iter()
-                    .filter(|p| p.clsid == registration::CLASS)
-                    .count()
-            })
-        };
-        let before = count();
-        // A fresh hosted desktop need not have TSF's desktop monitor running.
-        // This is the documented desktop setup API, not a TIP activation bypass.
-        checked(phase, "desktop-monitor.initialize", unsafe {
-            InitLocalMsCtfMonitor(ILMCM_LANGUAGEBAROFF)
-        })?;
-        let monitor = Self(true);
-        let after = count();
-        println!(
-            "formal_environment phase={phase} monitor_initialized=true own_profiles_before={before:?} own_profiles_after={after:?}"
-        );
-        Ok(monitor)
-    }
-    fn close(&mut self) -> windows::core::Result<()> {
-        if std::mem::replace(&mut self.0, false) {
-            unsafe { UninitLocalMsCtfMonitor() }
-        } else {
-            Ok(())
-        }
-    }
-}
-impl Drop for DesktopMonitor {
-    fn drop(&mut self) {
-        let _ = self.close();
-    }
-}
 fn checked<T, E: std::fmt::Display>(phase: &str, call: &str, result: Result<T, E>) -> Outcome<T> {
     result.map_err(|error| format!("formal_target phase={phase} call={call}: {error}").into())
+}
+fn profile_catalog(language: u16, legacy: bool) -> windows::core::Result<Vec<String>> {
+    unsafe {
+        let profiles = registration::profiles()?;
+        let mut rows = Vec::new();
+        let mut total = 0usize;
+        if legacy {
+            let enumerator = profiles.EnumLanguageProfiles(language)?;
+            loop {
+                let mut batch = [TF_LANGUAGEPROFILE::default(); 16];
+                let mut fetched = 0;
+                enumerator.Next(&mut batch, &mut fetched)?;
+                total += fetched as usize;
+                if fetched as usize > batch.len() || total > 512 {
+                    return Err(windows::core::Error::from(E_FAIL));
+                }
+                for p in &batch[..fetched as usize] {
+                    if p.clsid == registration::CLASS {
+                        rows.push(format!(
+                            "language={} category={:?} active={} profile={:?}",
+                            p.langid, p.catid, p.fActive.0, p.guidProfile
+                        ));
+                    }
+                }
+                if fetched == 0 {
+                    return Ok(rows);
+                }
+            }
+        } else {
+            let manager: ITfInputProcessorProfileMgr = profiles.cast()?;
+            let enumerator = manager.EnumProfiles(language)?;
+            loop {
+                let mut batch = [TF_INPUTPROCESSORPROFILE::default(); 16];
+                let mut fetched = 0;
+                enumerator.Next(&mut batch, &mut fetched)?;
+                total += fetched as usize;
+                if fetched as usize > batch.len() || total > 512 {
+                    return Err(windows::core::Error::from(E_FAIL));
+                }
+                for p in &batch[..fetched as usize] {
+                    if p.clsid == registration::CLASS {
+                        rows.push(format!(
+                            "language={} category={:?} flags={} profile={:?}",
+                            p.langid, p.catid, p.dwFlags, p.guidProfile
+                        ));
+                    }
+                }
+                if fetched == 0 {
+                    return Ok(rows);
+                }
+            }
+        }
+    }
 }
 fn activate_process(phase: &str) -> Outcome<u16> {
     // The same calls/flags as registration::activate(false), with the failing
@@ -81,6 +97,25 @@ fn activate_process(phase: &str) -> Outcome<u16> {
             TF_IPPMF_FORPROCESS,
         );
         if result.is_err() {
+            let mut exact = TF_INPUTPROCESSORPROFILE::default();
+            let exact_result = manager.GetProfile(
+                TF_PROFILETYPE_INPUTPROCESSOR,
+                language,
+                &registration::CLASS,
+                &registration::PROFILE,
+                windows::Win32::UI::Input::KeyboardAndMouse::HKL::default(),
+                &mut exact,
+            );
+            eprintln!(
+                "formal_catalog_failure phase={phase} legacy={:?} current_language={:?} exact={exact_result:?} exact_type={} exact_language={} exact_category={:?} exact_flags={} machine={:?}",
+                profile_catalog(language, true),
+                profile_catalog(language, false),
+                exact.dwProfileType,
+                exact.langid,
+                exact.catid,
+                exact.dwFlags,
+                registration::snapshot_installer_machine()
+            );
             let enabled = profiles.IsEnabledLanguageProfile(
                 &registration::CLASS,
                 language,
@@ -252,7 +287,6 @@ fn exercise(
     language: u16,
     phase: &str,
 ) -> Outcome<serde_json::Value> {
-    let mut desktop_monitor = DesktopMonitor::open(phase)?;
     unsafe {
         let top = checked(
             phase,
@@ -451,7 +485,6 @@ fn exercise(
         let deactivated = manager.Deactivate();
         let destroyed = DestroyWindow(top);
         pump(Duration::from_millis(100));
-        let monitor_closed = desktop_monitor.close();
         let can: unsafe extern "system" fn() -> HRESULT = std::mem::transmute(
             GetProcAddress(module, s!("DllCanUnloadNow")).ok_or("unload export")?,
         );
@@ -463,7 +496,6 @@ fn exercise(
         stopped?;
         deactivated?;
         destroyed?;
-        monitor_closed?;
         if !unloaded && phase != "old" {
             return Err("proxy resources remain".into());
         }

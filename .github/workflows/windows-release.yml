@@ -142,7 +142,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Ordinary component build failed.' }
           $env:SAYWEAVE_TSF_PAYLOAD = Join-Path $env:GITHUB_WORKSPACE 'src-tauri/text-service/target/release/sayweave_text_service.dll'
           node scripts/test-formal-core-switch.mjs
-          if ($LASTEXITCODE -ne 0) { throw 'Native upgrade diagnostic failed; see operation-bound original error.' }
+          if ($LASTEXITCODE -ne 0) {
+            Get-Process ctfmon -ErrorAction SilentlyContinue | Select-Object Id,SessionId,Path | ConvertTo-Json -Compress
+            throw 'Native upgrade diagnostic failed; see operation-bound original error.'
+          }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
