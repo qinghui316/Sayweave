@@ -720,12 +720,14 @@ fn upgrade(args: &[String]) -> Outcome<()> {
     registration::register_installer_machine(&old_module, language)?;
     let sid = sayweave_text_service::transport::current_user_sid()?;
     let mut installed = false;
+    let mut baseline_published = false;
     let result = (|| -> Outcome<()> {
         if !registration::initialize_installer_user(language, user_before)? {
             return Err("owned runner profile not enabled".into());
         }
         await_baseline_publication(language, &old_module)?;
         deployment::publish_engine(None, Some(&old_descriptor))?;
+        baseline_published = true;
         let mut previous = Target::launch(&old_module, &old_descriptor, &first, "old", language)?;
         let old_ready = previous.event("stageReady")?;
         deployment::install_bundle(
@@ -776,7 +778,7 @@ fn upgrade(args: &[String]) -> Outcome<()> {
             deployment::rollback_bundle(&proxy, core, &sid)?;
         }
         registration::restore_installer_user(language, user_before)?;
-        deployment::publish_engine(Some(&old_descriptor), None)?;
+        deployment::publish_engine(baseline_published.then_some(&old_descriptor), None)?;
         registration::restore_installer_machine(None, &old_module)?;
         if registration::snapshot_installer_machine()?.is_some()
             || deployment::current_engine()?.is_some()
