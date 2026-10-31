@@ -21,6 +21,56 @@ type Outcome<T> = Result<T, Box<dyn std::error::Error>>;
 fn checked<T, E: std::fmt::Display>(phase: &str, call: &str, result: Result<T, E>) -> Outcome<T> {
     result.map_err(|error| format!("formal_target phase={phase} call={call}: {error}").into())
 }
+fn activate_process(phase: &str) -> Outcome<u16> {
+    // The same calls/flags as registration::activate(false), with the failing
+    // native call identified. Keep diagnostics off the successful path.
+    unsafe {
+        let profiles = checked(phase, "profile.create", registration::profiles())?;
+        let language = checked(phase, "profile.language", profiles.GetCurrentLanguage())?;
+        let manager: ITfInputProcessorProfileMgr =
+            checked(phase, "profile.manager", profiles.cast())?;
+        let result = manager.ActivateProfile(
+            TF_PROFILETYPE_INPUTPROCESSOR,
+            language,
+            &registration::CLASS,
+            &registration::PROFILE,
+            windows::Win32::UI::Input::KeyboardAndMouse::HKL::default(),
+            TF_IPPMF_FORPROCESS,
+        );
+        if result.is_err() {
+            let enabled = profiles.IsEnabledLanguageProfile(
+                &registration::CLASS,
+                language,
+                &registration::PROFILE,
+            );
+            let inventory = sayweave_text_service::client::input_profiles().map(|profiles| {
+                profiles
+                    .into_iter()
+                    .filter(|p| p.clsid == registration::CLASS)
+                    .map(|p| {
+                        format!(
+                            "language={} category={:?} flags={} profile={:?}",
+                            p.langid, p.catid, p.dwFlags, p.guidProfile
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let instance: windows::core::Result<ITfTextInputProcessor> =
+                CoCreateInstance(&registration::CLASS, None, CLSCTX_INPROC_SERVER);
+            let mut session = 0;
+            let session_result = windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(
+                std::process::id(),
+                &mut session,
+            );
+            eprintln!(
+                "formal_activation_failure phase={phase} language={language} enabled={enabled:?} profiles={inventory:?} class_create={:?} session={session} session_result={session_result:?}",
+                instance.as_ref().map(|_| "created")
+            );
+        }
+        checked(phase, "profile.ActivateProfile", result)?;
+        Ok(language)
+    }
+}
 struct MachineLock(Pipe);
 impl Drop for MachineLock {
     fn drop(&mut self) {
@@ -210,7 +260,7 @@ fn exercise(
         let module = checked(phase, "module.load", load_fixture_module(proxy))?;
         let keyboard_before = checked(phase, "keyboard.snapshot", keyboard())?;
         let result = (|| -> Outcome<serde_json::Value> {
-            let activated = checked(phase, "profile.activate", registration::activate(false))?;
+            let activated = activate_process(phase)?;
             if activated != language
                 || !checked(
                     phase,
