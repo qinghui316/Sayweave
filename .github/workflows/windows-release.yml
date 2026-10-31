@@ -9,7 +9,7 @@ on:
     inputs:
       phase:
         type: choice
-        options: [build, build-frozen, resume-package, check-access, accept-existing]
+        options: [build, build-frozen, resume-package, check-access, accept-existing, diagnose-input-gate]
         default: build
         description: Build a release or resume the exact immutable draft
       release_tag:
@@ -59,8 +59,102 @@ env:
   SAYWEAVE_VERIFIER_RUN: ${{ inputs.verifier_run_id }}
 
 jobs:
+  diagnose-input-gate:
+    if: github.repository == 'qinghui316/Sayweave' && github.event_name == 'workflow_dispatch' && inputs.phase == 'diagnose-input-gate'
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SAYWEAVE_BUILD_CHANNEL: stable
+      SAYWEAVE_RELEASE_TAG: v0.1.21
+      SAYWEAVE_RELEASE_COMMIT: 2e207ed48d375dfa989d5fe01fffbe8cbeeeb51e
+      SAYWEAVE_VERIFIER_RUN: '41233491648'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - name: Calculate existing component cache keys
+        id: cargo-keys
+        shell: pwsh
+        run: |
+          node scripts/release-validation.mjs cargo-cache
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo cache context incomplete.' }
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: ${{ steps.cargo-keys.outputs.registryKey }}
+          restore-keys: ${{ steps.cargo-keys.outputs.registryPrefix }}
+          path: |
+            ~/.cargo/registry/index/index.crates.io-*
+            ~/.cargo/registry/cache/index.crates.io-*
+            ~/.cargo/registry/src/index.crates.io-*
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: ${{ steps.cargo-keys.outputs.compileKey }}
+          restore-keys: ${{ steps.cargo-keys.outputs.compilePrefix }}
+          path: |
+            src-tauri/text-service/target/debug/deps
+            src-tauri/text-service/target/debug/build
+            src-tauri/text-service/target/debug/.fingerprint
+            src-tauri/text-service/target/debug/incremental
+            src-tauri/text-service/target/release/deps
+            src-tauri/text-service/target/release/build
+            src-tauri/text-service/target/release/.fingerprint
+            src-tauri/text-service/target/release/incremental
+      - name: Download existing full verifier without rebuilding
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-verifier-v0.1.21-2e207ed48d375dfa989d5fe01fffbe8cbeeeb51e
+          run-id: 41233491648
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/release-verifier
+      - name: Authenticate retained verifier against its frozen product
+        shell: pwsh
+        run: |
+          $env:SAYWEAVE_VERIFIER_DIR = Join-Path $env:RUNNER_TEMP 'release-verifier'
+          "SAYWEAVE_VERIFIER_DIR=$env:SAYWEAVE_VERIFIER_DIR" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          @'
+          import {readFileSync} from 'node:fs';
+          import {execFileSync} from 'node:child_process';
+          import {createHash} from 'node:crypto';
+          import {join} from 'node:path';
+          import {trustedProducer,validateVerifierTool,verifierBuildConfig} from './scripts/release-validation.mjs';
+          const identity={tag:process.env.SAYWEAVE_RELEASE_TAG,commit:process.env.SAYWEAVE_RELEASE_COMMIT};
+          const entries=execFileSync('git',['ls-tree','-r','--full-tree',identity.commit],{encoding:'utf8'}).trim().split(/\r?\n/).filter(line=>{const p=line.split('\t')[1];return p?.startsWith('src-tauri/')||p==='rust-toolchain.toml'||p==='package-lock.json';});
+          const source=createHash('sha256').update(entries.sort().join('\n')).digest('hex');
+          const directory=process.env.SAYWEAVE_VERIFIER_DIR;
+          const receipt=JSON.parse(readFileSync(join(directory,'verifier-receipt.json'),'utf8'));
+          const bytes=readFileSync(join(directory,'verify-update-signature.exe'));
+          const producer=trustedProducer(identity,process.cwd(),process.env,'tool');
+          validateVerifierTool(identity,source,'1.99.0',verifierBuildConfig(process.cwd(),process.env),receipt,bytes,producer);
+          if(createHash('sha256').update(bytes).digest('hex')!=='e06ca47dc59b7d041a5acb847dd4ad59a9116b68e69201bb39c95413a12f8d2b')throw Error('Retained verifier differs');
+          '@ | node --input-type=module -
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen verifier authentication failed.' }
+      - name: Build ordinary component and run existing isolated upgrade gate
+        shell: pwsh
+        run: |
+          cargo build --locked --release --manifest-path src-tauri/text-service/Cargo.toml --lib --features engine
+          if ($LASTEXITCODE -ne 0) { throw 'Ordinary component build failed.' }
+          $env:SAYWEAVE_TSF_PAYLOAD = Join-Path $env:GITHUB_WORKSPACE 'src-tauri/text-service/target/release/sayweave_text_service.dll'
+          node scripts/test-formal-core-switch.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Native upgrade diagnostic failed; see operation-bound original error.' }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: input-gate-context-${{ github.sha }}-${{ github.run_attempt }}
+          retention-days: 14
+          include-hidden-files: true
+          path: |
+            .local/formal-core-switch/*.json
+            .local/formal-core-switch/*.log
+          if-no-files-found: warn
   verify:
-    if: github.repository == 'qinghui316/Sayweave'
+    if: github.repository == 'qinghui316/Sayweave' && inputs.phase != 'diagnose-input-gate'
     runs-on: windows-latest
     steps:
       - name: Validate existing-draft inputs
@@ -246,7 +340,7 @@ jobs:
             src-tauri/text-service/target/release/incremental
 
   draft:
-    if: startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing'
+    if: startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave' && inputs.phase != 'check-access' && inputs.phase != 'accept-existing' && inputs.phase != 'diagnose-input-gate'
     needs: verify
     runs-on: windows-latest
     environment: windows-signing

@@ -18,6 +18,9 @@ use windows::{
 };
 
 type Outcome<T> = Result<T, Box<dyn std::error::Error>>;
+fn checked<T, E: std::fmt::Display>(phase: &str, call: &str, result: Result<T, E>) -> Outcome<T> {
+    result.map_err(|error| format!("formal_target phase={phase} call={call}: {error}").into())
+}
 struct MachineLock(Pipe);
 impl Drop for MachineLock {
     fn drop(&mut self) {
@@ -157,49 +160,64 @@ fn exercise(
     phase: &str,
 ) -> Outcome<serde_json::Value> {
     unsafe {
-        let top = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("STATIC"),
-            w!("Sayweave formal core switch"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            50,
-            50,
-            520,
-            240,
-            None,
-            None,
-            None,
-            None,
+        let top = checked(
+            phase,
+            "window.create",
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Sayweave formal core switch"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                50,
+                50,
+                520,
+                240,
+                None,
+                None,
+                None,
+                None,
+            ),
         )?;
-        let editor = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("EDIT"),
-            w!(""),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_MULTILINE as u32),
-            10,
-            10,
-            480,
-            170,
-            Some(top),
-            None,
-            None,
-            None,
+        let editor = checked(
+            phase,
+            "editor.create",
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("EDIT"),
+                w!(""),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_MULTILINE as u32),
+                10,
+                10,
+                480,
+                170,
+                Some(top),
+                None,
+                None,
+                None,
+            ),
         )?;
-        let manager: ITfThreadMgr =
-            CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
-        manager.Activate()?;
+        let manager: ITfThreadMgr = checked(
+            phase,
+            "thread-manager.create",
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER),
+        )?;
+        checked(phase, "thread-manager.activate", manager.Activate())?;
         let _ = SetForegroundWindow(top);
         let _ = SetFocus(Some(editor));
         pump(Duration::from_millis(150));
         // TSF must create/activate the registered TIP and supply its client ID.
         // A manually created service's GetClientId is not TIP activation.
-        let module = load_fixture_module(proxy)?;
-        let keyboard_before = keyboard()?;
+        let module = checked(phase, "module.load", load_fixture_module(proxy))?;
+        let keyboard_before = checked(phase, "keyboard.snapshot", keyboard())?;
         let result = (|| -> Outcome<serde_json::Value> {
-            let activated = registration::activate(false)?;
+            let activated = checked(phase, "profile.activate", registration::activate(false))?;
             if activated != language
-                || !sayweave_text_service::client::own_profile_active(language)?
-                || keyboard()? != keyboard_before
+                || !checked(
+                    phase,
+                    "profile.read",
+                    sayweave_text_service::client::own_profile_active(language),
+                )?
+                || checked(phase, "keyboard.compare", keyboard())? != keyboard_before
             {
                 return Err("owned process TIP activation identity differs".into());
             }
