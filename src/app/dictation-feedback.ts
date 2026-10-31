@@ -20,6 +20,7 @@ export function dictationFeedback(value:DictationSnapshot,speech:SpeechSnapshot)
  const code=cleanup??inputFailure??value.error??delivery?.error??(speech.taskId===value.taskId&&speech.source==='external'?speech.error:null);
  if(!code)return undefined;
  if(code==='editing')return '准备期间检测到输入变化，请重新开始口述。';
+ if(code==='compositionCleanup')return '输入清理未完成，请退出并重新打开 Sayweave。';
  if(code in speechMessages)return speechMessages[code as keyof typeof speechMessages];
  return componentMessage(code);
 }

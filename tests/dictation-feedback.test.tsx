@@ -8,6 +8,7 @@ import {Home} from '../src/features/home';
 
 it.each([
  ['editing','准备期间检测到输入变化，请重新开始口述。'],
+ ['compositionCleanup','输入清理未完成，请退出并重新打开 Sayweave。'],
  ['cancelled','已取消。'],
  ['compositionTimeout','等待输入框就绪超时，请重试。'],
  ['compositionWorker','输入服务意外中断，请退出并重新打开 Sayweave。'],
