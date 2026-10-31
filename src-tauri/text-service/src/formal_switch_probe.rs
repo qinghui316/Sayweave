@@ -18,6 +18,9 @@ use windows::{
 };
 
 type Outcome<T> = Result<T, Box<dyn std::error::Error>>;
+fn checked<T, E: std::fmt::Display>(phase: &str, call: &str, result: Result<T, E>) -> Outcome<T> {
+    result.map_err(|error| format!("formal_target phase={phase} call={call}: {error}").into())
+}
 struct MachineLock(Pipe);
 impl Drop for MachineLock {
     fn drop(&mut self) {
@@ -157,49 +160,64 @@ fn exercise(
     phase: &str,
 ) -> Outcome<serde_json::Value> {
     unsafe {
-        let top = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("STATIC"),
-            w!("Sayweave formal core switch"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            50,
-            50,
-            520,
-            240,
-            None,
-            None,
-            None,
-            None,
+        let top = checked(
+            phase,
+            "window.create",
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Sayweave formal core switch"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                50,
+                50,
+                520,
+                240,
+                None,
+                None,
+                None,
+                None,
+            ),
         )?;
-        let editor = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            w!("EDIT"),
-            w!(""),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_MULTILINE as u32),
-            10,
-            10,
-            480,
-            170,
-            Some(top),
-            None,
-            None,
-            None,
+        let editor = checked(
+            phase,
+            "editor.create",
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("EDIT"),
+                w!(""),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_MULTILINE as u32),
+                10,
+                10,
+                480,
+                170,
+                Some(top),
+                None,
+                None,
+                None,
+            ),
         )?;
-        let manager: ITfThreadMgr =
-            CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER)?;
-        manager.Activate()?;
+        let manager: ITfThreadMgr = checked(
+            phase,
+            "thread-manager.create",
+            CoCreateInstance(&CLSID_TF_ThreadMgr, None, CLSCTX_INPROC_SERVER),
+        )?;
+        checked(phase, "thread-manager.activate", manager.Activate())?;
         let _ = SetForegroundWindow(top);
         let _ = SetFocus(Some(editor));
         pump(Duration::from_millis(150));
         // TSF must create/activate the registered TIP and supply its client ID.
         // A manually created service's GetClientId is not TIP activation.
-        let module = load_fixture_module(proxy)?;
-        let keyboard_before = keyboard()?;
+        let module = checked(phase, "module.load", load_fixture_module(proxy))?;
+        let keyboard_before = checked(phase, "keyboard.snapshot", keyboard())?;
         let result = (|| -> Outcome<serde_json::Value> {
-            let activated = registration::activate(false)?;
+            let activated = checked(phase, "profile.activate", registration::activate(false))?;
             if activated != language
-                || !sayweave_text_service::client::own_profile_active(language)?
-                || keyboard()? != keyboard_before
+                || !checked(
+                    phase,
+                    "profile.read",
+                    sayweave_text_service::client::own_profile_active(language),
+                )?
+                || checked(phase, "keyboard.compare", keyboard())? != keyboard_before
             {
                 return Err("owned process TIP activation identity differs".into());
             }
@@ -397,22 +415,8 @@ impl Drop for Target {
     }
 }
 impl Target {
-    fn launch(
-        module: &str,
-        first: &CurrentEngine,
-        second: &CurrentEngine,
-        phase: &str,
-        language: u16,
-    ) -> Outcome<Self> {
-        let mut child = Command::new(std::env::current_exe()?)
-            .args([
-                "formal-proxy-target",
-                module,
-                &serde_json::to_string(first)?,
-                &serde_json::to_string(second)?,
-                phase,
-                &language.to_string(),
-            ])
+    fn spawn(command: &mut Command) -> Outcome<Self> {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -433,8 +437,26 @@ impl Target {
         });
         Ok(Self { child, lines })
     }
+    fn launch(
+        module: &str,
+        first: &CurrentEngine,
+        second: &CurrentEngine,
+        phase: &str,
+        language: u16,
+    ) -> Outcome<Self> {
+        Self::spawn(Command::new(std::env::current_exe()?).args([
+            "formal-proxy-target",
+            module,
+            &serde_json::to_string(first)?,
+            &serde_json::to_string(second)?,
+            phase,
+            &language.to_string(),
+        ]))
+    }
     fn event(&mut self, key: &str) -> Outcome<serde_json::Value> {
-        let until = Instant::now() + Duration::from_secs(40);
+        self.event_before(key, Instant::now() + Duration::from_secs(40))
+    }
+    fn event_before(&mut self, key: &str, until: Instant) -> Outcome<serde_json::Value> {
         loop {
             let line = self
                 .lines
@@ -454,7 +476,9 @@ impl Target {
         Ok(())
     }
     fn finish(&mut self) -> Outcome<()> {
-        let until = Instant::now() + Duration::from_secs(10);
+        self.finish_before(Instant::now() + Duration::from_secs(10))
+    }
+    fn finish_before(&mut self, until: Instant) -> Outcome<()> {
         loop {
             if let Some(status) = self.child.try_wait()? {
                 if !status.success() {
@@ -467,6 +491,64 @@ impl Target {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+fn await_baseline_publication(language: u16, module: &str) -> Outcome<()> {
+    // Reuse the existing registration-query-detail probe and the installation
+    // acceptance readiness contract. Registration success is not publication.
+    let until = Instant::now() + Duration::from_secs(10);
+    let class = format!("{:?}", registration::CLASS);
+    let profile = format!("{:?}", registration::PROFILE);
+    let category = format!("{GUID_TFCAT_TIP_SPEECH:?}");
+    let mut stable = 0;
+    loop {
+        let mut query =
+            Target::spawn(Command::new(std::env::current_exe()?).arg("registration-query-detail"))?;
+        let reading = query.event_before("managerProfiles", until)?;
+        query.finish_before(until)?;
+        let profiles = reading["managerProfiles"]
+            .as_array()
+            .ok_or("profile query shape")?;
+        let categories = reading["categories"]
+            .as_array()
+            .ok_or("category query shape")?;
+        let ready = reading["class"] == class
+            && reading["expectedProfile"] == profile
+            && reading["legacyLanguage"] == language
+            && profiles.len() == 1
+            && profiles[0]["clsid"] == class
+            && profiles[0]["profile"] == profile
+            && profiles[0]["category"] == category
+            && profiles[0]["language"] == language
+            && profiles[0]["type"] == 1
+            && profiles[0]["flags"]
+                .as_u64()
+                .is_some_and(|flags| flags & TF_IPP_FLAG_ENABLED as u64 != 0)
+            && categories.len() == 1
+            && categories[0] == category
+            && reading["roots"]["machine"]["com"] == true
+            && reading["roots"]["machine"]["tip"] == true
+            && reading["roots"]["user"]["com"] == false;
+        // Root presence alone is not identity. Preserve the existing exact
+        // protected-module anchor in addition to the published profile proof.
+        if registration::owned_module()?.as_deref() != Some(module) {
+            return Err("baseline registration changed".into());
+        }
+        stable = if ready { stable + 1 } else { 0 };
+        println!(
+            "{}",
+            serde_json::json!({"baselinePublication":true,"ready":ready,"consecutive":stable,"reading":reading})
+        );
+        if Instant::now() >= until {
+            return Err("baseline profile publication timeout".into());
+        }
+        if stable == 2 {
+            return Ok(());
+        }
+        std::thread::sleep(
+            Duration::from_millis(250).min(until.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -510,11 +592,14 @@ fn upgrade(args: &[String]) -> Outcome<()> {
     registration::register_installer_machine(&old_module, language)?;
     let sid = sayweave_text_service::transport::current_user_sid()?;
     let mut installed = false;
+    let mut baseline_published = false;
     let result = (|| -> Outcome<()> {
         if !registration::initialize_installer_user(language, user_before)? {
             return Err("owned runner profile not enabled".into());
         }
+        await_baseline_publication(language, &old_module)?;
         deployment::publish_engine(None, Some(&old_descriptor))?;
+        baseline_published = true;
         let mut previous = Target::launch(&old_module, &old_descriptor, &first, "old", language)?;
         let old_ready = previous.event("stageReady")?;
         deployment::install_bundle(
@@ -565,7 +650,7 @@ fn upgrade(args: &[String]) -> Outcome<()> {
             deployment::rollback_bundle(&proxy, core, &sid)?;
         }
         registration::restore_installer_user(language, user_before)?;
-        deployment::publish_engine(Some(&old_descriptor), None)?;
+        deployment::publish_engine(baseline_published.then_some(&old_descriptor), None)?;
         registration::restore_installer_machine(None, &old_module)?;
         if registration::snapshot_installer_machine()?.is_some()
             || deployment::current_engine()?.is_some()
