@@ -543,22 +543,8 @@ impl Drop for Target {
     }
 }
 impl Target {
-    fn launch(
-        module: &str,
-        first: &CurrentEngine,
-        second: &CurrentEngine,
-        phase: &str,
-        language: u16,
-    ) -> Outcome<Self> {
-        let mut child = Command::new(std::env::current_exe()?)
-            .args([
-                "formal-proxy-target",
-                module,
-                &serde_json::to_string(first)?,
-                &serde_json::to_string(second)?,
-                phase,
-                &language.to_string(),
-            ])
+    fn spawn(command: &mut Command) -> Outcome<Self> {
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -579,8 +565,26 @@ impl Target {
         });
         Ok(Self { child, lines })
     }
+    fn launch(
+        module: &str,
+        first: &CurrentEngine,
+        second: &CurrentEngine,
+        phase: &str,
+        language: u16,
+    ) -> Outcome<Self> {
+        Self::spawn(Command::new(std::env::current_exe()?).args([
+            "formal-proxy-target",
+            module,
+            &serde_json::to_string(first)?,
+            &serde_json::to_string(second)?,
+            phase,
+            &language.to_string(),
+        ]))
+    }
     fn event(&mut self, key: &str) -> Outcome<serde_json::Value> {
-        let until = Instant::now() + Duration::from_secs(40);
+        self.event_before(key, Instant::now() + Duration::from_secs(40))
+    }
+    fn event_before(&mut self, key: &str, until: Instant) -> Outcome<serde_json::Value> {
         loop {
             let line = self
                 .lines
@@ -600,7 +604,9 @@ impl Target {
         Ok(())
     }
     fn finish(&mut self) -> Outcome<()> {
-        let until = Instant::now() + Duration::from_secs(10);
+        self.finish_before(Instant::now() + Duration::from_secs(10))
+    }
+    fn finish_before(&mut self, until: Instant) -> Outcome<()> {
         loop {
             if let Some(status) = self.child.try_wait()? {
                 if !status.success() {
@@ -613,6 +619,64 @@ impl Target {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+fn await_baseline_publication(language: u16, module: &str) -> Outcome<()> {
+    // Reuse the existing registration-query-detail probe and the installation
+    // acceptance readiness contract. Registration success is not publication.
+    let until = Instant::now() + Duration::from_secs(10);
+    let class = format!("{:?}", registration::CLASS);
+    let profile = format!("{:?}", registration::PROFILE);
+    let category = format!("{GUID_TFCAT_TIP_SPEECH:?}");
+    let mut stable = 0;
+    loop {
+        let mut query =
+            Target::spawn(Command::new(std::env::current_exe()?).arg("registration-query-detail"))?;
+        let reading = query.event_before("managerProfiles", until)?;
+        query.finish_before(until)?;
+        let profiles = reading["managerProfiles"]
+            .as_array()
+            .ok_or("profile query shape")?;
+        let categories = reading["categories"]
+            .as_array()
+            .ok_or("category query shape")?;
+        let ready = reading["class"] == class
+            && reading["expectedProfile"] == profile
+            && reading["legacyLanguage"] == language
+            && profiles.len() == 1
+            && profiles[0]["clsid"] == class
+            && profiles[0]["profile"] == profile
+            && profiles[0]["category"] == category
+            && profiles[0]["language"] == language
+            && profiles[0]["type"] == 1
+            && profiles[0]["flags"]
+                .as_u64()
+                .is_some_and(|flags| flags & TF_IPP_FLAG_ENABLED as u64 != 0)
+            && categories.len() == 1
+            && categories[0] == category
+            && reading["roots"]["machine"]["com"] == true
+            && reading["roots"]["machine"]["tip"] == true
+            && reading["roots"]["user"]["com"] == false;
+        // Root presence alone is not identity. Preserve the existing exact
+        // protected-module anchor in addition to the published profile proof.
+        if registration::owned_module()?.as_deref() != Some(module) {
+            return Err("baseline registration changed".into());
+        }
+        stable = if ready { stable + 1 } else { 0 };
+        println!(
+            "{}",
+            serde_json::json!({"baselinePublication":true,"ready":ready,"consecutive":stable,"reading":reading})
+        );
+        if Instant::now() >= until {
+            return Err("baseline profile publication timeout".into());
+        }
+        if stable == 2 {
+            return Ok(());
+        }
+        std::thread::sleep(
+            Duration::from_millis(250).min(until.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -660,6 +724,7 @@ fn upgrade(args: &[String]) -> Outcome<()> {
         if !registration::initialize_installer_user(language, user_before)? {
             return Err("owned runner profile not enabled".into());
         }
+        await_baseline_publication(language, &old_module)?;
         deployment::publish_engine(None, Some(&old_descriptor))?;
         let mut previous = Target::launch(&old_module, &old_descriptor, &first, "old", language)?;
         let old_ready = previous.event("stageReady")?;
