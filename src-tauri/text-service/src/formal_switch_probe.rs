@@ -23,7 +23,13 @@ fn checked<T, E: std::fmt::Display>(phase: &str, call: &str, result: Result<T, E
 }
 fn activate_process(phase: &str) -> Outcome<u16> {
     // The same calls/flags as registration::activate(false), with the failing
-    // native call identified. Keep diagnostics off the successful path.
+    // native call identified. Record pre-call ownership separately from the
+    // error-path inventory; a failed call cannot prove its pre-call state.
+    let before = checked(
+        phase,
+        "profile.preexisting",
+        sayweave_text_service::client::speech_activation(),
+    )?;
     unsafe {
         let profiles = checked(phase, "profile.create", registration::profiles())?;
         let language = checked(phase, "profile.language", profiles.GetCurrentLanguage())?;
@@ -63,7 +69,7 @@ fn activate_process(phase: &str) -> Outcome<u16> {
                 &mut session,
             );
             eprintln!(
-                "formal_activation_failure phase={phase} language={language} enabled={enabled:?} profiles={inventory:?} class_create={:?} session={session} session_result={session_result:?}",
+                "formal_activation_failure phase={phase} before={before:?} language={language} enabled={enabled:?} profiles={inventory:?} class_create={:?} session={session} session_result={session_result:?}",
                 instance.as_ref().map(|_| "created")
             );
         }
