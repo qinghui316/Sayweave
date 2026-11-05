@@ -108,9 +108,10 @@ pub struct Converter {
     total: usize,
     emitted: usize,
     skip: usize,
+    gain: f32,
 }
 impl Converter {
-    pub fn new(rate: usize) -> Result<Self, Error> {
+    pub fn new(rate: usize, gain: f32) -> Result<Self, Error> {
         if !(8000..=192000).contains(&rate) {
             return Err(Error::new("deviceFormat"));
         }
@@ -124,6 +125,7 @@ impl Converter {
             total: 0,
             emitted: 0,
             skip,
+            gain,
         })
     }
     fn chunk(&mut self, n: usize) -> Result<Vec<i16>, Error> {
@@ -143,9 +145,13 @@ impl Converter {
             .map_err(|_| Error::new("deviceFormat"))?;
         let skip = self.skip.min(written);
         self.skip -= skip;
+        let gain = self.gain;
         Ok(output[skip..written]
             .iter()
-            .map(|v| ((v.clamp(-1.0, 1.0) * 32767.0).round()) as i16)
+            .map(|&v| {
+                let v = if gain == 1.0 { v } else { v * gain };
+                (v.clamp(-1.0, 1.0) * 32767.0).round() as i16
+            })
             .collect())
     }
     pub fn push(&mut self, samples: &[f32]) -> Result<Vec<i16>, Error> {
@@ -185,13 +191,15 @@ struct CapturedSample {
 /// capture samples can cross an editing boundary into a newly acquired range.
 struct TurnConverter {
     rate: usize,
+    gain: f32,
     turn: u64,
     converter: Option<Converter>,
 }
 impl TurnConverter {
-    fn new(rate: usize) -> Self {
+    fn new(rate: usize, gain: f32) -> Self {
         Self {
             rate,
+            gain,
             turn: 0,
             converter: None,
         }
@@ -217,7 +225,7 @@ impl TurnConverter {
             if turn != self.turn {
                 self.turn = turn;
                 self.converter = if turn > 0 {
-                    Some(Converter::new(self.rate)?)
+                    Some(Converter::new(self.rate, self.gain)?)
                 } else {
                     None
                 };
@@ -434,7 +442,7 @@ impl Capture {
         signal: watch::Receiver<u8>,
         route: Option<Arc<super::continuous::AudioRoute>>,
     ) -> Result<Self, Error> {
-        let mut capture = Self::prepare(device_id, file, signal, route)?;
+        let mut capture = Self::prepare(device_id, 0, file, signal, route)?;
         capture.wait_ready().await?;
         Ok(capture)
     }
@@ -445,12 +453,14 @@ impl Capture {
     }
     pub fn prepare(
         device_id: Option<String>,
+        input_gain_db: i32,
         file: Option<(AudioFiles, String)>,
         signal: watch::Receiver<u8>,
         route: Option<Arc<super::continuous::AudioRoute>>,
     ) -> Result<Self, Error> {
         let stop = Arc::new(AtomicBool::new(false));
         let stopper = stop.clone();
+        let gain = 10_f32.powf(input_gain_db as f32 / 20.0);
         let (sender, packets) = mpsc::channel(100);
         let (done_tx, done) = oneshot::channel();
         let (ready_tx, ready) = oneshot::channel();
@@ -531,8 +541,8 @@ impl Capture {
                         cpal::SampleFormat::U8 => stream!(u8),
                         _ => return Err(Error::new("deviceFormat")),
                     };
-                    let mut converter = Converter::new(rate)?;
-                    let mut turn_converter = TurnConverter::new(rate);
+                    let mut converter = Converter::new(rate, gain)?;
+                    let mut turn_converter = TurnConverter::new(rate, gain);
                     let mut save_error = false;
                     let writer = match &file {
                         Some((files, key)) => match FileSink::start(files.clone(), key.clone()) {
@@ -750,6 +760,83 @@ mod tests {
         assert_eq!(callbacks.xruns.load(Ordering::Acquire), 3);
     }
     #[test]
+    fn input_gain_scales_pcm_once_including_the_resampler_tail() {
+        let input: Vec<_> = (0..4321).map(|i| 0.08 * (i as f32 * 0.072).sin()).collect();
+        let convert = |gain| {
+            let mut converter = Converter::new(44100, gain).unwrap();
+            let mut pcm = Vec::new();
+            for chunk in input.chunks(433) {
+                pcm.extend(converter.push(chunk).unwrap());
+            }
+            pcm.extend(converter.finish().unwrap());
+            pcm
+        };
+        let baseline = convert(1.0);
+        assert_eq!(baseline.len(), input.len() * 16000 / 44100);
+        assert!(baseline.iter().any(|value| value.abs() > 2000));
+        for db in [-6, -3, 0, 3, 6, 9, 12] {
+            let gain = 10_f32.powf(db as f32 / 20.0);
+            let actual = convert(gain);
+            assert_eq!(actual.len(), baseline.len());
+            if db == 0 {
+                assert_eq!(actual, baseline);
+            } else {
+                for (&got, &before) in actual.iter().zip(&baseline) {
+                    // Baseline and amplified output each round once to PCM16.
+                    let expected = before as f32 * gain;
+                    assert!((got as f32 - expected).abs() <= 0.51 * (1.0 + gain));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn input_gain_preserves_polarity_and_clips_before_pcm_conversion() {
+        let mut converter = Converter::new(48000, 10_f32.powf(12.0 / 20.0)).unwrap();
+        let samples: Vec<_> = (0..3840).map(|i| 0.75 * (i as f32 * 0.06).sin()).collect();
+        let mut actual = converter.push(&samples).unwrap();
+        actual.extend(converter.finish().unwrap());
+        assert_eq!(actual.len(), samples.len() / 3);
+        assert_eq!(actual.iter().min(), Some(&-32767));
+        assert_eq!(actual.iter().max(), Some(&32767));
+    }
+
+    #[test]
+    fn routed_resume_keeps_the_capture_gain() {
+        use super::super::continuous::{Control, Route};
+        use std::sync::atomic::AtomicU64;
+        let evidence = Arc::new(AtomicU64::new(0));
+        let control = Control::new(evidence.clone());
+        let gain = 10_f32.powf(6.0 / 20.0);
+        let mut routed = TurnConverter::new(48000, gain);
+        let signal: Vec<_> = (0..5283).map(|i| 0.09 * (i as f32 * 0.053).sin()).collect();
+        let mut local = Converter::new(48000, gain).unwrap();
+        let mut expected = local.push(&signal).unwrap();
+        expected.extend(local.finish().unwrap());
+        for turn in 1..=2 {
+            let activity = turn - 1;
+            if turn == 2 {
+                evidence.fetch_add(1, Ordering::AcqRel);
+                control.pause();
+            }
+            control.resume(turn, activity);
+            control.enabled(Route { turn, activity });
+            let stamped = signal
+                .iter()
+                .map(|&value| CapturedSample { value, turn })
+                .collect::<Vec<_>>();
+            let mut output = routed.push(&stamped, &control.audio).unwrap();
+            output.extend(routed.finish(&control.audio).unwrap());
+            assert!(output.iter().all(|(routed_turn, _)| *routed_turn == turn));
+            let pcm: Vec<_> = output
+                .into_iter()
+                .flat_map(|(_, samples)| samples)
+                .collect();
+            assert_eq!(pcm, expected);
+        }
+    }
+
+    #[test]
     fn delayed_capture_and_fft_tail_cannot_be_relabelled_as_the_next_turn() {
         use super::super::continuous::{Control, Route};
         use std::sync::atomic::AtomicU64;
@@ -760,7 +847,7 @@ mod tests {
             turn: 1,
             activity: 0,
         });
-        let mut encoder = TurnConverter::new(48000);
+        let mut encoder = TurnConverter::new(48000, 1.0);
         let old = vec![
             CapturedSample {
                 value: 1.0,
@@ -806,7 +893,7 @@ mod tests {
                 .iter()
                 .all(|(turn, pcm)| *turn == 2 && pcm.iter().all(|s| *s == 0))
         );
-        let mut local = Converter::new(48000).unwrap();
+        let mut local = Converter::new(48000, 1.0).unwrap();
         let mut recording = local
             .push(
                 &old.iter()

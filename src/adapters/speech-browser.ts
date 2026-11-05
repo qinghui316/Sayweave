@@ -2,7 +2,7 @@ import {SpeechError,initialSpeech,type SpeechPort,type SpeechSnapshot,type Speec
 import {historyText,summarizeHistory,type HistoryPort,type HistoryRecord,type HistoryCursor,type PlaybackState} from '../contracts/history';
 export class BrowserSpeech implements SpeechPort {
  readonly mode='simulation' as const;
- value=initialSpeech();settings:RecordingPreferences={deviceId:null,historyEnabled:true,audioEnabled:true,retentionDays:30,revision:1};
+ value=initialSpeech();settings:RecordingPreferences={deviceId:null,inputGainDb:0,historyEnabled:true,audioEnabled:true,retentionDays:30,revision:1};
  readonly listeners=new Set<(s:SpeechSnapshot)=>void>();readonly meters=new Set<(m:SpeechMeter)=>void>();readonly records:HistoryRecord[]=[];
  private timer:ReturnType<typeof setTimeout>|undefined;
  private active=false;private meterTimer:ReturnType<typeof setInterval>|undefined;

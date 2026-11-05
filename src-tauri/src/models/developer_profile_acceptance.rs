@@ -1,6 +1,6 @@
 //! Explicit test-only developer handoff. Never linked into a shipping application.
 use super::credentials::{Credentials, WindowsCredentials};
-use crate::data::{DataWorker, Operation};
+use crate::data::{DataWorker, Operation, repository::MIGRATIONS};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::{collections::BTreeMap, io::Write, path::Path, time::Duration};
@@ -54,7 +54,8 @@ async fn seed(
             r.get(0)
         })
         .map_err(|_| "profile-schema")?;
-    if !(10..=14).contains(&source_schema) {
+    let current_schema = MIGRATIONS.len() as i64;
+    if !(10..=current_schema).contains(&source_schema) {
         return Err("profile-schema");
     }
     let source_history = count(&source, "speech_records")?;
@@ -112,7 +113,8 @@ async fn seed(
     drop(data);
     if ready.is_err()
         || drained.is_err()
-        || !status.is_ok_and(|s| s.state == "ready" && s.schema_version == 14)
+        || !status
+            .is_ok_and(|s| s.state == "ready" && i64::from(s.schema_version) == current_schema)
     {
         return Err("profile-migration");
     }
@@ -136,7 +138,7 @@ async fn seed(
             r.get(0)
         })
         .map_err(|_| "profile-verification")?;
-    if target_schema != 14 {
+    if target_schema != current_schema {
         return Err("profile-migration");
     }
     let refs = target
@@ -322,7 +324,7 @@ async fn developer_seed_preserves_settings_and_words_without_history_or_shared_c
     assert_eq!(receipt.source_history, 1);
     assert_eq!(receipt.preserved["dictionary_terms"], 1);
     assert_eq!(receipt.preserved["model_configs"], 2);
-    assert_eq!(receipt.target_schema, 14);
+    assert_eq!(receipt.target_schema, MIGRATIONS.len() as i64);
     let copied = Connection::open_with_flags(
         dest.join("dictionary.sqlite"),
         OpenFlags::SQLITE_OPEN_READ_ONLY,

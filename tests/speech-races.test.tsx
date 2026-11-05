@@ -26,7 +26,7 @@ it.each([{bytes:0,durationMs:0,label:'没有录下音频'},{bytes:32000,duration
  expect(audioLabel(record)).toBe(label);
 });
 it('a late device refresh cannot overwrite a committed selection',async()=>{
- const old:RecordingPreferences={deviceId:null,historyEnabled:true,audioEnabled:true,retentionDays:30,revision:1};
+ const old:RecordingPreferences={deviceId:null,inputGainDb:0,historyEnabled:true,audioEnabled:true,retentionDays:30,revision:1};
  const refresh=deferred<RecordingPreferences>(),save=deferred<RecordingPreferences>();
  const port={mode:'native',devices:vi.fn().mockResolvedValue([{id:'mic',name:'Mic',isDefault:false}]),preferences:vi.fn().mockResolvedValueOnce(old).mockReturnValueOnce(refresh.promise),savePreferences:vi.fn().mockReturnValue(save.promise)} as unknown as SpeechPort;
  const user=userEvent.setup();render(<DeviceSettings port={port} settings={recordingSettings(port)}/>);const select=await screen.findByRole('combobox');

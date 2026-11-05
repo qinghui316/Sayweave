@@ -38,6 +38,7 @@ function websocket(req,socket,head){
 
  const accept=createHash('sha1').update(req.headers['sec-websocket-key']+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: '+accept+'\r\n\r\n');sockets.add(socket);socket.on('close',()=>sockets.delete(socket));socket.on('error',()=>{});
  const connection={protocol:expectedProtocol,mode,model:null,frames:0,bytes:0,started:false,finished:false};report.connections.push(connection);let task,buffer=head,fragment=Buffer.alloc(0),fragmentOpcode=0;
+ const gainPcm=connection.mode.startsWith('gain-')?createHash('sha256'):null;
  const send=(event,payload={})=>socket.write(frame({header:{task_id:task,event},payload}));
  const sentence=(sid,text,end)=>send('result-generated',{output:{sentence:{sentence_id:sid,sentence_end:end,text,begin_time:0,end_time:end?connection.bytes/32:null}}});
  if(connection.mode.startsWith('learning-restart-'))restartChannels.push({connection,sentence});
@@ -72,13 +73,13 @@ function websocket(req,socket,head){
     connection.finished=true;result(text,true);send('task-finished');return;
    }
   }
-  if(opcode===2){if(!connection.started)throw Error('Audio arrived before task-started');connection.frames++;connection.bytes+=payload.length;if(connection.mode==='copy-only')return;if(connection.mode.startsWith('polish-')){const text=connection.mode==='polish-edit'?(raceOrdinal===0?'呃，编辑前啊。':'嗯，继续输入🙂。'):connection.mode==='polish-revision'?'嗯，修订前啊。':'呃，等待原文啊。';if(connection.frames===1)sentence(1,text,false);if(connection.frames===8)sentence(1,text,true);return;}if(connection.mode==='polish'){if(connection.frames===1)sentence(1,'呃，第一段啊。',false);if(connection.frames===8)sentence(1,'呃，第一段啊。',true);if(connection.frames===16)sentence(2,'嗯，第二段啊。',false);if(connection.frames===35)sentence(2,'嗯，第二段啊。',true);if(connection.frames===45)sentence(3,'尾部',false);return;}if(connection.frames===1){if(connection.mode==='failure'){socket.write(frame({header:{task_id:task,event:'task-failed',error_code:'SERVICE_ERROR',error_message:'PRIVATE FIXTURE ERROR'}}));return;}result('正在',false);}if(connection.frames===8)result('正在识别',false);return;}
+  if(opcode===2){if(!connection.started)throw Error('Audio arrived before task-started');connection.frames++;connection.bytes+=payload.length;gainPcm?.update(payload);if(connection.mode==='copy-only')return;if(connection.mode.startsWith('polish-')){const text=connection.mode==='polish-edit'?(raceOrdinal===0?'呃，编辑前啊。':'嗯，继续输入🙂。'):connection.mode==='polish-revision'?'嗯，修订前啊。':'呃，等待原文啊。';if(connection.frames===1)sentence(1,text,false);if(connection.frames===8)sentence(1,text,true);return;}if(connection.mode==='polish'){if(connection.frames===1)sentence(1,'呃，第一段啊。',false);if(connection.frames===8)sentence(1,'呃，第一段啊。',true);if(connection.frames===16)sentence(2,'嗯，第二段啊。',false);if(connection.frames===35)sentence(2,'嗯，第二段啊。',true);if(connection.frames===45)sentence(3,'尾部',false);return;}if(connection.frames===1){if(connection.mode==='failure'){socket.write(frame({header:{task_id:task,event:'task-failed',error_code:'SERVICE_ERROR',error_message:'PRIVATE FIXTURE ERROR'}}));return;}result('正在',false);}if(connection.frames===8)result('正在识别',false);return;}
   if(opcode!==1)return;const value=JSON.parse(payload.toString());if(value.header.action==='run-task'){task=value.header.task_id;expect(value.payload.parameters.sample_rate).toBe(16000);expect(value.payload.parameters.format).toBe('pcm');expect(value.payload.model).toBe(expectedModel);connection.model=value.payload.model;
    if(connection.mode.startsWith('readiness-')){
     const channel={connection,receivedAt:Date.now(),released:false,release(){if(this.released)return this.releaseDelivery;this.released=true;this.releasedAt=Date.now();const sent=!socket.destroyed&&socket.writable;this.releaseDelivery={at:this.releasedAt,sent,socketDestroyed:socket.destroyed,socketWritable:socket.writable};if(sent){connection.started=true;send('task-started');}return this.releaseDelivery;}};
     readinessChannels.push(channel);
    }else{connection.started=true;send('task-started');}}
-  else if(value.header.action==='finish-task'){connection.finished=true;if(connection.mode.startsWith('polish-')){if(connection.mode==='polish-edit'&&raceOrdinal===0)sentence(2,'旧轮尾字不应覆盖。',true);send('task-finished');return;}if(connection.mode==='polish'){sentence(3,'尾部完成🙂',true);send('task-finished');return;}if(connection.mode==='pending')return;if(connection.mode==='copy-only'&&!connection.released){send('task-finished');return;}if(connection.mode==='empty'){send('task-finished');return;}result('原生受控识别完成。',true);result('重复最终结果不应覆盖。',true);send('task-finished');}
+  else if(value.header.action==='finish-task'){connection.finished=true;if(gainPcm)connection.pcmSha256=gainPcm.digest('hex');if(connection.mode.startsWith('polish-')){if(connection.mode==='polish-edit'&&raceOrdinal===0)sentence(2,'旧轮尾字不应覆盖。',true);send('task-finished');return;}if(connection.mode==='polish'){sentence(3,'尾部完成🙂',true);send('task-finished');return;}if(connection.mode==='pending')return;if(connection.mode==='copy-only'&&!connection.released){send('task-finished');return;}if(connection.mode==='empty'){send('task-finished');return;}result('原生受控识别完成。',true);result('重复最终结果不应覆盖。',true);send('task-finished');}
  }
  function receive(chunk){buffer=Buffer.concat([buffer,chunk]);try{while(buffer.length>=2){const opcode=buffer[0]&15,fin=(buffer[0]&128)!==0,masked=(buffer[1]&128)!==0;let length=buffer[1]&127,offset=2;if(length===126){if(buffer.length<4)return;length=buffer.readUInt16BE(2);offset=4;}else if(length===127){if(buffer.length<10)return;length=Number(buffer.readBigUInt64BE(2));offset=10;}if(length>1024*1024)throw Error('oversize frame');if(masked)offset+=4;if(buffer.length<offset+length)return;const payload=Buffer.from(buffer.subarray(offset,offset+length));if(masked){const mask=buffer.subarray(offset-4,offset);for(let n=0;n<length;n++)payload[n]^=mask[n%4];}buffer=buffer.subarray(offset+length);if(opcode===0){fragment=Buffer.concat([fragment,payload]);if(fin){consume(fragmentOpcode,fragment);fragment=Buffer.alloc(0);}}else if(!fin&&opcode<8){fragmentOpcode=opcode;fragment=payload;}else consume(opcode,payload);}}catch(e){report.protocolError=String(e);socket.destroy();}}
  socket.on('data',receive);if(head.length)receive(Buffer.alloc(0));
@@ -105,7 +106,7 @@ async function modelFixture(req,res){
   res.writeHead(200,{'Content-Type':'text/event-stream'});
   res.end('data: '+JSON.stringify({choices:[{index:0,delta:{role:'assistant',content:data.input_text},finish_reason:null}]})+'\n\ndata: '+JSON.stringify({choices:[{index:0,delta:{},finish_reason:'stop'}]})+'\n\ndata: [DONE]\n\n');return;
  }
- if(mode.startsWith('translation-')){
+ if(mode.startsWith('translation-')||mode==='gain-translation'){
   expect(request.stream).toBe(true);expect(request.model).toBe('translation-fixture');
   const receipt={mode,request:structuredClone(request),at:performance.now(),source:data.source_text};translationRequests.push(receipt);
   await new Promise(resolve=>{const timer=setTimeout(resolve,15000);const release=()=>{clearTimeout(timer);resolve();};translationReleases.set(receipt,release);res.once('close',release);});
@@ -628,7 +629,8 @@ async function homeTrialIsolation(page){
   const trial=await waitPhase(page,'recording');expect(trial.source).toBe('trial');
   await expect(practice).toContainText('正在识别');
   await page.getByRole('button',{name:'结束录音',exact:true}).click();
-  const done=await waitPhase(page,'completed');expect(done.source).toBe('trial');expect(done.saved).toBe(true);
+  const done=await waitPhase(page,'completed');expect(done.source).toBe('trial');expect(done.recordId).toBeTruthy();
+  await expect.poll(async()=>(await invoke(page,'history_detail',{id:done.recordId})).audio?.status).toBe('ready');
   const retained=await practice.textContent();
   await page.getByRole('group',{name:'识别完成',exact:true}).getByRole('button',{name:'开始录音',exact:true}).click();
   const restarted=await waitPhase(page,'recording');expect(restarted.source).toBe('trial');expect(restarted.taskId).not.toBe(done.taskId);
@@ -1058,6 +1060,72 @@ async function run(){try{
  const devices=await invoke(page,'speech_devices');report.microphoneCount=devices.length;expect(devices.some(d=>d.isDefault)).toBe(true);
  report.scope=process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE??'all';
  if(report.scope==='translation'){await translationScenario(page,base);report.passed=true;return;}
+ if(report.scope==='input-gain'){
+  const preferences=()=>invoke(page,'speech_preferences',{preferences:null});
+  const set=async patch=>invoke(page,'speech_preferences',{preferences:{...await preferences(),...patch}});
+  expect((await preferences()).inputGainDb).toBe(0);
+  await page.getByRole('button',{name:'设置',exact:true}).click();
+  const settings=page.getByRole('dialog',{name:'设置',exact:true});
+  await settings.getByRole('button',{name:'设备与快捷键',exact:true}).click();
+  const gain=settings.getByRole('slider',{name:'麦克风增益'});
+  await gain.press('ArrowRight');await gain.press('ArrowRight');
+  await expect.poll(async()=>(await preferences()).inputGainDb).toBe(6);
+  await settings.getByRole('button',{name:'关闭',exact:true}).click();
+  const record=async(label,afterStart)=>{
+   mode=label;await page.getByRole('button',{name:'开始录音',exact:true}).click();
+   expect((await waitPhase(page,'recording')).source).toBe('trial');
+   await afterStart();
+   await delay(400);await page.getByRole('button',{name:'结束录音',exact:true}).click();return waitPhase(page,'completed');
+  };
+  const hash=label=>{const c=report.connections.find(item=>item.mode===label);expect(c?.bytes).toBeGreaterThan(0);expect(c?.pcmSha256).toMatch(/^[a-f0-9]{64}$/);return c.pcmSha256;};
+  const recorded=await record('gain-record',()=>set({inputGainDb:-6}));
+  expect(recorded.recordId).toBeTruthy();
+  await expect.poll(async()=>(await invoke(page,'history_detail',{id:recorded.recordId})).audio?.status).toBe('ready');
+  const expected=hash('gain-record');
+  await stop(page);page=await start(2);
+  expect((await preferences()).inputGainDb).toBe(-6);
+  const history=await invoke(page,'history_detail',{id:recorded.recordId});
+  expect(history.audio.status).toBe('ready');
+  const config=(await readModels(page)).configs[0];
+  mode='gain-history-retry';await invoke(page,'history_retry',{id:recorded.recordId,configId:config.id,configRevision:config.revision});await waitPhase(page,'completed');
+  expect(hash('gain-history-retry')).toBe(expected);
+  await set({historyEnabled:false,audioEnabled:false,inputGainDb:6});
+  const transient=await record('gain-temporary',()=>set({inputGainDb:0}));
+  mode='gain-temporary-retry';await invoke(page,'speech_retry_current',{taskId:transient.taskId});await waitPhase(page,'completed');
+  expect(hash('gain-temporary-retry')).toBe(hash('gain-temporary'));
+  report.checks.push('Home records through native controls; slider persisted across restart; archived and in-memory retries reuse the exact captured PCM after a gain change');
+
+  const editor=await ownedEditor();
+  try{
+   await set({inputGainDb:6});
+   await invoke(page,'runtime_window',{surface:'main',action:'show'});
+   expect((await editor.command({action:'focus-process',process:app.pid})).foregroundProcess).toBe(app.pid);
+   mode='gain-external';const external=await invoke(page,'dictation_start');
+   expect((await waitPhase(page,'recording')).source).toBe('external');
+   expect((await invoke(page,'dictation_snapshot')).inputRoute).toBe('resultOnly');
+   await expect.poll(()=>report.connections.find(c=>c.mode==='gain-external')?.frames??0).toBeGreaterThan(0);
+   await invoke(page,'dictation_control',{taskId:external.taskId,action:'finish'});await waitPhase(page,'completed');hash('gain-external');
+   await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).stage).toBe('result');
+   const completed=await invoke(page,'dictation_snapshot');if(completed.presentationId)await dismiss(page,{taskId:completed.taskId,presentationId:completed.presentationId});
+   report.checks.push('External result-only dictation captured and finalized real microphone PCM');
+
+   await invoke(page,'model_save',{request:{id:null,revision:null,expectation:null,input:{name:'隔离翻译文字',protocol:'openai-chat',baseUrl:base+'/v1',modelId:'translation-fixture',usages:['text']},key:{action:'replace',value:key}}});
+   const keys=await invoke(page,'shortcut_status');await invoke(page,'shortcut_save',{config:{...keys.saved,binding:'AltRight',translationBinding:'F8',mode:'hold'}});
+   await editor.command({action:'focus',text:'前后',start:1,end:1});
+   mode='gain-translation';
+   const keyEdge=async down=>expect((await editor.command({action:'fixture-key',process:editor.pid,key:'F8',down})).keyResult?.accepted).toBe(true);
+   await keyEdge(true);
+   try{
+    await waitPhase(page,'recording');expect((await invoke(page,'dictation_snapshot')).purpose).toBe('translation');
+    await expect.poll(()=>report.connections.find(c=>c.mode==='gain-translation')?.frames??0).toBeGreaterThan(0);
+   }finally{await keyEdge(false);}
+   await expect.poll(()=>translationRequests.length,{timeout:12000}).toBe(1);
+   expect(translationRequests[0].source).toBe('原生受控识别完成。');translationReleases.get(translationRequests[0])?.();
+   await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).translationComplete,{timeout:12000}).toBe(true);
+   hash('gain-translation');report.checks.push('Translation held shortcut captured microphone PCM and translated the final ASR result after release');
+  }finally{await editor.close();}
+  report.passed=true;return;
+ }
  if(report.scope==='result-only'){await resultOnlyScenario(page);report.passed=true;return;}
   if(report.scope==='home-trial'){await homeTrialIsolation(page);report.passed=true;return;}
   if(report.scope==='learning-restart'){await learningRestartScenario(page,base);report.passed=true;return;}

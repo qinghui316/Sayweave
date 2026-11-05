@@ -1,4 +1,24 @@
 import {test,expect} from '@playwright/test';
+
+test('microphone gain is a seven-step keyboard setting that keeps its value when reopened',async({page})=>{
+ await page.goto('/');
+ const open=async()=>{
+  await page.getByRole('button',{name:'设置',exact:true}).click();
+  const dialog=page.getByRole('dialog',{name:'设置',exact:true});
+  await dialog.getByRole('button',{name:'设备与快捷键',exact:true}).click();
+  return dialog;
+ };
+ let dialog=await open();
+ let gain=dialog.getByRole('slider',{name:'麦克风增益'});
+ await expect(gain).toHaveValue('0');
+ await gain.press('ArrowRight');await expect(gain).toHaveValue('3');
+ await gain.press('ArrowRight');await expect(gain).toHaveAttribute('aria-valuetext','+6 dB');
+ await dialog.getByRole('button',{name:'关闭',exact:true}).click();
+ dialog=await open();gain=dialog.getByRole('slider',{name:'麦克风增益'});
+ await expect(gain).toHaveValue('6');
+ await gain.press('End');await expect(gain).toHaveValue('12');
+ await gain.press('Home');await expect(gain).toHaveValue('-6');
+});
 test('simulated speech saves only completed sessions and real UI result is read-only',async({page})=>{
  await page.goto('/');await page.getByRole('button',{name:'开始录音',exact:true}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();
  await page.getByRole('button',{name:'结束录音',exact:true}).click();await expect(page.locator('[data-phase="completed"]')).toBeVisible();

@@ -32,3 +32,7 @@
 :global([data-theme="graphite"]) .recorderWrap { --shortcut-error:#ff7a8b; }
 .shortcutRecorder[aria-invalid="true"] { border-color:var(--shortcut-error); }
 .shortcutError { width:100%; margin:0; color:var(--shortcut-error); font-size:var(--text-small); line-height:var(--line-small); }
+
+.inputGain{display:flex;align-items:center;gap:8px;min-width:0;}
+.inputGain input{width:clamp(88px,16vw,176px);margin:0;min-width:0;}
+.inputGainValue{min-width:5ch;text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums;}

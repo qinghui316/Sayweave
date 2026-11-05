@@ -866,6 +866,15 @@ fn interrupted_attempt_and_query_indexes() {
         _ => panic!(),
     };
     assert_eq!(p.retention_days, Some(30));
+    assert_eq!(p.input_gain_db, 0);
+    p.input_gain_db = 2;
+    assert_eq!(
+        repo.history_operation(DbOperation::SavePreferences(p.clone()))
+            .unwrap_err()
+            .code,
+        "invalid"
+    );
+    p.input_gain_db = 6;
     p.retention_days = Some(7);
     repo.history_operation(DbOperation::SavePreferences(p.clone()))
         .unwrap();
@@ -880,6 +889,20 @@ fn interrupted_attempt_and_query_indexes() {
             .execute("UPDATE speech_preferences SET retention_days=8", params![])
             .is_err()
     );
+    assert!(
+        repo.connection
+            .execute("UPDATE speech_preferences SET input_gain_db=15", [])
+            .is_err()
+    );
+    drop(repo);
+    let mut reopened = Repository::open(root.path()).unwrap();
+    let DbOutput::Preferences(saved) = reopened
+        .history_operation(DbOperation::Preferences)
+        .unwrap()
+    else {
+        panic!("recording preferences");
+    };
+    assert_eq!((saved.input_gain_db, saved.retention_days), (6, Some(7)));
 }
 
 #[tokio::test]

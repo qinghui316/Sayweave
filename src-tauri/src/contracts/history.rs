@@ -4,6 +4,7 @@ pub type Error = crate::contracts::dictionary::DataError;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Preferences {
     pub device_id: Option<String>,
+    pub input_gain_db: i32,
     pub history_enabled: bool,
     pub audio_enabled: bool,
     pub retention_days: Option<u32>,
@@ -12,6 +13,7 @@ pub struct Preferences {
 impl Preferences {
     pub fn validate(&self) -> Result<(), Error> {
         if self.revision < 1
+            || ![-6, -3, 0, 3, 6, 9, 12].contains(&self.input_gain_db)
             || self
                 .retention_days
                 .is_some_and(|d| ![7, 30, 90].contains(&d))

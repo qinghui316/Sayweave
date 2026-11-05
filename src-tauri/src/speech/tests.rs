@@ -129,7 +129,7 @@ fn resampling_preserves_first_and_last_audio_and_exact_duration() {
             let samples = (0..frames)
                 .map(|n| 0.4 * (2.0 * std::f32::consts::PI * 440.0 * n as f32 / rate as f32).sin())
                 .collect::<Vec<_>>();
-            let mut converter = audio::Converter::new(rate).unwrap();
+            let mut converter = audio::Converter::new(rate, 1.0).unwrap();
             let mut out = vec![];
             for block in samples.chunks(137) {
                 out.extend(converter.push(block).unwrap());

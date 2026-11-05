@@ -822,6 +822,7 @@ impl SpeechService {
             if task.replay.is_none() {
                 capture = Some(audio::Capture::prepare(
                     task.preferences.device_id.clone(),
+                    task.preferences.input_gain_db,
                     task.audio
                         .as_ref()
                         .map(|a| self.history.files.clone().map(|f| (f, a.file_key.clone())))

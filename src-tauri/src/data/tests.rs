@@ -5,6 +5,61 @@ use super::{
 use rusqlite::{Connection, params};
 use std::time::{Duration, Instant};
 #[test]
+fn microphone_gain_migrates_only_preferences_and_preserves_recorded_audio() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("dictionary.sqlite");
+    let mut connection = Connection::open(&path).unwrap();
+    configure(&connection).unwrap();
+    migrate(&mut connection, root.path(), &MIGRATIONS[..14]).unwrap();
+    connection.execute_batch("
+        UPDATE speech_preferences SET device_id='chosen-mic',retention_days=7,revision=5;
+        INSERT INTO speech_records(id,created_at,ended_at,duration_ms,status,current_attempt)
+            VALUES('r',1,2,1,'success','attempt');
+        INSERT INTO speech_attempts(id,record_id,kind,config_id,config_name,model_id,service_host,config_revision,created_at,status,text)
+            VALUES('attempt','r','live','config','ASR','model','fixture',1,1,'success','before upgrade');
+        INSERT INTO audio_assets(id,record_id,file_key,status,bytes)
+            VALUES('audio','r','existing','ready',48);
+    ").unwrap();
+    let wav = root.path().join("existing.wav");
+    let mut writer = hound::WavWriter::create(
+        &wav,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .unwrap();
+    writer.write_sample(30_i16).unwrap();
+    writer.write_sample(-15_i16).unwrap();
+    writer.finalize().unwrap();
+    let original = std::fs::read(&wav).unwrap();
+    migrate(&mut connection, root.path(), MIGRATIONS).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT device_id,retention_days,revision,input_gain_db FROM speech_preferences",
+                [],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, u32>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i32>(3)?
+                ))
+            )
+            .unwrap(),
+        ("chosen-mic".into(), 7, 5, 0),
+    );
+    assert_eq!(
+        connection.query_row("SELECT a.text,w.file_key,w.bytes FROM speech_records r JOIN speech_attempts a ON a.id=r.current_attempt JOIN audio_assets w ON w.record_id=r.id", [],
+            |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, i64>(2)?))).unwrap(),
+        ("before upgrade".into(),"existing".into(),48),
+    );
+    assert_eq!(std::fs::read(&wav).unwrap(), original);
+}
+
+#[test]
 fn shortcut_provenance_migration_uses_entering_schema_not_global_revision() {
     for (schema, binding, mode, revision, original, expected, source) in [
         (
