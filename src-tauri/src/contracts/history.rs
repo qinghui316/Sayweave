@@ -13,7 +13,7 @@ pub struct Preferences {
 impl Preferences {
     pub fn validate(&self) -> Result<(), Error> {
         if self.revision < 1
-            || ![-6, -3, 0, 3, 6, 9, 12].contains(&self.input_gain_db)
+            || ![0, 3, 6, 9, 12].contains(&self.input_gain_db)
             || self
                 .retention_days
                 .is_some_and(|d| ![7, 30, 90].contains(&d))

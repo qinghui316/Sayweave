@@ -1,6 +1,6 @@
 import {test,expect} from '@playwright/test';
 
-test('microphone gain is a seven-step keyboard setting that keeps its value when reopened',async({page})=>{
+test('microphone gain shows five named levels and keeps its selection when reopened',async({page})=>{
  await page.goto('/');
  const open=async()=>{
   await page.getByRole('button',{name:'设置',exact:true}).click();
@@ -11,13 +11,18 @@ test('microphone gain is a seven-step keyboard setting that keeps its value when
  let dialog=await open();
  let gain=dialog.getByRole('slider',{name:'麦克风增益'});
  await expect(gain).toHaveValue('0');
- await gain.press('ArrowRight');await expect(gain).toHaveValue('3');
- await gain.press('ArrowRight');await expect(gain).toHaveAttribute('aria-valuetext','+6 dB');
+ await expect(gain).toHaveAccessibleDescription('调整麦克风增益。说悄悄话也能听见。');
+ await gain.press('ArrowLeft');await expect(gain).toHaveAttribute('aria-valuetext','Normal');
+ for(const [value,label] of [['3','Low'],['6','Medium'],['9','High'],['12','Max']] as const){
+  await gain.press('ArrowRight');await expect(gain).toHaveValue(value);
+  await expect(gain).toHaveAttribute('aria-valuetext',label);
+  await expect(dialog.getByText(label,{exact:true})).toBeVisible();
+ }
+ await gain.press('ArrowRight');await expect(gain).toHaveValue('12');
  await dialog.getByRole('button',{name:'关闭',exact:true}).click();
  dialog=await open();gain=dialog.getByRole('slider',{name:'麦克风增益'});
- await expect(gain).toHaveValue('6');
- await gain.press('End');await expect(gain).toHaveValue('12');
- await gain.press('Home');await expect(gain).toHaveValue('-6');
+ await expect(gain).toHaveAttribute('aria-valuetext','Max');
+ await gain.press('Home');await expect(gain).toHaveValue('0');
 });
 test('simulated speech saves only completed sessions and real UI result is read-only',async({page})=>{
  await page.goto('/');await page.getByRole('button',{name:'开始录音',exact:true}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();

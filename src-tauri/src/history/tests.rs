@@ -867,13 +867,15 @@ fn interrupted_attempt_and_query_indexes() {
     };
     assert_eq!(p.retention_days, Some(30));
     assert_eq!(p.input_gain_db, 0);
-    p.input_gain_db = 2;
-    assert_eq!(
-        repo.history_operation(DbOperation::SavePreferences(p.clone()))
-            .unwrap_err()
-            .code,
-        "invalid"
-    );
+    for unsupported in [-6, -3, 2, 15] {
+        p.input_gain_db = unsupported;
+        assert_eq!(
+            repo.history_operation(DbOperation::SavePreferences(p.clone()))
+                .unwrap_err()
+                .code,
+            "invalid"
+        );
+    }
     p.input_gain_db = 6;
     p.retention_days = Some(7);
     repo.history_operation(DbOperation::SavePreferences(p.clone()))
@@ -903,6 +905,33 @@ fn interrupted_attempt_and_query_indexes() {
         panic!("recording preferences");
     };
     assert_eq!((saved.input_gain_db, saved.retention_days), (6, Some(7)));
+}
+
+#[test]
+fn microphone_gain_reads_existing_preferences_at_supported_levels() {
+    let root = tempfile::tempdir().unwrap();
+    let mut repo = Repository::open(root.path()).unwrap();
+    for (stored, effective) in [(-6, 0), (-3, 0), (12, 12)] {
+        repo.connection
+            .execute(
+                "UPDATE speech_preferences SET input_gain_db=?1, revision=5",
+                [stored],
+            )
+            .unwrap();
+        let DbOutput::Preferences(prefs) =
+            repo.history_operation(DbOperation::Preferences).unwrap()
+        else {
+            panic!("recording preferences");
+        };
+        assert_eq!((prefs.input_gain_db, prefs.revision), (effective, 5));
+        let untouched: i32 = repo
+            .connection
+            .query_row("SELECT input_gain_db FROM speech_preferences", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(untouched, stored);
+    }
 }
 
 #[tokio::test]

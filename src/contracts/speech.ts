@@ -17,7 +17,7 @@ export interface SpeechMeter {taskId:string;sequence:number;level:number;energie
 export type SpeechMeterFrame=SpeechMeter & {receivedAt:number};
 export interface SpeechMeterSource {subscribe:(listener:()=>void)=>()=>void;getSnapshot:()=>SpeechMeterFrame|null}
 export interface Microphone {id:string;name:string;isDefault:boolean}
-export const INPUT_GAIN_STOPS=[-6,-3,0,3,6,9,12] as const;
+export const INPUT_GAIN_STOPS=[0,3,6,9,12] as const;
 export type InputGainDb=typeof INPUT_GAIN_STOPS[number];
 export function isInputGainDb(value:unknown):value is InputGainDb{return INPUT_GAIN_STOPS.some(db=>db===value);}
 export interface RecordingPreferences {deviceId:string|null;inputGainDb:InputGainDb;historyEnabled:boolean;audioEnabled:boolean;retentionDays:7|30|90|null;revision:number}

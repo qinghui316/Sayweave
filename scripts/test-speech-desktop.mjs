@@ -1069,6 +1069,7 @@ async function run(){try{
   await settings.getByRole('button',{name:'设备与快捷键',exact:true}).click();
   const gain=settings.getByRole('slider',{name:'麦克风增益'});
   await gain.press('ArrowRight');await gain.press('ArrowRight');
+  await expect(gain).toHaveAttribute('aria-valuetext','Medium');
   await expect.poll(async()=>(await preferences()).inputGainDb).toBe(6);
   await settings.getByRole('button',{name:'关闭',exact:true}).click();
   const record=async(label,afterStart)=>{
@@ -1078,12 +1079,12 @@ async function run(){try{
    await delay(400);await page.getByRole('button',{name:'结束录音',exact:true}).click();return waitPhase(page,'completed');
   };
   const hash=label=>{const c=report.connections.find(item=>item.mode===label);expect(c?.bytes).toBeGreaterThan(0);expect(c?.pcmSha256).toMatch(/^[a-f0-9]{64}$/);return c.pcmSha256;};
-  const recorded=await record('gain-record',()=>set({inputGainDb:-6}));
+  const recorded=await record('gain-record',()=>set({inputGainDb:9}));
   expect(recorded.recordId).toBeTruthy();
   await expect.poll(async()=>(await invoke(page,'history_detail',{id:recorded.recordId})).audio?.status).toBe('ready');
   const expected=hash('gain-record');
   await stop(page);page=await start(2);
-  expect((await preferences()).inputGainDb).toBe(-6);
+  expect((await preferences()).inputGainDb).toBe(9);
   const history=await invoke(page,'history_detail',{id:recorded.recordId});
   expect(history.audio.status).toBe('ready');
   const config=(await readModels(page)).configs[0];
