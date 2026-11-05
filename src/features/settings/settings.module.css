@@ -7,6 +7,7 @@
 .content>header h2 { font-size:24px; line-height:32px; font-weight:500; }
 .panelSlot { min-height:0; min-width:0; flex:1; display:flex; }
 .scroll { flex:1; overflow-y:auto; overflow-x:hidden; min-height:0; min-width:0; padding:4px 8px 24px; margin:0 -8px; scrollbar-gutter:stable; }
+.deviceScroll { --settings-section-gap:var(--space-20); --settings-title-gap:var(--space-12); --settings-title-padding:var(--space-8); --settings-row-gap:var(--space-12); }
 .scroll>section[aria-label="输入恢复"] { margin-top:32px; display:flex; flex-direction:column; align-items:flex-start; gap:12px; }
 .notice { padding-top:16px; font-size:var(--text-small); }
 .aboutRow { display:flex; align-items:center; justify-content:space-between; gap:24px; min-height:36px; margin-top:32px; }

@@ -1,7 +1,7 @@
 .section { margin:0; }
-.section + .section { margin-top:32px; }
-.sectionTitle { margin:0 0 24px; padding-bottom:12px; border-bottom:1px solid var(--surface-key); font-size:16px; line-height:24px; font-weight:500; }
-.rows { display:flex; flex-direction:column; gap:24px; }
+.section + .section { margin-top:var(--settings-section-gap,32px); }
+.sectionTitle { margin:0 0 var(--settings-title-gap,24px); padding-bottom:var(--settings-title-padding,12px); border-bottom:1px solid var(--surface-key); font-size:16px; line-height:24px; font-weight:500; }
+.rows { display:flex; flex-direction:column; gap:var(--settings-row-gap,24px); }
 .row { display:grid; grid-template-columns:minmax(0,1fr) 220px; column-gap:24px; row-gap:8px; align-items:start; }
 .copy { min-width:0; }
 .title { font-size:14px; line-height:22px; font-weight:400; }
