@@ -48,7 +48,7 @@
  --gain-fill:color-mix(in srgb,var(--signal) 48%,var(--surface-content));
  --gain-thumb-surface:var(--text-primary);
 }
-.inputGainTrack,.inputGainThumb { display:none; }
+.inputGainTrack,.inputGainThumb,.inputGainBurst { display:none; }
 .inputGainRange {
  position:absolute; inset:0; inline-size:100%; block-size:100%; margin:0;
  border-radius:var(--radius-control); accent-color:var(--action-bg); cursor:pointer;
@@ -62,12 +62,29 @@
   border-radius:var(--radius-pill); background:var(--surface-key); overflow:hidden; pointer-events:none;
  }
  .inputGainFill { inline-size:var(--gain-center); height:100%; background:var(--gain-fill); }
+ .inputGainStop {
+  position:absolute; top:50%; left:calc(var(--gain-knob) / 2 + (100% - var(--gain-knob)) * var(--gain-stop));
+  width:4px; height:4px; border-radius:50%; transform:translate(-50%,-50%);
+  background:color-mix(in srgb,var(--text-primary) 31%,transparent);
+ }
+ .inputGainStop[data-filled] { background:rgb(255 255 255 / 58%); }
+ .inputGainControl[data-gain-max] .inputGainFill {
+  background:linear-gradient(90deg,var(--gain-fill),color-mix(in srgb,var(--gain-fill) 62%,var(--signal)));
+ }
+ .inputGainPixel {
+  position:absolute; width:2px; height:2px; border-radius:.5px;
+  background:var(--base-white); opacity:.4;
+ }
+ :global([data-theme="graphite"]) .inputGainPixel { background:var(--text-primary); }
  .inputGainThumb {
   display:block; position:absolute; top:50%; left:var(--gain-center); transform:translate(-50%,-50%);
   width:var(--gain-knob); height:var(--gain-knob); border-radius:50%; pointer-events:none;
   background:var(--gain-thumb-surface); box-shadow:0 2px 5px rgb(0 0 0 / 17%),inset 0 0 0 1px rgb(0 0 0 / 6%);
  }
  .inputGainFill,.inputGainThumb { transition-property:none; }
+ .inputGainControl[data-gain-max] .inputGainThumb {
+  box-shadow:0 2px 5px rgb(0 0 0 / 17%),0 0 8px color-mix(in srgb,var(--gain-fill) 42%,transparent);
+ }
  .inputGainRange { appearance:none; opacity:0; cursor:grab; }
  .inputGainRange:active { cursor:grabbing; }
  .inputGainRange:disabled { cursor:default; }
@@ -79,5 +96,21 @@
   .inputGainFill { transition:inline-size 140ms var(--ease-shape); }
   .inputGainThumb { transition:left 140ms var(--ease-shape); }
   .inputGainControl:active :is(.inputGainFill,.inputGainThumb) { transition-duration:60ms; }
+  .inputGainControl[data-gain-burst] .inputGainThumb { animation:inputGainPulse 480ms var(--ease-shape) both; }
+  .inputGainControl[data-gain-burst] .inputGainPixel { animation:inputGainTwinkle 280ms ease-in-out var(--gain-delay) 2 alternate both; }
+  .inputGainBurst {
+   display:block; position:absolute; top:50%; left:calc(100% - var(--gain-knob) / 2); pointer-events:none;
+  }
+  .inputGainRay {
+   position:absolute; width:3px; height:3px; margin:-1.5px; border-radius:1px; background:var(--gain-fill);
+   animation:inputGainRay 620ms var(--ease-shape) var(--gain-delay) both;
+  }
  }
+}
+@keyframes inputGainPulse { 0%,100% { scale:1; } 26% { scale:1.13; } }
+@keyframes inputGainTwinkle { from { opacity:.32; scale:.8; } to { opacity:.95; scale:1.45; } }
+@keyframes inputGainRay {
+ from { opacity:0; transform:translate(calc(var(--gain-ray-x) * .35),calc(var(--gain-ray-y) * .35)) scale(.65); }
+ 32% { opacity:.95; }
+ to { opacity:0; transform:translate(var(--gain-ray-x),var(--gain-ray-y)) scale(.6); }
 }
