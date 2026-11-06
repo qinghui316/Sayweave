@@ -17,7 +17,15 @@ export function TextServiceSettings({port}:{port:TextServicePort}){
   try{
    const value=action?await port.act(action):await port.status();
    if(id===generation.current.value){setStatus(value);setRestart(action==='install'&&value.restartRequired===true);}
-  }catch(e){if(id===generation.current.value)setError(componentMessage(typeof e==='object'&&e&&'code'in e?String(e.code):'componentUnavailable'));}
+  }catch(e){
+   if(id!==generation.current.value)return;
+   setError(componentMessage(typeof e==='object'&&e&&'code'in e?String(e.code):'componentUnavailable'));
+   if(action==='install'){
+    // The component update can finish before per-user enablement fails.
+    const current=await port.status().catch(()=>null);
+    if(current&&id===generation.current.value)setStatus(current);
+   }
+  }
   finally{if(id===generation.current.value){pending.current=false;setBusy(false);}}
  }
  if(source!==port)return null;

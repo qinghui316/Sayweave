@@ -44,6 +44,22 @@ describe('input recovery',()=>{
   view.rerender(<TextServiceSettings port={service({...ready,deploymentState:'failed',maintenanceAvailable:true})}/>);
   await screen.findByRole('button',{name:'恢复输入'});
  });
+ it('rechecks the installed component after its language enablement fails',async()=>{
+  const port=service(ready);
+  const code='componentLanguageUnavailable';
+  vi.mocked(port.status)
+   .mockResolvedValueOnce({...ready,enabled:false,updateAvailable:true})
+   .mockResolvedValueOnce({...ready,enabled:false,error:code});
+  vi.mocked(port.act).mockRejectedValueOnce({code});
+  const view=render(<TextServiceSettings port={port}/>);
+  await userEvent.click(await screen.findByRole('button',{name:'恢复输入'}));
+  const recheck=await screen.findByRole('button',{name:'重新检查'});
+  expect(screen.getByText(componentMessage(code))).toBeVisible();
+  expect(screen.queryByRole('button',{name:'恢复输入'})).not.toBeInTheDocument();
+  await userEvent.click(recheck);
+  await waitFor(()=>expect(view.container).toBeEmptyDOMElement());
+  expect(port.act).toHaveBeenCalledExactlyOnceWith('install');
+ });
  it('shows failed recovery accurately and ignores replies after unmount',async()=>{
   const port=service({...ready,enabled:false}),user=userEvent.setup();
   let finish!:(v:TextServiceStatus)=>void;
