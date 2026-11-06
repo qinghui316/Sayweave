@@ -620,6 +620,32 @@ async function resultOnlyScenario(page){
   report.checks.push('positive no-target startup records with microphone frames; fixed copy route across focus changes; result/empty/cancel and stale-copy identity; password rejection; editable live control actual text');
  }finally{await targetBrowser.close();await helper.close();}
 }
+async function richTextInsertion(page,target,focusHelper,process,overlay){
+ const bundle=await buildFixture({configFile:false,logLevel:'error',define:{'process.env.NODE_ENV':JSON.stringify('production')},build:{write:false,lib:{entry:path.join(root,'tests/fixtures/input-target.ts'),name:'InputFixture',formats:['iife']}}});
+  await target.addScriptTag({content:(Array.isArray(bundle)?bundle[0]:bundle).output[0].code});
+  for(const sample of [{text:'前面尾部',start:2,end:4},{text:'很长的文档。'.repeat(8000),start:24000,end:24000}]){
+   await target.bringToFront();await target.evaluate(sample=>window.fixtureEditor.set(sample.text,sample.start,sample.end),sample);
+   expect((await focusHelper.command({action:'focus-process',process})).foregroundProcess).toBe(process);await delay(100);
+   const result=await externalRound(page,async()=>delay(100),async()=>nativeOverlayClick(overlay,focusHelper,'结束录音'));const actual=await target.evaluate(()=>window.fixtureEditor.read());
+   const expected=sample.text.slice(0,sample.start)+'原生受控识别完成。'+sample.text.slice(sample.end);
+   expect(actual===expected,'ProseMirror exact text at '+sample.start+' in '+sample.text.length+' characters (actual length '+actual.length+'): '+JSON.stringify(result.dictation.delivery)).toBe(true);
+   expect(result.dictation.delivery.submission).toBe('submitted');
+   report.inputCompatibility.push({app:'Chromium',control:'ProseMirror',length:sample.text.length,delivery:result.dictation.delivery});
+   if(result.dictation.presentationId)await dismiss(page,{taskId:result.dictation.taskId,presentationId:result.dictation.presentationId});
+  }
+}
+async function richTextScenario(page){
+ const targetBrowser=await chromium.launch({headless:false,args:['--force-renderer-accessibility']});
+ const focusHelper=await ownedEditor();
+ try{
+  const session=await targetBrowser.newBrowserCDPSession();
+  const process=(await session.send('SystemInfo.getProcessInfo')).processInfo.find(p=>p.type==='browser').id;
+  await session.detach();
+  const target=await targetBrowser.newPage();
+  report.inputCompatibility=[];
+  await richTextInsertion(page,target,focusHelper,process,await overlayPage());
+ }finally{await focusHelper.close();await targetBrowser.close();}
+}
 async function homeTrialIsolation(page){
  const overlay=await overlayPage(),editor=await ownedEditor();
  const practice=page.getByRole('region',{name:'识别文字',exact:true});
@@ -1053,14 +1079,14 @@ async function run(){try{
  const retained=process.env.SAYWEAVE_SPEECH_REUSE_PREPARED;
  if(retained){
   const reuseScope=process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE??'all';
-  expect(['learning-restart','tab-startup','readiness','translation','all','home-trial','result-only']).toContain(reuseScope);
+  expect(['learning-restart','tab-startup','readiness','translation','all','home-trial','result-only','rich-text']).toContain(reuseScope);
   const proof=JSON.parse(readFileSync(retained,'utf8').replace(/^\uFEFF/,''));
-  if(['all','home-trial','result-only'].includes(reuseScope))expect(proof.sourceSnapshot,'Full fixture reuse requires frozen source inputs').toBeTruthy();
+  if(['all','home-trial','result-only','rich-text'].includes(reuseScope))expect(proof.sourceSnapshot,'Full fixture reuse requires frozen source inputs').toBeTruthy();
   expect(execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim()).toBe(proof.source??proof.controllerSource);
   if(proof.sourceSnapshot){
    const entries=proof.sourceSnapshot.files;expect(Array.isArray(entries)&&entries.length>0).toBe(true);
    for(const required of ['src-tauri/src/dictation.rs','src-tauri/src/dictation/presentation.rs','src-tauri/src/speech/mod.rs','src-tauri/src/speech/continuous.rs','src/contracts/dictation.ts','src/app/dictation-feedback.ts','package.json','src-tauri/Cargo.toml'])expect(entries.some(file=>file.path===required)).toBe(true);
-   if(['all','home-trial','result-only'].includes(reuseScope))for(const required of ['tests/fixtures/input-target.ts','scripts/storage-policy.mjs','scripts/build-text-service.mjs','vite.config.ts','package-lock.json'])expect(entries.some(file=>file.path===required),required).toBe(true);
+   if(['all','home-trial','result-only','rich-text'].includes(reuseScope))for(const required of ['tests/fixtures/input-target.ts','scripts/storage-policy.mjs','scripts/build-text-service.mjs','vite.config.ts','package-lock.json'])expect(entries.some(file=>file.path===required),required).toBe(true);
    // The controller is not compiled into the retained product. Every other
    // frozen input stays exact, including fixtures and product/build sources.
    for(const file of entries)if(file.path!=='scripts/test-speech-desktop.mjs')expect(createHash('sha256').update(readFileSync(path.join(root,file.path))).digest('hex'),file.path).toBe(file.sha256);
@@ -1179,6 +1205,7 @@ async function run(){try{
   }finally{await editor.close();}
   report.passed=true;return;
  }
+ if(report.scope==='rich-text'){await richTextScenario(page);report.passed=true;return;}
  if(report.scope==='result-only'){await resultOnlyScenario(page);report.passed=true;return;}
   if(report.scope==='home-trial'){await homeTrialIsolation(page);report.passed=true;return;}
   if(report.scope==='learning-restart'){await learningRestartScenario(page,base);report.passed=true;return;}
@@ -1357,17 +1384,7 @@ async function run(){try{
   const refused=await externalRound(page,async()=>delay(100),undefined,true);const refusedText=await target.locator('#area').inputValue();report.maxLength={classification:'target-constraint',unchanged:refusedText==='a'.repeat(3000),delivery:refused.dictation.delivery};expect(refusedText).toBe('a'.repeat(3000));expect(refused.dictation.delivery.verification).toBe('unavailable');expect(refused.speech.text).toBe('a');if(refusedText!=='a'.repeat(3000)||refused.dictation.delivery.state==='confirmed'){report.compatibilityFailures??=[];report.compatibilityFailures.push({control:'maxlength textarea',error:'composition constraint or confirmation mismatch'});}
   report.inputProtection={moved:moved.dictation.delivery,refused:refused.dictation.delivery};
   await dismiss(page,{taskId:refused.dictation.taskId,presentationId:refused.dictation.presentationId});mode='normal';
- const bundle=await buildFixture({configFile:false,logLevel:'error',define:{'process.env.NODE_ENV':JSON.stringify('production')},build:{write:false,lib:{entry:path.join(root,'tests/fixtures/input-target.ts'),name:'InputFixture',formats:['iife']}}});
-  await target.addScriptTag({content:(Array.isArray(bundle)?bundle[0]:bundle).output[0].code});
-  for(const sample of [{text:'前面尾部',start:2,end:4},{text:'很长的文档。'.repeat(8000),start:24000,end:24000}]){
-   await target.bringToFront();await target.evaluate(sample=>window.fixtureEditor.set(sample.text,sample.start,sample.end),sample);
-   expect((await focusHelper.command({action:'focus-process',process})).foregroundProcess).toBe(process);await delay(100);
-   const result=await externalRound(page,async()=>delay(100),async()=>nativeOverlayClick(overlay,focusHelper,'结束录音'));const actual=await target.evaluate(()=>window.fixtureEditor.read());
-   expect(actual,'ProseMirror must receive text: '+JSON.stringify(result.dictation.delivery)).toBe(sample.text.slice(0,sample.start)+'原生受控识别完成。'+sample.text.slice(sample.end));
-   expect(result.dictation.delivery.submission).toBe('submitted');
-   report.inputCompatibility.push({app:'Chromium',control:'ProseMirror',length:sample.text.length,delivery:result.dictation.delivery});
-   if(result.dictation.presentationId)await dismiss(page,{taskId:result.dictation.taskId,presentationId:result.dictation.presentationId});
-  }
+  await richTextInsertion(page,target,focusHelper,process,overlay);
   mode='unicode';
   for(const sample of [
    ...['area','editable','ProseMirror'].map(control=>({control,before:'前面尾部',start:2,end:4})),

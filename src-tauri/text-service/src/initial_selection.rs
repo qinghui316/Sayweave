@@ -258,15 +258,24 @@ unsafe fn field_identity(
             return Err(E_ACCESSDENIED.into());
         }
         if rich_edit {
-            // contenteditable/ProseMirror expose GROUPING, not MSAA TEXT.
-            // A group alone grants nothing: require a focused text provider
-            // whose field range explicitly reports writable. No text is read.
+            // Rich editors may expose a GROUPING rather than MSAA TEXT.
+            // Prove that the provider's focused selection is editable. A
+            // document-wide attribute query traverses unrelated paragraphs.
             let text: ITextProvider = raw.GetPatternProvider(UIA_TextPatternId)?.cast()?;
-            if identity_bool(
-                &text
-                    .DocumentRange()?
-                    .GetAttributeValue(UIA_IsReadOnlyAttributeId)?,
-            )? {
+            let selection = selected(&text)?;
+            let document = text.DocumentRange()?;
+            if selection.CompareEndpoints(
+                TextPatternRangeEndpoint_Start,
+                &document,
+                TextPatternRangeEndpoint_Start,
+            )? < 0
+                || selection.CompareEndpoints(
+                    TextPatternRangeEndpoint_End,
+                    &document,
+                    TextPatternRangeEndpoint_End,
+                )? > 0
+                || identity_bool(&selection.GetAttributeValue(UIA_IsReadOnlyAttributeId)?)?
+            {
                 return Err(E_ACCESSDENIED.into());
             }
         }

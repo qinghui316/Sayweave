@@ -1284,6 +1284,7 @@ impl Host {
         let profile = preparation_step(&task, turn, "activation", || {
             (|| {
             let (activation, language) = client::speech_activation()?;
+            log::info!(target:"sayweave", "operation=draft_activation task_id={} turn={} profile={activation:?} language={language:04x}",task,turn);
             if activation == SpeechActivation::Own {
                 let keyboard = keyboard_profile()?;
                 if client::speech_activation()? != (SpeechActivation::Own, language)
@@ -1304,7 +1305,7 @@ impl Host {
             }
         })()
         .map_err(|error| {
-            log::info!(target:"sayweave", "operation=draft_activation task_id={} turn={} hresult={:08x}", task, turn, error.code().0 as u32);
+            log::info!(target:"sayweave", "operation=draft_activation task_id={} turn={} hresult={:08x} detail={}", task, turn, error.code().0 as u32, error.message());
             Error::new("compositionActivationFailed")
         })
         })?;

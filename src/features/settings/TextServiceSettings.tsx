@@ -33,6 +33,6 @@ export function TextServiceSettings({port}:{port:TextServicePort}){
  return <section aria-label="输入恢复">
   {message&&<InlineMessage status="error">{message}</InlineMessage>}
   {restart&&<p role="status">请重新打开正在使用的输入应用一次。</p>}
-  {busy?<p role="status">正在恢复输入…</p>:recovery?<Button onClick={()=>void act(recovery)}>恢复输入</Button>:error?<Button variant="quiet" onClick={()=>void act()}>重新检查</Button>:null}
+  {busy?<p role="status">正在恢复输入…</p>:recovery?<Button onClick={()=>void act(recovery)}>恢复输入</Button>:(error||status?.error)?<Button variant="quiet" onClick={()=>void act()}>重新检查</Button>:null}
  </section>;
 }

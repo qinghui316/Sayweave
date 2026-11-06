@@ -55,6 +55,31 @@ fn apartment<T>(operation: impl FnOnce() -> Result<T, Error>) -> Result<T, Error
     operation()
 }
 #[cfg(windows)]
+fn registered_language(
+    profiles: &windows::Win32::UI::TextServices::ITfInputProcessorProfiles,
+) -> Result<u16, Error> {
+    use sayweave_text_service::{client, registration};
+    use windows::Win32::UI::TextServices::{GUID_TFCAT_TIP_SPEECH, TF_PROFILETYPE_INPUTPROCESSOR};
+
+    let language =
+        unsafe { profiles.GetCurrentLanguage() }.map_err(|_| Error::new("componentQueryFailed"))?;
+    let registered = client::input_profiles()
+        .map_err(|_| Error::new("componentQueryFailed"))?
+        .iter()
+        .any(|profile| {
+            profile.dwProfileType == TF_PROFILETYPE_INPUTPROCESSOR
+                && profile.langid == language
+                && profile.clsid == registration::CLASS
+                && profile.guidProfile == registration::PROFILE
+                && profile.catid == GUID_TFCAT_TIP_SPEECH
+        });
+    if !registered {
+        return Err(Error::new("componentLanguageUnavailable"));
+    }
+    Ok(language)
+}
+
+#[cfg(windows)]
 fn status() -> Result<Status, Error> {
     use sayweave_text_service::{deployment, registration};
     let installed = registration::owned_module()
@@ -62,13 +87,17 @@ fn status() -> Result<Status, Error> {
         .is_some();
     let matches = deployment::matches_bundle(PAYLOAD, CORE_PAYLOAD);
     let cleanup = deployment::cleanup_pending();
-    let enabled = if installed && matches.is_ok() {
+    let update_available = installed && !PAYLOAD.is_empty() && !matches!(matches, Ok(Some(true)));
+    let deployment_state = crate::installer::deployment_state(PAYLOAD);
+    let enabled = if installed
+        && matches.is_ok()
+        && !update_available
+        && !matches!(deployment_state, "pending" | "failed")
+    {
         (|| unsafe {
             let profiles =
                 registration::profiles().map_err(|_| Error::new("componentQueryFailed"))?;
-            let language = profiles
-                .GetCurrentLanguage()
-                .map_err(|_| Error::new("componentQueryFailed"))?;
+            let language = registered_language(&profiles)?;
             profiles
                 .IsEnabledLanguageProfile(&registration::CLASS, language, &registration::PROFILE)
                 .map(|v| v.as_bool())
@@ -80,13 +109,13 @@ fn status() -> Result<Status, Error> {
     Ok(Status {
         installed,
         enabled: enabled.as_ref().copied().unwrap_or(false),
-        update_available: installed && !PAYLOAD.is_empty() && !matches!(matches, Ok(Some(true))),
+        update_available,
         payload_available: !PAYLOAD.is_empty(),
         cleanup_pending: cleanup.as_ref().copied().unwrap_or(false),
         maintenance_available: deployment::can_repair_bundle(PAYLOAD, CORE_PAYLOAD)
             .unwrap_or(false),
         restart_required: deployment::proxy_restart_required(PAYLOAD, CORE_PAYLOAD).unwrap_or(true),
-        deployment_state: crate::installer::deployment_state(PAYLOAD),
+        deployment_state,
         error: if matches.is_err() || cleanup.is_err() {
             Some("componentRegistration".into())
         } else {
@@ -208,10 +237,8 @@ fn operate(
                 return Err(Error::new("componentMissing"));
             }
             let p = registration::profiles().map_err(|_| Error::new("componentUnavailable"))?;
+            let lang = registered_language(&p)?;
             unsafe {
-                let lang = p
-                    .GetCurrentLanguage()
-                    .map_err(|_| Error::new("componentUnavailable"))?;
                 p.EnableLanguageProfile(
                     &registration::CLASS,
                     lang,
