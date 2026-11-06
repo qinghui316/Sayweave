@@ -159,9 +159,45 @@ impl Repository {
                 tx.execute("UPDATE speech_records SET status=?2,revision=revision+1 WHERE id=(SELECT record_id FROM speech_attempts WHERE id=?1 AND kind='live') AND status IN ('preparing','recording','processing') AND status!=?2",params![attempt_id,status]).map_err(db_error)?;
                 tx.commit().map_err(db_error)?;Ok(DbOutput::Done)
             },
-            // Existing profiles can still contain attenuation. Read it at the neutral level.
-            DbOperation::Preferences=>Ok(DbOutput::Preferences(self.connection.query_row("SELECT device_id,history_enabled,audio_enabled,retention_days,revision,input_gain_db FROM speech_preferences WHERE singleton=1",[],|r|Ok(Preferences{device_id:r.get(0)?,history_enabled:r.get(1)?,audio_enabled:r.get(2)?,retention_days:r.get(3)?,revision:r.get(4)?,input_gain_db:r.get::<_,i32>(5)?.max(0)})).map_err(db_error)?)),
-            DbOperation::SavePreferences(p)=>{p.validate()?;let n=self.connection.execute("UPDATE speech_preferences SET device_id=?1,history_enabled=?2,audio_enabled=?3,retention_days=?4,input_gain_db=?5,revision=revision+1 WHERE singleton=1 AND revision=?6",params![p.device_id,p.history_enabled,p.audio_enabled,p.retention_days,p.input_gain_db,p.revision]).map_err(db_error)?;if n!=1{return Err(Error::new("conflict"));}self.history_operation(DbOperation::Preferences)},
+            DbOperation::Preferences => {
+                let preferences = self.connection.query_row(
+                    "SELECT device_id,history_enabled,audio_enabled,retention_days,revision,input_gain_db,interaction_sounds_enabled
+                     FROM speech_preferences WHERE singleton=1",
+                    [],
+                    |row| Ok(Preferences {
+                        device_id: row.get(0)?,
+                        history_enabled: row.get(1)?,
+                        audio_enabled: row.get(2)?,
+                        retention_days: row.get(3)?,
+                        revision: row.get(4)?,
+                        // Existing profiles can contain attenuation. Read it at the neutral level.
+                        input_gain_db: row.get::<_, i32>(5)?.max(0),
+                        interaction_sounds_enabled: row.get(6)?,
+                    }),
+                ).map_err(db_error)?;
+                Ok(DbOutput::Preferences(preferences))
+            }
+            DbOperation::SavePreferences(preferences) => {
+                preferences.validate()?;
+                let updated = self.connection.execute(
+                    "UPDATE speech_preferences SET device_id=?1,history_enabled=?2,audio_enabled=?3,
+                     retention_days=?4,input_gain_db=?5,interaction_sounds_enabled=?6,revision=revision+1
+                     WHERE singleton=1 AND revision=?7",
+                    params![
+                        preferences.device_id,
+                        preferences.history_enabled,
+                        preferences.audio_enabled,
+                        preferences.retention_days,
+                        preferences.input_gain_db,
+                        preferences.interaction_sounds_enabled,
+                        preferences.revision,
+                    ],
+                ).map_err(db_error)?;
+                if updated != 1 {
+                    return Err(Error::new("conflict"));
+                }
+                self.history_operation(DbOperation::Preferences)
+            }
             DbOperation::Detail(id)=>Ok(DbOutput::Record(detail(&self.connection,&id)?)),
             DbOperation::List(q)=>{
                 if q.search.chars().count()>256 || q.search.chars().any(char::is_control){return Err(Error::new("invalid"));}

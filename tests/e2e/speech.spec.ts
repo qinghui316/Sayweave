@@ -48,3 +48,17 @@ test('speech presets select concrete models and keep text fields independent',as
 test('default development overlay follows speech state and speech actions together',async({page})=>{
  await page.goto('/?surface=overlay');await page.getByRole('button',{name:'开始录音',exact:true}).click();await expect(page.locator('[data-phase="recording"]')).toBeVisible();await page.getByRole('button',{name:'结束录音',exact:true}).click();await expect(page.locator('[data-phase="completed"]')).toBeVisible();
 });
+
+test('interaction sounds save independently of microphone gain',async({page})=>{
+ await page.goto('/');await page.getByRole('button',{name:'设置',exact:true}).click();
+ const dialog=page.getByRole('dialog',{name:'设置'});
+ const toggle=dialog.getByRole('switch',{name:'交互声音'});
+ const gain=dialog.getByRole('slider',{name:'麦克风增益'});
+ await expect(toggle).toBeChecked();
+ await gain.focus();await gain.press('ArrowRight');await gain.press('ArrowRight');
+ await expect(gain).toHaveValue('6');
+ await toggle.click();await expect(toggle).not.toBeChecked();
+ await dialog.getByRole('button',{name:'模型',exact:true}).click();
+ await dialog.getByRole('button',{name:'设备与快捷键',exact:true}).click();
+ await expect(toggle).not.toBeChecked();await expect(gain).toHaveValue('6');
+});

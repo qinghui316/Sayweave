@@ -17,6 +17,8 @@ design/figma/
 .env*
 !.env.example
 *.wav
+!/src-tauri/assets/interaction-sounds/recording-start.wav
+!/src-tauri/assets/interaction-sounds/result-ready.wav
 *.mp3
 *.fig
 Thumbs.db

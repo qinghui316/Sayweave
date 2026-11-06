@@ -7,6 +7,7 @@ pub struct Preferences {
     pub input_gain_db: i32,
     pub history_enabled: bool,
     pub audio_enabled: bool,
+    pub interaction_sounds_enabled: bool,
     pub retention_days: Option<u32>,
     pub revision: i64,
 }

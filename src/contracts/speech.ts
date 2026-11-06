@@ -20,7 +20,15 @@ export interface Microphone {id:string;name:string;isDefault:boolean}
 export const INPUT_GAIN_STOPS=[0,3,6,9,12] as const;
 export type InputGainDb=typeof INPUT_GAIN_STOPS[number];
 export function isInputGainDb(value:unknown):value is InputGainDb{return INPUT_GAIN_STOPS.some(db=>db===value);}
-export interface RecordingPreferences {deviceId:string|null;inputGainDb:InputGainDb;historyEnabled:boolean;audioEnabled:boolean;retentionDays:7|30|90|null;revision:number}
+export interface RecordingPreferences {
+ deviceId:string|null;
+ inputGainDb:InputGainDb;
+ historyEnabled:boolean;
+ audioEnabled:boolean;
+ interactionSoundsEnabled:boolean;
+ retentionDays:7|30|90|null;
+ revision:number;
+}
 export interface SpeechPort {
  readonly mode:'native'|'simulation';snapshot():Promise<SpeechSnapshot>;
  subscribe(snapshot:(value:SpeechSnapshot)=>void,meter:(value:SpeechMeter)=>void,archived?:(value:SpeechArchive)=>void):Promise<()=>void>;
@@ -38,7 +46,17 @@ export function parseSpeech(v:unknown):SpeechSnapshot {
  if(s.error!==null&&!speechErrorCodes.includes(s.error as SpeechErrorCode))throw new SpeechError('protocol');return s as unknown as SpeechSnapshot;
 }
 export function parseMeter(v:unknown):SpeechMeter{const s=object(v);if(typeof s.taskId!=='string'||!count(s.sequence)||typeof s.level!=='number'||!Number.isFinite(s.level)||s.level<0||s.level>1||!count(s.captureSequence)||!Array.isArray(s.energies)||s.energies.length!==15||!s.energies.every(v=>typeof v==='number'&&Number.isFinite(v)&&v>=0&&v<=1)||!Array.isArray(s.bars)||s.bars.length!==15||!s.bars.every(v=>typeof v==='number'&&Number.isFinite(v)&&v>=0&&v<=1)||!count(s.durationMs))throw new SpeechError('protocol');return s as unknown as SpeechMeter;}
-export function parsePreferences(v:unknown):RecordingPreferences{const p=object(v);if(!nullableText(p.deviceId)||!isInputGainDb(p.inputGainDb)||typeof p.historyEnabled!=='boolean'||typeof p.audioEnabled!=='boolean'||!(p.retentionDays===null||typeof p.retentionDays==='number'&&[7,30,90].includes(p.retentionDays))||!count(p.revision)||p.revision===0)throw new SpeechError('protocol');return p as unknown as RecordingPreferences;}
+export function parsePreferences(value:unknown):RecordingPreferences {
+ const prefs=object(value);
+ const retention=prefs.retentionDays;
+ const validRetention=retention===null||typeof retention==='number'&&[7,30,90].includes(retention);
+ if(!nullableText(prefs.deviceId)||!isInputGainDb(prefs.inputGainDb)||typeof prefs.historyEnabled!=='boolean'
+  ||typeof prefs.audioEnabled!=='boolean'||typeof prefs.interactionSoundsEnabled!=='boolean'
+  ||!validRetention||!count(prefs.revision)||prefs.revision===0){
+  throw new SpeechError('protocol');
+ }
+ return prefs as unknown as RecordingPreferences;
+}
 export function parseDevices(v:unknown):Microphone[]{if(!Array.isArray(v))throw new SpeechError('protocol');return v.map(raw=>{const d=object(raw);if(typeof d.id!=='string'||typeof d.name!=='string'||typeof d.isDefault!=='boolean')throw new SpeechError('protocol');return d as unknown as Microphone;});}
 
 export function parseSpeechArchive(v:unknown):SpeechArchive {const s=object(v);if(typeof s.taskId!=='string'||typeof s.saved!=='boolean'||typeof s.saveError!=='boolean'||s.attemptId!==undefined&&s.attemptId!==null&&typeof s.attemptId!=='string'||s.revision!==undefined&&!count(s.revision)||s.state!==undefined&&!['disabled','pending','saved','unavailable'].includes(String(s.state)))throw new SpeechError('protocol');return {taskId:s.taskId,saved:s.saved,saveError:s.saveError,...(s.attemptId!==undefined?{attemptId:s.attemptId as string|null}:{}),...(s.revision!==undefined?{revision:s.revision as number}:{}),...(s.state!==undefined?{state:s.state as SpeechArchive['state']}:{} )};}

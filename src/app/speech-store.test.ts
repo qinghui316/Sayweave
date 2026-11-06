@@ -67,11 +67,12 @@ describe('speech renderer synchronization',()=>{
   expect(()=>parseSpeech({...initialSpeech(),source:undefined})).toThrow();
   expect(()=>parseSpeech({...initialSpeech(),source:'trial'})).toThrow();
   expect(()=>parseSpeech({...initialSpeech(),taskId:'task',source:'unknown'})).toThrow();
-  expect(()=>parsePreferences({deviceId:null,inputGainDb:0,historyEnabled:true,audioEnabled:true,retentionDays:'30',revision:1})).toThrow();
-  const preferences={deviceId:null,inputGainDb:0,historyEnabled:true,audioEnabled:true,retentionDays:30,revision:1};
+  expect(()=>parsePreferences({deviceId:null,inputGainDb:0,historyEnabled:true,audioEnabled:true,interactionSoundsEnabled:true,retentionDays:'30',revision:1})).toThrow();
+  const preferences={deviceId:null,inputGainDb:0,historyEnabled:true,audioEnabled:true,interactionSoundsEnabled:true,retentionDays:30,revision:1};
   expect(parsePreferences({...preferences,inputGainDb:12}).inputGainDb).toBe(12);
   expect(()=>parsePreferences({...preferences,inputGainDb:-3})).toThrow();
   expect(()=>parsePreferences({...preferences,inputGainDb:2})).toThrow();
+  expect(()=>parsePreferences({...preferences,interactionSoundsEnabled:0})).toThrow();
   expect(()=>parseSpeech({...initialSpeech(),segments:[{id:1,text:'missing fields'}]})).toThrow();
   expect(()=>parseRecord({id:'x',createdAt:0,durationMs:0,status:'success',revision:1,currentAttempt:null,endedAt:null,attempts:[],audio:{id:'x',recordId:'x',status:'outside',bytes:0,expiresAt:null}})).toThrow();
  });

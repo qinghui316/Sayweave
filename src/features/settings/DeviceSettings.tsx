@@ -1,5 +1,5 @@
 import {useEffect,useState,useRef,useId,type CSSProperties} from 'react';
-import {Button,InlineMessage,Select,SettingsRow,SettingsSection} from '../../ui';
+import {Button,InlineMessage,Select,SettingsRow,SettingsSection,Switch} from '../../ui';
 import {INPUT_GAIN_STOPS,isInputGainDb,speechError,type InputGainDb,type Microphone,type RecordingPreferences,type SpeechPort} from '../../contracts/speech';
 import {speechMessages} from '../../locales/speech';
 import type {SettingStore} from '../../settings/store';
@@ -21,7 +21,7 @@ export function DeviceSettings({port,settings}:{port:SpeechPort;settings:Setting
   const timer=window.setTimeout(()=>setMaxBurst(false),780);
   return()=>window.clearTimeout(timer);
  },[maxBurst]);
- const prefs=state.value,id=useId(),gainId=useId(),gainHelpId=useId();
+ const prefs=state.value,id=useId(),gainId=useId(),gainHelpId=useId(),soundsId=useId();
  const gain=prefs?.inputGainDb??0,gainLabel=gainLabels[gain];
  const isMax=gain===gainMax;
  const bursting=isMax&&maxBurst;
@@ -51,5 +51,15 @@ export function DeviceSettings({port,settings}:{port:SpeechPort;settings:Setting
    </div>
    <span className={s.inputGainValue} aria-hidden="true">{prefs?gainLabel:'—'}</span>
   </div>
- </SettingsRow></SettingsSection>;
+ </SettingsRow>
+ <SettingsRow title={<label htmlFor={soundsId}>交互声音</label>} description="录音就绪、最终结果可用时播放提示音。">
+  <Switch
+   id={soundsId}
+   label="交互声音"
+   disabled={!state.ready}
+   checked={prefs?.interactionSoundsEnabled??false}
+   onCheckedChange={interactionSoundsEnabled=>settings.update({interactionSoundsEnabled})}
+  />
+ </SettingsRow>
+ </SettingsSection>;
 }

@@ -60,6 +60,36 @@ fn microphone_gain_migrates_only_preferences_and_preserves_recorded_audio() {
 }
 
 #[test]
+fn interaction_sounds_migration_preserves_recording_preferences_and_old_ledger() {
+    let root = tempfile::tempdir().unwrap();
+    let mut connection = Connection::open(root.path().join("dictionary.sqlite")).unwrap();
+    configure(&connection).unwrap();
+    let previous = &MIGRATIONS[..15];
+    migrate(&mut connection, root.path(), previous).unwrap();
+    connection
+        .execute_batch("UPDATE speech_preferences SET device_id='chosen',history_enabled=0,audio_enabled=0,input_gain_db=9,retention_days=7,revision=9")
+        .unwrap();
+    let checksums = |c: &Connection| {
+        c.prepare("SELECT checksum FROM schema_migrations WHERE version<=15 ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    let before = checksums(&connection);
+    migrate(&mut connection, root.path(), MIGRATIONS).unwrap();
+    assert_eq!(before, checksums(&connection));
+    let prefs = connection
+        .query_row("SELECT device_id,history_enabled,audio_enabled,retention_days,revision,input_gain_db,interaction_sounds_enabled FROM speech_preferences", [], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get::<_, bool>(2)?, row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, i32>(5)?, row.get::<_, bool>(6)?))
+        })
+        .unwrap();
+    assert_eq!(prefs, ("chosen".into(), false, false, 7, 9, 9, true));
+    assert!(migrate(&mut connection, root.path(), previous).is_err());
+}
+
+#[test]
 fn shortcut_provenance_migration_uses_entering_schema_not_global_revision() {
     for (schema, binding, mode, revision, original, expected, source) in [
         (

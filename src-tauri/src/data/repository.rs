@@ -65,6 +65,10 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
         "microphone_input_gain_v1",
         include_str!("migrations/015_microphone_input_gain.sql"),
     ),
+    (
+        "interaction_sounds_v1",
+        include_str!("migrations/016_interaction_sounds.sql"),
+    ),
 ];
 pub fn now() -> i64 {
     SystemTime::now()

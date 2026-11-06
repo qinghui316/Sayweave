@@ -5,6 +5,8 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use std::{collections::BTreeMap, io::Write, path::Path, time::Duration};
 
+const CURRENT_SCHEMA: i64 = MIGRATIONS.len() as i64;
+
 const PRESERVED: &[&str] = &[
     "model_configs",
     "model_defaults",
@@ -54,8 +56,7 @@ async fn seed(
             r.get(0)
         })
         .map_err(|_| "profile-schema")?;
-    let current_schema = MIGRATIONS.len() as i64;
-    if !(10..=current_schema).contains(&source_schema) {
+    if !(10..=CURRENT_SCHEMA).contains(&source_schema) {
         return Err("profile-schema");
     }
     let source_history = count(&source, "speech_records")?;
@@ -114,7 +115,7 @@ async fn seed(
     if ready.is_err()
         || drained.is_err()
         || !status
-            .is_ok_and(|s| s.state == "ready" && i64::from(s.schema_version) == current_schema)
+            .is_ok_and(|s| s.state == "ready" && i64::from(s.schema_version) == CURRENT_SCHEMA)
     {
         return Err("profile-migration");
     }
@@ -138,7 +139,7 @@ async fn seed(
             r.get(0)
         })
         .map_err(|_| "profile-verification")?;
-    if target_schema != current_schema {
+    if target_schema != CURRENT_SCHEMA {
         return Err("profile-migration");
     }
     let refs = target
@@ -313,7 +314,7 @@ async fn fixture() -> (tempfile::TempDir, std::path::PathBuf, MemoryVault) {
 async fn developer_seed_preserves_settings_and_words_without_history_or_shared_credentials() {
     let (folder, source, mut original) = fixture().await;
     let original_db = Connection::open(&source).unwrap();
-    original_db.execute_batch("UPDATE language_edits SET automatic_terms_state='settled',personalization_state='pending' WHERE id='proof';").unwrap();
+    original_db.execute_batch("UPDATE language_edits SET automatic_terms_state='settled',personalization_state='pending' WHERE id='proof'; UPDATE speech_preferences SET interaction_sounds_enabled=0;").unwrap();
     drop(original_db);
     let dest = folder.path().join("dev");
     let mut independent = MemoryVault::default();
@@ -324,13 +325,22 @@ async fn developer_seed_preserves_settings_and_words_without_history_or_shared_c
     assert_eq!(receipt.source_history, 1);
     assert_eq!(receipt.preserved["dictionary_terms"], 1);
     assert_eq!(receipt.preserved["model_configs"], 2);
-    assert_eq!(receipt.target_schema, MIGRATIONS.len() as i64);
+    assert_eq!(receipt.target_schema, CURRENT_SCHEMA);
     let copied = Connection::open_with_flags(
         dest.join("dictionary.sqlite"),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .unwrap();
     assert_eq!(count(&copied, "language_edits").unwrap(), 1);
+    assert!(
+        !copied
+            .query_row(
+                "SELECT interaction_sounds_enabled FROM speech_preferences",
+                [],
+                |row| row.get::<_, bool>(0)
+            )
+            .unwrap()
+    );
     assert_eq!(
         copied
             .query_row(

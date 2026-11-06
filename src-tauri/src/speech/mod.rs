@@ -69,6 +69,8 @@ impl Source {
 pub struct Snapshot {
     #[serde(skip)]
     pub source_record_id: Option<String>,
+    #[serde(skip)]
+    pub(crate) interaction_sounds_enabled: bool,
     pub protocol: u8,
     pub sequence: u64,
     pub lifecycle: u64,
@@ -92,6 +94,7 @@ impl Default for Snapshot {
     fn default() -> Self {
         Self {
             source_record_id: None,
+            interaction_sounds_enabled: false,
             protocol: 1,
             sequence: 1,
             lifecycle: 1,
@@ -638,6 +641,7 @@ impl SpeechService {
             .lock()
             .map_err(|_| Error::new("unavailable"))? = Snapshot {
             source_record_id: Some(record_id.clone()),
+            interaction_sounds_enabled: preferences.interaction_sounds_enabled,
             task_id: Some(task_id.clone()),
             source: Some(source),
             attempt_id: Some(attempt_id.clone()),

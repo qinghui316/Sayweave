@@ -114,6 +114,28 @@ async fn pending_initial_deadline_uses_result_delivery_without_dropping_recognit
     assert_eq!(state.latest.text, "等待期间说的话还在继续");
     assert_eq!(state.turn, 1);
     assert_eq!(actor.control.audio.current(), 1);
+
+    let (reply, _) = oneshot::channel();
+    state.ending = Some(Ending {
+        mode: Finish::Commit,
+        reply,
+        deadline: Instant::now() + Duration::from_secs(15),
+        expired: false,
+    });
+    let mut delivery = actor.result_delivery(&mut state).unwrap();
+    state.terminal_failure(&actor.task, &mut delivery);
+    assert_eq!(delivery.error.as_deref(), Some("editing"));
+    assert_eq!(delivery.submission, Submission::NotSubmitted);
+    let mut cue = super::super::OutputCue::default();
+    cue.note_draft(&state.report);
+    let view = super::super::Snapshot {
+        source: "external".into(),
+        text: state.report.result_raw.clone(),
+        presentation: Presentation::Result,
+        delivery: Some(delivery),
+        ..super::super::Snapshot::default()
+    };
+    assert!(cue.ready(&view));
 }
 
 #[tokio::test(start_paused = true)]

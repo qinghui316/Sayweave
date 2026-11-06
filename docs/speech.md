@@ -12,6 +12,8 @@
 
 设备支持默认或明确麦克风，明确设备失效不会换到另一支。识别文字只读，可选择、复制；复制只在点击后写入系统剪贴板，不读取剪贴板。
 
+「设备与快捷键 → 音频输入 → 交互声音」默认开启。普通口述和翻译在录音就绪时响一声，正常结束后等最终识别以及所需的整理或翻译完成、结果已输出或可复制时再响一声。开关从下一轮录音生效。应用在后台提前准备系统默认输出设备，录音和结果交付不等待播放。
+
 ## 架构与会话
 
 `SpeechPort / HistoryPort → adapters → speech/commands → SpeechService`。采集在 `speech/audio.rs`、协议在 `speech/qwen.rs` 与 `speech/doubao.rs`、会话在 `speech/mod.rs`、存档/文件/播放在 `history/`。Repository 复用容量 64 的单连接数据线程。文件、采集、网络不占数据库线程，Runtime 锁不跨异步等待。

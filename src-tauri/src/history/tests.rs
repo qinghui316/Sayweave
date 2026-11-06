@@ -878,6 +878,8 @@ fn interrupted_attempt_and_query_indexes() {
     }
     p.input_gain_db = 6;
     p.retention_days = Some(7);
+    assert!(p.interaction_sounds_enabled);
+    p.interaction_sounds_enabled = false;
     repo.history_operation(DbOperation::SavePreferences(p.clone()))
         .unwrap();
     assert_eq!(
@@ -905,6 +907,7 @@ fn interrupted_attempt_and_query_indexes() {
         panic!("recording preferences");
     };
     assert_eq!((saved.input_gain_db, saved.retention_days), (6, Some(7)));
+    assert!(!saved.interaction_sounds_enabled);
 }
 
 #[test]

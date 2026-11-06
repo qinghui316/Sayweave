@@ -13,6 +13,8 @@ const readmeMedia = new Set([
   'hero.gif', 'comparison.gif', 'cleanup.gif', 'handoff.gif', 'dictionary.gif', 'personalization.gif',
   'home.webp', 'words.webp', 'history.webp', 'appearance.webp', 'provenance.md', 'manifest.json',
 ].map(file => `images/readme/${file}`));
+const recordingCues = new Set(['recording-start.wav', 'result-ready.wav']
+  .map(file => `src-tauri/assets/interaction-sounds/${file}`));
 const releaseNotes = /^release-notes\/v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.json$/;
 const publicWorkflow = file => ['windows-release.yml','windows-ci.yml'].includes(file.replace('.github/workflows/','')) && file.startsWith('.github/workflows/');
 const scripts = new Set(["windows-update-debug-policy.mjs",'release-validation.mjs','test-windows-installed-startup.mjs','windows-update-startup.mjs','windows-update-packages.mjs','windows-update-registration.mjs','windows-update-artifacts.mjs','reuse-windows-update-evidence.mjs','windows-update-fixtures.mjs','test-windows-update.mjs','test-windows-update.ps1','check-boundaries.mjs', 'check-native-boundaries.mjs', 'check-text.mjs', 'check-distribution.mjs', 'generate-update-manifest.mjs', 'verify-update-release.mjs',
@@ -27,6 +29,7 @@ const testFixtures = new Set(['voice-recovery.html', 'voice-recovery.tsx', 'inpu
 const generated = /(?:^|\/)(?:node_modules|target|gen|dist|coverage|test-results|playwright-report|\.local|\.git)(?:\/|$)|^tests\/visual\//i;
 const ownerLocal = /(?:^|\/)(?:\.agents|\.claude|\.codex|\.impeccable)(?:\/|$)|(?:^|\/)(?:AGENTS\.md|CLAUDE\.md|\.env[^/]*|dev\.ps1|doctor\.mjs|environment\.ps1|setup-tools\.ps1|harness-skill-link\.(?:mjs|ps1|py))$|\.cmd$/i;
 function allowed(file) {
+  if (recordingCues.has(file)) return true;
   if (generated.test(file) || ownerLocal.test(file) || /\.(?:sqlite(?:-journal|-shm|-wal)?|db|log|fig|wav|mp3)$/i.test(file)) return false;
   if (roots.has(file)) return true;
   if (publicWorkflow(file)) return true;
