@@ -1102,7 +1102,11 @@ impl DictationCoordinator {
             return result;
         }
         #[cfg(windows)]
-        let shared_record = app.state::<SpeechService>().task_record(&id);
+        let shared_record = if raw_draft.is_some() || purpose == Purpose::Translation {
+            app.state::<SpeechService>().task_record(&id)
+        } else {
+            None
+        };
         self.update(&app, &id, |s| s.stage = "recognizing".into());
         let source = source.to_string();
         tauri::async_runtime::spawn(async move {
