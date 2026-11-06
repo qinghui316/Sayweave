@@ -3321,7 +3321,15 @@ impl ITfKeyEventSink_Impl for KeySink_Impl {
             }
             let observation = prepare_key_observation(&shared);
             let ended = end_owned_with_source(&shared, TF_ES_SYNC, first_source);
-            shared.borrow_mut().key_handoff = ended;
+            {
+                let mut state = shared.borrow_mut();
+                state.key_handoff = ended;
+                if ended && !state.version.owned && !state.cleanup {
+                    state
+                        .ownership_loss
+                        .get_or_insert("draftOwnershipTerminated");
+                }
+            }
             if let Some(request) = observation {
                 let connection = shared.borrow().connection;
                 settle_observation(&shared, &request, connection, ended, None);
@@ -4012,6 +4020,7 @@ impl ITfEditSession_Impl for Edit_Impl {
         let mut mutation = Mutation::NotAttempted;
         let mut settlement = (self.request.action == Action::Settle).then(Settlement::default);
         let mut phase = "lease";
+        let mut composition_only = false;
 
         let result =
             lease(&self.state, &self.request, self.generation, &self.context).and_then(|()| {
@@ -4040,7 +4049,8 @@ impl ITfEditSession_Impl for Edit_Impl {
                 )?;
                 if self.request.block.is_some() {
                     phase = "writeTracking";
-                    let snapshot = unsafe {
+                    let epoch = self.state.borrow().epoch;
+                    let tracked = unsafe {
                         block_tracking::bind_owned(
                             &self.state,
                             &self.context,
@@ -4050,9 +4060,30 @@ impl ITfEditSession_Impl for Edit_Impl {
                             ec,
                             origin,
                             mutation,
-                        )?
+                            &mut phase,
+                        )
                     };
-                    self.state.borrow_mut().block_reply = Some(snapshot);
+                    match tracked {
+                        Ok(snapshot) => self.state.borrow_mut().block_reply = Some(snapshot),
+                        Err(error)
+                            if phase == "writeTracking:fieldProvider"
+                                && error.code() == E_INVALIDARG
+                                && mutation == Mutation::Changed =>
+                        {
+                            phase = "writeTracking:compositionProof";
+                            block_tracking::confirm_owned_write(
+                                &self.state,
+                                &self.context,
+                                &self.request,
+                                self.connection,
+                                self.generation,
+                                epoch,
+                                ec,
+                            )?;
+                            composition_only = true;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Ok(())
             });
@@ -4062,7 +4093,11 @@ impl ITfEditSession_Impl for Edit_Impl {
                 &self.request,
                 self.connection,
                 true,
-                "applied",
+                if composition_only {
+                    "appliedCompositionOnly:fieldProvider:80070057"
+                } else {
+                    "applied"
+                },
                 mutation,
                 settlement,
             ),

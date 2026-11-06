@@ -27,8 +27,10 @@ impl BlockScope {
         manager: &ITfThreadMgr,
         context: &ITfContext,
         native: edit_context::Binding,
+        phase: &mut &'static str,
     ) -> windows::core::Result<Self> {
         unsafe {
+            *phase = "writeTracking:fieldNative";
             if native.context != *context || !native.current(manager)? {
                 return Err(failure(TF_E_DISCONNECTED));
             }
@@ -43,6 +45,7 @@ impl BlockScope {
                 return Err(failure(E_ACCESSDENIED));
             }
             let root = GetAncestor(window, GA_ROOT);
+            *phase = "writeTracking:fieldView";
             let view = context.GetActiveView()?;
             let view_window = view.GetWnd()?;
             if root.0.is_null()
@@ -55,6 +58,9 @@ impl BlockScope {
             let native_only = block_faults::native_scope_only();
             #[cfg(not(feature = "acceptance"))]
             let native_only = false;
+            *phase = "writeTracking:fieldProvider";
+            #[cfg(feature = "acceptance")]
+            block_faults::field_provider()?;
             let field = if native_only {
                 FieldProof::NativeOwned
             } else {
@@ -73,6 +79,7 @@ impl BlockScope {
                 root,
                 field,
             };
+            *phase = "writeTracking:fieldValidate";
             if !scope.matches()? {
                 return Err(failure(TF_E_DISCONNECTED));
             }

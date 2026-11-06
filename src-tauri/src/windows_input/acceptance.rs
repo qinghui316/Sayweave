@@ -888,6 +888,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
     // explicitly controlled here; this does not stand in for physical-key/Codex acceptance.
     {
         use crate::{
+            contracts::processing::SourceSegment,
             dictation::{Presentation, drafts::SessionDraft},
             speech::{NativeTranscript, continuous::Control},
         };
@@ -922,7 +923,12 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             turn: 1,
             sequence: 1,
             text: "第1轮你好".into(),
-            ..NativeTranscript::default()
+            segments: vec![SourceSegment {
+                id: 1,
+                revision: 1,
+                text: "第1轮你好".into(),
+                confirmed: true,
+            }],
         };
         let result = (|| -> Result<(), String> {
             let active = || -> Result<(), String> {
@@ -955,6 +961,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
                 }
             };
             let mut edited_prefix = String::new();
+            let mut spoken = latest.text.clone();
             manager.update(&latest);
             wait_text(&mut fixture, "a第1轮你好bc")?;
             let auxiliary = fixture.command(serde_json::json!({"action":"auxiliary-info"}))?;
@@ -992,8 +999,8 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
                 }
                 let before = fixture.command(serde_json::json!({"action":"read"}))?;
                 let expected_caret =
-                    1 + edited_prefix.encode_utf16().count() + latest.text.encode_utf16().count();
-                if before["text"] != format!("a{edited_prefix}{}bc", latest.text)
+                    1 + edited_prefix.encode_utf16().count() + spoken.encode_utf16().count();
+                if before["text"] != format!("a{edited_prefix}{spoken}bc")
                     || before["start"].as_u64() != Some(expected_caret as u64)
                     || before["end"].as_u64() != Some(expected_caret as u64)
                 {
@@ -1003,7 +1010,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
                 // The helper dispatches TSF keys before Win32 edit messages; no physical
                 // keyboard or main-program low-level hook coverage is claimed.
                 let before_edit_prefix = edited_prefix.clone();
-                edited_prefix.push_str(latest.text.strip_suffix("你好").ok_or("BMP tail")?);
+                edited_prefix.push_str(spoken.strip_suffix("你好").ok_or("BMP tail")?);
                 edited_prefix.push('X');
                 crate::input_state::edited();
                 let edited = fixture.command(serde_json::json!({"action":"controlled-edit"}))?;
@@ -1020,11 +1027,11 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
                 let expected_steps = [
                     format!(
                         "a{before_edit_prefix}{}bc",
-                        latest.text.strip_suffix('好').ok_or("first BMP tail")?
+                        spoken.strip_suffix('好').ok_or("first BMP tail")?
                     ),
                     format!(
                         "a{before_edit_prefix}{}bc",
-                        latest.text.strip_suffix("你好").ok_or("second BMP tail")?
+                        spoken.strip_suffix("你好").ok_or("second BMP tail")?
                     ),
                 ];
                 if steps.len() != expected_steps.len() {
@@ -1053,27 +1060,38 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
                     }
                     thread::sleep(Duration::from_millis(20));
                 }
-                while manager.presentation() != Presentation::Resuming {
+                // This fixture supplies transcripts directly, without an ASR
+                // readiness event. Native recovery leaves Editing on the same
+                // turn; the following actual write proves that recovery.
+                while manager.presentation() == Presentation::Editing {
                     active()?;
                     if Instant::now() >= until {
-                        return Err(format!("six-edit round {round} new turn was not acquired"));
+                        return Err(format!(
+                            "six-edit round {round} same-turn input did not resume"
+                        ));
                     }
                     thread::sleep(Duration::from_millis(20));
                 }
                 manager.update(&NativeTranscript {
                     task_id: id.clone(),
                     turn: latest.turn,
-                    sequence: latest.sequence + 1,
-                    text: "旧轮禁止覆盖".into(),
+                    sequence: latest.sequence.saturating_sub(1),
+                    text: "旧更新禁止覆盖".into(),
                     ..NativeTranscript::default()
                 });
                 thread::sleep(Duration::from_millis(60));
                 wait_text(&mut fixture, &expected)?;
-                latest.turn += 1;
-                latest.sequence += 2;
-                latest.text = format!("第{}轮你好", round + 1);
+                latest.sequence += 1;
+                spoken = format!("第{}轮你好", round + 1);
+                latest.text.push_str(&spoken);
+                latest.segments.push(SourceSegment {
+                    id: round + 1,
+                    revision: 1,
+                    text: spoken.clone(),
+                    confirmed: true,
+                });
                 manager.update(&latest);
-                wait_text(&mut fixture, &format!("a{edited_prefix}{}bc", latest.text))?;
+                wait_text(&mut fixture, &format!("a{edited_prefix}{spoken}bc"))?;
                 active()?;
                 println!(
                     "SAYWEAVE_COMPOSITION_EDIT_ROUND_PASS round={round} turn={} same_session=true controlled_edit=true synthetic_accessibility_notice=true actual_text=true cancel=0 stopping=false",
@@ -1089,12 +1107,13 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
             let actual = fixture.command(serde_json::json!({"action":"read"}))?;
             let report = manager.report().ok_or("six-edit final report missing")?;
-            if latest.turn != 7
+            if latest.turn != 1
+                || latest.segments.len() != 7
                 || report.error.is_some()
                 || delivery.verification != Verification::Unavailable
                 || delivery.submission != Submission::Submitted
                 || delivery.error.as_deref() != Some("inputUnconfirmed")
-                || actual["text"] != format!("a{edited_prefix}{}bc", latest.text)
+                || actual["text"] != format!("a{edited_prefix}{spoken}bc")
             {
                 return Err(format!(
                     "six-edit final assertion turn={} delivery={:?} report_error={:?} actual={actual}",
@@ -1126,7 +1145,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         release_watch(&id);
         result?;
         println!(
-            "SAYWEAVE_COMPOSITION_TURNS_PASS rounds=6 final_turn=7 controlled_edit=true actual_handoff=true resumed_range=true old_turn_ignored=true final_single_copy=true"
+            "SAYWEAVE_COMPOSITION_TURNS_PASS rounds=6 final_turn=1 controlled_edit=true actual_handoff=true same_turn_continuation=true stale_update_body_unchanged=true final_single_copy=true"
         );
     }
     // User edits followed by Finish on the same production actor. Delay cases
@@ -1141,6 +1160,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
         (0, false, true),
     ] {
         use crate::{
+            contracts::processing::SourceSegment,
             dictation::drafts::SessionDraft,
             speech::{NativeTranscript, continuous::Control},
         };
@@ -1179,7 +1199,12 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             turn: 1,
             sequence: 1,
             text: "用户你好".into(),
-            ..NativeTranscript::default()
+            segments: vec![SourceSegment {
+                id: 1,
+                revision: 1,
+                text: "用户你好".into(),
+                confirmed: true,
+            }],
         };
         let result = (|| -> Result<(), String> {
             let wait_text = |fixture: &mut Fixture, expected: &str| -> Result<(), String> {
@@ -1205,9 +1230,14 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             thread::sleep(Duration::from_millis(delay));
             let mut expected = "a用户Xbc".to_string();
             if continue_speaking {
-                latest.turn = 2;
                 latest.sequence = 2;
-                latest.text = "继续说话".into();
+                latest.text.push_str("继续说话");
+                latest.segments.push(SourceSegment {
+                    id: 2,
+                    revision: 1,
+                    text: "继续说话".into(),
+                    confirmed: true,
+                });
                 manager.update(&latest);
                 expected = "a用户X继续说话bc".into();
                 wait_text(&mut fixture, &expected)?;
@@ -1216,7 +1246,7 @@ pub(super) fn composition_run(exe: &std::path::Path) -> Result<(), String> {
             cancel.send_replace(1);
             if late_result {
                 let mut late = latest.clone();
-                late.sequence += 100;
+                late.sequence = 0;
                 late.text = "旧结果不得覆盖用户正文".into();
                 manager.update(&late);
             }

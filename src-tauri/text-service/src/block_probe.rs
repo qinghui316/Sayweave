@@ -67,6 +67,9 @@ pub(super) fn run(
     capability: &str,
     module: windows::Win32::Foundation::HMODULE,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var("SAYWEAVE_BLOCK_FIXTURE").as_deref() == Ok("composition-only") {
+        return composition_only(editor, pipe, capability, module);
+    }
     if std::env::var("SAYWEAVE_BLOCK_FIXTURE").as_deref() == Ok("native-scope") {
         return native_scope_cases(editor, manager, pipe, capability, module);
     }
@@ -347,6 +350,139 @@ pub(super) fn run(
         "block manual-edit/read/stale-refusal/lease-rotation/reacquire/actual-write/focus-retirement/release=true"
     );
     boundary_cases(editor, pipe, capability, module)?;
+    Ok(())
+}
+fn composition_only(
+    editor: HWND,
+    pipe: &Pipe,
+    capability: &str,
+    module: windows::Win32::Foundation::HMODULE,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fault: unsafe extern "system" fn(u32) = unsafe {
+        std::mem::transmute(
+            windows::Win32::System::LibraryLoader::GetProcAddress(
+                module,
+                windows::core::s!("SayweaveBlockFixtureFault"),
+            )
+            .ok_or("missing field provider fixture hook")?,
+        )
+    };
+    for (kind, first) in [(12, "周"), (12, "多字开始🙂"), (13, "权限拒绝")] {
+        unsafe {
+            SendMessageW(
+                editor,
+                WM_SETTEXT,
+                None,
+                Some(LPARAM(windows::core::w!("").as_ptr() as isize)),
+            );
+        }
+        pump(Duration::from_millis(30));
+        let task = uuid::Uuid::new_v4().to_string();
+        if !exchange(pipe, capability, &task, 1, 1, 0, Action::Begin, "", false)?.applied {
+            return Err("composition-only Begin failed".into());
+        }
+        unsafe {
+            fault(kind);
+        }
+        let initial = frame(
+            capability,
+            &task,
+            2,
+            Some(BlockCommand {
+                id: uuid::Uuid::new_v4().to_string(),
+                action: BlockAction::Bind,
+                epoch: 0,
+                version: 0,
+                lease: 0,
+                expected: String::new(),
+                selection_start: 0,
+                selection_end: 0,
+            }),
+            Action::Update,
+            first,
+            None,
+        );
+        pipe.send(&serde_json::to_vec(&initial)?)?;
+        let receive = || -> Result<Reply, Box<dyn std::error::Error>> {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                pump(Duration::from_millis(10));
+                if let Some(data) = pipe.receive()? {
+                    return Ok(serde_json::from_slice(&data)?);
+                }
+                if Instant::now() > deadline {
+                    return Err("composition-only receipt timeout".into());
+                }
+            }
+        };
+        let result = receive()?;
+        if kind == 13 {
+            if result.applied
+                || result.code != "edit:writeTracking:fieldProvider:80070005"
+                || result.mutation != Mutation::Changed
+            {
+                return Err(
+                    format!("provider permission refusal misclassified: {}", result.code).into(),
+                );
+            }
+            let denied = exchange(
+                pipe,
+                capability,
+                &task,
+                1,
+                3,
+                3,
+                Action::Update,
+                "不得续写",
+                false,
+            )?;
+            if denied.applied
+                || denied.mutation != Mutation::NotAttempted
+                || editor_text(editor)? != first
+            {
+                return Err("permission refusal allowed continuation".into());
+            }
+        } else {
+            if !result.applied
+                || result.code != "appliedCompositionOnly:fieldProvider:80070057"
+                || result.block.is_some()
+                || result.range_epoch == 0
+                || result.mutation != Mutation::Changed
+            {
+                return Err(format!("missing composition-only outcome: {}", result.code).into());
+            }
+            for (operation, text) in [(3, "舟山开会。"), (4, "舟山开会。\n第二句🙂")]
+            {
+                let next = exchange(
+                    pipe,
+                    capability,
+                    &task,
+                    1,
+                    operation,
+                    operation,
+                    Action::Update,
+                    text,
+                    false,
+                )?;
+                if !next.applied || next.code != "applied" || next.block.is_some() {
+                    return Err(format!("composition-only update failed: {}", next.code).into());
+                }
+            }
+            if !exchange(pipe, capability, &task, 1, 5, 4, Action::Handoff, "", false)?.applied {
+                return Err("composition-only Handoff failed".into());
+            }
+            if editor_text(editor)?
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+                != "舟山开会。\n第二句🙂"
+            {
+                return Err("composition-only final body mismatch".into());
+            }
+        }
+    }
+    println!(
+        "composition-only provider-failure/stream/revision/unicode/tail/permission-refusal=true"
+    );
     Ok(())
 }
 

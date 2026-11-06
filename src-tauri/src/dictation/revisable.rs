@@ -34,6 +34,7 @@ pub(super) struct State {
     block_source: Option<crate::processing::draft_source::Watermark>,
     interior_insertion: bool,
     caret_only: bool,
+    composition_only: bool,
 }
 impl State {
     pub fn configured() -> Option<Self> {
@@ -70,6 +71,7 @@ impl State {
             block_source: None,
             interior_insertion: false,
             caret_only: false,
+            composition_only: false,
         }
     }
     pub fn handoff(&mut self) {
@@ -706,7 +708,14 @@ fn sealed(actor: &SessionDraft, s: &mut super::State, r: &mut State) {
     s.handoff = false;
     s.activity = input_state::activity();
     s.paused_at = None;
-    if s.stopping || actor.control.stopping() || !s.input_delivery.live() {
+    let compatible_finish = r.composition_only
+        && s.stop_error.is_none()
+        && *actor.cancel.borrow() < 2
+        && s.ending
+            .as_ref()
+            .is_none_or(|e| e.mode == Finish::Commit && !e.expired);
+    if !s.input_delivery.live() || ((s.stopping || actor.control.stopping()) && !compatible_finish)
+    {
         // End may race the settled Release receipt. Its accepted final source
         // still belongs to this task, even though no fresh write is permitted.
         s.latest = source;
@@ -935,7 +944,7 @@ pub(super) fn schedule(
             .map(|coverage| (revision, coverage));
             let sequence = r.sequence;
             let permit = r.permit.clone();
-            let initial_block = (!r.bound).then(|| r.block.id().to_owned());
+            let initial_block = (!r.bound && !r.composition_only).then(|| r.block.id().to_owned());
             job(
                 s,
                 Effect::Write {
@@ -1171,7 +1180,20 @@ pub(super) fn native_done(
                     mutation = failure.mutation;
                     Err(failure.error)
                 }
-                NativeValue::TrackedReplaced(Ok(snapshot)) => {
+                NativeValue::TrackedReplaced(Ok(
+                    windows_input::composition::TrackedWrite::CompositionOnly,
+                )) => {
+                    r.composition_only = true;
+                    r.caret_only = true;
+                    cancel(actor, s, r);
+                    // Only tracking is absent; the authenticated live composition
+                    // and its permit still own the body just written.
+                    log::info!(target:"sayweave", "operation=draft_input_mode task_id={} block={} mode=compositionOnly reason=trackingUnavailable", actor.task, r.block.id());
+                    Ok(())
+                }
+                NativeValue::TrackedReplaced(Ok(
+                    windows_input::composition::TrackedWrite::Tracked(snapshot),
+                )) => {
                     if snapshot.id != r.block.id() {
                         Err(Error::new("compositionProtocol"))
                     } else {
@@ -1624,7 +1646,7 @@ mod tests {
         let mut tracked = r.snapshot.clone().unwrap();
         tracked.id = id;
         tracked.text = body;
-        reply.send(Ok(tracked)).unwrap();
+        reply.send(Ok(tracked.into())).unwrap();
         let value = SessionDraft::native_value(&mut s.native).await.unwrap();
         let completed = s.native.take().unwrap();
         native_done(&actor, &mut s, &mut r, &completed.kind, value);
@@ -1814,7 +1836,8 @@ mod tests {
                             selection_start: count,
                             selection_end: count,
                             writable: false,
-                        }))
+                        }
+                        .into()))
                         .unwrap();
                 }
                 Command::Replace(turn, text, raw, _, reply) => {
@@ -1883,6 +1906,43 @@ mod tests {
             !State::new().caret_only,
             "a new session still starts revisable"
         );
+    }
+    #[test]
+    fn composition_only_receipt_discards_ready_cleanup_and_keeps_raw_updates() {
+        let (actor, mut s, _) = actor(None);
+        let mut r = State::new();
+        r.block.observe("周三开会".into(), 4).unwrap();
+        let source = r.block.snapshot(true).unwrap();
+        s.unit = Some(UnitSlot::Ready(
+            unit(&r, &s, source, false),
+            Ok(crate::contracts::processing::GeneratedText {
+                text: "下周一上午开会".into(),
+                usage: crate::contracts::processing::TokenUsage::default(),
+                first_output_ms: None,
+                elapsed_ms: 1,
+            }),
+        ));
+        let revision = r.block.state_snapshot().version;
+        native_done(
+            &actor,
+            &mut s,
+            &mut r,
+            &NativeKind::Revisable(Effect::Write {
+                preview: None,
+                revision,
+                text: "周三开会".into(),
+                raw: "周三开会".into(),
+            }),
+            NativeValue::TrackedReplaced(Ok(
+                windows_input::composition::TrackedWrite::CompositionOnly,
+            )),
+        );
+        assert!(r.composition_only && r.caret_only);
+        assert!(s.unit.is_none());
+        assert_eq!(r.block.visible(), "周三开会");
+        assert_eq!(s.report.units.last().unwrap().application, "notApplied");
+        assert!(r.permit.load(Ordering::Acquire));
+        assert!(!State::new().composition_only);
     }
     #[tokio::test]
     async fn lost_old_block_seals_only_acknowledged_source_without_stopping_speech() {
@@ -1965,7 +2025,7 @@ mod tests {
             selection_end: 3,
             writable: false,
         };
-        reply.send(Ok(snapshot)).unwrap();
+        reply.send(Ok(snapshot.into())).unwrap();
         let value = SessionDraft::native_value(&mut s.native).await.unwrap();
         let completed = s.native.take().unwrap();
         native_done(&actor, &mut s, &mut r, &completed.kind, value);
@@ -2074,6 +2134,80 @@ mod tests {
         assert_eq!(r.block.state_snapshot().text, "三开会");
         assert_eq!(s.turn, 1);
     }
+    #[test]
+    fn composition_only_finish_keeps_unwritten_tail_after_seal() {
+        for end_arrived in [false, true] {
+            let (actor, mut s, _) = actor(None);
+            s.draft = None;
+            let mut r = State::new();
+            r.composition_only = true;
+            r.caret_only = true;
+            baseline(&mut r, "周");
+            let segments = vec![crate::contracts::processing::SourceSegment {
+                id: 1,
+                revision: 2,
+                text: "周三开会。".into(),
+                confirmed: true,
+            }];
+            r.visible_coverage = crate::processing::draft_source::Watermark::capture(&segments, 1);
+            s.written_raw = "周".into();
+            s.latest = NativeTranscript {
+                task_id: actor.task.clone(),
+                turn: 1,
+                sequence: 2,
+                text: "周三开会。".into(),
+                segments,
+            };
+            s.stopping = true;
+            actor.control.request_finish();
+            if end_arrived {
+                let (reply, _) = oneshot::channel();
+                s.ending = Some(Ending {
+                    mode: Finish::Commit,
+                    reply,
+                    deadline: Instant::now() + Duration::from_secs(15),
+                    expired: false,
+                });
+            }
+            sealed(&actor, &mut s, &mut r);
+            assert!(s.stop_error.is_none());
+            assert!(!r.stopped);
+            assert!(r.composition_only);
+            assert_eq!(r.offset, 1);
+            assert_eq!(r.block.visible(), "三开会。");
+            assert!(actor.control.stopping());
+        }
+    }
+    #[test]
+    fn composition_only_seal_never_reopens_cancelled_expired_or_detached_input() {
+        for reason in ["cancelled", "expired", "targetChanged"] {
+            let (actor, mut s, _) = actor(None);
+            s.draft = None;
+            let mut r = State::new();
+            r.composition_only = true;
+            r.caret_only = true;
+            actor.control.request_finish();
+            if reason == "targetChanged" {
+                s.record_failure(&actor.task, "targetChanged".into());
+            } else {
+                let (reply, _) = oneshot::channel();
+                s.ending = Some(Ending {
+                    mode: if reason == "cancelled" {
+                        Finish::Abort
+                    } else {
+                        Finish::Commit
+                    },
+                    reply,
+                    deadline: Instant::now(),
+                    expired: reason == "expired",
+                });
+            }
+            sealed(&actor, &mut s, &mut r);
+            assert!(r.stopped);
+            assert!(s.native.is_none());
+        }
+    }
+
     #[test]
     fn sealed_partial_source_revision_never_guesses_a_new_split() {
         let (actor, mut s, _) = actor(None);
@@ -2834,7 +2968,7 @@ mod tests {
         tracked.id = id;
         tracked.text = body;
         tracked.writable = false;
-        reply.send(Ok(tracked)).unwrap();
+        reply.send(Ok(tracked.into())).unwrap();
         let value = SessionDraft::native_value(&mut s.native).await.unwrap();
         let completed = s.native.take().unwrap();
         native_done(&actor, &mut s, &mut r, &completed.kind, value);

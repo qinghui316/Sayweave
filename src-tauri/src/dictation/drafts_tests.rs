@@ -48,7 +48,7 @@ async fn pending_initial_input_keeps_audio_and_all_asr_until_the_first_real_writ
     };
     assert_eq!(text, "周三开会");
     assert_eq!(raw.as_deref(), Some("周三开会"));
-    reply.send(Ok(tracked_snapshot(&id, &text))).unwrap();
+    reply.send(Ok(tracked_snapshot(&id, &text).into())).unwrap();
     acknowledge(&actor, &mut state).await;
     assert_eq!(state.written_raw, "周三开会");
     actor.observe(
@@ -439,7 +439,7 @@ async fn in_flight_write_must_settle_before_retirement_without_replay_or_new_sou
         native.try_recv().is_err(),
         "in-flight write must settle before cleanup"
     );
-    reply.send(Ok(tracked_snapshot(&id, &text))).unwrap();
+    reply.send(Ok(tracked_snapshot(&id, &text).into())).unwrap();
     acknowledge(&actor, &mut state).await;
     actor.observe(
         &mut state,
@@ -553,7 +553,7 @@ async fn revisable_preview_does_not_commit_and_next_request_rewrites_full_block(
         panic!("tracked real-time preview expected")
     };
     assert_eq!(text, "周三开会");
-    reply.send(Ok(tracked_snapshot(&id, &text))).unwrap();
+    reply.send(Ok(tracked_snapshot(&id, &text).into())).unwrap();
     acknowledge(&actor, &mut state).await;
     generated(&mut state).await;
     actor.schedule(&mut state).unwrap();
@@ -606,7 +606,7 @@ async fn revisable_stop_uses_handoff_and_does_not_append_unshown_tail() {
         panic!("preview expected")
     };
     assert_eq!(text, "已经显示");
-    reply.send(Ok(tracked_snapshot(&id, &text))).unwrap();
+    reply.send(Ok(tracked_snapshot(&id, &text).into())).unwrap();
     acknowledge(&actor, &mut state).await;
     actor.observe(
         &mut state,
@@ -785,7 +785,7 @@ async fn bound_preview(
         panic!("atomic tracked preview")
     };
     assert_eq!(text, body);
-    reply.send(Ok(tracked_snapshot(&id, body))).unwrap();
+    reply.send(Ok(tracked_snapshot(&id, body).into())).unwrap();
     acknowledge(actor, state).await;
     id
 }
@@ -1023,7 +1023,9 @@ async fn capacity_delivers_one_block_and_keeps_the_same_dictation_open() {
         panic!("first tracked preview")
     };
     assert_eq!(text, first);
-    reply.send(Ok(tracked_snapshot(&id, &first))).unwrap();
+    reply
+        .send(Ok(tracked_snapshot(&id, &first).into()))
+        .unwrap();
     acknowledge(&actor, &mut state).await;
     actor.schedule(&mut state).unwrap();
     let Command::Block(_, _, request, _, _, reply) = command(&native).await else {
@@ -1060,7 +1062,7 @@ async fn capacity_delivers_one_block_and_keeps_the_same_dictation_open() {
         panic!("continuing tracked tail")
     };
     assert_eq!(text, "后续文字");
-    reply.send(Ok(tracked_snapshot(&id, &text))).unwrap();
+    reply.send(Ok(tracked_snapshot(&id, &text).into())).unwrap();
     acknowledge(&actor, &mut state).await;
     assert!(!state.stopping);
     assert_eq!(state.report.raw, first);
@@ -1554,4 +1556,43 @@ fn result_route_change_is_published_even_when_recording_presentation_is_unchange
             (Presentation::Recording, true)
         ]
     );
+}
+
+#[tokio::test]
+async fn composition_only_first_write_keeps_streaming_and_updates_the_owned_range() {
+    let (actor, mut state, native) = actor(None);
+    state.revisable = Some(revisable::State::new());
+    actor.observe(&mut state, snapshot(1, vec![segment(1, "周", false)]));
+    actor.schedule(&mut state).unwrap();
+    let Command::ReplaceTracked(_, text, _, _, _, reply) = command(&native).await else {
+        panic!("initial tracking")
+    };
+    assert_eq!(text, "周");
+    reply
+        .send(Ok(
+            windows_input::composition::TrackedWrite::CompositionOnly,
+        ))
+        .unwrap();
+    acknowledge(&actor, &mut state).await;
+    assert!(state.stop_error.is_none());
+    assert_eq!(state.written_raw, "周");
+    for (sequence, text) in [(2, "周三"), (3, "舟山开会。"), (4, "舟山开会。随后确认。")]
+    {
+        actor.observe(
+            &mut state,
+            snapshot(sequence, vec![segment(1, text, false)]),
+        );
+        actor.schedule(&mut state).unwrap();
+        let Command::Replace(turn, body, _, _, reply) = command(&native).await else {
+            panic!("owned writes must not bind tracking again")
+        };
+        assert_eq!(turn, 1);
+        assert_eq!(body, text);
+        reply.send(Ok(())).unwrap();
+        acknowledge(&actor, &mut state).await;
+        assert!(state.stop_error.is_none());
+        assert_eq!(state.written_raw, text);
+    }
+    assert_eq!(state.turn, 1);
+    assert!(!actor.result_only());
 }

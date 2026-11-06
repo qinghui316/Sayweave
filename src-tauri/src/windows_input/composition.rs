@@ -38,7 +38,7 @@ pub(crate) enum Command {
         Option<String>,
         String,
         Arc<AtomicBool>,
-        oneshot::Sender<Result<BlockSnapshot, WriteFailure>>,
+        oneshot::Sender<Result<TrackedWrite, WriteFailure>>,
     ),
     Acquire(
         u64,
@@ -234,12 +234,33 @@ impl WriteFailure {
         }
     }
 }
+/// Successful body delivery and optional retained-block capability are separate.
+#[derive(Debug)]
+pub(crate) enum TrackedWrite {
+    Tracked(BlockSnapshot),
+    CompositionOnly,
+}
+impl From<BlockSnapshot> for TrackedWrite {
+    fn from(snapshot: BlockSnapshot) -> Self {
+        Self::Tracked(snapshot)
+    }
+}
 fn update_receipt(
     reply: Reply,
     text: &str,
     block_id: Option<&str>,
-) -> Result<Option<BlockSnapshot>, WriteFailure> {
+) -> Result<Option<TrackedWrite>, WriteFailure> {
     if reply.applied {
+        if block_id.is_some() && reply.code == "appliedCompositionOnly:fieldProvider:80070057" {
+            return if reply.mutation == Mutation::Changed
+                && reply.range_epoch > 0
+                && reply.block.is_none()
+            {
+                Ok(Some(TrackedWrite::CompositionOnly))
+            } else {
+                Err(WriteFailure::uncertain(Error::new("compositionProtocol")))
+            };
+        }
         if let Some(id) = block_id
             && reply
                 .block
@@ -253,7 +274,7 @@ fn update_receipt(
                 scope_unavailable: false,
             });
         }
-        return Ok(reply.block);
+        return Ok(reply.block.map(TrackedWrite::Tracked));
     }
     let tracking_failed = block_id.is_some() && reply.code.starts_with("edit:writeTracking:");
     let error = if reply.mutation != Mutation::NotAttempted {
@@ -739,7 +760,7 @@ impl Draft {
         raw: Option<String>,
         id: String,
         permit: Arc<AtomicBool>,
-    ) -> Result<BlockSnapshot, WriteFailure> {
+    ) -> Result<TrackedWrite, WriteFailure> {
         if self.closed.load(Ordering::Acquire) {
             return Err(WriteFailure::not_attempted("staleSession"));
         }
@@ -946,6 +967,8 @@ struct Host {
     range_open: bool,
     initial_pending: bool,
     pending_focus: Option<super::native::PendingFocus>,
+    continuation_focus: Option<super::native::PendingFocus>,
+    composition_only: bool,
     /// Exact successful Settle that already ended an empty composition.
     settled_empty_revision: Option<u64>,
     // An already active speech profile belongs to the session, not this worker.
@@ -1341,6 +1364,8 @@ impl Host {
             range_open: false,
             initial_pending: false,
             pending_focus: None,
+            continuation_focus: None,
+            composition_only: false,
             settled_empty_revision: None,
             profile,
             _lease: lease,
@@ -1365,6 +1390,7 @@ impl Host {
         let original_focus = allow_pending
             .then(|| super::native::PendingFocus::capture(&host.anchor).ok())
             .flatten();
+        host.continuation_focus = original_focus.clone();
         if allow_pending {
             log::info!(target:"sayweave", "operation=draft_admission_proof task_id={} captured={} elapsed_ms={}",host.task,original_focus.is_some(),proof_started.elapsed().as_millis());
         }
@@ -1418,6 +1444,12 @@ impl Host {
                 .ok_or_else(|| Error::new("targetChanged"))?
                 .check(&anchor)?;
         }
+        if self.composition_only {
+            self.continuation_focus
+                .as_ref()
+                .ok_or_else(|| Error::new("targetChanged"))?
+                .check_continuation(&anchor)?;
+        }
         self.stop_observation();
         self.anchor = anchor;
         self.turn = turn;
@@ -1444,6 +1476,12 @@ impl Host {
                         .as_ref()
                         .ok_or_else(|| Error::new("targetChanged"))?
                         .check(&self.anchor)?;
+                }
+                if self.composition_only {
+                    self.continuation_focus
+                        .as_ref()
+                        .ok_or_else(|| Error::new("targetChanged"))?
+                        .check_continuation(&self.anchor)?;
                 }
                 Ok(())
             });
@@ -2176,7 +2214,7 @@ impl Host {
         text: &str,
         permit: Option<&AtomicBool>,
         block_id: Option<String>,
-    ) -> Result<Option<BlockSnapshot>, WriteFailure> {
+    ) -> Result<Option<TrackedWrite>, WriteFailure> {
         if permit.is_some_and(|p| !p.load(Ordering::Acquire)) {
             return Err(WriteFailure::not_attempted("staleSnapshot"));
         }
@@ -2214,6 +2252,9 @@ impl Host {
                 }
             })
             .and_then(|r| update_receipt(r, text, block_id.as_deref()));
+        if matches!(result, Ok(Some(TrackedWrite::CompositionOnly))) {
+            self.composition_only = true;
+        }
         if result.is_ok()
             || result
                 .as_ref()
@@ -2221,7 +2262,7 @@ impl Host {
                 .is_some_and(|e| e.mutation == Mutation::Changed && e.tracking_failed)
         {
             self.text = text.into();
-            if let Ok(Some(snapshot)) = &result {
+            if let Ok(Some(TrackedWrite::Tracked(snapshot))) = &result {
                 log::info!(target:"sayweave", "operation=draft_block_bound task_id={} turn={} block={} epoch={}", self.task,self.turn,snapshot.id,snapshot.epoch);
             }
         }
@@ -2607,6 +2648,25 @@ mod tests {
             assert!(initial_begin_ready(&reply(code, Mutation::NotAttempted)).is_err());
         }
     }
+    #[test]
+    fn composition_only_receipt_requires_completed_write_and_native_epoch() {
+        let mut reply: Reply = serde_json::from_value(serde_json::json!({
+            "engine": EngineBinding { proxy_instance: uuid::Uuid::new_v4().to_string(), engine_generation: 1 },
+            "task":"capability-test","turn":1,"operation":1,"revision":1,
+            "applied":true,"code":"appliedCompositionOnly:fieldProvider:80070057",
+            "mutation":"changed","range_epoch":7
+        })).unwrap();
+        assert!(matches!(
+            update_receipt(reply.clone(), "周", Some("block")).unwrap(),
+            Some(TrackedWrite::CompositionOnly)
+        ));
+        reply.range_epoch = 0;
+        assert!(update_receipt(reply.clone(), "周", Some("block")).is_err());
+        reply.range_epoch = 7;
+        reply.mutation = Mutation::Uncertain;
+        assert!(update_receipt(reply, "周", Some("block")).is_err());
+    }
+
     #[test]
     fn write_effect_and_tracking_refusal_are_independent_receipt_facts() {
         let reply = |phase: &str, mutation: Mutation| -> Reply {

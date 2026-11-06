@@ -886,6 +886,74 @@ unsafe fn relative_selection(
     }
 }
 
+/// Revalidate a completed Update after the optional field provider failed.
+/// This grants only the existing composition, never an independent block.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn confirm_owned_write(
+    shared: &Shared,
+    context: &ITfContext,
+    request: &Request,
+    connection: u64,
+    generation: u64,
+    epoch: u64,
+    ec: u32,
+) -> windows::core::Result<()> {
+    edit_authorized(shared, request, connection, generation)?;
+    let (manager, composition, native, expected) = {
+        let state = shared.borrow();
+        if request.action != Action::Update
+            || state.epoch != epoch
+            || !state.version.owned
+            || state.version.task != request.task
+            || state.version.turn != request.turn
+            || state.version.operation != request.operation
+            || state.version.revision != request.revision
+            || state.context.as_ref() != Some(context)
+            || state.block.is_some()
+            || state
+                .text
+                .as_ref()
+                .is_none_or(|text| text.semantic != request.text)
+        {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        (
+            state.manager.clone().ok_or_else(|| failure(E_FAIL))?,
+            state
+                .composition
+                .clone()
+                .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
+            state
+                .native_context
+                .clone()
+                .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
+            state.expected.clone(),
+        )
+    };
+    unsafe {
+        if native.context != *context || !native.current(&manager)? || !native.focus_matches() {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+        native.permits()?;
+        let range = composition.GetRange()?;
+        if range_text(&range, ec)? != expected || password(context, &range, ec)? {
+            return Err(failure(TF_E_DISCONNECTED));
+        }
+    }
+    edit_authorized(shared, request, connection, generation)?;
+    let state = shared.borrow();
+    if state.epoch != epoch
+        || !state.version.owned
+        || state.version.operation != request.operation
+        || state.composition.as_ref() != Some(&composition)
+        || state.expected != expected
+        || state.block.is_some()
+    {
+        return Err(failure(TF_E_DISCONNECTED));
+    }
+    Ok(())
+}
+
 // Runs inside the owning write lock, before its Update receipt can escape.
 // Effect and original scope are separate facts supplied by the same writer.
 #[allow(clippy::too_many_arguments)]
@@ -898,8 +966,10 @@ pub(super) unsafe fn bind_owned(
     ec: u32,
     origin: Option<Rc<initial_selection::ParagraphOrigin>>,
     mutation: Mutation,
+    phase: &mut &'static str,
 ) -> windows::core::Result<BlockSnapshot> {
     unsafe {
+        *phase = "writeTracking:focus";
         let epoch = shared.borrow().epoch;
         let manager = shared
             .borrow()
@@ -909,7 +979,7 @@ pub(super) unsafe fn bind_owned(
         if edit_context::focused(shared, &manager)? != *context {
             return Err(failure(TF_E_DISCONNECTED));
         }
-        let mut track = Track::bind(shared, context, r, ec)?;
+        let mut track = Track::bind(shared, context, r, ec, phase)?;
         track.origin = origin;
         let track = Rc::new(track);
         // Binding records an already-owned write, not an external
@@ -929,6 +999,7 @@ pub(super) unsafe fn bind_owned(
                     .ok_or_else(|| failure(TF_E_DISCONNECTED))?,
             )
         };
+        *phase = "writeTracking:ownedRange";
         let owned = composition.GetRange()?;
         if owned.CompareStart(ec, &track.range, TF_ANCHOR_START)? != 0
             || owned.CompareEnd(ec, &track.range, TF_ANCHOR_END)? != 0
@@ -936,6 +1007,7 @@ pub(super) unsafe fn bind_owned(
             return Err(failure(TF_E_DISCONNECTED));
         }
         let actual = range_text(&owned, ec)?;
+        *phase = "writeTracking:selection";
         let (start, end) = relative_selection(context, &owned, ec)?;
         let start = written
             .position(&actual, start, false)
@@ -959,6 +1031,7 @@ pub(super) unsafe fn bind_owned(
                 writable: false,
             }
         };
+        *phase = "writeTracking:revalidate";
         if edit_context::focused(shared, &manager)? != *context || !track.field.matches()? {
             return Err(failure(TF_E_DISCONNECTED));
         }
@@ -1181,8 +1254,10 @@ impl Track {
         context: &ITfContext,
         request: &Request,
         ec: u32,
+        phase: &mut &'static str,
     ) -> windows::core::Result<Self> {
         unsafe {
+            *phase = "writeTracking:identity";
             let command = request
                 .block
                 .as_ref()
@@ -1207,6 +1282,7 @@ impl Track {
                     state.text_notifications.clone(),
                 )
             };
+            *phase = "writeTracking:range";
             let range = composition.GetRange()?.Clone()?;
             if range_text(&range, ec)? != expected || expected.is_empty() {
                 return Err(failure(TF_E_DISCONNECTED));
@@ -1216,8 +1292,14 @@ impl Track {
                 .manager
                 .clone()
                 .ok_or_else(|| failure(TF_E_DISCONNECTED))?;
-            let field =
-                BlockScope::capture(&manager, context, edit_context::retained(shared, &manager)?)?;
+            *phase = "writeTracking:field";
+            let field = BlockScope::capture(
+                &manager,
+                context,
+                edit_context::retained(shared, &manager)?,
+                phase,
+            )?;
+            *phase = "writeTracking:gravity";
             range.SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_FORWARD)?;
             // Unavailable/oversized outside evidence keeps the original strict
             // notification rule. It does not block ordinary composition input.
@@ -1234,6 +1316,7 @@ impl Track {
                 })
                 .ok()
                 .map(Rc::new);
+            *phase = "writeTracking:position";
             let data = Rc::new(RefCell::new(Data {
                 id: command.id.clone(),
                 epoch: COMPOSITION_EPOCH.fetch_add(1, Ordering::AcqRel) + 1,
@@ -1287,7 +1370,9 @@ impl Track {
                 _lease: Lease::new(),
             }
             .into();
+            *phase = "writeTracking:editSink";
             let cookie = source.AdviseSink(&ITfTextEditSink::IID, &sink)?;
+            *phase = "writeTracking:focusSink";
             let manager_cookie =
                 match manager_source.AdviseSink(&ITfThreadMgrEventSink::IID, &focus) {
                     Ok(cookie) => cookie,
@@ -3903,6 +3988,7 @@ impl ITfEditSession_Impl for EditBlock_Impl {
                     ec,
                     None,
                     Mutation::NotAttempted,
+                    &mut "writeTracking",
                 );
             }
             let track = shared

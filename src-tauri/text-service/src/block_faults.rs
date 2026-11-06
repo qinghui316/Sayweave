@@ -15,6 +15,21 @@ pub extern "system" fn SayweaveBlockFixtureFault(value: u32) {
 pub fn native_scope_only() -> bool {
     NATIVE_SCOPE_ONLY.load(Ordering::Acquire)
 }
+pub fn field_provider() -> windows::core::Result<()> {
+    let fault = FAULT.load(Ordering::Acquire);
+    if matches!(fault, 12 | 13)
+        && FAULT
+            .compare_exchange(fault, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        return Err(failure(if fault == 12 {
+            E_INVALIDARG
+        } else {
+            E_ACCESSDENIED
+        }));
+    }
+    Ok(())
+}
 pub fn coarse_notification(text_changed: bool) -> bool {
     text_changed
         && FAULT

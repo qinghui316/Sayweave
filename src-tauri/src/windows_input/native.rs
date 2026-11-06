@@ -159,11 +159,14 @@ pub(crate) fn reanchor_turn(id: &str, original: &Anchor) -> Result<Anchor, Error
     watch.anchor = next.clone();
     Ok(next)
 }
-/// Apartment-owned identity fence for a refused initial Begin. Ordinary input
-/// does not depend on this optional capability. It never reads or writes text.
+/// Apartment-owned identity fence for initial admission and compatibility
+/// continuation. Reads accessibility metadata, never the editor body.
+#[derive(Clone)]
 pub(super) struct PendingFocus {
     automation: IUIAutomation,
     element: IUIAutomationElement,
+    name: String,
+    label: Option<(IUIAutomationElement, String)>,
 }
 impl PendingFocus {
     pub(super) fn capture(anchor: &Anchor) -> Result<Self, Error> {
@@ -188,10 +191,80 @@ impl PendingFocus {
             // Retain the original object before sending Begin. Safety and
             // current-caret editability are checked only if a retry is needed;
             // ordinary successful native admission does not depend on UIA.
+            let name = element
+                .CurrentName()
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let label = Self::field_label(&automation, &element, &name);
             Ok(Self {
                 automation,
+                name,
                 element,
+                label,
             })
+        }
+    }
+    fn field_label(
+        automation: &IUIAutomation,
+        element: &IUIAutomationElement,
+        name: &str,
+    ) -> Option<(IUIAutomationElement, String)> {
+        // Virtualized editors may append transient hints to their accessible
+        // name. Retain a matching visible label from the nearest surrounding
+        // container, rather than treating the hint as the document identity.
+        unsafe {
+            if let Ok(label) = element.CurrentLabeledBy()
+                && let Ok(text) = label.CurrentName()
+                && !text.is_empty()
+            {
+                return Some((label, text.to_string()));
+            }
+            if name.is_empty() {
+                return None;
+            }
+            let walker = automation.RawViewWalker().ok()?;
+            let condition = automation
+                .CreatePropertyCondition(
+                    UIA_ControlTypePropertyId,
+                    &windows::Win32::System::Variant::VARIANT::from(UIA_TextControlTypeId.0),
+                )
+                .ok()?;
+            let started = Instant::now();
+            let mut owner = element.clone();
+            for _ in 0..10 {
+                if started.elapsed() > Duration::from_millis(250) {
+                    return None;
+                }
+                owner = walker.GetParentElement(&owner).ok()?;
+                let labels = owner.FindAll(TreeScope_Descendants, &condition).ok()?;
+                let count = labels.Length().ok()?;
+                if count > 256 {
+                    return None;
+                }
+                let mut best: Option<(IUIAutomationElement, String)> = None;
+                for index in 0..count {
+                    if started.elapsed() > Duration::from_millis(250) {
+                        return None;
+                    }
+                    let candidate = labels.GetElement(index).ok()?;
+                    if candidate.CurrentIsOffscreen().ok()?.as_bool() {
+                        continue;
+                    }
+                    let text = candidate.CurrentName().ok()?.to_string();
+                    if !text.is_empty()
+                        && name.starts_with(&text)
+                        && best
+                            .as_ref()
+                            .is_none_or(|(_, prior)| text.len() > prior.len())
+                    {
+                        best = Some((candidate, text));
+                    }
+                }
+                if best.is_some() {
+                    return best;
+                }
+            }
+            None
         }
     }
     pub(super) fn check(&self, anchor: &Anchor) -> Result<(), Error> {
@@ -249,6 +322,34 @@ impl PendingFocus {
             }
             budget()
         }
+    }
+    pub(super) fn check_continuation(&self, anchor: &Anchor) -> Result<(), Error> {
+        if self.label.is_none() && self.name.is_empty() {
+            return Err(err("targetChanged"));
+        }
+        self.check(anchor).inspect_err(|error| {
+            log::info!(target:"sayweave", "operation=continuation_field stage=focus error={}", error.code);
+        })?;
+        let name = unsafe { self.element.CurrentName() }
+            .map_err(|_| err("targetChanged"))?
+            .to_string();
+        if let Some((original, label)) = &self.label {
+            let Some((current, current_label)) =
+                Self::field_label(&self.automation, &self.element, &name)
+            else {
+                return Err(err("targetChanged"));
+            };
+            if current_label != *label
+                || !unsafe { self.automation.CompareElements(original, &current) }
+                    .map_err(|_| err("targetChanged"))?
+                    .as_bool()
+            {
+                return Err(err("targetChanged"));
+            }
+        } else if name != self.name {
+            return Err(err("targetChanged"));
+        }
+        Ok(())
     }
 }
 /// Physical pointer evidence shares the same task-window lease as WinEvent evidence.
