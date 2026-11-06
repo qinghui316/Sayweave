@@ -14,7 +14,9 @@ import {verifyComponentEmbeddings} from './build-text-service.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),id=randomUUID();
 const storageContext=beginValidation(root,{id,kind:'speech-desktop'});
 const directory=path.join(root,'.local','data-acceptance',id),data=path.join(directory,'data');mkdirSync(data,{recursive:true});
-const exe=path.join(root,'src-tauri','target','release','desktop-acceptance.exe'),port=9241,key='fixture-'+randomUUID();
+const target=path.resolve(root,process.env.CARGO_TARGET_DIR??'src-tauri/target');
+const exe=path.join(target,'release','desktop-acceptance.exe'),inputFixture=path.join(target,'debug','input-fixture.exe');
+const port=9241,key='fixture-'+randomUUID();
 const polishCase=process.argv.find(value=>value.startsWith('--polish-case='))?.slice('--polish-case='.length);
 if(polishCase&&!['cancel','no-history'].includes(polishCase))throw Error('Unknown polish acceptance case');
 const polishOnly=process.argv.includes('--polish')||Boolean(polishCase);
@@ -478,7 +480,7 @@ async function stop(page,graceful=true){
  if(browser){await browser.close().catch(()=>{});browser=null;}if(app?.exitCode===null){const owned=app;owned.kill();await new Promise(r=>owned.exitCode!==null?r():owned.once('exit',r));}app=null;await delay(600);
 }
 async function ownedEditor(composition=true){
- const child=spawn(path.join(root,'src-tauri/target/debug/input-fixture.exe'),composition?['composition']:[],{cwd:root,windowsHide:true,env:{...process.env,SAYWEAVE_INPUT_ACCEPTANCE:'1'},stdio:['pipe','pipe','pipe']});
+ const child=spawn(inputFixture,composition?['composition']:[],{cwd:root,windowsHide:true,env:{...process.env,SAYWEAVE_INPUT_ACCEPTANCE:'1'},stdio:['pipe','pipe','pipe']});
  const trace={pid:child.pid,commands:[],stderr:'',exit:null};report.ownedEditors??=[];report.ownedEditors.push(trace);
  child.stderr.on('data',chunk=>{trace.stderr=(trace.stderr+chunk.toString('utf8')).slice(-4096);});
  let buffer='',queue=[],waiting=[],channelFailure;
@@ -1018,6 +1020,17 @@ async function readinessScenario(page){
  }
 }
 
+async function beginMicrophoneTest(page){
+ await page.getByRole('button',{name:'设置',exact:true}).click();
+ const dialog=page.getByRole('dialog',{name:'设置',exact:true});
+ await dialog.getByRole('button',{name:'设备与快捷键',exact:true}).click();
+ await expect(dialog.getByRole('combobox',{name:'录音设备'})).toContainText('系统默认 ·');
+ await dialog.getByRole('button',{name:'测试麦克风',exact:true}).click();
+ await expect(dialog.getByRole('button',{name:'停止测试',exact:true})).toBeVisible();
+ await expect(dialog.getByRole('meter',{name:'输入音量'})).toHaveAttribute('aria-busy','false');
+ return dialog;
+}
+
 async function run(){try{
  // A reviewed controller retry can retain exact already-built product bytes.
  const retained=process.env.SAYWEAVE_SPEECH_REUSE_PREPARED;
@@ -1034,7 +1047,7 @@ async function run(){try{
    report.productSourceDigest=proof.sourceSnapshot.digest;
   }else execFileSync('git',['diff','--quiet','HEAD','--','src','src-tauri'],{cwd:root});
   for(const file of proof.files)expect(createHash('sha256').update(readFileSync(file.path)).digest('hex')).toBe(file.sha256);
-  for(const required of [exe,proof.fixtureTest,path.join(root,'src-tauri/target/debug/input-fixture.exe'),path.join(root,'src-tauri/resources/fixed-proxy/abi1.dll'),process.env.SAYWEAVE_TSF_PAYLOAD]){
+  for(const required of [exe,proof.fixtureTest,inputFixture,path.join(root,'src-tauri/resources/fixed-proxy/abi1.dll'),process.env.SAYWEAVE_TSF_PAYLOAD]){
    expect(required).toBeTruthy();expect(proof.files.some(file=>path.resolve(file.path)===path.resolve(required))).toBe(true);
   }
   report.componentPayloads=verifyComponentEmbeddings([exe],{core:process.env.SAYWEAVE_TSF_PAYLOAD,proxy:path.join(root,'src-tauri/resources/fixed-proxy/abi1.dll')});
@@ -1042,7 +1055,8 @@ async function run(){try{
  }else{
   await buildFixture({logLevel:'error'});
   if(!process.env.SAYWEAVE_TSF_PAYLOAD)await command(['build','--manifest-path','src-tauri/text-service/Cargo.toml','--release']);
-  const payload=process.env.SAYWEAVE_TSF_PAYLOAD??path.join(root,'src-tauri/text-service/target/release/sayweave_text_service.dll');report.componentSha256=createHash('sha256').update(readFileSync(payload)).digest('hex');
+  const tsfTarget=process.env.CARGO_TARGET_DIR?target:path.join(root,'src-tauri','text-service','target');
+  const payload=process.env.SAYWEAVE_TSF_PAYLOAD??path.join(tsfTarget,'release','sayweave_text_service.dll');report.componentSha256=createHash('sha256').update(readFileSync(payload)).digest('hex');
   await command(['build','--manifest-path','src-tauri/Cargo.toml','--release','--features','desktop-acceptance,tauri/custom-protocol','--bin','desktop-acceptance'],{SAYWEAVE_TSF_PAYLOAD:payload});
   await command(['build','--manifest-path','src-tauri/Cargo.toml','--features','desktop-acceptance','--bin','input-fixture']);
  }
@@ -1053,6 +1067,15 @@ async function run(){try{
   await readModels(page);
   await invoke(page,'model_save',{request:{id:null,revision:null,expectation:null,input:{name:'隔离翻译识别',protocol:'qwen-audio-streaming',baseUrl:base,modelId:expectedModel,usages:['speech']},key:{action:'replace',value:key}}});
   report.scope='translation';await translationScenario(page,base);report.passed=true;return;
+ }
+ if(process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE==='input-gain'){
+  const settings=await beginMicrophoneTest(page);
+  await page.screenshot({path:path.join(directory,'microphone-test-native.png')});
+  expect(report.connections).toHaveLength(0);
+  expect((await invoke(page,'history_browse',{query:{search:'',cursor:null}})).total).toBe(0);
+  await settings.getByRole('button',{name:'关闭',exact:true}).click();
+  await expect(settings).toHaveCount(0);
+  report.checks.push('Live native microphone test worked before model setup, without a recognition connection or history record');
  }
  await expect(page.getByRole('link',{name:'组件展示'})).toHaveCount(0);await page.getByRole('button',{name:'配置模型',exact:true}).click();const dialog=page.getByRole('dialog');await delay(250);await page.screenshot({path:path.join(directory,'settings-speech-native.png')});await dialog.getByRole('button',{name:'更多设置'}).click();await dialog.getByLabel('名称',{exact:true}).fill('隔离语音验收');await dialog.getByLabel('服务地址（URL）',{exact:true}).fill(base);await dialog.getByLabel('API 密钥',{exact:true}).fill(key);await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(dialog.getByText('已保存。')).toBeVisible();await dialog.getByRole('button',{name:'关闭',exact:true}).click();await expect(dialog).toHaveCount(0);
  if(polishOnly){await polishScenario(page,base);await stop(page);if(polishCase==='no-history'){page=await start(2);expect((await invoke(page,'history_browse',{query:{search:'',cursor:null}})).total).toBe(0);await stop(page);report.checks.push('restart after history-disabled cancellation recovers without a stale cancellation intent');}report.passed=true;return;}
@@ -1101,29 +1124,35 @@ async function run(){try{
    await set({inputGainDb:6});
    await invoke(page,'runtime_window',{surface:'main',action:'show'});
    expect((await editor.command({action:'focus-process',process:app.pid})).foregroundProcess).toBe(app.pid);
+   const externalTest=await beginMicrophoneTest(page);
    mode='gain-external';const external=await invoke(page,'dictation_start');
    expect((await waitPhase(page,'recording')).source).toBe('external');
+   await expect(externalTest.getByRole('button',{name:'停止测试',exact:true})).toHaveCount(0);
    expect((await invoke(page,'dictation_snapshot')).inputRoute).toBe('resultOnly');
    await expect.poll(()=>report.connections.find(c=>c.mode==='gain-external')?.frames??0).toBeGreaterThan(0);
    await invoke(page,'dictation_control',{taskId:external.taskId,action:'finish'});await waitPhase(page,'completed');hash('gain-external');
    await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).stage).toBe('result');
    const completed=await invoke(page,'dictation_snapshot');if(completed.presentationId)await dismiss(page,{taskId:completed.taskId,presentationId:completed.presentationId});
-   report.checks.push('External result-only dictation captured and finalized real microphone PCM');
+   await expect(externalTest.getByRole('button',{name:'测试麦克风',exact:true})).toBeEnabled();
+   await externalTest.getByRole('button',{name:'关闭',exact:true}).click();
+   report.checks.push('External result-only dictation took over the microphone test, captured and finalized real PCM');
 
    await invoke(page,'model_save',{request:{id:null,revision:null,expectation:null,input:{name:'隔离翻译文字',protocol:'openai-chat',baseUrl:base+'/v1',modelId:'translation-fixture',usages:['text']},key:{action:'replace',value:key}}});
    const keys=await invoke(page,'shortcut_status');await invoke(page,'shortcut_save',{config:{...keys.saved,binding:'AltRight',translationBinding:'F8',mode:'hold'}});
+   const translationTest=await beginMicrophoneTest(page);
    await editor.command({action:'focus',text:'前后',start:1,end:1});
    mode='gain-translation';
    const keyEdge=async down=>expect((await editor.command({action:'fixture-key',process:editor.pid,key:'F8',down})).keyResult?.accepted).toBe(true);
    await keyEdge(true);
    try{
     await waitPhase(page,'recording');expect((await invoke(page,'dictation_snapshot')).purpose).toBe('translation');
+    await expect(translationTest.getByRole('button',{name:'停止测试',exact:true})).toHaveCount(0);
     await expect.poll(()=>report.connections.find(c=>c.mode==='gain-translation')?.frames??0).toBeGreaterThan(0);
    }finally{await keyEdge(false);}
    await expect.poll(()=>translationRequests.length,{timeout:12000}).toBe(1);
    expect(translationRequests[0].source).toBe('原生受控识别完成。');translationReleases.get(translationRequests[0])?.();
    await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).translationComplete,{timeout:12000}).toBe(true);
-   hash('gain-translation');report.checks.push('Translation held shortcut captured microphone PCM and translated the final ASR result after release');
+   hash('gain-translation');report.checks.push('Translation held shortcut took over the microphone test, captured PCM and translated the final ASR result after release');
   }finally{await editor.close();}
   report.passed=true;return;
  }

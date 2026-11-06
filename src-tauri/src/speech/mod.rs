@@ -8,6 +8,7 @@ mod live_continuation;
 #[cfg(all(test, windows))]
 mod live_hotwords;
 mod local;
+mod microphone;
 pub mod qwen;
 mod recognition;
 #[cfg(all(test, windows))]
@@ -194,6 +195,7 @@ pub struct NativeTranscript {
 pub struct SpeechService {
     pub history: HistoryService,
     pub playback: Playback,
+    microphone_test: microphone::MicrophoneTest,
     snapshot: Mutex<Snapshot>,
     record_lease: Mutex<Option<(String, Weak<crate::history::RecordLease>)>>,
     states: watch::Sender<Snapshot>,
@@ -223,6 +225,7 @@ impl SpeechService {
         Self {
             history,
             playback: Playback::new(),
+            microphone_test: microphone::MicrophoneTest::default(),
             snapshot: Mutex::new(Snapshot::default()),
             record_lease: Mutex::new(None),
             states,
@@ -466,25 +469,23 @@ impl SpeechService {
         if context.as_ref().is_some_and(|c| *c.cancel.borrow() >= 2) {
             return Err(Error::new("cancelled"));
         }
-        let mut preferences = self.history.preferences().await?;
+        let preferences = self.history.preferences().await?;
         self.playback.control("stop", None).await?;
-        let devices = if retry_id.is_none() {
-            tokio::task::spawn_blocking(audio::devices)
+        let device = if retry_id.is_none() {
+            self.stop_microphone_test().await;
+            let selected = preferences.device_id.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    let device = audio::resolve_input(selected.as_deref())?;
+                    let name = audio::device_name(&device);
+                    Ok::<_, Error>((device, name))
+                })
                 .await
-                .map_err(|_| Error::new("deviceAccess"))??
+                .map_err(|_| Error::new("deviceAccess"))??,
+            )
         } else {
-            vec![]
+            None
         };
-        let device = match &preferences.device_id {
-            Some(id) => devices.iter().find(|d| &d.id == id),
-            None => devices.iter().find(|d| d.is_default),
-        };
-        if retry_id.is_none() && device.is_none() {
-            return Err(Error::new("deviceMissing"));
-        }
-        if let Some(device) = device {
-            preferences.device_id = Some(device.id.clone());
-        }
         let task_id = context
             .as_ref()
             .map(|c| c.id.clone())
@@ -653,7 +654,7 @@ impl SpeechService {
             sequence: old.sequence + 1,
             lifecycle: old.lifecycle + 1,
             model_name: Some(cfg.model_id().into()),
-            device_name: device.map(|d| d.name.clone()),
+            device_name: device.as_ref().map(|(_, name)| name.clone()),
             retry: retry_id.is_some(),
             ..Snapshot::default()
         };
@@ -692,7 +693,14 @@ impl SpeechService {
             let id = task.id.clone();
             let mut cancel = rx;
             let result = service
-                .run(&app, &task, &cfg, &mut cancel, &mut admission)
+                .run(
+                    &app,
+                    &task,
+                    &cfg,
+                    device.map(|(device, _)| device),
+                    &mut cancel,
+                    &mut admission,
+                )
                 .await;
             if let Err(e) = result {
                 service.update(&id, |s| {
@@ -801,6 +809,7 @@ impl SpeechService {
         app: &tauri::AppHandle,
         task: &Task,
         cfg: &crate::models::SpeechConfiguration,
+        device: Option<cpal::Device>,
         cancel: &mut watch::Receiver<u8>,
         admission: &mut crate::network::RequestGuard,
     ) -> Result<(), Error> {
@@ -823,9 +832,9 @@ impl SpeechService {
             if *cancel.borrow() >= 2 {
                 return Err(Error::new("cancelled"));
             }
-            if task.replay.is_none() {
+            if let Some(device) = device {
                 capture = Some(audio::Capture::prepare(
-                    task.preferences.device_id.clone(),
+                    device,
                     task.preferences.input_gain_db,
                     task.audio
                         .as_ref()
@@ -1192,10 +1201,14 @@ impl SpeechService {
         }
     }
     pub async fn drain(&self) -> Result<(), Error> {
+        self.stop_microphone_test().await;
         while self.is_active() || self.operations.load(Ordering::Acquire) > 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         self.playback.control("stop", None).await.map(|_| ())
+    }
+    pub(crate) async fn stop_microphone_test(&self) {
+        self.microphone_test.stop(None).await;
     }
     pub async fn play(&self, id: &str) -> Result<crate::history::playback::PlaybackState, Error> {
         let _operation = self.admit()?;

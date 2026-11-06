@@ -1,5 +1,31 @@
 import {test,expect} from '@playwright/test';
 
+test('microphone test starts on demand and shows the saved gain on a fixed scale',async({page})=>{
+ await page.goto('/');
+ const open=page.getByRole('button',{name:'设置',exact:true});
+ await open.click();
+ const dialog=page.getByRole('dialog',{name:'设置',exact:true});
+ const start=dialog.getByRole('button',{name:'测试麦克风',exact:true});
+ const meter=dialog.getByRole('meter',{name:'输入音量'});
+ const gain=dialog.getByRole('slider',{name:'麦克风增益'});
+ const read=()=>meter.evaluate(element=>(element as HTMLMeterElement).value);
+ await expect(dialog.getByRole('combobox',{name:'录音设备'})).toContainText('系统默认 · 模拟麦克风');
+ await expect.poll(read).toBe(0);
+ await start.click();
+ await expect(dialog.getByRole('button',{name:'停止测试'})).toBeVisible();
+ await expect.poll(read).toBeGreaterThan(0);
+ const normal=await read();
+ await gain.press('End');
+ await expect.poll(read).toBeCloseTo(normal+12/60,3);
+ await dialog.getByRole('button',{name:'停止测试'}).click();
+ await expect.poll(read).toBe(0);
+ await start.click();
+ await dialog.getByRole('button',{name:'关闭',exact:true}).click();
+ await open.click();
+ await expect(start).toBeEnabled();
+ await expect.poll(read).toBe(0);
+});
+
 test('microphone gain shows five named levels and keeps its selection when reopened',async({page})=>{
  await page.goto('/');
  const open=async()=>{

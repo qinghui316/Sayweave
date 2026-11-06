@@ -431,6 +431,14 @@ fn window_action_internal(
         _ => return Err(RuntimeError::new("invalidAction")),
     };
     result.map_err(|_| RuntimeError::new("unavailable"))?;
+    if surface == "main" && matches!(action, "hide" | "minimize") {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            app.state::<speech::SpeechService>()
+                .stop_microphone_test()
+                .await;
+        });
+    }
     let snapshot = {
         let runtime = app.state::<Runtime>();
         let mut s = runtime
@@ -739,6 +747,9 @@ pub fn run() {
             model_help,
             speech_snapshot,
             speech_devices,
+            speech_microphone_test_start,
+            speech_microphone_test_control,
+            speech_open_microphone_settings,
             speech_start,
             speech_retry_current,
             speech_control,

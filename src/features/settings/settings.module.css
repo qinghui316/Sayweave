@@ -34,6 +34,14 @@
 .shortcutRecorder[aria-invalid="true"] { border-color:var(--shortcut-error); }
 .shortcutError { width:100%; margin:0; color:var(--shortcut-error); font-size:var(--text-small); line-height:var(--line-small); }
 
+.refreshDevices { min-block-size:24px; margin-block:-3px; padding-inline:4px; border-radius:4px; background:transparent; color:inherit; text-decoration:underline; text-underline-offset:2px; }
+.refreshDevices:hover { color:var(--text-primary); }
+.microphoneTest { display:flex; align-items:center; gap:var(--space-8); }
+.microphoneTest meter { inline-size:86px; block-size:8px; appearance:none; }
+.microphoneTest meter::-webkit-meter-bar { background:var(--surface-key); border:0; border-radius:4px; }
+.microphoneTest meter::-webkit-meter-optimum-value { background:var(--text-primary); border-radius:4px; }
+.microphoneTest meter::-moz-meter-bar { background:var(--text-primary); border-radius:4px; }
+
 .inputGain {
  --gain-fill:color-mix(in srgb,var(--signal) 68%,var(--action-bg));
  --gain-thumb-surface:var(--switch-off-thumb);

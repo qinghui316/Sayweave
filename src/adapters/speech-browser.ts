@@ -1,19 +1,40 @@
 import {SpeechError,initialSpeech,type SpeechPort,type SpeechSnapshot,type SpeechMeter,type RecordingPreferences} from '../contracts/speech';
 import {historyText,summarizeHistory,type HistoryPort,type HistoryRecord,type HistoryCursor,type PlaybackState} from '../contracts/history';
+import type {InputGainDb,MicrophoneTestControl,MicrophoneTestEvent,MicrophoneTestInput} from '../contracts/speech';
 export class BrowserSpeech implements SpeechPort {
  readonly mode='simulation' as const;
  value=initialSpeech();settings:RecordingPreferences={deviceId:null,inputGainDb:0,historyEnabled:true,audioEnabled:true,interactionSoundsEnabled:true,retentionDays:30,revision:1};
  readonly listeners=new Set<(s:SpeechSnapshot)=>void>();readonly meters=new Set<(m:SpeechMeter)=>void>();readonly records:HistoryRecord[]=[];
  private timer:ReturnType<typeof setTimeout>|undefined;
  private active=false;private meterTimer:ReturnType<typeof setInterval>|undefined;
+ private microphoneTest:{id:string;onEvent:(event:MicrophoneTestEvent)=>void}|null=null;
  async snapshot(){return structuredClone(this.value);}
  async subscribe(s:(v:SpeechSnapshot)=>void,m:(v:SpeechMeter)=>void){this.listeners.add(s);this.meters.add(m);return()=>{this.listeners.delete(s);this.meters.delete(m);};}
  async devices(){return[{id:'browser-simulated',name:'模拟麦克风（不采集声音）',isDefault:true}];}
+ async startMicrophoneTest(input:MicrophoneTestInput,onEvent:(event:MicrophoneTestEvent)=>void){
+  if(this.active)throw new SpeechError('busy');
+  if(input.deviceId&&input.deviceId!=='browser-simulated')throw new SpeechError('deviceMissing');
+  this.stopMicrophoneTest();
+  this.microphoneTest={id:input.id,onEvent};
+  this.testLevel(input.gainDb);
+ }
+ async controlMicrophoneTest(control:MicrophoneTestControl){
+  if(this.microphoneTest?.id!==control.id)return;
+  if(control.action==='stop')this.stopMicrophoneTest();
+  else this.testLevel(control.gainDb);
+ }
+ async openMicrophoneSettings(){/* Browser preview has no native settings. */}
+ private testLevel(gainDb:InputGainDb){this.microphoneTest?.onEvent({kind:'level',level:.015*10**(gainDb/20)});}
+ private stopMicrophoneTest(){
+  const test=this.microphoneTest;
+  this.microphoneTest=null;
+  test?.onEvent({kind:'stopped',error:null});
+ }
  async preferences(){return {...this.settings};}
  async savePreferences(p:RecordingPreferences){if(p.revision!==this.settings.revision)throw new SpeechError('conflict');this.settings={...p,revision:p.revision+1};return this.preferences();}
  private emit(){this.value.sequence++;for(const fn of this.listeners)fn(structuredClone(this.value));}
  async start(){
-  if(this.active)throw new SpeechError('busy');clearTimeout(this.timer);this.active=true;
+  if(this.active)throw new SpeechError('busy');this.stopMicrophoneTest();clearTimeout(this.timer);this.active=true;
   const prior=this.value;this.value={...initialSpeech(),sequence:prior.sequence+1,lifecycle:prior.lifecycle+1,taskId:crypto.randomUUID(),source:'trial',attemptId:crypto.randomUUID(),recordId:this.settings.historyEnabled?crypto.randomUUID():null,modelName:'模拟语音模型',deviceName:'模拟麦克风',phase:'connecting'};this.emit();
   this.timer=setTimeout(()=>{this.value.phase='recording';this.value.lifecycle++;this.value.text='这是浏览器模拟文字。';this.value.durationMs=1000;this.emit();let frame=0;this.meterTimer=setInterval(()=>{if(this.value.phase!=='recording')return;frame++;const energies=Array.from({length:15},(_,i)=>.04*(1+Math.sin(frame*.28+i*.6)));const meter:SpeechMeter={taskId:this.value.taskId!,sequence:frame,captureSequence:frame,level:energies.reduce((a,b)=>a+b,0)/15,energies,bars:energies.map(v=>Math.tanh(v*12)),durationMs:1000+frame*50};for(const fn of this.meters)fn(meter);},50);},250);return this.snapshot();
  }

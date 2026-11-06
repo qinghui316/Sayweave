@@ -1,9 +1,14 @@
-use super::{Snapshot, SpeechService, audio::Device};
+use super::{
+    Snapshot, SpeechService,
+    audio::Device,
+    microphone::{TestControl, TestEvent, TestInput},
+};
 use crate::{
     data::{DataWorker, Operation},
     history::{playback::PlaybackState, types::*},
 };
-use tauri::{Manager, State, WebviewWindow};
+use tauri::{Manager, State, WebviewWindow, ipc::Channel};
+use tauri_plugin_opener::OpenerExt;
 fn speech_caller(window: &WebviewWindow) -> Result<(), Error> {
     if ["main", "voice-overlay"].contains(&window.label()) {
         Ok(())
@@ -32,6 +37,51 @@ pub async fn speech_devices(
     tokio::task::spawn_blocking(super::audio::devices)
         .await
         .map_err(|_| Error::new("deviceAccess"))?
+}
+#[tauri::command]
+pub async fn speech_microphone_test_start(
+    window: WebviewWindow,
+    service: State<'_, SpeechService>,
+    input: TestInput,
+    events: Channel<TestEvent>,
+) -> Result<(), Error> {
+    main(&window)?;
+    let _operation = service.admit()?;
+    service
+        .microphone_test
+        .start(input, events, || {
+            if service.is_stopping() {
+                return Err(Error::new("stopping"));
+            }
+            if service.is_active() {
+                return Err(Error::new("busy"));
+            }
+            if !window.is_visible().unwrap_or(false) || window.is_minimized().unwrap_or(false) {
+                return Err(Error::new("unavailable"));
+            }
+            Ok(())
+        })
+        .await
+}
+
+#[tauri::command]
+pub async fn speech_microphone_test_control(
+    window: WebviewWindow,
+    service: State<'_, SpeechService>,
+    control: TestControl,
+) -> Result<(), Error> {
+    main(&window)?;
+    service.microphone_test.control(control).await
+}
+
+#[tauri::command]
+pub fn speech_open_microphone_settings(window: WebviewWindow) -> Result<(), Error> {
+    main(&window)?;
+    window
+        .app_handle()
+        .opener()
+        .open_url("ms-settings:privacy-microphone", None::<&str>)
+        .map_err(|_| Error::new("unavailable"))
 }
 #[tauri::command]
 pub async fn speech_start(app: tauri::AppHandle, window: WebviewWindow) -> Result<Snapshot, Error> {

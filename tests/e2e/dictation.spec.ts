@@ -53,7 +53,7 @@ test('device and shortcut controls fit both window sizes with shared styles and 
  for(const [width,height] of [[1120,760],[960,640]] as const){
   await page.setViewportSize({width,height});
   const device=dialog.getByRole('combobox',{name:'录音设备'});
-  await expect(device).toBeVisible();await device.click();await expect(page.getByRole('option',{name:'系统默认麦克风',exact:true})).toBeFocused();await page.keyboard.press('Escape');await expect(page.getByRole('listbox')).toHaveCount(0);await expect(dialog).toBeVisible();
+  await expect(device).toBeVisible();await device.click();await expect(page.getByRole('option',{name:/^系统默认 · 模拟麦克风/})).toBeFocused();await page.keyboard.press('Escape');await expect(page.getByRole('listbox')).toHaveCount(0);await expect(dialog).toBeVisible();
   const keyField=dialog.getByRole('button',{name:'更改快捷键'});await keyField.focus();await page.keyboard.press('Enter');
   await expect(keyField).toHaveAttribute('aria-pressed','true');await expect(keyField).toHaveText('按下快捷键…');
   await expect(dialog.getByRole('button',{name:'取消录入'})).toBeVisible();await expect(dialog.getByRole('button',{name:'保存快捷键'})).toHaveCount(0);

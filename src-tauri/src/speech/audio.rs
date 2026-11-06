@@ -7,7 +7,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -85,21 +85,38 @@ pub fn devices() -> Result<Vec<Device>, Error> {
         .default_input_device()
         .and_then(|d| d.id().ok())
         .map(|i| i.to_string());
-    host.input_devices()
+    Ok(host
+        .input_devices()
         .map_err(|_| Error::new("deviceAccess"))?
-        .map(|d| {
-            let id = d.id().map_err(|_| Error::new("deviceAccess"))?.to_string();
-            Ok(Device {
+        .filter_map(|d| {
+            let id = d.id().ok()?.to_string();
+            Some(Device {
                 is_default: Some(&id) == default.as_ref(),
                 id,
-                name: d
-                    .description()
-                    .map_err(|_| Error::new("deviceAccess"))?
-                    .name()
-                    .into(),
+                name: device_name(&d),
             })
         })
-        .collect()
+        .collect())
+}
+
+pub(super) fn device_name(device: &cpal::Device) -> String {
+    device.description().map_or_else(
+        |_| "录音设备".into(),
+        |description| description.name().into(),
+    )
+}
+
+pub(super) fn resolve_input(id: Option<&str>) -> Result<cpal::Device, Error> {
+    let host = cpal::default_host();
+    let device = match id {
+        Some(id) => host.device_by_id(&id.parse().map_err(|_| Error::new("deviceMissing"))?),
+        None => host.default_input_device(),
+    };
+    device.ok_or_else(|| Error::new("deviceMissing"))
+}
+
+fn input_gain(db: i32) -> f32 {
+    10_f32.powf(db as f32 / 20.0)
 }
 pub struct Converter {
     resampler: Fft<f32>,
@@ -442,7 +459,8 @@ impl Capture {
         signal: watch::Receiver<u8>,
         route: Option<Arc<super::continuous::AudioRoute>>,
     ) -> Result<Self, Error> {
-        let mut capture = Self::prepare(device_id, 0, file, signal, route)?;
+        let mut capture =
+            Self::prepare(resolve_input(device_id.as_deref())?, 0, file, signal, route)?;
         capture.wait_ready().await?;
         Ok(capture)
     }
@@ -452,15 +470,41 @@ impl Capture {
             .map_err(|_| Error::new("deviceAccess"))?
     }
     pub fn prepare(
-        device_id: Option<String>,
+        device: cpal::Device,
         input_gain_db: i32,
         file: Option<(AudioFiles, String)>,
         signal: watch::Receiver<u8>,
         route: Option<Arc<super::continuous::AudioRoute>>,
     ) -> Result<Self, Error> {
+        Self::prepare_input(move || Ok(device), input_gain_db, file, signal, route, None)
+    }
+
+    pub(super) fn preview(
+        device_id: Option<String>,
+        gain: Arc<AtomicI32>,
+        signal: watch::Receiver<u8>,
+    ) -> Result<Self, Error> {
+        Self::prepare_input(
+            move || resolve_input(device_id.as_deref()),
+            gain.load(Ordering::Acquire),
+            None,
+            signal,
+            None,
+            Some(gain),
+        )
+    }
+
+    fn prepare_input(
+        open_device: impl FnOnce() -> Result<cpal::Device, Error> + Send + 'static,
+        input_gain_db: i32,
+        file: Option<(AudioFiles, String)>,
+        signal: watch::Receiver<u8>,
+        route: Option<Arc<super::continuous::AudioRoute>>,
+        preview_gain: Option<Arc<AtomicI32>>,
+    ) -> Result<Self, Error> {
         let stop = Arc::new(AtomicBool::new(false));
         let stopper = stop.clone();
-        let gain = 10_f32.powf(input_gain_db as f32 / 20.0);
+        let gain = input_gain(input_gain_db);
         let (sender, packets) = mpsc::channel(100);
         let (done_tx, done) = oneshot::channel();
         let (ready_tx, ready) = oneshot::channel();
@@ -480,15 +524,8 @@ impl Capture {
                 let mut ready_tx = Some(ready_tx);
                 let mut archived = None;
                 let result = (|| -> Result<CaptureResult, Error> {
-                    let host = cpal::default_host();
-                    let device = match device_id {
-                        Some(id) => host
-                            .device_by_id(&id.parse().map_err(|_| Error::new("deviceMissing"))?)
-                            .ok_or(Error::new("deviceMissing"))?,
-                        None => host
-                            .default_input_device()
-                            .ok_or(Error::new("deviceMissing"))?,
-                    };
+                    if stopper.load(Ordering::Acquire) {return Err(Error::new("cancelled"));}
+                    let device = open_device()?;
                     let supported = device
                         .default_input_config()
                         .map_err(|_| Error::new("deviceAccess"))?;
@@ -560,7 +597,9 @@ impl Capture {
                         stopper.store(true, Ordering::Release);
                     }
                     let began = Instant::now();
-                    let mut pcm = Vec::with_capacity(16000 * 10);
+                    let preview = preview_gain.is_some();
+                    let mut pcm = Vec::with_capacity(if preview {0} else {16000 * 10});
+                    let mut applied_gain_db = input_gain_db;
                     let mut peak = 0;
                     let mut error = None;
                     let mut meter_window=MeterWindow::default();
@@ -568,8 +607,11 @@ impl Capture {
                         if chunk.is_empty() {
                             return;
                         }
-                        if let Some(w) = &writer { w.push(&chunk); }
                         meter_window.push(&chunk, |sample| { meter_tx.send_replace(sample); });
+                        if preview {
+                            return;
+                        }
+                        if let Some(w) = &writer { w.push(&chunk); }
                         pcm.extend_from_slice(&chunk);
                         if route.is_none() && sender
                             .try_send(Packet {
@@ -596,6 +638,13 @@ impl Capture {
                         }
                         captured_frames += input.len() as u64;
                         let local: Vec<_> = input.iter().map(|s: &CapturedSample|s.value).collect();
+                        if let Some(gain) = &preview_gain {
+                            let db = gain.load(Ordering::Acquire);
+                            if db != applied_gain_db {
+                                converter.gain = input_gain(db);
+                                applied_gain_db = db;
+                            }
+                        }
                         accept(converter.push(&local)?);
                         if let Some(route) = &route {
                             for (turn,pcm) in turn_converter.push(&input,route)? { transmit(turn,pcm,captured_frames*1000/rate as u64); }
@@ -629,7 +678,11 @@ impl Capture {
                         log::info!(target:"sayweave", "operation=capture_callback result=failed category={}", failure.fatal.load(Ordering::Acquire));
                         #[cfg(test)]
                         eprintln!("CAPTURE_CALLBACK category={}", failure.fatal.load(Ordering::Acquire));
-                        error = Some("deviceAccess".into());
+                        error = Some(if preview && matches!(failure.fatal.load(Ordering::Acquire), 1 | 2) {
+                            "deviceMissing"
+                        } else {
+                            "deviceAccess"
+                        }.into());
                     }
                     let xruns = failure.xruns.load(Ordering::Acquire);
                     if xruns > 0 {
@@ -761,7 +814,9 @@ mod tests {
     }
     #[test]
     fn input_gain_scales_pcm_once_including_the_resampler_tail() {
-        let input: Vec<_> = (0..4321).map(|i| 0.08 * (i as f32 * 0.072).sin()).collect();
+        let input: Vec<_> = (0..4321)
+            .map(|i| 0.003 * (i as f32 * 0.072).sin())
+            .collect();
         let convert = |gain| {
             let mut converter = Converter::new(44100, gain).unwrap();
             let mut pcm = Vec::new();
@@ -773,9 +828,9 @@ mod tests {
         };
         let baseline = convert(1.0);
         assert_eq!(baseline.len(), input.len() * 16000 / 44100);
-        assert!(baseline.iter().any(|value| value.abs() > 2000));
+        assert!(baseline.iter().any(|value| value.abs() > 80));
         for db in [-6, -3, 0, 3, 6, 9, 12] {
-            let gain = 10_f32.powf(db as f32 / 20.0);
+            let gain = input_gain(db);
             let actual = convert(gain);
             assert_eq!(actual.len(), baseline.len());
             if db == 0 {
@@ -788,6 +843,50 @@ mod tests {
                 }
             }
         }
+        let level = |pcm: &[i16]| {
+            let mut peak = 0.0_f32;
+            MeterWindow::default().push(pcm, |reading| peak = peak.max(reading.level));
+            peak
+        };
+        let max_gain = input_gain(12);
+        let normal_level = level(&baseline);
+        let max_level = level(&convert(max_gain));
+        assert!(normal_level > 0.0);
+        assert!((max_level / normal_level - max_gain).abs() < 0.03);
+    }
+
+    #[tokio::test]
+    #[ignore = "Explicit real microphone preview check; emits only numeric levels"]
+    async fn real_microphone_preview_acceptance() {
+        let (_stop, signal) = watch::channel(0);
+        let gain = Arc::new(AtomicI32::new(0));
+        let mut capture = Capture::preview(None, gain.clone(), signal).unwrap();
+        capture.wait_ready().await.unwrap();
+        for db in [0, 12] {
+            gain.store(db, Ordering::Release);
+            let baseline = capture.meter.borrow_and_update().capture_sequence;
+            let level = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    capture.meter.changed().await.unwrap();
+                    let sample = *capture.meter.borrow_and_update();
+                    if sample.capture_sequence >= baseline + 16 {
+                        break sample.level;
+                    }
+                }
+            })
+            .await
+            .expect("the selected input must deliver samples");
+            assert!(level.is_finite() && (0.0..=1.0).contains(&level));
+            assert!(matches!(
+                capture.packets.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            eprintln!("MICROPHONE_PREVIEW gain_db={db} level={level:.6}");
+        }
+        capture.stop();
+        let result = (&mut capture.done).await.unwrap();
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(result.pcm.is_empty() && result.archived.is_none() && result.bytes == 0);
     }
 
     #[test]

@@ -5,7 +5,7 @@ import {render,renderHook,screen,act} from '@testing-library/react';
 import {DeviceSettings} from '../src/features/settings/DeviceSettings';
 import {audioLabel} from '../src/features/history/HistoryRow';
 import {useHistoryPlayback} from '../src/features/history/usePlayback';
-import {initialSpeech,parseSpeech,speechError,type SpeechPort,type RecordingPreferences} from '../src/contracts/speech';
+import {initialSpeech,parseSpeech,speechError,type MicrophoneTestEvent,type SpeechPort,type RecordingPreferences} from '../src/contracts/speech';
 import type {HistoryPort,HistoryRecord,PlaybackState} from '../src/contracts/history';
 import {speechMessages} from '../src/locales/speech';
 // jsdom has no layout; native menus and scrolling are covered by browser/desktop checks.
@@ -35,6 +35,32 @@ it('a late device refresh cannot overwrite a committed selection',async()=>{
  await act(async()=>{save.resolve({...old,deviceId:'mic',revision:2});});expect(select).toHaveTextContent('Mic');
  await act(async()=>{refresh.resolve(old);});expect(select).toHaveTextContent('Mic');
  expect(port.savePreferences).toHaveBeenCalledWith({...old,deviceId:'mic'});
+});
+it('discards old microphone readings on device switch and stops on recording handoff',async()=>{
+ const callbacks:((event:MicrophoneTestEvent)=>void)[]=[];
+ const prefs:RecordingPreferences={deviceId:null,inputGainDb:0,historyEnabled:true,audioEnabled:true,interactionSoundsEnabled:true,retentionDays:30,revision:1};
+ const port={
+  mode:'native',devices:vi.fn().mockResolvedValue([{id:'headset',name:'Headset',isDefault:true}]),
+  preferences:vi.fn().mockResolvedValue(prefs),
+  savePreferences:vi.fn(async(value:RecordingPreferences)=>({...value,revision:value.revision+1})),
+  startMicrophoneTest:vi.fn(async(_input,onEvent:(event:MicrophoneTestEvent)=>void)=>{callbacks.push(onEvent);}),
+  controlMicrophoneTest:vi.fn().mockResolvedValue(undefined)
+ } as unknown as SpeechPort;
+ const user=userEvent.setup(),settings=recordingSettings(port);
+ const {rerender}=render(<DeviceSettings port={port} settings={settings}/>);
+ await user.click(await screen.findByRole('button',{name:'测试麦克风'}));
+ expect(callbacks).toHaveLength(1);
+ const meter=screen.getByRole<HTMLMeterElement>('meter');
+ act(()=>callbacks[0]!({kind:'level',level:.2}));expect(meter.value).toBeGreaterThan(0);
+ screen.getByRole('combobox').focus();
+ await user.keyboard('[ArrowDown][End][Enter]');
+ expect(callbacks).toHaveLength(2);
+ expect(meter.value).toBe(0);
+ act(()=>callbacks[0]!({kind:'level',level:1}));expect(meter.value).toBe(0);
+ act(()=>callbacks[1]!({kind:'level',level:.1}));expect(meter.value).toBeGreaterThan(0);
+ rerender(<DeviceSettings port={port} settings={settings} microphoneTestAvailable={false}/>);
+ expect(screen.getByRole('button',{name:'测试麦克风'})).toBeDisabled();
+ expect(port.controlMicrophoneTest).toHaveBeenCalledWith({action:'stop',id:vi.mocked(port.startMicrophoneTest).mock.calls[1]![0].id});
 });
 it('late playback polling cannot overwrite a newer play action',async()=>{
  vi.useFakeTimers();try{

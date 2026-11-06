@@ -1,11 +1,18 @@
-import {invoke,isTauri} from '@tauri-apps/api/core';
+import {Channel,invoke,isTauri} from '@tauri-apps/api/core';
 import {listen} from '@tauri-apps/api/event';
 import {speechError,parseSpeechArchive,type SpeechArchive,parseSpeech,parseMeter,parseDevices,parsePreferences,type SpeechPort,type SpeechSnapshot,type SpeechMeter,type RecordingPreferences} from '../contracts/speech';
 import {parseDeliveryReports,parseFeed,parseHistory,parseRecord,parseUsage,parsePlayback,type HistoryPort,type HistoryCursor} from '../contracts/history';
 import {BrowserSpeech,BrowserHistory} from './speech-browser';
+import {parseMicrophoneTestEvent,type MicrophoneTestControl,type MicrophoneTestEvent,type MicrophoneTestInput} from '../contracts/speech';
 async function call(command:string,args:Record<string,unknown>={}){try{return await invoke<unknown>(command,args);}catch(e){throw speechError(e);}}
 class TauriSpeech implements SpeechPort {
  readonly mode='native' as const;
+ private microphoneCommands=Promise.resolve();
+ private microphoneCommand(command:()=>Promise<void>){
+  const next=this.microphoneCommands.then(command);
+  this.microphoneCommands=next.catch(()=>{});
+  return next;
+ }
  async snapshot(){return parseSpeech(await call('speech_snapshot'));}
  async subscribe(s:(v:SpeechSnapshot)=>void,m:(v:SpeechMeter)=>void,archived?:(v:SpeechArchive)=>void){
   const a=await listen<unknown>('speech:snapshot',e=>s(parseSpeech(e.payload)));
@@ -13,6 +20,20 @@ class TauriSpeech implements SpeechPort {
   try{releases.push(await listen<unknown>('speech:meter',e=>m(parseMeter(e.payload))));releases.push(await listen<unknown>('speech:archived',e=>archived?.(parseSpeechArchive(e.payload))));return()=>releases.forEach(release=>release());}catch(e){releases.forEach(release=>release());throw e;}
  }
  async devices(){return parseDevices(await call('speech_devices'));}
+ startMicrophoneTest(input:MicrophoneTestInput,onEvent:(event:MicrophoneTestEvent)=>void){
+  return this.microphoneCommand(async()=>{
+   const events=new Channel<unknown>(value=>{
+    let event:MicrophoneTestEvent;
+    try{event=parseMicrophoneTestEvent(value);}catch{event={kind:'stopped',error:'protocol'};}
+    onEvent(event);
+   });
+   await call('speech_microphone_test_start',{input,events});
+  });
+ }
+ controlMicrophoneTest(control:MicrophoneTestControl){
+  return this.microphoneCommand(async()=>{await call('speech_microphone_test_control',{control});});
+ }
+ async openMicrophoneSettings(){await call('speech_open_microphone_settings');}
  async preferences(){return parsePreferences(await call('speech_preferences',{preferences:null}));}
  async savePreferences(preferences:RecordingPreferences){return parsePreferences(await call('speech_preferences',{preferences}));}
  async retryCurrent(taskId:string){return parseSpeech(await call('speech_retry_current',{taskId}));}
