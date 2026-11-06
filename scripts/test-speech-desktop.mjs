@@ -1073,9 +1073,12 @@ async function run(){try{
   await page.screenshot({path:path.join(directory,'microphone-test-native.png')});
   expect(report.connections).toHaveLength(0);
   expect((await invoke(page,'history_browse',{query:{search:'',cursor:null}})).total).toBe(0);
+  await invoke(page,'runtime_window',{surface:'main',action:'minimize'});
+  await expect(settings.getByRole('button',{name:'测试麦克风',exact:true})).toBeEnabled();
+  await invoke(page,'runtime_window',{surface:'main',action:'show'});
   await settings.getByRole('button',{name:'关闭',exact:true}).click();
   await expect(settings).toHaveCount(0);
-  report.checks.push('Live native microphone test worked before model setup, without a recognition connection or history record');
+  report.checks.push('Live native microphone test worked before model setup, without a recognition connection or history record, and stopped when Windows minimized the window');
  }
  await expect(page.getByRole('link',{name:'组件展示'})).toHaveCount(0);await page.getByRole('button',{name:'配置模型',exact:true}).click();const dialog=page.getByRole('dialog');await delay(250);await page.screenshot({path:path.join(directory,'settings-speech-native.png')});await dialog.getByRole('button',{name:'更多设置'}).click();await dialog.getByLabel('名称',{exact:true}).fill('隔离语音验收');await dialog.getByLabel('服务地址（URL）',{exact:true}).fill(base);await dialog.getByLabel('API 密钥',{exact:true}).fill(key);await dialog.getByRole('button',{name:'保存',exact:true}).click();await expect(dialog.getByText('已保存。')).toBeVisible();await dialog.getByRole('button',{name:'关闭',exact:true}).click();await expect(dialog).toHaveCount(0);
  if(polishOnly){await polishScenario(page,base);await stop(page);if(polishCase==='no-history'){page=await start(2);expect((await invoke(page,'history_browse',{query:{search:'',cursor:null}})).total).toBe(0);await stop(page);report.checks.push('restart after history-disabled cancellation recovers without a stale cancellation intent');}report.passed=true;return;}

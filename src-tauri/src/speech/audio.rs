@@ -108,11 +108,21 @@ pub(super) fn device_name(device: &cpal::Device) -> String {
 
 pub(super) fn resolve_input(id: Option<&str>) -> Result<cpal::Device, Error> {
     let host = cpal::default_host();
-    let device = match id {
-        Some(id) => host.device_by_id(&id.parse().map_err(|_| Error::new("deviceMissing"))?),
-        None => host.default_input_device(),
-    };
-    device.ok_or_else(|| Error::new("deviceMissing"))
+    let find_input =
+        |id: &cpal::DeviceId| host.device_by_id(id).filter(DeviceTrait::supports_input);
+    if let Some(id) = id {
+        let id = id.parse().map_err(|_| Error::new("deviceMissing"))?;
+        return find_input(&id).ok_or_else(|| Error::new("deviceMissing"));
+    }
+    let default = host
+        .default_input_device()
+        .ok_or_else(|| Error::new("deviceMissing"))?;
+    // Keep the resolved endpoint for this stream if Windows changes its default.
+    Ok(default
+        .id()
+        .ok()
+        .and_then(|id| find_input(&id))
+        .unwrap_or(default))
 }
 
 fn input_gain(db: i32) -> f32 {
@@ -858,6 +868,19 @@ mod tests {
     #[tokio::test]
     #[ignore = "Explicit real microphone preview check; emits only numeric levels"]
     async fn real_microphone_preview_acceptance() {
+        #[cfg(windows)]
+        {
+            let host = cpal::default_host();
+            let default = host.default_input_device().unwrap();
+            let resolved = resolve_input(None).unwrap();
+            assert!(resolved != default);
+            assert_eq!(resolved.id().unwrap(), default.id().unwrap());
+            if let Some(output_id) = host.default_output_device().and_then(|d| d.id().ok()) {
+                assert!(
+                    matches!(resolve_input(Some(&output_id.to_string())), Err(error) if error.code == "deviceMissing")
+                );
+            }
+        }
         let (_stop, signal) = watch::channel(0);
         let gain = Arc::new(AtomicI32::new(0));
         let mut capture = Capture::preview(None, gain.clone(), signal).unwrap();

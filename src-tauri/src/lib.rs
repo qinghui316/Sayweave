@@ -396,6 +396,15 @@ fn overlay_visibility(window: &WebviewWindow, visible: bool) -> tauri::Result<()
         .and_then(|s| s.task_id);
     voice_window::visibility(window, visible, task)
 }
+fn stop_main_microphone_test(app: &tauri::AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        app.state::<speech::SpeechService>()
+            .stop_microphone_test()
+            .await;
+    });
+}
+
 fn window_action_internal(
     app: &tauri::AppHandle,
     surface: &str,
@@ -431,13 +440,8 @@ fn window_action_internal(
         _ => return Err(RuntimeError::new("invalidAction")),
     };
     result.map_err(|_| RuntimeError::new("unavailable"))?;
-    if surface == "main" && matches!(action, "hide" | "minimize") {
-        let app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            app.state::<speech::SpeechService>()
-                .stop_microphone_test()
-                .await;
-        });
+    if surface == "main" && action == "hide" {
+        stop_main_microphone_test(app);
     }
     let snapshot = {
         let runtime = app.state::<Runtime>();
@@ -1003,6 +1007,12 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() == "main"
+                && matches!(event, tauri::WindowEvent::Resized(_))
+                && window.is_minimized().unwrap_or(false)
+            {
+                stop_main_microphone_test(window.app_handle());
+            }
             if window.label() == "voice-overlay"
                 && matches!(event, tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_) | tauri::WindowEvent::ScaleFactorChanged { .. })
                 && let Some(overlay) = window.app_handle().get_webview_window("voice-overlay")
