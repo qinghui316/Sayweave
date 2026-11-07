@@ -149,6 +149,7 @@ async function translationScenario(page,base){
  const configuration=await invoke(page,'translation_settings');
  expect(configuration.settings.targets).toEqual(['en-US','ja','ko','fr','zh-Hans']);
  const editor=await ownedEditor(),overlay=await overlayPage();
+ let gestureLayout;
  // Native focus loss is part of recording ownership; Playwright enables
  // synthetic always-focused pages by default, masking actual window blur.
  const captureCdp=await page.context().newCDPSession(page);
@@ -156,11 +157,19 @@ async function translationScenario(page,base){
  try {
  await invoke(page,'shortcut_save',{config:{...(await invoke(page,'shortcut_status')).saved,translationBinding:'F8'}});
  await invoke(page,'runtime_window',{surface:'main',action:'show'});
- await editor.command({action:'focus-process',process:app.pid});
+ const focusMain=async()=>{
+  const focus=await editor.command({action:'focus-process',process:app.pid});
+  expect(focus.foregroundProcess).toBe(app.pid);
+  await expect.poll(()=>page.evaluate(()=>document.hasFocus())).toBe(true);
+  return focus.foregroundKeyboardLayout;
+ };
+ await focusMain();
  await page.getByRole('button',{name:'设置',exact:true}).click();
+ gestureLayout=await focusMain();
+ expect(gestureLayout).toBeGreaterThan(0);
  await page.getByRole('button',{name:'更改翻译快捷键',exact:true}).click();
  await expect.poll(async()=>(await invoke(page,'shortcut_status')).capturing).toBe(true);
- report.captureProbe={before:await invoke(page,'shortcut_status'),cases:[]};
+ report.captureProbe={before:await invoke(page,'shortcut_status'),keyboardLayout:gestureLayout,cases:[]};
  await page.evaluate(()=>{window.__captureEdges=[];for(const type of ['keydown','keyup'])window.addEventListener(type,e=>window.__captureEdges.push({type,code:e.code,trusted:e.isTrusted}),true);});
  const keyEvent=async(key,down)=>{const value=await editor.command({action:'fixture-key',process:app.pid,...(Array.isArray(key)?{keys:key}:{key}),down});expect(value.keyResult?.accepted).toBe(true);};
  const beginCapture=async(field='translationBinding')=>{
@@ -187,7 +196,7 @@ async function translationScenario(page,base){
   await expect.poll(async()=>(await invoke(page,'shortcut_status')).capturing).toBe(false);
   const after=await invoke(page,'shortcut_status');expect(after.saved).toEqual(before.saved);expect(after.active).toEqual(before.active);
   report.captureProbe.cases.push({label:'cancel '+reason,token,before,after});
-  if(reason==='blur'){await editor.command({action:'focus-process',process:app.pid});await expect.poll(()=>page.evaluate(()=>document.hasFocus())).toBe(true);}
+  if(reason==='blur')await focusMain();
  }
  const stale=await beginCapture();await page.getByRole('button',{name:'取消录入',exact:true}).click();
  await expect.poll(async()=>(await invoke(page,'shortcut_status')).capturing).toBe(false);
@@ -229,6 +238,11 @@ async function translationScenario(page,base){
  });
  report.translation={requests:translationRequests,rounds:[],gestures:[],menuGeometry:[],pointerEvents,supplier:'isolated TLS fixture',microphone:'actual default device',target:'owned native TSF control'};
  const body=async()=>{const value=await editor.command({action:'read'});expect(value.foregroundProcess,'Only the authorized native target may own foreground').toBe(editor.pid);return value.text;};
+ const focusTarget=async(text,start,end)=>{
+  const focus=await editor.command({action:'focus',text,start,end,keyboardLayout:gestureLayout});
+  expect(focus.foregroundProcess).toBe(editor.pid);
+  expect(focus.keyboardLayout).toBe(gestureLayout);
+ };
  let gestureIndex=0;
  const translateTap=async()=>{
   const order=['AltRight','ShiftRight'];
@@ -254,7 +268,7 @@ async function translationScenario(page,base){
   for(const name of ['success','same-batch','failure','cancel','target-change','hold']){
    mode='translation-'+name;
    if(name==='hold')await invoke(page,'shortcut_save',{config:{...(await invoke(page,'shortcut_status')).saved,translationBinding:'F8',mode:'hold'}});
-   await editor.command({action:'focus',text:'前后',start:1,end:1});
+   await focusTarget('前后',1,1);
    const beforeRequests=translationRequests.length;
    if(name==='hold'){const down=await editor.command({action:'fixture-key',process:editor.pid,key:'F8',down:true});expect(down.keyResult?.accepted).toBe(true);}else await translateTap();
    await waitPhase(page,'recording');
@@ -316,7 +330,7 @@ async function translationScenario(page,base){
   expect(report.translationLearningRequests??[]).toHaveLength(0);
   await invoke(page,'shortcut_save',{config:{...(await invoke(page,'shortcut_status')).saved,translationBinding:'AltRight+ShiftRight',mode:'toggle'}});
   for(let round=0;round<2;round++){
-   mode='normal';const beforeOrdinary=report.ordinaryTranslationRegressionRequests?.length??0;await editor.command({action:'focus',text:'',start:0,end:0});
+   mode='normal';const beforeOrdinary=report.ordinaryTranslationRegressionRequests?.length??0;await focusTarget('',0,0);
    const result=await externalRound(page,async()=>{await expect.poll(body,{timeout:8000}).toBe('正在识别');},undefined,false,async()=>{
     for(const down of [true,false]){const event=await editor.command({action:'fixture-key',process:editor.pid,key:'AltRight',down});expect(event.keyResult?.accepted).toBe(true);}
     return waitPhase(page,'recording');
@@ -674,19 +688,20 @@ async function homeTrialIsolation(page){
   const trial=await waitPhase(page,'recording');expect(trial.source).toBe('trial');
   await expect(practice).toContainText('正在识别');
   await page.getByRole('button',{name:'结束录音',exact:true}).click();
-  const done=await waitPhase(page,'completed');expect(done.source).toBe('trial');expect(done.recordId).toBeTruthy();
+  const done=await waitFinishedPhase(page,'completed');expect(done.source).toBe('trial');expect(done.recordId).toBeTruthy();
   await expect.poll(async()=>(await invoke(page,'history_detail',{id:done.recordId})).audio?.status).toBe('ready');
-  const retained=await practice.textContent();
-  await page.getByRole('group',{name:'识别完成',exact:true}).getByRole('button',{name:'开始录音',exact:true}).click();
+  const retained=done.text;
+  await expect(practice).toHaveText(retained);
+  await page.getByRole('button',{name:'开始录音',exact:true}).click();
   const restarted=await waitPhase(page,'recording');expect(restarted.source).toBe('trial');expect(restarted.taskId).not.toBe(done.taskId);
   await page.getByRole('button',{name:'结束录音',exact:true}).click();
-  const restartedDone=await waitPhase(page,'completed');
+  const restartedDone=await waitFinishedPhase(page,'completed');
   const model=(await readModels(page)).configs[0];
   const retried=await invoke(page,'speech_retry_current',{taskId:restartedDone.taskId});expect(retried.source).toBe('trial');
-  await waitPhase(page,'completed');await waitPhase(page,'idle');
+  await waitFinishedPhase(page,'completed');await waitPhase(page,'idle');
   await external(retained);
   mode='failure';await invoke(page,'history_retry',{id:done.recordId,configId:model.id,configRevision:model.revision});
-  const failed=await waitPhase(page,'failed');expect(failed.source).toBe('history');
+  const failed=await waitFinishedPhase(page,'failed');expect(failed.source).toBe('history');
   await expect(practice).toHaveText(retained);await expect(page.getByRole('alert')).toHaveCount(0);
   await expect(page.getByRole('button',{name:'重新识别',exact:true})).toHaveCount(0);
   await page.getByRole('link',{name:'历史记录',exact:true}).click();

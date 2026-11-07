@@ -1662,6 +1662,23 @@ fn main() {
                     // Only this owned test fixture may establish focus; product delivery never does so.
                     focus_window(top);
                     let _ = SetFocus(Some(editor));
+                    if let Some(layout) = value["keyboardLayout"].as_u64()
+                        && std::env::var("SAYWEAVE_INPUT_ACCEPTANCE").as_deref() == Ok("1")
+                        && GetForegroundWindow() == top
+                        && GetKeyboardLayout(0).0 as u64 != layout
+                    {
+                        let mut loaded =
+                            vec![HKL::default(); GetKeyboardLayoutList(None).max(0) as usize];
+                        let count = GetKeyboardLayoutList(Some(&mut loaded)).max(0) as usize;
+                        if loaded.iter().take(count).any(|hkl| hkl.0 as u64 == layout) {
+                            message(
+                                top,
+                                WM_INPUTLANGCHANGEREQUEST,
+                                WPARAM(0),
+                                LPARAM(layout as isize),
+                            );
+                        }
+                    }
                 }
                 if value["action"] == "focus-sibling" && GetForegroundWindow() == top {
                     if sibling.0.is_null() {
@@ -1767,7 +1784,10 @@ fn main() {
                     }
                 }
                 let mut foreground_process = 0;
-                GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut foreground_process));
+                let foreground_thread =
+                    GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut foreground_process));
+                let foreground_layout = (foreground_thread != 0)
+                    .then(|| GetKeyboardLayout(foreground_thread).0 as usize);
                 let mut foreground_client = RECT::default();
                 let _ = GetClientRect(GetForegroundWindow(), &mut foreground_client);
                 let mut buf = [0u16; 4096];
@@ -1821,7 +1841,7 @@ fn main() {
                 };
                 println!(
                     "{}",
-                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"foregroundWindow":GetForegroundWindow().0 as usize,"modifiersDown":modifiers_down,"keyboardLayout":GetKeyboardLayout(0).0 as usize,"ime":ime,"shiftUpSequence":shift_up_sequence,"menuActive":gui_read && gui.flags.0 & GUI_INMENUMODE.0 != 0,"foregroundClient":[foreground_client.right,foreground_client.bottom],"nativeFocus":GetFocus().0 as usize,"sibling":sibling_value,"desktopWindow":GetShellWindow().0 as usize,"clipboardSequence":windows::Win32::System::DataExchange::GetClipboardSequenceNumber(),"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window,"overlayRect":overlay_rect,"controlledEdit":controlled_edit,"controlledEditSteps":controlled_edit_steps,"auxiliary":auxiliary_result,"keyResult":key_result})
+                    serde_json::json!({"foreground":GetForegroundWindow()==top,"foregroundProcess":foreground_process,"foregroundWindow":GetForegroundWindow().0 as usize,"foregroundKeyboardLayout":foreground_layout,"modifiersDown":modifiers_down,"keyboardLayout":GetKeyboardLayout(0).0 as usize,"ime":ime,"shiftUpSequence":shift_up_sequence,"menuActive":gui_read && gui.flags.0 & GUI_INMENUMODE.0 != 0,"foregroundClient":[foreground_client.right,foreground_client.bottom],"nativeFocus":GetFocus().0 as usize,"sibling":sibling_value,"desktopWindow":GetShellWindow().0 as usize,"clipboardSequence":windows::Win32::System::DataExchange::GetClipboardSequenceNumber(),"text":String::from_utf16_lossy(&buf[..len]),"start":selection&65535,"end":(selection>>16)&65535,"clicked":clicked,"clickCheck":click_check,"overlayWindow":overlay_window,"overlayRect":overlay_rect,"controlledEdit":controlled_edit,"controlledEditSteps":controlled_edit_steps,"auxiliary":auxiliary_result,"keyResult":key_result})
                 );
                 io::stdout().flush().unwrap();
                 let _ = ok.send(());

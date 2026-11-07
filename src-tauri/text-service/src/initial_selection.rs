@@ -262,19 +262,25 @@ unsafe fn field_identity(
             // Prove that the provider's focused selection is editable. A
             // document-wide attribute query traverses unrelated paragraphs.
             let text: ITextProvider = raw.GetPatternProvider(UIA_TextPatternId)?.cast()?;
-            let selection = selected(&text)?;
             let document = text.DocumentRange()?;
-            if selection.CompareEndpoints(
-                TextPatternRangeEndpoint_Start,
-                &document,
-                TextPatternRangeEndpoint_Start,
-            )? < 0
-                || selection.CompareEndpoints(
-                    TextPatternRangeEndpoint_End,
+            let selection_writable = (|| -> Result<bool> {
+                let selection = selected(&text)?;
+                Ok(selection.CompareEndpoints(
+                    TextPatternRangeEndpoint_Start,
                     &document,
-                    TextPatternRangeEndpoint_End,
-                )? > 0
-                || identity_bool(&selection.GetAttributeValue(UIA_IsReadOnlyAttributeId)?)?
+                    TextPatternRangeEndpoint_Start,
+                )? >= 0
+                    && selection.CompareEndpoints(
+                        TextPatternRangeEndpoint_End,
+                        &document,
+                        TextPatternRangeEndpoint_End,
+                    )? <= 0
+                    && !identity_bool(&selection.GetAttributeValue(UIA_IsReadOnlyAttributeId)?)?)
+            })();
+            // During composition some providers update the selection before
+            // the document range. Keep the field-wide proof in that case.
+            if !matches!(selection_writable, Ok(true))
+                && identity_bool(&document.GetAttributeValue(UIA_IsReadOnlyAttributeId)?)?
             {
                 return Err(E_ACCESSDENIED.into());
             }
