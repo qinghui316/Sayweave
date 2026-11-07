@@ -24,6 +24,7 @@ const report={id,passed:false,checks:[],connections:[],handshakes:[],polishReque
 report.controllerSha256=createHash('sha256').update(readFileSync(fileURLToPath(import.meta.url))).digest('hex');
 let app,browser,server,mode='normal',expectedProtocol='qwen',expectedModel='qwen-audio-3.1-asr-flash-streaming';const sockets=new Set(),polishReleases=new Map(),polishChannels=[],copyReleases=new Map();
 const restartChannels=[],readinessChannels=[],translationRequests=[],translationReleases=new Map();
+const heldEditChannels=[];
 async function command(args,extraEnv={}){
  const fixtures={model_desktop_fixture:'models::tests::model_desktop_fixture',model_desktop_cleanup:'models::tests::model_desktop_cleanup',history_desktop_fixture:'history::tests::history_desktop_fixture'};
  const fixture=args[0]==='test'?args.find(value=>Object.hasOwn(fixtures,value)):null;
@@ -51,11 +52,23 @@ function websocket(req,socket,head){
  if(connection.mode.startsWith('polish-'))polishChannels.push({mode:connection.mode,ordinal:raceOrdinal,sentence,finished:()=>send('task-finished')});
  const binaryPayload=(value,last=false)=>{const bytes=gzipSync(Buffer.from(JSON.stringify(value)));connection.responseSequence=(connection.responseSequence??0)+1;const header=Buffer.alloc(12);header.set([0x11,last?0x93:0x91,0x11,0]);header.writeInt32BE(last?-1:connection.responseSequence,4);header.writeUInt32BE(bytes.length,8);socket.write(frame(Buffer.concat([header,bytes]),2));};
  const binaryResult=(text,end,last=false)=>binaryPayload({code:20000000,result:{text,utterances:text?[{text,definite:end,start_time:0,end_time:Math.round(connection.bytes/32)}]:[]}},last);
+ const heldEditResult=(tail,last=false)=>{
+  const prefix='正在识别';
+  const utterances=[{text:prefix,definite:!!tail,start_time:0,end_time:80}];
+  if(tail)utterances.push({text:tail,definite:last,start_time:80,end_time:160});
+  binaryPayload({code:20000000,result:{text:prefix+tail,utterances}},last);
+ };
+ if(connection.mode==='held-edit')heldEditChannels.push({connection,continueInput:()=>heldEditResult('继续输入')});
  function consume(opcode,payload){
   if(doubao&&opcode===2){
    const kind=payload[1]>>4,flags=payload[1]&15;expect(payload.readUInt32BE(4)).toBe(payload.length-8);const body=gunzipSync(payload.subarray(8));
    if(kind===1){const value=JSON.parse(body.toString());expect(value.audio).toMatchObject({format:'pcm',rate:16000,bits:16,channel:1});expect(value.request).toMatchObject({model_name:'bigmodel',result_type:'full',show_utterances:true});connection.model='Doubao-Seed-ASR-2.0';connection.started=true;binaryResult('',false);return;}
    expect(kind).toBe(2);expect(connection.started).toBe(true);
+   if(connection.mode==='held-edit'){
+    if(flags&2){connection.finished=true;heldEditResult('继续输入完成。',true);}
+    else{connection.frames++;connection.bytes+=body.length;if(connection.frames===1)heldEditResult('');}
+    return;
+   }
    if(flags&2){connection.finished=true;if(connection.mode==='pending')return;if(connection.mode==='empty'||connection.mode==='empty-ack'){binaryResult('',true,true);return;}if(connection.mode==='malformed-terminal'){binaryPayload({code:20000000,result:{text:123}},true);return;}const complete=()=>{const text=connection.mode==='single-a'?'a':connection.mode==='unicode'?'中文，🙂\n第二行 e\u0301。':'原生受控识别完成。';binaryResult(text,true);binaryResult('旧暂定不能覆盖。',false);binaryResult(text,true,true);};if(connection.mode==='delayed-final')setTimeout(complete,650);else complete();return;}
    connection.frames++;connection.bytes+=body.length;if(connection.frames===1)binaryResult('正在',false);if(connection.frames===8)binaryResult('正在识别',false);return;
   }
@@ -1089,19 +1102,52 @@ async function beginMicrophoneTest(page){
  return dialog;
 }
 
+async function historyPagingScenario(page){
+ const samples=[];for(let n=0;n<15;n++){const began=performance.now();const feed=await invoke(page,'history_browse',{query:{search:'中文',cursor:null}});samples.push(performance.now()-began);expect(feed.records).toHaveLength(50);expect(feed.total).toBe(10000);}
+ samples.sort((a,b)=>a-b);report.historyIpc={size:10000,searchP95Ms:Math.round(samples[14]*100)/100};
+ await page.getByRole('link',{name:'历史记录',exact:true}).click();await expect(page.getByText('10000 条',{exact:true})).toBeVisible();const scroll=page.getByLabel('历史记录列表',{exact:true});
+ const paging=page.getByRole('navigation',{name:'历史分页'}),rows=page.getByRole('listitem');
+ const visibleIds=()=>rows.evaluateAll(items=>items.map(row=>row.dataset.recordId));
+ const renderStarted=performance.now(),seen=new Set();
+ for(let number=1;number<=50;number++){
+  if(number>1)await paging.getByRole('button',{name:'下一页',exact:true}).click();
+  await expect(paging).toContainText(`第 ${number} 页 · 10000 条`);
+  await expect(rows).toHaveCount(20);
+  for(const id of await visibleIds()){expect(id).toBeTruthy();expect(seen.has(id)).toBe(false);seen.add(id);}
+ }
+ expect(seen.size).toBe(1000);report.historyBrowse1000Ms=Math.round(performance.now()-renderStarted);
+ const readingIds=await visibleIds();
+ await scroll.evaluate(node=>{node.scrollTop=1200;});await delay(50);const readingTop=await scroll.evaluate(node=>node.scrollTop);expect(readingTop).toBeGreaterThan(0);
+ await page.getByRole('link',{name:'首页',exact:true}).click();await page.getByRole('link',{name:'历史记录',exact:true}).click();
+ await expect(paging).toContainText('第 50 页 · 10000 条');await expect.poll(visibleIds).toEqual(readingIds);await expect.poll(()=>scroll.evaluate(node=>node.scrollTop)).toBe(readingTop);
+ await page.getByRole('button',{name:'刷新历史',exact:true}).click();
+ await expect(paging).toContainText('第 1 页 · 10000 条');
+ await expect(rows.first()).toHaveAttribute('data-record-id',seen.values().next().value);
+ await invoke(page,'acceptance_main_size',{minimum:false});await expect.poll(()=>page.evaluate(()=>({width:innerWidth,height:innerHeight}))).toEqual({width:1120,height:760});
+ const expanded=page.getByRole('region',{name:'历史识别文字'}),longHistoryText='长中文识别文字，支持完整复制与展开。'.repeat(50);
+ await scroll.evaluate(node=>{node.scrollTop=0;});await rows.first().hover();await rows.first().getByRole('button',{name:'展开',exact:true}).click();await expect(expanded).toHaveText(longHistoryText);await page.screenshot({path:path.join(directory,'history-default.png')});
+ report.historyScale=await invoke(page,'acceptance_main_size',{minimum:true});await expect.poll(()=>page.evaluate(()=>({width:innerWidth,height:innerHeight}))).toEqual({width:960,height:640});await expect(expanded).toBeVisible();await expect(expanded).toHaveText(longHistoryText);
+ await page.getByRole('button',{name:'搜索识别文字',exact:true}).click();
+ const search=page.getByRole('textbox',{name:'搜索识别文字'});await search.focus();report.searchGeometry=await search.evaluate(node=>{const css=getComputedStyle(node),box=node.getBoundingClientRect();return {textHeight:node.clientHeight-parseFloat(css.paddingTop)-parseFloat(css.paddingBottom),lineHeight:parseFloat(css.lineHeight),outlineExtent:css.outlineStyle==='none'?0:parseFloat(css.outlineWidth)+parseFloat(css.outlineOffset),left:box.left,right:box.right,containerRight:node.parentElement.getBoundingClientRect().right};});expect(report.searchGeometry.textHeight).toBeGreaterThanOrEqual(report.searchGeometry.lineHeight);expect(report.searchGeometry.outlineExtent).toBeLessThanOrEqual(0);expect(report.searchGeometry.right).toBeLessThanOrEqual(report.searchGeometry.containerRight);await page.screenshot({path:path.join(directory,'history-minimum-search.png')});
+ await page.getByRole('listitem').first().getByRole('button',{name:'更多操作'}).click();await expect(page.getByRole('menu')).toBeVisible();await page.screenshot({path:path.join(directory,'history-minimum-menu.png')});await page.keyboard.press('Escape');await expect(page.getByRole('listitem').first().getByRole('button',{name:'更多操作'})).toBeFocused();
+ await page.getByRole('listitem').first().getByRole('button',{name:'收起记录'}).click();await page.getByRole('button',{name:'历史保存设置',exact:true}).click();await expect(page.getByRole('combobox',{name:'录音保留时间'})).toBeVisible();await page.screenshot({path:path.join(directory,'history-minimum-settings.png')});expect(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth)).toBe(false);await page.getByRole('button',{name:'历史保存设置',exact:true}).first().click();
+ await invoke(page,'acceptance_main_size',{minimum:false});
+ report.checks.push('10k native summaries through IPC; 1000 unique rows across 50 pages; cached page and reading position restored by real routes');
+}
+
 async function run(){try{
  // A reviewed controller retry can retain exact already-built product bytes.
  const retained=process.env.SAYWEAVE_SPEECH_REUSE_PREPARED;
  if(retained){
   const reuseScope=process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE??'all';
-  expect(['learning-restart','tab-startup','readiness','translation','all','home-trial','result-only','rich-text']).toContain(reuseScope);
+  expect(['learning-restart','tab-startup','readiness','translation','all','home-trial','result-only','rich-text','history-paging']).toContain(reuseScope);
   const proof=JSON.parse(readFileSync(retained,'utf8').replace(/^\uFEFF/,''));
-  if(['all','home-trial','result-only','rich-text'].includes(reuseScope))expect(proof.sourceSnapshot,'Full fixture reuse requires frozen source inputs').toBeTruthy();
+  if(['all','home-trial','result-only','rich-text','history-paging'].includes(reuseScope))expect(proof.sourceSnapshot,'Full fixture reuse requires frozen source inputs').toBeTruthy();
   expect(execFileSync('git',['rev-parse','HEAD'],{cwd:root,encoding:'utf8'}).trim()).toBe(proof.source??proof.controllerSource);
   if(proof.sourceSnapshot){
    const entries=proof.sourceSnapshot.files;expect(Array.isArray(entries)&&entries.length>0).toBe(true);
    for(const required of ['src-tauri/src/dictation.rs','src-tauri/src/dictation/presentation.rs','src-tauri/src/speech/mod.rs','src-tauri/src/speech/continuous.rs','src/contracts/dictation.ts','src/app/dictation-feedback.ts','package.json','src-tauri/Cargo.toml'])expect(entries.some(file=>file.path===required)).toBe(true);
-   if(['all','home-trial','result-only','rich-text'].includes(reuseScope))for(const required of ['tests/fixtures/input-target.ts','scripts/storage-policy.mjs','scripts/build-text-service.mjs','vite.config.ts','package-lock.json'])expect(entries.some(file=>file.path===required),required).toBe(true);
+   if(['all','home-trial','result-only','rich-text','history-paging'].includes(reuseScope))for(const required of ['tests/fixtures/input-target.ts','scripts/storage-policy.mjs','scripts/build-text-service.mjs','vite.config.ts','package-lock.json'])expect(entries.some(file=>file.path===required),required).toBe(true);
    // The controller is not compiled into the retained product. Every other
    // frozen input stays exact, including fixtures and product/build sources.
    for(const file of entries)if(file.path!=='scripts/test-speech-desktop.mjs')expect(createHash('sha256').update(readFileSync(path.join(root,file.path))).digest('hex'),file.path).toBe(file.sha256);
@@ -1123,6 +1169,13 @@ async function run(){try{
  }
  report.targetGroup=process.env.SAYWEAVE_INPUT_TARGET_GROUP??'all';
  await command(['test','--manifest-path','src-tauri/Cargo.toml','--lib','model_desktop_fixture','--','--ignored']);server=createServer({cert:readFileSync(path.join(data,'fixture-ca.pem')),key:readFileSync(path.join(data,'fixture-key.pem'))});server.on('upgrade',websocket);server.on('request',(req,res)=>void modelFixture(req,res).catch(error=>{report.modelError=String(error);res.destroy();}));await new Promise(r=>server.listen(0,'127.0.0.1',r));const base='https://localhost:'+server.address().port;
+ if(process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE==='history-paging'){
+  await command(['test','--manifest-path','src-tauri/Cargo.toml','history_desktop_fixture','--','--ignored']);
+  const page=await start(1);
+  report.scope='history-paging';
+  await historyPagingScenario(page);
+  await stop(page);report.passed=true;return;
+ }
  let page=await start(1);
  if(process.env.SAYWEAVE_SPEECH_ACCEPTANCE_SCOPE==='translation'){
   await readModels(page);
@@ -1256,7 +1309,21 @@ async function run(){try{
  report.checks.push('process restart preserves audio/text/vault; cancelled retry keeps success; successful retry adds version without counting again; processing cancel discards new recording');
  mode='failure';await invoke(page,'speech_start');await waitFinishedPhase(page,'failed');const failed=await invoke(page,'speech_snapshot');expect(failed.error).toBe('service');await waitArchived(page,failed.taskId);const failedHistory=await invoke(page,'history_list',{query:{search:'',page:1}});expect(failedHistory.total).toBe(2);expect(failedHistory.records.some(r=>r.status==='failed')).toBe(true);
  // The most recent captured PCM belongs to B, but the displayed failed retry is A.
- await invoke(page,'history_retry',retryArgs);const displayedRetry=await waitFinishedPhase(page,'failed');await waitArchived(page,displayedRetry.taskId);mode='normal';const bound=await invoke(page,'speech_retry_current',{taskId:displayedRetry.taskId});expect(bound.recordId).toBe(record.id);await waitFinishedPhase(page,'completed');expect((await invoke(page,'history_detail',{id:failed.recordId})).attempts).toHaveLength(1);
+ await invoke(page,'history_retry',retryArgs);
+ const displayedRetry=await waitFinishedPhase(page,'failed');await waitArchived(page,displayedRetry.taskId);
+ const beforeBound=await invoke(page,'history_detail',{id:record.id});
+ mode='normal';const bound=await invoke(page,'speech_retry_current',{taskId:displayedRetry.taskId});
+ expect(bound.recordId).toBe(record.id);
+ // The completed projection can already be idle when the next poll runs.
+ // Check the bound task's release and the durable new attempt on its record.
+ await expect.poll(async()=>{
+  const current=await invoke(page,'history_detail',{id:record.id});
+  if(current.currentAttempt===beforeBound.currentAttempt||current.attempts.length!==beforeBound.attempts.length+1)return null;
+  const attempt=current.attempts.find(value=>value.id===current.currentAttempt);
+  return attempt&&{kind:attempt.kind,status:attempt.status,text:attempt.text};
+ },{timeout:beforeBound.durationMs+45000}).toEqual({kind:'retry',status:'success',text:'原生受控识别完成。'});
+ await waitReleased(bound.taskId);
+ expect((await invoke(page,'history_detail',{id:failed.recordId})).attempts).toHaveLength(1);
  for(const scenario of ['auth','empty']){mode=scenario;await invoke(page,'speech_start');if(scenario==='empty'){await waitPhase(page,'recording');await delay(150);const current=await invoke(page,'speech_snapshot');await invoke(page,'speech_control',{taskId:current.taskId,action:'finish'});}await waitFinishedPhase(page,'failed');expect((await invoke(page,'speech_snapshot')).error).toBe(scenario==='auth'?'auth':'emptyText');}
  const preferences=await invoke(page,'speech_preferences',{preferences:null});await invoke(page,'speech_preferences',{preferences:{...preferences,historyEnabled:false,audioEnabled:false}});const before=(await invoke(page,'history_list',{query:{search:'',page:1}})).total;mode='normal';const temporary=await invoke(page,'speech_start');await waitPhase(page,'recording');await delay(150);await invoke(page,'speech_control',{taskId:temporary.taskId,action:'finish'});await waitFinishedPhase(page,'completed');expect((await invoke(page,'speech_snapshot')).canRetry).toBe(true);const temporaryRetry=await invoke(page,'speech_retry_current',{taskId:temporary.taskId});expect(temporaryRetry.recordId).toBeNull();await waitFinishedPhase(page,'completed');expect((await invoke(page,'history_list',{query:{search:'',page:1}})).total).toBe(before);report.checks.push('retry current binds displayed persistent/temporary identity; no-history audio retries only in memory');
  // Change the actual saved record through the model menu and exercise the same native adapter.
@@ -1428,6 +1495,8 @@ async function run(){try{
   const keyEvent=(key,down)=>focusHelper.command({action:'fixture-key',process,key,down});
   try {
    for(const control of ['area','ProseMirror']) {
+    mode='held-edit';
+    const initialChannels=heldEditChannels.length;
     await target.bringToFront();
     if(control==='area'){await target.locator('#area').fill('abc');await target.locator('#area').focus();}
     else await target.evaluate(()=>window.fixtureEditor.set('abc',3,3));
@@ -1435,22 +1504,32 @@ async function run(){try{
     const read=()=>control==='area'?target.locator('#area').inputValue():target.evaluate(()=>window.fixtureEditor.read());
     const result=await externalRound(page,async(start)=>{
      await expect.poll(read).toBe('abc正在识别');
-     await keyEvent('Backspace',true);
-     // A held edit key must not acquire a new range halfway through editing.
+     expect(heldEditChannels).toHaveLength(initialChannels+1);
+     const channel=heldEditChannels.at(-1);
+     expect((await keyEvent('Backspace',true)).keyResult?.accepted).toBe(true);
+     await expect.poll(read).toBe('abc正在识');
+     await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).presentation).toBe('editing');
+     const updates=()=>report.taskTrace.filter(e=>e.line.includes('task_id='+start.taskId+' ')&&e.line.includes('action=Update applied=true')).length;
+     const atHandoff=updates();
      await delay(700);
-     expect(report.taskTrace.some(e=>e.line.includes('task_id='+start.taskId+' ')&&e.line.includes('turn=2')&&e.line.includes('action=Begin'))).toBe(false);
-     await keyEvent('Backspace',false);
-     await expect.poll(()=>report.taskTrace.some(e=>e.line.includes('task_id='+start.taskId+' ')&&e.line.includes('turn=2')&&e.line.includes('action=Update applied=true')),{timeout:8000}).toBe(true);
-     expect(await read()).toBe('abc正在识正在识别');
+     expect(updates()).toBe(atHandoff);
+     expect(await read()).toBe('abc正在识');
+     expect((await keyEvent('Backspace',false)).keyResult?.accepted).toBe(true);
+     await expect.poll(async()=>(await invoke(page,'dictation_snapshot')).presentation,{timeout:8000}).toBe('recording');
+     channel.continueInput();
+     await expect.poll(read,{timeout:8000}).toBe('abc正在识继续输入');
+     expect(heldEditChannels).toHaveLength(initialChannels+1);
      expect(report.taskTrace.some(e=>e.line.includes('task_id='+start.taskId+' ')&&e.line.includes('keyboardHandedOff'))).toBe(true);
-    },()=>keyEvent('AltRight',false),false,async()=>{
-     await keyEvent('AltRight',true);await waitPhase(page,'recording');return invoke(page,'dictation_snapshot');
+    },async()=>{expect((await keyEvent('AltRight',false)).keyResult?.accepted).toBe(true);},false,async()=>{
+     expect((await keyEvent('AltRight',true)).keyResult?.accepted).toBe(true);await waitPhase(page,'recording');return invoke(page,'dictation_snapshot');
     });
-    expect(await read()).toBe('abc正在识原生受控识别完成。');
+    expect(await read()).toBe('abc正在识继续输入完成。');
+    expect(heldEditChannels).toHaveLength(initialChannels+1);
     report.inputCompatibility.push({app:'Chromium',control,case:'held-backspace',eventSource:'tagged-injected-keyboard',exactDeletionPreserved:true,delivery:result.dictation.delivery});
     if(result.dictation.presentationId)await dismiss(page,{taskId:result.dictation.taskId,presentationId:result.dictation.presentationId});
    }
   } finally {
+   mode='normal';
    await keyEvent('AltRight',false).catch(()=>{});
    await invoke(page,'shortcut_save',{config:{...(await invoke(page,'shortcut_status')).saved,binding:shortcut.binding,mode:shortcut.mode}});
   }
@@ -1461,19 +1540,7 @@ for(const r of (await invoke(page,'history_list',{query:{search:'',page:1}})).re
  expect(report.connections.every(c=>c.started)).toBe(true);expect(report.protocolError).toBeUndefined();report.checks.push('auth/empty/service errors, content updates never invalidate native shrink; service failure retains recoverable recording; revision-guarded delete cleans registered files');
  await stop(page);
  await command(['test','--manifest-path','src-tauri/Cargo.toml','history_desktop_fixture','--','--ignored']);page=await start(5);
- const samples=[];for(let n=0;n<15;n++){const began=performance.now();const feed=await invoke(page,'history_browse',{query:{search:'中文',cursor:null}});samples.push(performance.now()-began);expect(feed.records).toHaveLength(50);expect(feed.total).toBe(10000);}
- samples.sort((a,b)=>a-b);report.historyIpc={size:10000,searchP95Ms:Math.round(samples[14]*100)/100};
- await page.getByRole('link',{name:'历史记录',exact:true}).click();await expect(page.getByText('10000 条',{exact:true})).toBeVisible();const scroll=page.getByLabel('历史记录列表',{exact:true});
- const renderStarted=performance.now();for(let n=0;n<30&&await page.getByRole('listitem').count()<1000;n++){await scroll.evaluate(node=>{node.scrollTop=node.scrollHeight;});await delay(150);}expect(await page.getByRole('listitem').count()).toBeGreaterThanOrEqual(1000);expect(new Set(await page.getByRole('listitem').evaluateAll(rows=>rows.map(row=>row.dataset.recordId))).size).toBe(await page.getByRole('listitem').count());report.historyBrowse1000Ms=Math.round(performance.now()-renderStarted);
- await scroll.evaluate(node=>{node.scrollTop=1200;});await delay(50);const readingTop=await scroll.evaluate(node=>node.scrollTop);await page.getByRole('link',{name:'首页',exact:true}).click();await page.getByRole('link',{name:'历史记录',exact:true}).click();await expect.poll(()=>scroll.evaluate(node=>node.scrollTop)).toBe(readingTop);
- await invoke(page,'acceptance_main_size',{minimum:false});await expect.poll(()=>page.evaluate(()=>({width:innerWidth,height:innerHeight}))).toEqual({width:1120,height:760});
- await scroll.evaluate(node=>{node.scrollTop=0;});await page.getByRole('listitem').first().hover();await page.getByRole('listitem').first().getByRole('button',{name:'展开',exact:true}).click();await expect(page.getByRole('region',{name:'历史识别文字'})).toBeVisible();await page.screenshot({path:path.join(directory,'history-default.png')});
- report.historyScale=await invoke(page,'acceptance_main_size',{minimum:true});await expect.poll(()=>page.evaluate(()=>({width:innerWidth,height:innerHeight}))).toEqual({width:960,height:640});await expect(page.getByRole('region',{name:'历史识别文字'})).toBeVisible();
- const search=page.getByRole('textbox',{name:'搜索识别文字'});await search.focus();report.searchGeometry=await search.evaluate(node=>{const css=getComputedStyle(node),box=node.getBoundingClientRect();return {textHeight:node.clientHeight-parseFloat(css.paddingTop)-parseFloat(css.paddingBottom),lineHeight:parseFloat(css.lineHeight),outlineExtent:parseFloat(css.outlineWidth)+parseFloat(css.outlineOffset),left:box.left,right:box.right,containerRight:node.parentElement.getBoundingClientRect().right};});expect(report.searchGeometry.textHeight).toBeGreaterThanOrEqual(report.searchGeometry.lineHeight);expect(report.searchGeometry.outlineExtent).toBeLessThanOrEqual(0);expect(report.searchGeometry.right).toBeLessThanOrEqual(report.searchGeometry.containerRight);await page.screenshot({path:path.join(directory,'history-minimum-search.png')});
- await page.getByRole('listitem').first().getByRole('button',{name:'更多操作'}).click();await expect(page.getByRole('menu')).toBeVisible();await page.screenshot({path:path.join(directory,'history-minimum-menu.png')});await page.keyboard.press('Escape');await expect(page.getByRole('listitem').first().getByRole('button',{name:'更多操作'})).toBeFocused();
- await page.getByRole('listitem').first().getByRole('button',{name:'收起记录'}).click();await page.getByRole('button',{name:'历史保存设置',exact:true}).click();await expect(page.getByRole('combobox',{name:'录音保留时间'})).toBeVisible();await page.screenshot({path:path.join(directory,'history-minimum-settings.png')});expect(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth)).toBe(false);await page.getByRole('button',{name:'历史保存设置',exact:true}).first().click();
- await invoke(page,'acceptance_main_size',{minimum:false});
- report.checks.push('10k native summaries through IPC;1000 rows continuously loaded; cached reading restored by real routes');
+ await historyPagingScenario(page);
  await stop(page);expect(readFileSync(path.join(data,'dictionary.sqlite')).includes(Buffer.from(key))).toBe(false);for(let round=1;round<=5;round++)for(const suffix of ['.log','-errors.log'])expect(readFileSync(path.join(directory,'round-'+round+suffix),'utf8')).not.toContain(key);if(report.compatibilityFailures?.length)throw Error('Actual input compatibility failures remain; see compatibilityFailures.');report.passed=true;
 }catch(e){report.error=String(e).replaceAll(key,'[redacted]');report.errorStack=e.stack?.replaceAll(key,'[redacted]');if(browser){const main=browser.contexts().flatMap(c=>c.pages()).find(p=>!p.url().includes('surface=overlay'));if(main){await main.screenshot({path:path.join(directory,'failure.png')}).catch(()=>{});report.failureDialogs=await main.getByRole('dialog').count().catch(()=>null);const speech=await invoke(main,'speech_snapshot').catch(()=>null);report.failureSpeechPhase=speech?.phase??null;report.failureSpeechError=speech?.error??null;}}writeFileSync(path.join(directory,'pending-report.json'),JSON.stringify(report,null,2));process.exitCode=1;}finally{
  if(browser){const page=browser.contexts().flatMap(c=>c.pages()).find(p=>!p.url().includes('surface=overlay'));await stop(page).catch(()=>stop(null,false));}else await stop(null,false);for(const socket of sockets)socket.destroy();if(server)await new Promise(r=>server.close(r));
