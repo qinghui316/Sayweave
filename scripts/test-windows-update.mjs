@@ -9,7 +9,7 @@ import {DatabaseSync} from 'node:sqlite';
 import {databaseInventory,seedLegacyRows,legacySeedRows} from './windows-update-fixtures.mjs';
 import {readTools,writeTools,readMechanismEvidence,writeMechanismEvidence,proofMarkers} from './windows-update-artifacts.mjs';
 import {temporaryPreferenceCleanup} from './windows-update-registration.mjs';
-import {installedStartup,restartAndReconnect,aclPrelude,aclSnapshotScript,aclRestoreScript,deploymentReading} from './windows-update-startup.mjs';
+import {installedStartup,restartAndReconnect,aclPrelude,aclSnapshotScript,aclRestoreScript,deploymentReading,safeStartupText} from './windows-update-startup.mjs';
 import {readPackages,writePackages,nsisExecutableIdentity,nsisPayloadInventory,nsisHelperIdentity} from './windows-update-packages.mjs';
 import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
 import {pinnedProxy,verifyComponentEmbeddings} from './build-text-service.mjs';
@@ -51,7 +51,17 @@ async function command(file,args,cwd=root,env=process.env,expectedFailure,timeou
  if(spawnError)throw spawnError;
  if(child.killed)throw Error(`Command exceeded ${timeoutMs}ms: ${path.basename(file)}`);
  if(expectedFailure){if(code!==0&&(expectedFailure===true||tail.includes(expectedFailure)))return;throw Error('Expected command rejection was not observed');}
- if(code!==0)throw Error(`Command failed: ${file} ${args.slice(0,3).join(' ')} (${code}); ${safe?stderr.slice(-4096):'private fixture log retained'}`);
+ if(code!==0){
+  let detail=safe?stderr.slice(-4096):'private fixture log retained';
+  if(file===process.execPath&&path.basename(args[0]??'')==='desktop.mjs'&&args[1]==='package'){
+   const secrets=Object.entries(env).filter(([name])=>/TOKEN|PASSWORD|SECRET|PRIVATE_KEY/i.test(name)).map(([,value])=>value);
+   if(existsSync(keyPath))secrets.push(readFileSync(keyPath,'utf8').trim());
+   mkdirSync(diagnostics,{recursive:true});
+   writeFileSync(path.join(diagnostics,'package-build-failure.log'),safeStartupText(tail,secrets));
+   detail='see package-build-failure.log in the Windows update receipt artifact';
+  }
+  throw Error(`Command failed: ${file} ${args.slice(0,3).join(' ')} (${code}); ${detail}`);
+ }
  return {stdout,stderr};
 }
 function stage(value){report.stage=value;checkpoint();console.log(`Windows update acceptance: ${value}`);}
