@@ -4,7 +4,7 @@ import path from 'node:path';
 
 const names={component:'sayweave_text_service.dll',probe:'tsf-probe.exe'};
 const binaryLimit=128*1024*1024,jsonLimit=1024*1024;
-export const proofMarkers=['owned production DLL fault export absent=true','owned installed production DLL actual text=true protocol8=true','owned COM DLL unloaded with no live leases=true'];
+export const proofMarkers=['owned production DLL fault export absent=true','owned installed production DLL actual text=true','owned COM DLL unloaded with no live leases=true'];
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
 function identity(commit){if(!/^[a-f0-9]{40}$/.test(commit))throw Error('Exact artifact commit required');}
 function root(directory){
@@ -29,7 +29,10 @@ function write(directory,name,bytes,limit=jsonLimit){
  writeFileSync(target(directory,name),bytes);
 }
 function checkProof(proof){
- if(proof?.registrationClean!==true||proof.capabilities?.acceptance!==true||proof.capabilities.installedFixture!==true||proof.capabilities.protocol!==8||proof.markers?.join()!==proofMarkers.join()||typeof proof.rustc!=='string'||!proof.rustc.startsWith('rustc ')||typeof proof.cargo!=='string'||!proof.cargo.startsWith('cargo '))throw Error('Tooling proof is incomplete');
+ const protocol=proof?.capabilities?.protocol;
+ const markers=proof?.markers?.join();
+ const legacyMarkers=[proofMarkers[0],`${proofMarkers[1]} protocol8=true`,proofMarkers[2]].join();
+ if(proof?.registrationClean!==true||proof.capabilities?.acceptance!==true||proof.capabilities.installedFixture!==true||!Number.isSafeInteger(protocol)||protocol<1||(markers!==proofMarkers.join()&&!(protocol===8&&markers===legacyMarkers))||typeof proof.rustc!=='string'||!proof.rustc.startsWith('rustc ')||typeof proof.cargo!=='string'||!proof.cargo.startsWith('cargo '))throw Error('Tooling proof is incomplete');
 }
 export function writeTools(directory,commit,component,probe,proof){
  identity(commit);checkProof(proof);mkdirSync(directory,{recursive:true});root(directory);

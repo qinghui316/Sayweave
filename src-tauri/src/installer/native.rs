@@ -431,7 +431,12 @@ fn previous_ready(directory: &Path, installer: &Process, target: &Target) -> Res
         && record.target.product == target.product
     {
         let main = record.files[0].before_hash.as_deref();
-        if machine.transaction == record.transaction && machine.phase == Phase::RolledBack {
+        if machine.phase == Phase::RolledBack
+            && (machine.transaction == record.transaction
+                || record.server.is_none()
+                    && machine.installer.sid == installer.sid
+                    && machine.target.product == target.product)
+        {
             let registered = registration::snapshot_installer_machine()
                 .map_err(|_| "installerProofIncomplete")?;
             let core = deployment::current_engine().map_err(|_| "installerProofIncomplete")?;

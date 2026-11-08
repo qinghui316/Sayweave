@@ -332,6 +332,14 @@ impl UpdateService {
                 diagnostic = diagnostics::latest(&installer.image_hash, scope, Some(installer))
                     .filter(|attempt| attempt.installed && attempt.to == snapshot.build.version);
             }
+            if let Some(preparation) = scope.as_deref().and_then(|scope| {
+                diagnostics::latest_preparation_failure(scope, snapshot.build.version)
+            }) && diagnostic
+                .as_ref()
+                .is_none_or(|attempt| preparation.started_ms > attempt.started_ms)
+            {
+                diagnostic = Some(preparation);
+            }
             relaunch = relaunch.filter(|_| {
                 diagnostic.as_ref().is_some_and(|attempt| {
                     installed_by
@@ -599,13 +607,6 @@ impl UpdateService {
         }
         let watermark = crate::archive::watermark();
         let prepare = tokio::time::timeout(Duration::from_secs(10), async {
-            lifecycle.drain().await.map_err(Error::new)?;
-            crate::archive::drain_since(watermark)
-                .await
-                .map_err(Error::new)?;
-            if foreground_busy(app) {
-                return Err(Error::new("busy"));
-            }
             let bytes = bounded_read(&self.root.join("candidate.exe"), MAX_PACKAGE)?;
             verify_package(&bytes, &candidate, &self.key)?;
             #[cfg(windows)]
@@ -613,7 +614,15 @@ impl UpdateService {
                 diagnostic.package = crate::installer::package_hash(&bytes);
                 diagnostic.save();
             }
-            self.journal(&candidate, "preparing", Some(&attempt_id))
+            self.journal(&candidate, "preparing", Some(&attempt_id))?;
+            lifecycle.drain().await.map_err(Error::new)?;
+            crate::archive::drain_since(watermark)
+                .await
+                .map_err(Error::new)?;
+            if foreground_busy(app) {
+                return Err(Error::new("busy"));
+            }
+            Ok(())
         })
         .await
         .unwrap_or_else(|_| Err(Error::new("prepareTimeout")));
