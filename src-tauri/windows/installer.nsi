@@ -90,6 +90,15 @@ Var SayweaveMaintenanceResult
 Var SayweaveFailureHandled
 Var SayweaveRestartRequested
 
+!macro SayweaveExecWait COMMAND
+  ClearErrors
+  ExecWait '${COMMAND}' $SayweaveMaintenanceResult
+  ${If} ${Errors}
+    StrCpy $SayweaveMaintenanceResult 1
+    ClearErrors
+  ${EndIf}
+!macroend
+
 Name "${PRODUCTNAME}"
 BrandingText "${COPYRIGHT}"
 OutFile "${OUTFILE}"
@@ -527,7 +536,7 @@ Section Install
   !endif
 
   ; Native preflight waits for a normal exit; never force-kill an active dictation.
-  ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=check "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
+  !insertmacro SayweaveExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=check "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"'
   ${If} $SayweaveMaintenanceResult != 0
     Call SayweaveRecoverUpdate
     Call SayweaveRollback
@@ -550,7 +559,7 @@ Section Install
   {{/each}}
   SetOverwrite on
   ${If} ${Errors}
-    ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=copy-failed "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
+    !insertmacro SayweaveExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=copy-failed "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"'
     Call SayweaveRecoverUpdate
     Call SayweaveRollback
     SetErrorLevel 1
@@ -643,7 +652,7 @@ Section Install
     !insertmacro NSIS_HOOK_POSTINSTALL
   !endif
 
-  ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=commit "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
+  !insertmacro SayweaveExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=commit "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"'
   ${If} $SayweaveMaintenanceResult != 0
   ${AndIf} $SayweaveMaintenanceResult != 2
     Call SayweaveRecoverUpdate
@@ -680,7 +689,7 @@ FunctionEnd
 Function SayweaveLaunch
   ${GetOptions} $CMDLINE "/ARGS" $R0
   ${If} $UpdateMode = 1
-    ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=launch-new "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
+    !insertmacro SayweaveExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=launch-new "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"'
     ${If} $SayweaveMaintenanceResult != 0
       DetailPrint "程序已安装。请从开始菜单打开 Sayweave。"
       Return
@@ -720,7 +729,7 @@ Section Uninstall
   CopyFiles /SILENT "$INSTDIR\sayweave-installer-helper.exe" "$PLUGINSDIR\sayweave-uninstall-maintenance.exe"
   System::Call 'kernel32::GetCurrentProcessId() i.r0'
   StrCpy $SayweaveInstallerPid $0
-  ExecWait '"$PLUGINSDIR\sayweave-uninstall-maintenance.exe" --sayweave-installer=uninstall "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}"' $SayweaveMaintenanceResult
+  !insertmacro SayweaveExecWait '"$PLUGINSDIR\sayweave-uninstall-maintenance.exe" --sayweave-installer=uninstall "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}"'
   ${If} $SayweaveMaintenanceResult = 2
     DetailPrint "程序卸载已完成，但所属启动项未能完成清理。"
     MessageBox MB_ICONEXCLAMATION|MB_OK "程序卸载已完成，但所属启动项未能完成清理。" /SD IDOK
@@ -850,7 +859,7 @@ Function SayweaveBegin
   ${EndIf}
   StrCpy $SayweaveTransactionStarted 1
   StrCpy $SayweaveTransactionDir $INSTDIR
-  ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=begin "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
+  !insertmacro SayweaveExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=begin "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"'
   ${If} $SayweaveMaintenanceResult != 0
     Call SayweaveRecoverUpdate
     Call SayweaveRollback
@@ -862,7 +871,7 @@ FunctionEnd
 Function SayweaveRollback
   ${If} $SayweaveTransactionStarted = 1
   ${AndIf} $SayweaveTransactionCommitted = 0
-    ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=rollback "--install-dir=$SayweaveTransactionDir" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
+    !insertmacro SayweaveExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=rollback "--install-dir=$SayweaveTransactionDir" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"'
     ${If} $SayweaveMaintenanceResult = 0
       StrCpy $SayweaveTransactionStarted 0
     ${Else}
@@ -879,7 +888,7 @@ Function .onInstFailed
   ${If} $UpdateMode = 1
   ${AndIf} $SayweaveFailureHandled = 0
   ${AndIf} $SayweaveTransactionStarted = 1
-    ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=copy-failed "--install-dir=$SayweaveTransactionDir" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
+    !insertmacro SayweaveExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=copy-failed "--install-dir=$SayweaveTransactionDir" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"'
     Call SayweaveRecoverUpdate
   ${EndIf}
   Call SayweaveRollback
@@ -892,7 +901,7 @@ Function .onGUIEnd
 FunctionEnd
 
 Function SayweaveRecordLaunchFailure
-  ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=launch-failed "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
+  !insertmacro SayweaveExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=launch-failed "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"'
 FunctionEnd
 
 Function SayweaveRecoverUpdate
@@ -906,7 +915,7 @@ Function SayweaveRecoverUpdate
   ${If} $SayweaveTransactionStarted != 0
     Call SayweaveRepairRequired
   ${EndIf}
-  ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=launch-old "--install-dir=$SayweaveTransactionDir" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
+  !insertmacro SayweaveExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=launch-old "--install-dir=$SayweaveTransactionDir" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"'
   ${If} $SayweaveMaintenanceResult = 0
     nsis_tauri_utils::RunAsUser "$SayweaveTransactionDir\${MAINBINARYNAME}.exe" ""
     Pop $0

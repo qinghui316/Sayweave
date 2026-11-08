@@ -251,6 +251,19 @@ pub fn latest(package: &str, scope: &str, installer: Option<&record::Process>) -
         .max_by_key(|attempt| attempt.started_ms)
 }
 
+pub fn latest_preparation_failure(scope: &str, version: &str) -> Option<Attempt> {
+    inventory(&root().ok()?)
+        .into_iter()
+        .map(|(attempt, _)| attempt)
+        .filter(|attempt| {
+            attempt.scope.as_deref() == Some(scope)
+                && attempt.from.as_deref() == Some(version)
+                && attempt.installer_pid.is_none()
+                && attempt.failure_stage.as_deref() == Some("prepare")
+        })
+        .max_by_key(|attempt| attempt.started_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

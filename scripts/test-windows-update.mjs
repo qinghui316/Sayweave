@@ -12,6 +12,7 @@ import {temporaryPreferenceCleanup} from './windows-update-registration.mjs';
 import {installedStartup,restartAndReconnect,aclPrelude,aclSnapshotScript,aclRestoreScript,deploymentReading} from './windows-update-startup.mjs';
 import {readPackages,writePackages,nsisExecutableIdentity,nsisPayloadInventory,nsisHelperIdentity} from './windows-update-packages.mjs';
 import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
+import {verifyComponentEmbeddings} from './build-text-service.mjs';
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'&&process.env.SAYWEAVE_DISPOSABLE_WINDOWS!=='1')throw Error('Use an elevated disposable Windows VM; never an owner machine.');
 const root=process.cwd(),id=randomUUID(),directory=path.join(root,'.local','windows-update',id),source=path.join(directory,'source');mkdirSync(source,{recursive:true});
 const stableVersion=JSON.parse(readFileSync(path.join(root,'package.json'),'utf8')).version;
@@ -129,9 +130,9 @@ async function runRecoveryFixtures(old,next,seeded){
   await command(next,['/S','/UPDATE','/R'],root,{...process.env,SAYWEAVE_UPDATE_ATTEMPT:attempt,SAYWEAVE_INSTALL_ACCEPTANCE_FAULT:fault},failed,120000);
   const diagnostic=readAttempt(attempt);attempts.push(diagnostic);return diagnostic;
  };
- for(const [fault,code] of [['cancel-elevation','installerElevationCancelled'],['fail-elevation','installerElevationFailed'],['after-program','acceptanceInstallerProgramFailure']]){
+ await install(old);
+ for(const [fault,code] of [['after-program','acceptanceInstallerProgramFailure'],['cancel-elevation','installerElevationCancelled'],['fail-elevation','installerElevationFailed']]){
   stage(`automatic recovery ${fault}`);
-  await install(old);
   const attempt=await invokeInstaller(fault);
   expect(attempt).toMatchObject({error:code,rollback:'restored',installed:false,restart:'requested'});
   const page=await connect(testExe,false);
@@ -215,7 +216,19 @@ function installerIdentity(file,version,channel){
 function componentIdentity(){
  const module=execFileSync('powershell',['-NoProfile','-Command',"(Get-Item -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}\\InprocServer32').GetValue('')"],{encoding:'utf8'}).trim();
  if(!path.isAbsolute(module))throw Error('Installed component path missing');
- return {module,sha256:createHash('sha256').update(readFileSync(module)).digest('hex')};
+ const sha256=createHash('sha256').update(readFileSync(module)).digest('hex');
+ const pinned=path.join(source,'src-tauri','resources','fixed-proxy','manifest.json');
+ if(!existsSync(pinned))return {module,sha256};
+ const proxy=JSON.parse(readFileSync(pinned,'utf8'));
+ expect(sha256).toBe(proxy.sha256);
+ const componentRoot=path.dirname(path.dirname(module));
+ const descriptor=JSON.parse(readFileSync(path.join(componentRoot,'current-engine.json'),'utf8'));
+ expect(descriptor.proxySha256).toBe(sha256);
+ expect(descriptor.coreSha256).toMatch(/^[a-f0-9]{64}$/);
+ const core=path.join(componentRoot,descriptor.coreSha256,'sayweave_text_service.dll');
+ const coreSha256=createHash('sha256').update(readFileSync(core)).digest('hex');
+ expect(coreSha256).toBe(descriptor.coreSha256);
+ return {module,sha256,core,coreSha256};
 }
 function quote(value){return "'"+value.replaceAll("'","''")+"'";}
 async function registrationInventory(timeoutMs=30000){
@@ -406,7 +419,7 @@ async function upgradePublic023(stableInstaller,probe){
  expect(evidence).toMatchObject({from:'0.1.23',to:stableVersion,error:null,installed:true,restart:'confirmed'});
  report.stableUpgrade=evidence;
  const component=componentIdentity();
- expect(component.sha256).toBe(tools.manifest.artifacts.component.sha256);
+ report.stableComponents=verifyComponentEmbeddings([stableExe,path.join(path.dirname(stableExe),'sayweave-installer-helper.exe')],{core:component.core,proxy:component.module});
  await installedRegistrationReady(probe);
  await command(probe,['installed-fixture',component.module]);
  await page.screenshot({path:path.join(directory,'native-stable-upgraded.png')});
@@ -465,12 +478,15 @@ try{
  else{
   const env={...process.env};delete env.CARGO_TARGET_DIR;
   const componentTarget=path.join(directory,'component-target'),probeTarget=path.join(directory,'probe-target'),manifest=path.join(source,'src-tauri/text-service/Cargo.toml');
-  stage('production component tooling');await command('cargo',['build','--manifest-path',manifest,'--release','--lib','--target-dir',componentTarget],source,env);
+  const engine=/^engine\s*=/m.test(readFileSync(manifest,'utf8'))?['--features','engine']:[];
+  stage('production component tooling');await command('cargo',['build','--locked','--manifest-path',manifest,'--release','--lib',...engine,'--target-dir',componentTarget],source,env);
   stage('acceptance probe tooling');await command('cargo',['build','--manifest-path',manifest,'--release','--features','acceptance','--bin','tsf-probe','--target-dir',probeTarget],source,env);
   tools={component:path.join(componentTarget,'release/sayweave_text_service.dll'),probe:path.join(probeTarget,'release/tsf-probe.exe')};
  }
  stage('short production DLL tooling proof');
- const capability=await command(tools.probe,['capabilities']);const capabilities=JSON.parse(capability.stdout.trim());expect(capabilities).toEqual({acceptance:true,installedFixture:true,protocol:8});
+ const protocol=Number(/^pub const PROTOCOL: u32 = (\d+);/m.exec(readFileSync(path.join(source,'src-tauri','text-service','src','wire.rs'),'utf8'))?.[1]);
+ expect(Number.isSafeInteger(protocol)&&protocol>0).toBe(true);
+ const capability=await command(tools.probe,['capabilities']);const capabilities=JSON.parse(capability.stdout.trim());expect(capabilities).toEqual({acceptance:true,installedFixture:true,protocol});
  stage('temporary production TIP preparation');
  const initialRegistration=await registrationInventory(),initialProfiles=await command(tools.probe,['registration-state'],root,process.env,undefined,30000);
  report.toolRegistrationInitial=initialRegistration;checkpoint();
@@ -566,7 +582,7 @@ try{
  const packageEntries=priorPackages?{...priorPackages.entries}:{old:{installer:old,executableSha256:report.installers.at(-1).executableSha256}};publishPackages();
  await verifyPackage(old,'0.1.700',context.publicKey);
  stage('installed startup short verification');await install(old);
- const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);
+ const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.coreSha256??installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);
  await installedRegistrationReady(probe);await command(probe,['installed-fixture',installedComponent.module]);
  page=await connect(testExe);const buildInfo=(await invoke(page,'update_snapshot')).build;expect(buildInfo).toMatchObject({version:'0.1.700',channel:'test',commit});const installedBytes=readFileSync(testExe);expect(createHash('sha256').update(installedBytes).digest('hex')).toBe(packageEntries.old.executableSha256);for(const value of [commit,identifier,context.url,context.publicKey])if(!installedBytes.includes(Buffer.from(value)))throw Error('Frozen build context absent in installed executable');
  report.startupProof={passed:true,build:buildInfo,executableSha256:packageEntries.old.executableSha256,installerSha256:installerIdentity(old,'0.1.700','test').sha256};await close(page);publishPackages();console.log('Windows installed startup short proof passed: exact process/window/page/CDP/native renderer/build identity.');
@@ -577,7 +593,8 @@ try{
  if(startupOnly){report.checks.push('actual installed startup short proof; no update mechanism or formal package acceptance');report.passed=true;}
  else{
  packageBytes=readFileSync(next);signature=readFileSync(`${next}.sig`,'utf8').trim();
- stage('real NSIS manual replacement');page=await connect(testExe);const seeded=await invoke(page,'acceptance_update_seed');expect(seeded.credentialMatches).toBe(true);expect(seeded.history.count).toBe(10);expect(seeded.profile.preferenceCount).toBe(1);expect(seeded.schema).toBe(9);expect(seeded.component.installed).toBe(true);expect(seeded.component.updateAvailable).toBe(false);expect(seeded.component.error).toBeNull();
+ const schemaVersion=readdirSync(path.join(source,'src-tauri','src','data','migrations')).filter(file=>/^\d{3}_.+\.sql$/.test(file)).length;
+ stage('real NSIS manual replacement');page=await connect(testExe);const seeded=await invoke(page,'acceptance_update_seed');expect(seeded.credentialMatches).toBe(true);expect(seeded.history.count).toBe(10);expect(seeded.profile.preferenceCount).toBe(1);expect(seeded.schema).toBe(schemaVersion);expect(seeded.component.installed).toBe(true);expect(seeded.component.updateAvailable).toBe(false);expect(seeded.component.error).toBeNull();
  await invoke(page,'text_service_action',{action:'disable'});const disabledData=await data(page);expect(disabledData.component.enabled).toBe(false);
  await close(page);const seedDb=new DatabaseSync(path.join(testData,'dictionary.sqlite'),{readOnly:true});legacySeed=legacySeedRows(seedDb);seedDb.close();
  stage('installer program-copy failure rollback');const beforeExecutable=createHash('sha256').update(readFileSync(testExe)).digest('hex');
@@ -641,7 +658,7 @@ try{
  await upgradePublic023(stableInstaller,probe);report.passed=true;
  }else{
  stage('formal draft component baseline');const stableData=path.join(process.env.APPDATA,'local.sayweave.skeleton','data');if(existsSync(stableData))throw Error('Stable runner profile is not empty');
- const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');report.installers.push(installerIdentity(stableInstaller,stableVersion,'stable'));await candidatePayload(stableInstaller);await command(stableInstaller,['/S']);const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);await installedRegistrationReady(probe);await command(probe,['installed-fixture',installedComponent.module]);
+ const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');report.installers.push(installerIdentity(stableInstaller,stableVersion,'stable'));await candidatePayload(stableInstaller);await command(stableInstaller,['/S']);const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.coreSha256??installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);await installedRegistrationReady(probe);await command(probe,['installed-fixture',installedComponent.module]);
  stage('old public version and formal draft replacement');const oldAssets=path.join(directory,'old-public');mkdirSync(oldAssets);await command('gh',['release','download','v0.1.6','--repo','qinghui316/Sayweave','--pattern','*setup.exe','--dir',oldAssets]);const publicOld=path.join(oldAssets,'Sayweave_0.1.6_x64-setup.exe');report.installers.push(installerIdentity(publicOld,'0.1.6','old-public'));await command(publicOld,['/S']);
  const oldVersion=await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$v=(Get-Item -LiteralPath ${quote(stableExe)}).VersionInfo;@{fileVersion=$v.FileVersion;productVersion=$v.ProductVersion;fileParts=@($v.FileMajorPart,$v.FileMinorPart,$v.FileBuildPart,$v.FilePrivatePart);productParts=@($v.ProductMajorPart,$v.ProductMinorPart,$v.ProductBuildPart,$v.ProductPrivatePart)}|ConvertTo-Json -Compress`],root,process.env,undefined,30000);
  report.legacyExecutableIdentity={...JSON.parse(oldVersion.stdout.trim()),sha256:createHash('sha256').update(readFileSync(stableExe)).digest('hex')};checkpoint();expect(report.legacyExecutableIdentity.fileParts).toEqual([0,1,6,0]);expect(report.legacyExecutableIdentity.productParts).toEqual([0,1,6,0]);page=await connect(stableExe,true,true);
