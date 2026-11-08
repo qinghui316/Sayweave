@@ -45,12 +45,11 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
     if input_fixture && args.len() == 3 {
         let module = Path::new(&args[2]);
         let descriptor = deployment::current_engine()?.ok_or("installed descriptor missing")?;
-        let core = deployment::verified_core(&descriptor)?;
+        deployment::verified_core(&descriptor)?;
         let registration =
             registration::snapshot_installer_machine()?.ok_or("installed registration missing")?;
         if std::fs::canonicalize(&registration.module)? != std::fs::canonicalize(module)?
             || deployment::installer_module_hash(&registration.module)? != descriptor.proxy_sha256
-            || !core.is_file()
         {
             return Err("installed component identity differs".into());
         }
@@ -107,6 +106,16 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
         }
         deployment::publish_engine(None, Some(&first))?;
         current = Some(first.clone());
+        if input_fixture {
+            await_baseline_publication(language, &module)?;
+            let mut child = Target::spawn(
+                Command::new(std::env::current_exe()?).args(["formal-input-fixture", &module]),
+            )?;
+            let proof = child.event("formalTargetPassed")?;
+            child.finish()?;
+            println!("{proof}");
+            return Ok(());
+        }
         let second = if let Some(new) = &new {
             let (same, second) = deployment::prepare_engine(&proxy, new)?;
             if same != module {
@@ -122,7 +131,7 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
             &second,
             &mut current,
             language,
-            if input_fixture { "input" } else { "" },
+            "",
         )
         .map(|_| ())
     })();

@@ -425,6 +425,13 @@ async function upgradePublic023(stableInstaller,probe){
  await expect.poll(async()=>(await invoke(page,'update_snapshot')).diagnostic).toBe('更新已安装，已自动打开新版。');
  expect(await invoke(page,'speech_preferences',{preferences:null})).toEqual(savedPreferences);
  expect(await legacyData(page,saved.configs[0])).toEqual(before);
+ const upgradedDb=new DatabaseSync(dbPath,{readOnly:true});
+ try{
+  const tables=['speech_preferences','speech_records','speech_attempts','delivery_attempts'];
+  const upgraded=databaseInventory(upgradedDb,tables);
+  expect(upgraded).toEqual(Object.fromEntries(tables.map(table=>[table,report.legacySeed[table]])));
+  report.stableHistoryAndPreferences=upgraded;
+ }finally{upgradedDb.close();}
  const diagnostics=path.join(process.env.LOCALAPPDATA,'SayweaveInstallTransactions','diagnostics');
  const attempts=readdirSync(diagnostics).filter(file=>file.endsWith('.json')).map(file=>JSON.parse(readFileSync(path.join(diagnostics,file),'utf8')));
  const evidence=attempts.find(attempt=>attempt.id.startsWith('legacy-')&&attempt.package===createHash('sha256').update(payload).digest('hex'));
