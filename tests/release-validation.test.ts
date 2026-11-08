@@ -6,7 +6,7 @@ import {join,resolve,sep} from 'node:path';
 import {describe,expect,it} from 'vitest';
 // The public release tools are JavaScript entry points with separately exercised inputs.
 // @ts-expect-error JavaScript release validator has no declaration file.
-import {releaseIdentity,validateRelease,releaseNotes,validateFrozenController,validateNativeTestOverride,validateMeterTestOverride,runFrozenReleaseTests,validateOwnedDraft,validateVerificationRun,cargoCacheKeys,validateVerifierTool,validateProducerRun,validateRetainedArtifacts,validateUploadInventory,packageArtifactName,verifierArtifactName,assertNoRetainedPackage} from '../scripts/release-validation.mjs';
+import {releaseIdentity,validateRelease,releaseNotes,validateOwnerUpgrade,validateFrozenController,validateNativeTestOverride,validateMeterTestOverride,runFrozenReleaseTests,validateOwnedDraft,validateVerificationRun,cargoCacheKeys,validateVerifierTool,validateProducerRun,validateRetainedArtifacts,validateUploadInventory,packageArtifactName,verifierArtifactName,assertNoRetainedPackage} from '../scripts/release-validation.mjs';
 function fixture(){
  const identity=releaseIdentity('0.1.7','v0.1.7','a'.repeat(40)),bytes=Buffer.from('synthetic installer'),signature='synthetic signature';
  const sha512=createHash('sha512').update(bytes).digest('base64');
@@ -23,6 +23,18 @@ describe('public release identity and inventory',()=>{
  it.each(['https://evil.example/releases/download/v0.1.7/Sayweave_0.1.7_x64-setup.exe','https://github.com/qinghui316/Sayweave/releases/download/v0.1.7/wrong.exe'])('rejects an ambiguous URL %s',url=>{const f=fixture();f.manifest.platforms['windows-x86_64'].url=url;expect(()=>validateRelease(f.identity,f.manifest,f.receipt,f.assets)).toThrow();});
  it.each(['missing','duplicate','traversal','extra'])('rejects %s checksum entries',kind=>{const f=fixture(),lines=f.sums().split('\n');if(kind==='missing')lines.pop();if(kind==='duplicate')lines[3]=lines[0]!;if(kind==='traversal')lines[0]=lines[0]!.replace(f.identity.installer,'../bad.exe');if(kind==='extra')lines.push(lines[0]!);f.assets.set('SHA256SUMS.txt',Buffer.from(lines.join('\n')));expect(()=>validateRelease(f.identity,f.manifest,f.receipt,f.assets)).toThrow();});
  it('rejects extra assets and a version without an exact commit',()=>{const f=fixture();f.assets.set('extra.exe',Buffer.from('extra'));expect(()=>validateRelease(f.identity,f.manifest,f.receipt,f.assets)).toThrow();expect(()=>releaseIdentity('0.1.7','v0.1.7','unknown')).toThrow();});
+});
+
+describe('owner trial for the 0.1.24 draft',()=>{
+ const identity=releaseIdentity('0.1.24','v0.1.24','a'.repeat(40));
+ const installer=Buffer.from('signed draft');
+ const proof={attempt:'legacy-1234-134386098000000000',commit:identity.commit,from:'0.1.23',to:'0.1.24',package:createHash('sha256').update(installer).digest('hex'),installed:true,restart:'confirmed',error:null,dataPreserved:true,dictationPassed:true};
+ it('accepts a successful legacy update on the exact draft',()=>{
+  expect(validateOwnerUpgrade(identity,installer,JSON.stringify(proof))).toEqual(proof);
+ });
+ it.each([{attempt:'unrelated'},{from:'0.1.22'},{to:'0.1.25'},{commit:'b'.repeat(40)},{package:'b'.repeat(64)},{installed:false},{restart:'requested'},{error:'installerWriteFailed'},{dataPreserved:false},{dictationPassed:false},{privatePath:'private'}])('rejects mismatched or incomplete proof %j',delta=>{
+  expect(()=>validateOwnerUpgrade(identity,installer,JSON.stringify({...proof,...delta}))).toThrow();
+ });
 });
 
 describe('Cargo reuse identity',()=>{
