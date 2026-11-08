@@ -637,7 +637,7 @@ try{
  const packageEntries=priorPackages?{...priorPackages.entries}:{old:{installer:old,executableSha256:report.installers.at(-1).executableSha256}};publishPackages();
  await verifyPackage(old,'0.1.700',context.publicKey);
  if(priorPackages&&!priorPackages.next&&!startupOnly)throw Error('Reusable package set has no target package; no implicit rebuild');
- const next=priorPackages?.next??(!startupOnly&&!priorPackages?await build('0.1.701'):null);
+ const next=priorPackages?.next??(!priorPackages?await build('0.1.701'):null);
  if(next&&!packageEntries.next){packageEntries.next={installer:next,executableSha256:report.installers.at(-1).executableSha256};publishPackages();}
  if(next)await verifyPackage(next,'0.1.701',context.publicKey);
  stage('installed startup short verification');await install(old);
