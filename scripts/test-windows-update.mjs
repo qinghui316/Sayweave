@@ -425,8 +425,8 @@ async function upgradePublic023(stableInstaller,probe){
  await candidatePayload(stableInstaller);
 
  stage('click Restart and update in public v0.1.23');
- await page.locator('aside button[aria-haspopup="dialog"]').click();
- await page.getByRole('button',{name:'重启并更新',exact:true}).click();
+ const {panel}=await openUpdatePanel(page);
+ await panel.getByRole('button',{name:'重启并更新',exact:true}).click();
  await browser.close().catch(()=>{});browser=null;
  await delay(1800);page=await connect(stableExe,false);
  const updated=await invoke(page,'update_snapshot');
@@ -456,13 +456,19 @@ async function upgradePublic023(stableInstaller,probe){
  report.checks.push('Public v0.1.23 installed the exact verified draft through Restart and update, automatically reopened and retained preferences, model credentials, dictionary, history and input component.');
 }
 async function ready(page){await invoke(page,'update_check',{manual:true});return state(page,'readyToInstall');}
+async function openUpdatePanel(page){
+ await page.locator('aside').getByRole('button',{name:/^(?:关于|.+，打开关于)$/}).click();
+ const dialog=page.getByRole('dialog',{name:'设置',exact:true});
+ const panel=dialog.getByRole('region',{name:'软件更新',exact:true});
+ await expect(panel).toBeVisible();
+ return {dialog,panel};
+}
 async function nativeLayout(page,label){
  for(const [minimum,zoom,motion] of [[false,1,'no-preference'],[true,1,'reduce'],[true,1.5,'reduce']]){
   await invoke(page,'acceptance_main_size',{minimum,zoom});await page.emulateMedia({reducedMotion:motion});
   await expect.poll(()=>page.evaluate(()=>({width:innerWidth,height:innerHeight})),{timeout:5000}).toEqual({width:Math.round((minimum?960:1120)/zoom),height:Math.round((minimum?640:760)/zoom)});
   const update=await invoke(page,'update_snapshot');
-  await (update.version||update.recovery?page.locator('aside button[aria-haspopup="dialog"]'):page.getByRole('button',{name:'关于',exact:true})).click();const dialog=page.getByRole('dialog');await expect(dialog).toBeVisible();
-  const panel=dialog.locator('section[aria-label="软件更新"]');await expect(panel).toBeVisible();
+  const {dialog,panel}=await openUpdatePanel(page);
   const samples=[];let geometry,previous,stable=0;
   try{await expect.poll(async()=>{geometry=await dialog.evaluate(el=>{const r=el.getBoundingClientRect(),button=[...document.querySelectorAll('button[aria-controls]')].find(b=>b.getAttribute('aria-controls')===el.id),anchor=button?.getBoundingClientRect();return{x:r.x,y:r.y,right:r.right,bottom:r.bottom,width:innerWidth,height:innerHeight,ratio:devicePixelRatio,anchor:anchor?{x:anchor.x,y:anchor.y,right:anchor.right,bottom:anchor.bottom}:null};});if(samples.length<32)samples.push({at:Date.now(),state:update.state,...geometry});const bounded=geometry.x>=0&&geometry.y>=0&&geometry.right<=geometry.width+1&&geometry.bottom<=geometry.height+1,unchanged=previous&&['x','y','right','bottom','width','height','ratio'].every(key=>Math.abs(geometry[key]-previous[key])<0.5);stable=bounded&&unchanged?stable+1:0;previous=geometry;return stable>=1;},{timeout:5000,intervals:[50,100,200]}).toBe(true);}finally{(report.layoutSamples??=[]).push({label,minimum,zoom,samples});checkpoint();}
   expect(geometry.x).toBeGreaterThanOrEqual(0);expect(geometry.y).toBeGreaterThanOrEqual(0);expect(geometry.right).toBeLessThanOrEqual(geometry.width+1);expect(geometry.bottom).toBeLessThanOrEqual(geometry.height+1);
@@ -697,7 +703,7 @@ try{
  for(let round=1;round<=3;round++){
   stage(`native UI and real automatic upgrade ${round}/3`);
   if(round>1){await install(old);page=await connect(testExe);await ready(page);}
-  await page.locator('aside button[aria-haspopup="dialog"]').click();await page.getByRole('button',{name:'重启并更新',exact:true}).click();await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);
+  const {panel}=await openUpdatePanel(page);await panel.getByRole('button',{name:'重启并更新',exact:true}).click();await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);
   await expect.poll(async()=>(await invoke(page,'update_snapshot')).build.version,{timeout:60000}).toBe('0.1.701');expect(await data(page)).toEqual(seeded);expect((await invoke(page,'update_snapshot')).state).toBe('idle');expect(componentIdentity()).toEqual(installedComponent);
   await expect.poll(async()=>(await invoke(page,'update_snapshot')).diagnostic).toBe('更新已安装，已自动打开新版。');
   const attempts=readdirSync(diagnosticDirectory()).filter(file=>file.endsWith('.json')).map(file=>readAttempt(path.basename(file,'.json')));
