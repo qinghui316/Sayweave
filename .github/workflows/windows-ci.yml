@@ -45,7 +45,7 @@ env:
 concurrency:
   # Preserve installer diagnostics when a corrected candidate is pushed.
   # Only duplicate runs of this exact ref/commit supersede one another.
-  group: windows-validation-${{ github.ref }}-${{ github.sha }}
+  group: windows-validation-${{ github.ref }}-${{ github.sha }}-${{ inputs.phase == 'input-baseline' && 'input-baseline' || 'validation' }}
   cancel-in-progress: true
 jobs:
   published-input-baseline:
