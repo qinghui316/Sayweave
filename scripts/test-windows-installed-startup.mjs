@@ -21,8 +21,10 @@ const packages=readPackages('.local/prior-update-packages',candidate);
 const recovery=process.argv.includes('--restart-recovery');
 const metadata=process.argv.includes('--metadata');
 const aclDiagnostic=process.argv.includes('--acl');
+const installerPreparation=process.argv.includes('--installer-preparation');
 const lifecycle=process.argv.includes('--deployment-lifecycle');
 if(lifecycle&&(metadata||recovery||aclDiagnostic))throw Error('Deployment lifecycle requires isolated automatic deployment, without manual component preparation or other diagnoses.');
+if(installerPreparation&&(metadata||recovery||aclDiagnostic||lifecycle))throw Error('Installer preparation diagnosis requires a fresh isolated installation.');
 const tools=metadata?readTools('.local/prior-update-tools',candidate):null;
 if(recovery&&!packages.next)throw Error('Recovery diagnosis requires both frozen signed packages.');
 const directory=path.join(root,'.local','installed-startup',randomUUID());mkdirSync(directory,{recursive:true});
@@ -200,11 +202,11 @@ async function cleanupComponent(){
  }while(Date.now()<deadline);
  throw Error('Prepared component cleanup did not settle; see bounded independent-process samples');
 }
-async function command(file,args,timeout=180000,cwd=root){
+async function command(file,args,timeout=180000,cwd=root,env=process.env){
  if(!Number.isSafeInteger(timeout)||timeout<1||timeout>180000)throw Error('Diagnostic command timeout exceeds bound');
  const entry={tool:path.basename(file),args,stage:report.stage,startedAt:new Date().toISOString()};report.commands.push(entry);persist();
  let stdout=Buffer.alloc(0),stderr=Buffer.alloc(0),error;
- const processChild=spawn(file,args,{cwd,windowsHide:true,stdio:['ignore','pipe','pipe'],timeout});
+ const processChild=spawn(file,args,{cwd,env,windowsHide:true,stdio:['ignore','pipe','pipe'],timeout});
  entry.pid=processChild.pid;entry.timeoutMs=timeout;persist();
  processChild.stdout.on('data',bytes=>{stdout=boundedTail(stdout,bytes);});processChild.stderr.on('data',bytes=>{stderr=boundedTail(stderr,bytes);});processChild.once('error',value=>{error=value;});
  const started=Date.now();entry.exitCode=await new Promise(resolve=>processChild.once('close',resolve));entry.elapsedMs=Date.now()-started;
@@ -243,7 +245,25 @@ try{
  const policy=await command('powershell',['-NoProfile','-Command',"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);$items=@();foreach($scope in @('HKLM:','HKCU:')){foreach($suffix in @('Software\\Policies\\Microsoft\\Edge','Software\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments')){$key=$scope+'\\'+$suffix;if(Test-Path -LiteralPath $key){$entry=Get-Item -LiteralPath $key;foreach($name in @('RemoteDebuggingAllowed','sayweave.exe','*')){if($entry.GetValueNames() -contains $name){$value=$entry.GetValue($name);$items+=@{scope=$scope;key=$suffix;name=$name;kind=[string]$entry.GetValueKind($name);debugAllowed=if($name -eq 'RemoteDebuggingAllowed'){$value -eq 1}else{$null};hasDebugPort=([string]$value -match '--remote-debugging-port');hasLoopback=([string]$value -match '--remote-debugging-address=127.0.0.1')}}}}}};ConvertTo-Json -InputObject $items -Compress"]);
  report.debugPolicy=JSON.parse(policy);persist();
  if(metadata)await frozenToolingPrelude();
- stage('same candidate installation');await attemptInstallation(packages.old);
+ stage('same candidate installation');
+ try{await attemptInstallation(packages.old);}catch(error){
+  const records=deploymentReading();
+  if(installerPreparation&&!existsSync(exe)&&!records.user.exists&&!records.machine.exists){
+   stage('same signed package with installer diagnostics enabled');
+   const id=randomUUID();
+   const diagnostic={id,originalError:String(error.message)};report.installerPreparation=diagnostic;persist();
+   try{await command(packages.old,['/S','/UPDATE'],120000,root,{...process.env,SAYWEAVE_UPDATE_ATTEMPT:id});diagnostic.completed=true;}
+   catch(retryError){diagnostic.error=String(retryError.message);}
+   const file=path.join(process.env.LOCALAPPDATA,'SayweaveInstallTransactions','diagnostics',`${id}.json`);
+   if(existsSync(file)){
+    const attempt=JSON.parse(readFileSync(file,'utf8'));
+    if(attempt.id!==id||attempt.package!==packages.manifest.artifacts.old.sha256)throw Error('Installer diagnostic identity differs',{cause:error});
+    diagnostic.outcome=attempt;
+   }
+   diagnostic.records=deploymentReading();persist();
+  }
+  throw error;
+ }
  if(hash(readFileSync(exe))!==report.payload.sha256)throw Error('Installed executable differs from signed payload.');
  if(metadata){
   stage('frozen installed component preparation');
