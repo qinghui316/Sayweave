@@ -427,8 +427,8 @@ fn previous_ready(directory: &Path, installer: &Process, target: &Target) -> Res
         verify_committed_component(&machine)?;
         verify_program_files(&record)?;
     } else if record.phase == Phase::RolledBack
-        && &record.installer == installer
-        && &record.target == target
+        && record.installer.sid == installer.sid
+        && record.target.product == target.product
     {
         let main = record.files[0].before_hash.as_deref();
         if machine.transaction == record.transaction && machine.phase == Phase::RolledBack {
