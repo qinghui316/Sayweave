@@ -79,9 +79,18 @@ jobs:
           $installDir = Join-Path $env:LOCALAPPDATA 'Sayweave'
           $installed = Join-Path $installDir 'sayweave.exe'
           $os = Get-CimInstance Win32_OperatingSystem
-          foreach ($mode in @('default', 'explicit-path')) {
-            $arguments = if ($mode -eq 'default') { '/S' } else { "/S /D=$installDir" }
-            $setup = Start-Process -FilePath $exe -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $dir "$mode-stdout.log") -RedirectStandardError (Join-Path $dir "$mode-stderr.log")
+          foreach ($mode in @('default', 'explicit-path', 'passive-window')) {
+            if ($mode -eq 'passive-window') {
+              $setup = Start-Process -FilePath $exe -ArgumentList '/P' -PassThru
+              if (!$setup.WaitForExit(60000)) {
+                @{timedOut=$true;window=$setup.MainWindowTitle} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $dir 'passive-window-timeout.log')
+                $setup.Kill()
+                $setup.WaitForExit()
+              }
+            } else {
+              $arguments = if ($mode -eq 'default') { '/S' } else { "/S /D=$installDir" }
+              $setup = Start-Process -FilePath $exe -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $dir "$mode-stdout.log") -RedirectStandardError (Join-Path $dir "$mode-stderr.log")
+            }
             $owned = @(Get-ChildItem -LiteralPath $receiptRoot -Directory -ErrorAction SilentlyContinue)
             $receipts = @($owned | ForEach-Object { Join-Path $_.FullName 'receipt.json' })
             $receipts += Join-Path $env:ProgramFiles 'Sayweave/TextService/installer.json'
