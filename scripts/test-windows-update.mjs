@@ -233,11 +233,11 @@ function componentIdentity(){
  expect(sha256).toBe(proxy.sha256);
  const componentRoot=path.dirname(path.dirname(module));
  const descriptor=JSON.parse(readFileSync(path.join(componentRoot,'current-engine.json'),'utf8'));
- expect(descriptor.proxySha256).toBe(sha256);
- expect(descriptor.coreSha256).toMatch(/^[a-f0-9]{64}$/);
- const core=path.join(componentRoot,descriptor.coreSha256,'sayweave_text_service.dll');
+ expect(descriptor.proxy_sha256).toBe(sha256);
+ expect(descriptor.core_sha256).toMatch(/^[a-f0-9]{64}$/);
+ const core=path.join(componentRoot,descriptor.core_sha256,'sayweave_text_service.dll');
  const coreSha256=createHash('sha256').update(readFileSync(core)).digest('hex');
- expect(coreSha256).toBe(descriptor.coreSha256);
+ expect(coreSha256).toBe(descriptor.core_sha256);
  return {module,sha256,core,coreSha256};
 }
 async function inputProof(probe,module,core){
@@ -626,15 +626,15 @@ try{
  const old=priorPackages?.old??await build('0.1.700');
  const packageEntries=priorPackages?{...priorPackages.entries}:{old:{installer:old,executableSha256:report.installers.at(-1).executableSha256}};publishPackages();
  await verifyPackage(old,'0.1.700',context.publicKey);
+ if(priorPackages&&!priorPackages.next&&!startupOnly)throw Error('Reusable package set has no target package; no implicit rebuild');
+ const next=priorPackages?.next??(!startupOnly&&!priorPackages?await build('0.1.701'):null);
+ if(next&&!packageEntries.next){packageEntries.next={installer:next,executableSha256:report.installers.at(-1).executableSha256};publishPackages();}
+ if(next)await verifyPackage(next,'0.1.701',context.publicKey);
  stage('installed startup short verification');await install(old);
  const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.coreSha256??installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);
  await installedRegistrationReady(probe);await installedInputProof(probe,installedComponent);
  page=await connect(testExe);const buildInfo=(await invoke(page,'update_snapshot')).build;expect(buildInfo).toMatchObject({version:'0.1.700',channel:'test',commit});const installedBytes=readFileSync(testExe);expect(createHash('sha256').update(installedBytes).digest('hex')).toBe(packageEntries.old.executableSha256);for(const value of [commit,identifier,context.url,context.publicKey])if(!installedBytes.includes(Buffer.from(value)))throw Error('Frozen build context absent in installed executable');
  report.startupProof={passed:true,build:buildInfo,executableSha256:packageEntries.old.executableSha256,installerSha256:installerIdentity(old,'0.1.700','test').sha256};await close(page);publishPackages();console.log('Windows installed startup short proof passed: exact process/window/page/CDP/native renderer/build identity.');
- if(priorPackages&&!priorPackages.next&&!startupOnly)throw Error('Reusable package set has no target package; no implicit rebuild');
- const next=priorPackages?.next??(!priorPackages?await build('0.1.701'):null);
- if(next&&!packageEntries.next){packageEntries.next={installer:next,executableSha256:report.installers.at(-1).executableSha256};publishPackages();}
- if(next)await verifyPackage(next,'0.1.701',context.publicKey);
  if(startupOnly){report.checks.push('actual installed startup short proof; no update mechanism or formal package acceptance');report.passed=true;}
  else{
  packageBytes=readFileSync(next);signature=readFileSync(`${next}.sig`,'utf8').trim();
