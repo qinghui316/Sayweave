@@ -49,9 +49,13 @@ concurrency:
   cancel-in-progress: true
 jobs:
   published-input-baseline:
-    name: Published v0.1.23 input baseline
+    name: Published v0.1.23 input baseline (${{ matrix.image }})
     if: github.event_name == 'workflow_dispatch' && inputs.phase == 'input-baseline'
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [windows-latest, windows-2022]
+    runs-on: ${{ matrix.image }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -71,9 +75,20 @@ jobs:
           $exe = Join-Path $dir $name
           $checksum = (Get-Content -LiteralPath (Join-Path $dir 'SHA256SUMS.txt') | Where-Object { $_ -match ('^[a-f0-9]{64}  ' + [regex]::Escape($name) + '$') }) -split '\s+'
           if (!$checksum -or (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash -ine $checksum[0]) { throw 'Published baseline checksum differs.' }
-          $setup = Start-Process -FilePath $exe -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden
-          if ($setup.ExitCode) { throw "Published baseline installation failed ($($setup.ExitCode))." }
+          $setup = Start-Process -FilePath $exe -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $dir 'setup-stdout.log') -RedirectStandardError (Join-Path $dir 'setup-stderr.log')
+          $receiptRoot = Join-Path $env:LOCALAPPDATA 'SayweaveInstallTransactions'
+          $receipts = @(Get-ChildItem -LiteralPath $receiptRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { Join-Path $_.FullName 'receipt.json' })
+          $receipts += Join-Path $env:ProgramFiles 'Sayweave/TextService/installer.json'
+          $transactions = @(foreach ($receipt in $receipts) {
+            if (Test-Path -LiteralPath $receipt -PathType Leaf) {
+              $record = Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json
+              @{kind=(Split-Path $receipt -Leaf);phase=$record.phase;error=$record.error;lastFailure=$record.lastFailure;version=$record.target.version}
+            }
+          })
           $installed = Join-Path $env:LOCALAPPDATA 'Sayweave/sayweave.exe'
+          $os = Get-CimInstance Win32_OperatingSystem
+          @{exit=$setup.ExitCode;installed=(Test-Path -LiteralPath $installed);os=$os.Caption;build=$os.BuildNumber;transactions=$transactions} | ConvertTo-Json -Depth 5 | Tee-Object -FilePath (Join-Path $dir 'installer.log')
+          if ($setup.ExitCode) { throw "Published baseline installation failed ($($setup.ExitCode))." }
           if ((Get-Item -LiteralPath $installed).VersionInfo.FileVersion -ne '0.1.23') { throw 'Installed baseline version differs.' }
           cargo build --locked --manifest-path src-tauri/text-service/Cargo.toml --features acceptance --bin tsf-probe
           if ($LASTEXITCODE) { throw 'Input probe build failed.' }
@@ -87,7 +102,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: published-input-baseline
+          name: published-input-baseline-${{ matrix.image }}
           retention-days: 7
           path: ${{ runner.temp }}/sayweave-input-baseline/*.log
           if-no-files-found: warn
