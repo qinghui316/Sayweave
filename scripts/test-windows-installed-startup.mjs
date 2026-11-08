@@ -13,7 +13,7 @@ if(process.platform!=='win32'||process.arch!=='x64'||process.env.GITHUB_ACTIONS!
 const root=process.cwd(),candidate=process.env.STARTUP_CANDIDATE;
 const harness=execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim();
 if(!/^[a-f0-9]{40}$/.test(candidate??''))throw Error('Exact product candidate required.');
- const permitted=new Set(['.github/workflows/windows-ci.yml','scripts/windows-update-startup.mjs','scripts/windows-update-packages.mjs','scripts/windows-update-debug-policy.mjs','scripts/windows-update-metadata.ps1','scripts/windows-update-metadata.cs','scripts/test-windows-installed-startup.mjs','scripts/check-distribution.mjs','scripts/test-windows-update.mjs','docs/release.md','docs/testing.md','tests/windows-update-startup.test.ts']);
+ const permitted=new Set(['.github/workflows/windows-ci.yml','scripts/windows-update-startup.mjs','scripts/windows-update-packages.mjs','scripts/windows-update-debug-policy.mjs','scripts/windows-update-metadata.ps1','scripts/windows-update-metadata.cs','scripts/test-windows-installed-startup.mjs','scripts/windows-installer-test-owner.ps1','scripts/check-distribution.mjs','scripts/test-windows-update.mjs','docs/release.md','docs/testing.md','tests/windows-update-startup.test.ts']);
 const changed=execFileSync('git',['diff','--name-only',candidate,harness],{encoding:'utf8'}).trim().split('\n').filter(Boolean);
 if(changed.some(file=>!permitted.has(file)))throw Error(`Candidate product sources differ: ${changed.filter(file=>!permitted.has(file)).join(', ')}`);
 if(execFileSync('git',['status','--porcelain','--untracked-files=no'],{encoding:'utf8'}).trim())throw Error('Diagnostic source tree is dirty.');
@@ -259,6 +259,20 @@ try{
     const attempt=JSON.parse(readFileSync(file,'utf8'));
     if(attempt.id!==id||attempt.package!==packages.manifest.artifacts.old.sha256)throw Error('Installer diagnostic identity differs',{cause:error});
     diagnostic.outcome=attempt;
+    if(typeof attempt.scope==='string'&&/^[a-f0-9]{64}$/.test(attempt.scope)){
+     const scope=path.join(process.env.LOCALAPPDATA,'SayweaveInstallTransactions',attempt.scope);
+     const ownerEnv={...process.env,SAYWEAVE_TEST_RECEIPT_DIR:scope};
+     const readOwner="$path=$env:SAYWEAVE_TEST_RECEIPT_DIR;$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$items=@(foreach($file in @($path,(Join-Path $path 'lock'))){if(Test-Path -LiteralPath $file){$owner=(Get-Acl -LiteralPath $file).GetOwner([Security.Principal.SecurityIdentifier]).Value;@{sameUser=$owner -eq $sid;administrators=$owner -eq 'S-1-5-32-544'}}});ConvertTo-Json -InputObject $items -Compress";
+     diagnostic.receiptOwners=JSON.parse(await command('powershell',['-NoProfile','-Command',readOwner],30000,root,ownerEnv));persist();
+     if(diagnostic.receiptOwners.some(owner=>owner.administrators&&!owner.sameUser)){
+      const corrected=path.join(process.env.LOCALAPPDATA,`${packages.manifest.product} user owner`);
+      const correctedEnv={...process.env,SAYWEAVE_TEST_INSTALLER:packages.old,SAYWEAVE_TEST_INSTALL_DIRECTORY:corrected};
+      const runWithOwner="$ErrorActionPreference='Stop';. ./scripts/windows-installer-test-owner.ps1;Set-SayweaveInstallerTestOwner;$arg='/S /D='+$env:SAYWEAVE_TEST_INSTALL_DIRECTORY;$p=Start-Process -FilePath $env:SAYWEAVE_TEST_INSTALLER -ArgumentList $arg -WindowStyle Hidden -Wait -PassThru;exit $p.ExitCode";
+      try{await command('powershell',['-NoProfile','-ExecutionPolicy','Bypass','-Command',runWithOwner],120000,root,correctedEnv);diagnostic.ordinaryOwnerInstalled=true;}
+      catch(ownerError){diagnostic.ordinaryOwnerError=String(ownerError.message);}
+      diagnostic.ordinaryOwnerRecords=readDeployment(corrected);persist();
+     }
+    }
    }
    diagnostic.records=deploymentReading();persist();
   }
