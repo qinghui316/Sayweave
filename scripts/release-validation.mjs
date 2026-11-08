@@ -42,6 +42,17 @@ export function releaseNotes(value){
  return `Sayweave ${value.version}\n\n${value.changes.map(change=>`- ${change}`).join('\n')}\n${value.installation?`\n${value.installation}\n`:''}`;
 }
 
+export function validateOwnerUpgrade(identity,installer,raw){
+ if(identity.tag!=='v0.1.24'||typeof raw!=='string'||raw.length>1024)throw Error('Invalid owner upgrade evidence');
+ const proof=JSON.parse(raw);
+ const keys=['attempt','commit','from','to','package','installed','restart','error','dataPreserved','dictationPassed'];
+ if(!proof||Object.keys(proof).length!==keys.length||keys.some(key=>!Object.hasOwn(proof,key))
+  ||typeof proof.attempt!=='string'||!/^legacy-[1-9]\d{0,9}-[1-9]\d{0,19}$/.test(proof.attempt)
+  ||proof.commit!==identity.commit||proof.from!=='0.1.23'||proof.to!==identity.version||proof.package!==sha256(installer)
+  ||proof.installed!==true||proof.restart!=='confirmed'||proof.error!==null||proof.dataPreserved!==true||proof.dictationPassed!==true)throw Error('Owner upgrade evidence differs from the verified draft or required outcome');
+ return proof;
+}
+
 export const frozenTestPaths=['tests/e2e/models.spec.ts','tests/e2e/ui-interaction.spec.ts','tests/e2e/dictation.spec.ts','tests/fixtures/voice-recovery.tsx'];
 const receiptTestPath='src-tauri/src/installer/record.rs';
 const startupTestPath='src-tauri/src/installer/login_startup.rs';
@@ -318,6 +329,12 @@ if(process.argv[1]&&pathToFileURL(resolve(process.argv[1])).href===import.meta.u
  else if(mode==='reuse-verification')verifyReusedChecks();
  else if(mode==='cargo-cache'){const {compileKey,compilePrefix,registryKey,registryPrefix}=cargoCacheContext();output({compileKey,compilePrefix,registryKey,registryPrefix},process.env);}
  else if(mode==='package-preflight')preflightPackage();
+ else if(mode==='check-owner-upgrade'){
+  const identity=currentIdentity(process.cwd(),process.env);
+  const proof=validateOwnerUpgrade(identity,readPlainFile(join(process.env.SAYWEAVE_RELEASE_DIR,identity.installer)),process.env.OWNER_UPGRADE_PROOF);
+  writeFileSync('.local/owner-upgrade-acceptance.json',JSON.stringify(proof,null,2)+'\n',{flag:'wx'});
+  output({owner_upgrade_verified:'true'},process.env);
+ }
  else if(mode==='upload-package')uploadRetainedPackage().catch(error=>{console.error(error);process.exitCode=1;});
  else if(mode==='check-frozen')runFrozenReleaseTests(process.cwd(),process.env,undefined,'check').catch(error=>{console.error(error);process.exitCode=1;});
  else if(mode==='formal-frozen')runFrozenReleaseTests(process.cwd(),process.env,undefined,'formal').catch(error=>{console.error(error);process.exitCode=1;});

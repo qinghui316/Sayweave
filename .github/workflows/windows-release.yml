@@ -40,6 +40,10 @@ on:
         type: string
         default: ''
         description: Exact preserved verifier producer when no package was built
+      owner_upgrade_proof:
+        type: string
+        default: ''
+        description: Sanitized successful 0.1.23 owner upgrade receipt for the verified 0.1.24 draft
 
 permissions:
   contents: read
@@ -71,8 +75,10 @@ jobs:
           VERIFICATION_RUN: ${{ inputs.verification_run_id }}
           PACKAGE_RUN: ${{ inputs.package_run_id }}
           VERIFIER_RUN: ${{ inputs.verifier_run_id }}
+          OWNER_UPGRADE_PROOF: ${{ inputs.owner_upgrade_proof }}
         run: |
           if ($env:SAYWEAVE_RELEASE_PHASE -notin @('build','build-frozen','resume-package','check-access','accept-existing')) { throw 'Unknown release phase.' }
+          if ($env:OWNER_UPGRADE_PROOF -and ($env:SAYWEAVE_RELEASE_PHASE -ne 'check-access' -or $env:SAYWEAVE_RELEASE_TAG -ne 'v0.1.24' -or $env:SAYWEAVE_CONTROLLER_REF -ne 'refs/tags/v0.1.24' -or $env:SAYWEAVE_CONTROLLER_COMMIT -ne $env:SAYWEAVE_RELEASE_COMMIT)) { throw 'Owner trial requires check-access on the exact 0.1.24 product tag.' }
           if ($env:SAYWEAVE_RELEASE_PHASE -eq 'build-frozen' -and ($env:SAYWEAVE_RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$' -or $env:SAYWEAVE_RELEASE_COMMIT -notmatch '^[a-f0-9]{40}$' -or $env:SAYWEAVE_CONTROLLER_REF -notmatch "^refs/tags/$([regex]::Escape($env:SAYWEAVE_RELEASE_TAG))-release-check-[a-z0-9][a-z0-9.-]*$" -or $env:EXPECTED_RELEASE_ID -notmatch '^[1-9]\d*$' -or $env:EXPECTED_CHECKSUM)) { throw 'Exact frozen product, empty owner draft and diagnostic controller identities are required.' }
           if ($env:VERIFICATION_RUN -and ($env:SAYWEAVE_RELEASE_PHASE -notin @('build-frozen','resume-package') -or $env:VERIFICATION_RUN -notmatch '^[1-9]\d*$')) { throw 'Verification reuse is restricted to an exact frozen build.' }
           if ($env:SAYWEAVE_RELEASE_PHASE -in @('check-access','accept-existing') -and ($env:SAYWEAVE_RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+$' -or $env:SAYWEAVE_RELEASE_COMMIT -notmatch '^[a-f0-9]{40}$' -or $env:EXPECTED_RELEASE_ID -notmatch '^[1-9]\d*$' -or $env:EXPECTED_CHECKSUM -notmatch '^[a-f0-9]{64}$')) { throw 'Exact existing-draft identities are required.' }
@@ -530,6 +536,8 @@ jobs:
     needs: [verify, draft]
     runs-on: windows-latest
     timeout-minutes: 90
+    outputs:
+      owner_upgrade_verified: ${{ steps.accept.outputs.owner_upgrade_verified }}
     permissions:
       contents: write
       actions: read
@@ -568,13 +576,16 @@ jobs:
           run-id: ${{ inputs.verifier_run_id || inputs.package_run_id || github.run_id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/release-verifier
-      - if: inputs.phase == 'accept-existing' || (env.SAYWEAVE_RELEASE_TAG == 'v0.1.24' && inputs.phase != 'check-access')
+      - if: inputs.phase == 'accept-existing' || (env.SAYWEAVE_RELEASE_TAG == 'v0.1.24' && (inputs.phase != 'check-access' || inputs.owner_upgrade_proof != ''))
         run: npm ci
       - name: Reuse exact-commit Windows update evidence for draft installation
-        if: inputs.phase == 'accept-existing' || (env.SAYWEAVE_RELEASE_TAG == 'v0.1.24' && inputs.phase != 'check-access')
+        if: inputs.phase == 'accept-existing' || (env.SAYWEAVE_RELEASE_TAG == 'v0.1.24' && (inputs.phase != 'check-access' || inputs.owner_upgrade_proof != ''))
         run: node scripts/reuse-windows-update-evidence.mjs .local/release-mechanism-evidence
       - name: Verify draft assets and run required installation acceptance
+        id: accept
         shell: pwsh
+        env:
+          OWNER_UPGRADE_PROOF: ${{ inputs.owner_upgrade_proof }}
         run: |
           $download = Join-Path $env:RUNNER_TEMP 'sayweave-draft-acceptance'
           New-Item -ItemType Directory -Path $download | Out-Null
@@ -591,9 +602,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Draft full signature verification failed.' }
           if ($env:SAYWEAVE_RELEASE_PHASE -eq 'check-access') {
             $controller | ConvertTo-Json | Set-Content -LiteralPath '.local/release-draft-access.json' -Encoding utf8
-          } elseif ($env:SAYWEAVE_RELEASE_PHASE -eq 'accept-existing' -or $env:SAYWEAVE_RELEASE_TAG -eq 'v0.1.24') {
+            if ($env:OWNER_UPGRADE_PROOF) {
+              node $env:SAYWEAVE_RELEASE_HELPER check-owner-upgrade
+              if ($LASTEXITCODE -ne 0) { throw 'Owner upgrade evidence check failed.' }
+            }
+          } elseif ($env:SAYWEAVE_RELEASE_PHASE -eq 'accept-existing') {
             node scripts/test-windows-update.mjs --stable-installer (Join-Path $download "Sayweave_$(node -p "require('./package.json').version")_x64-setup.exe") --mechanism-evidence .local/release-mechanism-evidence
             if ($LASTEXITCODE -ne 0) { throw 'Draft installation check failed.' }
+          } elseif ($env:SAYWEAVE_RELEASE_TAG -eq 'v0.1.24') {
+            Write-Output 'Signed draft verified. Complete the approved 0.1.23 owner upgrade before publication.'
           } else {
             Write-Output 'Same package and full verifier reused; actual installation/update remains owner trial. No Cargo build here.'
           }
@@ -606,13 +623,18 @@ jobs:
           path: |
             .local/release-controller.json
             .local/release-draft-access.json
+            .local/owner-upgrade-acceptance.json
             .local/windows-update-acceptance.json
             .local/windows-update/*/acceptance.json
             .local/windows-update/*/native-*.png
             .local/windows-update/*/diagnostics/*.log
           if-no-files-found: warn
   publish:
-    if: always() && !cancelled() && startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave' && needs.accept-installer.result == 'success' && ((needs.draft.result == 'success' && inputs.phase != 'check-access') || (needs.draft.result == 'skipped' && inputs.phase == 'accept-existing'))
+    if: >-
+      always() && !cancelled() && startsWith(github.ref, 'refs/tags/') && github.repository == 'qinghui316/Sayweave' && needs.accept-installer.result == 'success' &&
+      ((github.ref == 'refs/tags/v0.1.24' && inputs.phase == 'check-access' && needs.accept-installer.outputs.owner_upgrade_verified == 'true') ||
+       (github.ref != 'refs/tags/v0.1.24' && (inputs.release_tag || github.ref_name) != 'v0.1.24' &&
+        ((needs.draft.result == 'success' && inputs.phase != 'check-access') || (needs.draft.result == 'skipped' && inputs.phase == 'accept-existing'))))
     needs: [draft, accept-installer]
     runs-on: windows-latest
     environment: windows-release
@@ -622,8 +644,8 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       SAYWEAVE_BUILD_CHANNEL: stable
-      EXPECTED_RELEASE_ID: ${{ inputs.phase == 'accept-existing' && inputs.release_id || needs.draft.outputs.release_id }}
-      EXPECTED_CHECKSUM: ${{ inputs.phase == 'accept-existing' && inputs.checksum_sha256 || needs.draft.outputs.checksum }}
+      EXPECTED_RELEASE_ID: ${{ (inputs.phase == 'accept-existing' || inputs.phase == 'check-access') && inputs.release_id || needs.draft.outputs.release_id }}
+      EXPECTED_CHECKSUM: ${{ (inputs.phase == 'accept-existing' || inputs.phase == 'check-access') && inputs.checksum_sha256 || needs.draft.outputs.checksum }}
       SAYWEAVE_PACKAGE_RUN: ${{ inputs.package_run_id || needs.draft.outputs.package_run }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
