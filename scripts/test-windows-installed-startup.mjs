@@ -262,9 +262,11 @@ try{
     if(typeof attempt.scope==='string'&&/^[a-f0-9]{64}$/.test(attempt.scope)){
      const scope=path.join(process.env.LOCALAPPDATA,'SayweaveInstallTransactions',attempt.scope);
      const ownerEnv={...process.env,SAYWEAVE_TEST_RECEIPT_DIR:scope};
-     const readOwner="$path=$env:SAYWEAVE_TEST_RECEIPT_DIR;$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$items=@(foreach($file in @($path,(Join-Path $path 'lock'))){if(Test-Path -LiteralPath $file){$owner=(Get-Acl -LiteralPath $file).GetOwner([Security.Principal.SecurityIdentifier]).Value;@{sameUser=$owner -eq $sid;administrators=$owner -eq 'S-1-5-32-544';system=$owner -eq 'S-1-5-18'}}});ConvertTo-Json -InputObject $items -Compress";
-     diagnostic.receiptOwners=JSON.parse(await command('powershell',['-NoProfile','-Command',readOwner],30000,root,ownerEnv));persist();
-     if(diagnostic.receiptOwners.some(owner=>!owner.sameUser)){
+     const readOwner="$ErrorActionPreference='Stop';$path=$env:SAYWEAVE_TEST_RECEIPT_DIR;$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;$section=[Security.AccessControl.AccessControlSections]::Owner;$items=@(foreach($file in @($path,(Join-Path $path 'lock'))){if([IO.Directory]::Exists($file)){$acl=[IO.Directory]::GetAccessControl($file,$section)}elseif([IO.File]::Exists($file)){$acl=[IO.File]::GetAccessControl($file,$section)}else{continue};$owner=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value;@{sameUser=$owner -eq $sid;administrators=$owner -eq 'S-1-5-32-544';system=$owner -eq 'S-1-5-18'}});ConvertTo-Json -InputObject $items -Compress";
+     try{diagnostic.receiptOwners=JSON.parse(await command('powershell',['-NoProfile','-Command',readOwner],30000,root,ownerEnv));}
+     catch(ownerReadError){diagnostic.receiptOwnerReadError=String(ownerReadError.message);}
+     persist();
+     if(diagnostic.receiptOwners?.some(owner=>!owner.sameUser)){
       const corrected=path.join(process.env.LOCALAPPDATA,`${packages.manifest.product} user owner`);
       const correctedEnv={...process.env,SAYWEAVE_TEST_INSTALLER:packages.old,SAYWEAVE_TEST_INSTALL_DIRECTORY:corrected};
       const runWithOwner="$ErrorActionPreference='Stop';. ./scripts/windows-installer-test-owner.ps1;Set-SayweaveInstallerTestOwner;$arg='/S /D='+$env:SAYWEAVE_TEST_INSTALL_DIRECTORY;$p=Start-Process -FilePath $env:SAYWEAVE_TEST_INSTALLER -ArgumentList $arg -WindowStyle Hidden -Wait -PassThru;exit $p.ExitCode";

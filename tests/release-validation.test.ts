@@ -112,7 +112,7 @@ describe('retained package resume and partial upload',()=>{
 describe('frozen product release controller boundaries',()=>{
  // Reconstruct the frozen fixture without requiring release tags in shallow CI clones.
  // The validator pins each original/reviewed native test suffix through EOF.
- const nativeReviewed=readFileSync('src-tauri/src/installer/record.rs','utf8').replaceAll('\r\n','\n');
+ const nativeReviewed='fn installer_runtime_fixture() {}\n'+readFileSync('tests/fixtures/frozen-installer-receipt-tests.rs.txt','utf8').replaceAll('\r\n','\n');
  const start=nativeReviewed.indexOf('    fn ordinary_owner_receipt_preserves_owner_and_confirms_replacement() {');
  const end=nativeReviewed.indexOf('    #[test]\n    fn live_installer_identity_fences_receipt_recovery_including_pid_reuse()',start);
  const nativeOriginal=nativeReviewed.slice(0,start)+`    fn ordinary_owner_receipt_preserves_owner_and_confirms_replacement() {
