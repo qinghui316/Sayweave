@@ -5,6 +5,7 @@ use super::{
 };
 use sayweave_text_service::transport::{Pipe, identity, process_user_sid};
 use std::{
+    os::windows::ffi::OsStringExt,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -21,7 +22,7 @@ use windows::{
 
 pub fn process(pid: u32) -> Result<Process> {
     let id = identity(pid).map_err(|_| "installerProcessIdentity")?;
-    let path = process_path(pid)?;
+    let path = process_path(pid).map_err(|_| "installerProcessIdentity")?;
     Ok(Process {
         pid,
         session: id.session,
@@ -30,12 +31,9 @@ pub fn process(pid: u32) -> Result<Process> {
         image_hash: hash(&read(&path, MAX_FILE)?),
     })
 }
-pub fn process_path(pid: u32) -> Result<PathBuf> {
+fn process_path(pid: u32) -> windows::core::Result<PathBuf> {
     unsafe {
-        let handle = Pipe(
-            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
-                .map_err(|_| "installerProcessIdentity")?,
-        );
+        let handle = Pipe(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)?);
         let mut buffer = vec![0u16; 32768];
         let mut len = buffer.len() as u32;
         QueryFullProcessImageNameW(
@@ -43,11 +41,10 @@ pub fn process_path(pid: u32) -> Result<PathBuf> {
             PROCESS_NAME_WIN32,
             PWSTR(buffer.as_mut_ptr()),
             &mut len,
-        )
-        .map_err(|_| "installerProcessIdentity")?;
-        Ok(PathBuf::from(
-            String::from_utf16(&buffer[..len as usize]).map_err(|_| "installerProcessIdentity")?,
-        ))
+        )?;
+        Ok(PathBuf::from(std::ffi::OsString::from_wide(
+            &buffer[..len as usize],
+        )))
     }
 }
 pub fn live(process: &Process) -> bool {
@@ -198,7 +195,11 @@ pub fn elevate(args: &str) -> Result<Pipe> {
         ..Default::default()
     };
     unsafe {
-        ShellExecuteExW(&mut request).map_err(|_| "installerElevationCancelled")?;
+        ShellExecuteExW(&mut request).map_err(|error| match error.code().0 as u32 {
+            0x8007_04c7 => "installerElevationCancelled",
+            0x8007_0005 => "installerElevationDenied",
+            _ => "installerElevationFailed",
+        })?;
     }
     if request.hProcess.is_invalid() {
         return Err("installerElevationFailed".into());
@@ -207,6 +208,10 @@ pub fn elevate(args: &str) -> Result<Pipe> {
 }
 pub fn running_at(path: &std::path::Path) -> Result<bool> {
     use windows::Win32::System::Diagnostics::ToolHelp::*;
+    let expected = path
+        .file_name()
+        .ok_or("installerDirectory")?
+        .to_string_lossy();
     unsafe {
         let snapshot = Pipe(
             CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).map_err(|_| "installerProcessQuery")?,
@@ -221,11 +226,22 @@ pub fn running_at(path: &std::path::Path) -> Result<bool> {
                 let name = String::from_utf16_lossy(&entry.szExeFile)
                     .trim_end_matches('\0')
                     .to_owned();
-                if name.eq_ignore_ascii_case("sayweave.exe") {
-                    let image = process_path(entry.th32ProcessID)?;
-                    if super::metadata::same_path(&image.to_string_lossy(), &path.to_string_lossy())
-                    {
-                        return Ok(true);
+                if name.eq_ignore_ascii_case(&expected) {
+                    match process_path(entry.th32ProcessID) {
+                        Ok(image) => {
+                            if super::metadata::same_path(
+                                &image.to_string_lossy(),
+                                &path.to_string_lossy(),
+                            ) {
+                                return Ok(true);
+                            }
+                        }
+                        // The process can exit between enumeration and opening its handle.
+                        Err(error)
+                            if [ERROR_INVALID_PARAMETER, ERROR_INVALID_HANDLE]
+                                .iter()
+                                .any(|code| error.code() == code.to_hresult()) => {}
+                        Err(_) => return Err("installerProcessIdentity".into()),
                     }
                 }
             }

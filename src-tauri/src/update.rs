@@ -1,4 +1,9 @@
 //! Native-owned update transaction. Renderer calls carry the exact candidate identity.
+#[cfg(windows)]
+use crate::installer::{
+    diagnostics::{self, Attempt},
+    native,
+};
 use crate::{
     build_info::{self, BuildInfo},
     network::{RequestCoordinator, RequestError},
@@ -30,6 +35,7 @@ pub struct Snapshot {
     failure_stage: Option<String>,
     blocked_reason: Option<String>,
     recovery: bool,
+    diagnostic: Option<String>,
     notes: Option<String>,
     build: BuildInfo,
 }
@@ -64,11 +70,15 @@ struct Journal {
     schema_version: u8,
     candidate: Candidate,
     stage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt: Option<String>,
 }
 struct Inner {
     snapshot: Snapshot,
     candidate: Option<Candidate>,
     last_check: u64,
+    #[cfg(windows)]
+    diagnostic: Option<Attempt>,
 }
 pub struct UpdateService {
     inner: Mutex<Inner>,
@@ -76,6 +86,8 @@ pub struct UpdateService {
     requests: Arc<RequestCoordinator>,
     key: String,
     feed: String,
+    #[cfg(windows)]
+    relaunch: Option<u32>,
 }
 #[derive(Debug, Serialize)]
 pub struct Error {
@@ -224,10 +236,28 @@ impl UpdateService {
             failure_stage: None,
             blocked_reason: None,
             recovery: false,
+            diagnostic: None,
             notes: None,
             build,
         };
         let mut candidate = None;
+        #[cfg(windows)]
+        let mut diagnostic = None;
+        #[cfg(windows)]
+        let scope = native::running_scope().ok();
+        #[cfg(windows)]
+        let installed_by = native::running_installation().ok().flatten();
+        #[cfg(windows)]
+        let mut relaunch = std::env::args()
+            .find_map(|arg| {
+                arg.strip_prefix("--sayweave-update-launch=")
+                    .and_then(|value| value.parse().ok())
+            })
+            .filter(|pid: &u32| {
+                installed_by
+                    .as_ref()
+                    .is_some_and(|process| process.pid == *pid)
+            });
         if !cache_available {
             snapshot.state = "failed".into();
             snapshot.error = Some("无法准备更新缓存，当前程序可以继续使用。".into());
@@ -241,6 +271,22 @@ impl UpdateService {
             let verified_package = bounded_read(&root.join("candidate.exe"), MAX_PACKAGE)
                 .ok()
                 .filter(|bytes| verify_package(bytes, &journal.candidate, &key).is_ok());
+            #[cfg(windows)]
+            if let (Some(bytes), Some(scope)) = (&verified_package, &scope) {
+                let package = crate::installer::package_hash(bytes);
+                diagnostic = match journal.attempt.as_deref() {
+                    Some(id) => diagnostics::load(id, &package),
+                    None => diagnostics::latest(
+                        &package,
+                        scope,
+                        installed_by.as_ref().filter(|_| relaunch.is_some()),
+                    ),
+                }
+                .filter(|attempt| {
+                    attempt.scope.as_deref() == Some(scope)
+                        && attempt.to == journal.candidate.version
+                });
+            }
             if journal.candidate.version == snapshot.build.version
                 && verified_package.as_ref().is_some_and(|bytes| {
                     crate::installer::acknowledge_running(&crate::installer::package_hash(bytes))
@@ -262,6 +308,14 @@ impl UpdateService {
                     snapshot.error = Some("上次更新未完成，可以重新安装。".into());
                     snapshot.failure_stage = Some(journal.stage);
                 }
+                #[cfg(windows)]
+                if let Some(attempt) = diagnostic
+                    .as_ref()
+                    .filter(|attempt| attempt.error.is_some())
+                {
+                    snapshot.error = Some(attempt.summary().into());
+                    snapshot.failure_stage = attempt.error.clone();
+                }
                 candidate = Some(journal.candidate);
             } else if journal.candidate.version == snapshot.build.version {
                 snapshot.state = "recovery".into();
@@ -270,16 +324,37 @@ impl UpdateService {
                 snapshot.error = Some("输入组件维护尚未完成，请重新运行安装包恢复。".into());
             }
         }
+        #[cfg(windows)]
+        if snapshot.build.updates_enabled {
+            if diagnostic.is_none()
+                && let (Some(scope), Some(installer)) = (&scope, &installed_by)
+            {
+                diagnostic = diagnostics::latest(&installer.image_hash, scope, Some(installer))
+                    .filter(|attempt| attempt.installed && attempt.to == snapshot.build.version);
+            }
+            relaunch = relaunch.filter(|_| {
+                diagnostic.as_ref().is_some_and(|attempt| {
+                    installed_by
+                        .as_ref()
+                        .is_some_and(|installer| attempt.matches_installer(installer))
+                })
+            });
+            snapshot.diagnostic = diagnostic.as_ref().map(|attempt| attempt.summary().into());
+        }
         Ok(Self {
             inner: Mutex::new(Inner {
                 snapshot,
                 candidate,
                 last_check,
+                #[cfg(windows)]
+                diagnostic,
             }),
             root,
             requests,
             key,
             feed,
+            #[cfg(windows)]
+            relaunch,
         })
     }
     fn snapshot(&self) -> Result<Snapshot, Error> {
@@ -310,11 +385,17 @@ impl UpdateService {
         let snapshot = inner.snapshot.clone();
         Some(snapshot)
     }
-    fn journal(&self, candidate: &Candidate, stage: &str) -> Result<(), Error> {
+    fn journal(
+        &self,
+        candidate: &Candidate,
+        stage: &str,
+        attempt: Option<&str>,
+    ) -> Result<(), Error> {
         let bytes = serde_json::to_vec(&Journal {
             schema_version: 1,
             candidate: candidate.clone(),
             stage: stage.into(),
+            attempt: attempt.map(str::to_owned),
         })
         .map_err(|_| Error::new("journalWrite"))?;
         if bytes.len() > MAX_METADATA {
@@ -433,7 +514,7 @@ impl UpdateService {
             return Err(Error::new("cancelled"));
         }
         atomic_write(&self.root.join("candidate.exe"), &payload)?;
-        self.journal(&candidate, "ready")?;
+        self.journal(&candidate, "ready", None)?;
         inner.candidate = Some(candidate);
         drop(inner);
         self.publish(app, id, |s| {
@@ -503,6 +584,19 @@ impl UpdateService {
             });
             return Ok(());
         }
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        #[cfg(windows)]
+        let mut diagnostic = Attempt::new(
+            attempt_id.clone(),
+            String::new(),
+            Some(build_info::current().version.into()),
+            candidate.version.clone(),
+        );
+        #[cfg(windows)]
+        {
+            diagnostic.scope = native::running_scope().ok();
+            diagnostic.save();
+        }
         let watermark = crate::archive::watermark();
         let prepare = tokio::time::timeout(Duration::from_secs(10), async {
             lifecycle.drain().await.map_err(Error::new)?;
@@ -514,11 +608,18 @@ impl UpdateService {
             }
             let bytes = bounded_read(&self.root.join("candidate.exe"), MAX_PACKAGE)?;
             verify_package(&bytes, &candidate, &self.key)?;
-            self.journal(&candidate, "preparing")
+            #[cfg(windows)]
+            {
+                diagnostic.package = crate::installer::package_hash(&bytes);
+                diagnostic.save();
+            }
+            self.journal(&candidate, "preparing", Some(&attempt_id))
         })
         .await
         .unwrap_or_else(|_| Err(Error::new("prepareTimeout")));
         if let Err(error) = prepare {
+            #[cfg(windows)]
+            self.note_failure(&mut diagnostic, "prepare", &error.code);
             lifecycle.release();
             let invalid_package = ["cacheRead", "tooLarge", "packageIdentity", "signature"]
                 .contains(&error.code.as_str());
@@ -544,7 +645,9 @@ impl UpdateService {
             });
             return Ok(());
         }
-        if let Err(error) = self.journal(&candidate, "stopping") {
+        if let Err(error) = self.journal(&candidate, "stopping", Some(&attempt_id)) {
+            #[cfg(windows)]
+            self.note_failure(&mut diagnostic, "prepare", &error.code);
             lifecycle.release();
             self.publish(app, id, |s| {
                 s.state = "readyToInstall".into();
@@ -553,6 +656,11 @@ impl UpdateService {
             });
             return Ok(());
         }
+        #[cfg(windows)]
+        {
+            diagnostic.stage = "shutdown".into();
+            diagnostic.save();
+        }
         self.publish(app, id, |s| s.state = "stopping".into());
         let stopped = tokio::time::timeout(
             Duration::from_secs(5),
@@ -560,21 +668,31 @@ impl UpdateService {
         )
         .await;
         if !matches!(stopped, Ok(Ok(()))) {
+            #[cfg(windows)]
+            self.note_failure(&mut diagnostic, "shutdown", "updateShutdownFailed");
             self.recover(app, id, "stop", "停止服务未完成，请重启当前版本后再试。");
             return Ok(());
         }
         let launch = (|| {
             let bytes = bounded_read(&self.root.join("candidate.exe"), MAX_PACKAGE)?;
             verify_package(&bytes, &candidate, &self.key)?;
-            self.journal(&candidate, "launching")?;
-            launch_installer(&self.root.join("candidate.exe"))
+            self.journal(&candidate, "launching", Some(&attempt_id))?;
+            #[cfg(windows)]
+            {
+                diagnostic.stage = "launch".into();
+                diagnostic.save();
+            }
+            launch_installer(&self.root.join("candidate.exe"), &attempt_id)
         })();
-        if launch.is_err() {
+        if let Err(error) = launch {
+            #[cfg(windows)]
+            self.note_failure(&mut diagnostic, "launch", &error.code);
+            log::warn!(target: "sayweave", "operation=update_installer_launch error={}", error.code);
             self.recover(app, id, "launch", "安装器未能启动，请重启当前版本后再试。");
             return Ok(());
         }
         // A launched installer is not yet a completed update; the next process confirms its version.
-        let _ = self.journal(&candidate, "launched");
+        let _ = self.journal(&candidate, "launched", Some(&attempt_id));
         self.publish(app, id, |s| s.state = "installing".into());
         log::logger().flush();
         app.exit(0);
@@ -596,6 +714,41 @@ impl UpdateService {
             s.failure_stage = Some(stage.into());
             s.error = Some(message.into());
         });
+    }
+
+    #[cfg(windows)]
+    fn note_failure(&self, attempt: &mut Attempt, stage: &str, code: &str) {
+        attempt.stage = stage.into();
+        attempt.fail(stage, code);
+        attempt.save();
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.snapshot.diagnostic = Some(attempt.summary().into());
+            inner.diagnostic = Some(attempt.clone());
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn confirm_relaunch(&self, app: &tauri::AppHandle) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let Some(attempt) = inner.diagnostic.as_mut().filter(|attempt| {
+            attempt.installed
+                && attempt.restart.as_deref() == Some("requested")
+                && self
+                    .relaunch
+                    .is_some_and(|pid| attempt.installer_pid == Some(pid))
+                && attempt.to == build_info::current().version
+        }) else {
+            return;
+        };
+        attempt.restart = Some("confirmed".into());
+        attempt.save();
+        inner.snapshot.diagnostic = Some(attempt.summary().into());
+        inner.snapshot.revision += 1;
+        let snapshot = inner.snapshot.clone();
+        drop(inner);
+        let _ = app.emit_to("main", "update:snapshot", snapshot);
     }
 }
 fn foreground_busy(app: &tauri::AppHandle) -> bool {
@@ -646,12 +799,13 @@ fn verify_package(bytes: &[u8], candidate: &Candidate, key: &str) -> Result<(), 
     crate::update_signature::verify(bytes, key, &candidate.signature, &candidate.version)
         .map_err(|_| Error::new("signature"))
 }
-fn launch_installer(path: &Path) -> Result<(), Error> {
+fn launch_installer(path: &Path, attempt: &str) -> Result<(), Error> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         std::process::Command::new(path)
             .args(["/P", "/UPDATE", "/R"])
+            .env(diagnostics::ATTEMPT_ENV, attempt)
             .creation_flags(0x08000000)
             .spawn()
             .map_err(|_| Error::new("launch"))?;
@@ -659,7 +813,7 @@ fn launch_installer(path: &Path) -> Result<(), Error> {
     }
     #[cfg(not(windows))]
     {
-        let _ = path;
+        let _ = (path, attempt);
         Err(Error::new("unsupported"))
     }
 }
@@ -677,6 +831,36 @@ pub fn update_snapshot(
 ) -> Result<Snapshot, Error> {
     authorize(&window)?;
     service.snapshot()
+}
+
+#[tauri::command]
+pub fn update_copy_diagnostics(
+    window: WebviewWindow,
+    service: State<'_, UpdateService>,
+) -> Result<(), Error> {
+    authorize(&window)?;
+    #[cfg(windows)]
+    {
+        use tauri_plugin_clipboard_manager::ClipboardExt;
+        let text = service
+            .inner
+            .lock()
+            .map_err(|_| Error::new("unavailable"))?
+            .diagnostic
+            .as_ref()
+            .ok_or_else(|| Error::new("missingDiagnostic"))?
+            .shareable();
+        window
+            .app_handle()
+            .clipboard()
+            .write_text(text)
+            .map_err(|_| Error::new("clipboard"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = service;
+        Err(Error::new("unsupported"))
+    }
 }
 #[tauri::command]
 pub fn update_check(

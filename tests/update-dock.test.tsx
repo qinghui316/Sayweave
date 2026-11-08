@@ -7,7 +7,7 @@ import {UpdateDock} from '../src/ui/UpdateDock';
 afterEach(cleanup);
 function fixture(patch:Partial<UpdateSnapshot>={}) {
  let value:UpdateSnapshot={...initialUpdate,...patch};const listeners=new Set<()=>void>();
- const port:UpdatePort={snapshot:()=>value,subscribe:fn=>{listeners.add(fn);return()=>{listeners.delete(fn);};},check:vi.fn(),cancel:vi.fn(),install:vi.fn(),restart:vi.fn()};
+ const port:UpdatePort={snapshot:()=>value,subscribe:fn=>{listeners.add(fn);return()=>{listeners.delete(fn);};},check:vi.fn(),cancel:vi.fn(),install:vi.fn(),restart:vi.fn(),copyDiagnostics:vi.fn()};
  return {port,update:(next:Partial<UpdateSnapshot>)=>{value={...value,...next};listeners.forEach(fn=>fn());}};
 }
 it.each(['idle','checking','downloading','verifying','readyToInstall','preparing','stopping','installing','failed','recovery'] as const)('routes %s to About without starting installation',async state=>{

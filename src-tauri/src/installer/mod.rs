@@ -1,6 +1,8 @@
 //! Installer orchestration owns application files; component registration stays in its owner.
 //! None of these entries starts Tauri, opens SQLite, or reads Windows credentials.
 #[cfg(windows)]
+pub(crate) mod diagnostics;
+#[cfg(windows)]
 mod ipc;
 #[cfg(test)]
 mod local_payload_tests;
@@ -10,7 +12,7 @@ mod machine;
 #[cfg(windows)]
 mod metadata;
 #[cfg(windows)]
-mod native;
+pub(crate) mod native;
 mod record;
 
 pub fn package_hash(bytes: &[u8]) -> String {
@@ -52,6 +54,8 @@ pub fn helper_entry() -> Option<i32> {
                 eprintln!("SAYWEAVE_INSTALLER result=committed startup=warning");
                 2
             }
+            Err(error) if error == "installerPreviousRunning" => 3,
+            Err(error) if error == "installerUpdateCommitted" => 4,
             Err(error) => {
                 log::error!(target:"sayweave", "installer result=failed code={error}");
                 1

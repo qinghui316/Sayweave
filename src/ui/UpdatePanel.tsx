@@ -8,8 +8,9 @@ export function UpdatePanel({port,onInstall,preparing,error,showIdentity=true}:{
  const value=useSyncExternalStore(port.subscribe,port.snapshot);
  const [commandError,setCommandError]=useState<string|null>(null);
  const [requesting,setRequesting]=useState(false);
+ const [copied,setCopied]=useState(false);
  const busy=preparing||requesting||['checking','downloading','verifying','preparing','stopping','installing'].includes(value.state);
- const run=async(action:()=>Promise<void>)=>{if(requesting)return;setCommandError(null);setRequesting(true);try{await action();}catch{setCommandError('操作未完成，请重试。');}finally{setRequesting(false);}};
+ const run=async(action:()=>Promise<void>)=>{if(requesting)return;setCommandError(null);setCopied(false);setRequesting(true);try{await action();}catch{setCommandError('操作未完成，请重试。');}finally{setRequesting(false);}};
  const message=error??commandError??value.error??value.blockedReason;
  const saving=preparing&&value.state==='readyToInstall';
  const actionLabel=value.state==='installing'?'正在安装':value.state==='stopping'?'正在停止服务':value.state==='preparing'?'正在准备更新':value.state==='verifying'?'正在验证':value.state==='downloading'?'正在下载':value.state==='checking'?'正在检查':value.state==='failed'?'重试':'检查更新';
@@ -22,6 +23,11 @@ export function UpdatePanel({port,onInstall,preparing,error,showIdentity=true}:{
    </div>
    {value.state==='downloading'&&<div className={s.track} role="progressbar" aria-label="更新下载进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={value.progress??undefined}><span style={{transform:`scaleX(${Math.min(100,Math.max(0,value.progress??0))/100})`}}/></div>}
    {message&&<InlineMessage status="error">{message}</InlineMessage>}
+   {value.diagnostic&&<div>
+    {value.diagnostic!==message&&<InlineMessage>{value.diagnostic}</InlineMessage>}
+    <Button variant="quiet" disabled={requesting} onClick={()=>void run(async()=>{await port.copyDiagnostics();setCopied(true);})}>复制更新诊断</Button>
+    {copied&&<InlineMessage status="success">已复制更新诊断。</InlineMessage>}
+   </div>}
 
    {value.notes&&<details className={s.notes}><summary>查看版本说明</summary><div>{value.notes}</div></details>}
   </section>}
