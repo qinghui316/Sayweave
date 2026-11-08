@@ -7,7 +7,7 @@ on:
       phase:
         description: CI only, or explicitly requested update acceptance
         type: choice
-        options: [ci, diagnose, startup, full, controller]
+        options: [ci, diagnose, input-baseline, startup, full, controller]
         default: ci
       reuse_run:
         description: Same-commit run containing immutable tools/packages (optional)
@@ -48,6 +48,50 @@ concurrency:
   group: windows-validation-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 jobs:
+  published-input-baseline:
+    name: Published v0.1.23 input baseline
+    if: github.event_name == 'workflow_dispatch' && inputs.phase == 'input-baseline'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install public v0.1.23 and exercise the registered input component
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'sayweave-input-baseline'
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          $name = 'Sayweave_0.1.23_x64-setup.exe'
+          gh release download v0.1.23 --repo qinghui316/Sayweave --pattern $name --pattern SHA256SUMS.txt --dir $dir
+          if ($LASTEXITCODE) { throw 'Published baseline download failed.' }
+          $exe = Join-Path $dir $name
+          $checksum = (Get-Content -LiteralPath (Join-Path $dir 'SHA256SUMS.txt') | Where-Object { $_ -match ('^[a-f0-9]{64}  ' + [regex]::Escape($name) + '$') }) -split '\s+'
+          if (!$checksum -or (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash -ine $checksum[0]) { throw 'Published baseline checksum differs.' }
+          $setup = Start-Process -FilePath $exe -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden
+          if ($setup.ExitCode) { throw "Published baseline installation failed ($($setup.ExitCode))." }
+          $installed = Join-Path $env:LOCALAPPDATA 'Sayweave/sayweave.exe'
+          if ((Get-Item -LiteralPath $installed).VersionInfo.FileVersion -ne '0.1.23') { throw 'Installed baseline version differs.' }
+          cargo build --locked --manifest-path src-tauri/text-service/Cargo.toml --features acceptance --bin tsf-probe
+          if ($LASTEXITCODE) { throw 'Input probe build failed.' }
+          $tip = Get-Item -LiteralPath 'Registry::HKEY_LOCAL_MACHINE\Software\Classes\CLSID\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}\InprocServer32'
+          $module = $tip.GetValue('')
+          $probe = 'src-tauri/text-service/target/debug/tsf-probe.exe'
+          & $probe registration-query-detail 2>&1 | Tee-Object -FilePath (Join-Path $dir 'registration.log')
+          if ($LASTEXITCODE) { throw 'Installed profile readback failed.' }
+          & $probe formal-input-fixture $module 2>&1 | Tee-Object -FilePath (Join-Path $dir 'input.log')
+          if ($LASTEXITCODE) { throw 'Installed public input proof failed.' }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: published-input-baseline
+          retention-days: 7
+          path: ${{ runner.temp }}/sayweave-input-baseline/*.log
+          if-no-files-found: warn
+
   ci:
     name: CI
     needs: windows-tooling
@@ -90,7 +134,7 @@ jobs:
       - run: npm run check:distribution
   windows-tooling:
     name: Windows update tooling
-    if: github.event_name == 'workflow_dispatch' && inputs.phase != 'diagnose' && inputs.phase != 'ci'
+    if: github.event_name == 'workflow_dispatch' && inputs.phase != 'diagnose' && inputs.phase != 'ci' && inputs.phase != 'input-baseline'
     outputs:
       reuse_run: ${{ steps.reuse.outputs.run_id }}
       product_commit: ${{ steps.scope.outputs.product_commit }}
