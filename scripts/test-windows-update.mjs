@@ -55,7 +55,7 @@ async function command(file,args,cwd=root,env=process.env,expectedFailure,timeou
   let detail=safe?stderr.slice(-4096):'private fixture log retained';
   if(file===process.execPath&&path.basename(args[0]??'')==='desktop.mjs'&&args[1]==='package'){
    const secrets=Object.entries(env).filter(([name])=>/TOKEN|PASSWORD|SECRET|PRIVATE_KEY/i.test(name)).map(([,value])=>value);
-   if(existsSync(keyPath))secrets.push(readFileSync(keyPath,'utf8').trim());
+   if(existsSync(keyPath))secrets.push(...readFileSync(keyPath,'utf8').trim().split(/\r?\n/));
    mkdirSync(diagnostics,{recursive:true});
    writeFileSync(path.join(diagnostics,'package-build-failure.log'),safeStartupText(tail,secrets));
    detail='see package-build-failure.log in the Windows update receipt artifact';
@@ -486,8 +486,18 @@ async function build(version,channel='test'){
   if(!lstatSync(modules).isSymbolicLink()||realpathSync(modules)!==dependencyRoot)throw Error('Package build dependency junction changed');
   rmdirSync(modules);
  };
+ const args=[path.join(source,'scripts','desktop.mjs'),'package','--config',file,...(channel==='test'?['--features','desktop-acceptance']:[])];
  try{
-  await command(process.execPath,[path.join(source,'scripts','desktop.mjs'),'package','--config',file,...(channel==='test'?['--features','desktop-acceptance']:[])],source,env);
+  try{await command(process.execPath,args,source,env);}
+  catch(error){
+   const failure=path.join(directory,'diagnostics','package-build-failure.log');
+   if(report.commands.at(-1)?.exitCode!==1||!existsSync(failure))throw error;
+   const output=readFileSync(failure,'utf8');
+   if(!/Downloading https:\/\/github\.com\/tauri-apps\/(?:binary-releases|nsis-tauri-utils)\/releases\/download\/[^\r\n]+\r?\nfailed to bundle project: `http status: 50[234]`/.test(output))throw error;
+   stage(`retrying ${channel} ${version} after a transient NSIS tool download failure`);
+   await delay(3000);
+   await command(process.execPath,args,source,env);
+  }
  }finally{detachDependencies();}
  readTools(tools.directory,commit);
  const installer=path.join(env.CARGO_TARGET_DIR,'release','bundle','nsis',`${config.productName}_${version}_x64-setup.exe`),copy=path.join(directory,`${channel}-${version}-setup.exe`);writeFileSync(copy,readFileSync(installer));writeFileSync(`${copy}.sig`,readFileSync(`${installer}.sig`));
