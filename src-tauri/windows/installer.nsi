@@ -87,6 +87,8 @@ Var SayweaveTransactionStarted
 Var SayweaveTransactionCommitted
 Var SayweaveTransactionDir
 Var SayweaveMaintenanceResult
+Var SayweaveFailureHandled
+Var SayweaveRestartRequested
 
 Name "${PRODUCTNAME}"
 BrandingText "${COPYRIGHT}"
@@ -343,6 +345,8 @@ Function .onInit
   StrCpy $SayweaveInstallerPid $0
   StrCpy $SayweaveTransactionStarted 0
   StrCpy $SayweaveTransactionCommitted 0
+  StrCpy $SayweaveFailureHandled 0
+  StrCpy $SayweaveRestartRequested 0
   ${GetOptions} $CMDLINE "/P" $PassiveMode
   ${IfNot} ${Errors}
     StrCpy $PassiveMode 1
@@ -356,6 +360,13 @@ Function .onInit
   ${GetOptions} $CMDLINE "/UPDATE" $UpdateMode
   ${IfNot} ${Errors}
     StrCpy $UpdateMode 1
+    System::Call 'kernel32::SetEnvironmentVariableW(w "SAYWEAVE_INSTALL_UPDATE", w "1") i.r0'
+  ${Else}
+    System::Call 'kernel32::SetEnvironmentVariableW(w "SAYWEAVE_INSTALL_UPDATE", p 0) i.r0'
+  ${EndIf}
+  ${GetOptions} $CMDLINE "/R" $0
+  ${IfNot} ${Errors}
+    StrCpy $SayweaveRestartRequested 1
   ${EndIf}
 
 
@@ -518,11 +529,15 @@ Section Install
   ; Native preflight waits for a normal exit; never force-kill an active dictation.
   ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=check "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
   ${If} $SayweaveMaintenanceResult != 0
+    Call SayweaveRecoverUpdate
     Call SayweaveRollback
     SetErrorLevel 1
     Abort "请先正常退出 Sayweave，再重试安装。"
   ${EndIf}
 
+  ; A failed extraction is handled by the same transaction as a failed commit.
+  ClearErrors
+  SetOverwrite try
   ; Copy main executable
   File "${MAINBINARYSRCPATH}"
 
@@ -533,6 +548,14 @@ Section Install
   {{#each resources}}
     File /a "/oname={{this.[1]}}" "{{no-escape @key}}"
   {{/each}}
+  SetOverwrite on
+  ${If} ${Errors}
+    ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=copy-failed "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
+    Call SayweaveRecoverUpdate
+    Call SayweaveRollback
+    SetErrorLevel 1
+    Abort "无法写入安装文件。请关闭占用文件的程序后重试。"
+  ${EndIf}
 
   ; Cargo tool binaries are build inputs, outside the owned install manifest.
   ; The maintenance resource above is the sole installed helper.
@@ -623,6 +646,7 @@ Section Install
   ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=commit "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
   ${If} $SayweaveMaintenanceResult != 0
   ${AndIf} $SayweaveMaintenanceResult != 2
+    Call SayweaveRecoverUpdate
     Call SayweaveRollback
     SetErrorLevel 1
     Abort "程序或输入组件安装未完成。已恢复的版本可继续使用；若恢复未完成，请重新运行此安装包。"
@@ -648,9 +672,26 @@ Function .onInstSuccess
   ${OrIf} ${Silent}
     ${GetOptions} $CMDLINE "/R" $R0
     ${IfNot} ${Errors}
-      ${GetOptions} $CMDLINE "/ARGS" $R0
-      nsis_tauri_utils::RunAsUser "$INSTDIR\${MAINBINARYNAME}.exe" "$R0"
+      Call SayweaveLaunch
     ${EndIf}
+  ${EndIf}
+FunctionEnd
+
+Function SayweaveLaunch
+  ${GetOptions} $CMDLINE "/ARGS" $R0
+  ${If} $UpdateMode = 1
+    ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=launch-new "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
+    ${If} $SayweaveMaintenanceResult != 0
+      DetailPrint "程序已安装。请从开始菜单打开 Sayweave。"
+      Return
+    ${EndIf}
+    StrCpy $R0 "--sayweave-update-launch=$SayweaveInstallerPid $R0"
+  ${EndIf}
+  nsis_tauri_utils::RunAsUser "$INSTDIR\${MAINBINARYNAME}.exe" "$R0"
+  Pop $0
+  ${If} $UpdateMode = 1
+  ${AndIf} $0 != 0
+    Call SayweaveRecordLaunchFailure
   ${EndIf}
 FunctionEnd
 
@@ -811,6 +852,7 @@ Function SayweaveBegin
   StrCpy $SayweaveTransactionDir $INSTDIR
   ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=begin "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
   ${If} $SayweaveMaintenanceResult != 0
+    Call SayweaveRecoverUpdate
     Call SayweaveRollback
     SetErrorLevel 1
     Abort "无法准备安装。请正常退出 Sayweave，并完成 Windows 管理员确认后重试。"
@@ -831,9 +873,61 @@ Function SayweaveRollback
 FunctionEnd
 
 Function .onInstFailed
+  ${If} $SayweaveFailureHandled = 1
+    Return
+  ${EndIf}
+  ${If} $UpdateMode = 1
+  ${AndIf} $SayweaveFailureHandled = 0
+  ${AndIf} $SayweaveTransactionStarted = 1
+    ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=copy-failed "--install-dir=$SayweaveTransactionDir" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
+    Call SayweaveRecoverUpdate
+  ${EndIf}
   Call SayweaveRollback
 FunctionEnd
 
 Function .onGUIEnd
+  ${If} $SayweaveFailureHandled = 0
+    Call SayweaveRollback
+  ${EndIf}
+FunctionEnd
+
+Function SayweaveRecordLaunchFailure
+  ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=launch-failed "--install-dir=$INSTDIR" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
+FunctionEnd
+
+Function SayweaveRecoverUpdate
+  ${If} $UpdateMode != 1
+  ${OrIf} $SayweaveRestartRequested != 1
+  ${OrIf} $SayweaveFailureHandled = 1
+    Return
+  ${EndIf}
+  StrCpy $SayweaveFailureHandled 1
   Call SayweaveRollback
+  ${If} $SayweaveTransactionStarted != 0
+    Call SayweaveRepairRequired
+  ${EndIf}
+  ExecWait '"$PLUGINSDIR\sayweave-maintenance.exe" --sayweave-installer=launch-old "--install-dir=$SayweaveTransactionDir" "--installer-pid=$SayweaveInstallerPid" "--product-key=${MANUPRODUCTKEY}" "--main-source=$PLUGINSDIR\sayweave-main.exe"' $SayweaveMaintenanceResult
+  ${If} $SayweaveMaintenanceResult = 0
+    nsis_tauri_utils::RunAsUser "$SayweaveTransactionDir\${MAINBINARYNAME}.exe" ""
+    Pop $0
+    ${If} $0 != 0
+      Call SayweaveRecordLaunchFailure
+      MessageBox MB_ICONEXCLAMATION|MB_OK "更新未完成。请从开始菜单打开 Sayweave 后重试。" /SD IDOK
+    ${EndIf}
+  ${ElseIf} $SayweaveMaintenanceResult = 4
+    StrCpy $SayweaveTransactionCommitted 1
+    Call SayweaveLaunch
+    SetErrorLevel 0
+    Quit
+  ${ElseIf} $SayweaveMaintenanceResult != 3
+    Call SayweaveRepairRequired
+  ${EndIf}
+  SetErrorLevel 1
+  Quit
+FunctionEnd
+
+Function SayweaveRepairRequired
+  MessageBox MB_ICONEXCLAMATION|MB_OK "更新恢复未完成，请重新运行完整安装包。" /SD IDOK
+  SetErrorLevel 1
+  Quit
 FunctionEnd

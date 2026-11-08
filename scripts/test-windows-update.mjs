@@ -2,7 +2,7 @@
 import {spawn,execFileSync} from 'node:child_process';
 import {randomUUID,createHash} from 'node:crypto';
 import {createServer} from 'node:https';
-import {mkdirSync,readFileSync,writeFileSync,existsSync,symlinkSync,rmSync,rmdirSync,renameSync,realpathSync} from 'node:fs';
+import {copyFileSync,mkdirSync,readFileSync,readdirSync,writeFileSync,existsSync,symlinkSync,rmSync,rmdirSync,renameSync,realpathSync} from 'node:fs';
 import path from 'node:path';
 import {chromium,expect} from '@playwright/test';
 import {DatabaseSync} from 'node:sqlite';
@@ -120,6 +120,82 @@ async function restartCurrent(page){
 async function state(page,wanted){await expect.poll(async()=>(await invoke(page,'update_snapshot')).state,{timeout:60000}).toBe(wanted);return invoke(page,'update_snapshot');}
 async function install(installer){await candidatePayload(installer);try{await command(installer,['/S']);if(!existsSync(testExe))throw Error('NSIS current-user path differs');}finally{(report.deployments??=[]).push({stage:report.stage,installerSha256:createHash('sha256').update(readFileSync(installer)).digest('hex'),records:deploymentReading(path.dirname(testExe))});checkpoint();}}
 const data=page=>invoke(page,'acceptance_update_data');
+const diagnosticDirectory=()=>path.join(process.env.LOCALAPPDATA,'SayweaveInstallTransactions','diagnostics');
+function readAttempt(id){return JSON.parse(readFileSync(path.join(diagnosticDirectory(),`${id}.json`),'utf8'));}
+async function runRecoveryFixtures(old,next,seeded){
+ const attempts=[];
+ const invokeInstaller=async(fault,failed=true)=>{
+  const attempt=randomUUID();
+  await command(next,['/S','/UPDATE','/R'],root,{...process.env,SAYWEAVE_UPDATE_ATTEMPT:attempt,SAYWEAVE_INSTALL_ACCEPTANCE_FAULT:fault},failed,120000);
+  const diagnostic=readAttempt(attempt);attempts.push(diagnostic);return diagnostic;
+ };
+ for(const [fault,code] of [['cancel-elevation','installerElevationCancelled'],['fail-elevation','installerElevationFailed'],['after-program','acceptanceInstallerProgramFailure']]){
+  stage(`automatic recovery ${fault}`);
+  await install(old);
+  const attempt=await invokeInstaller(fault);
+  expect(attempt).toMatchObject({error:code,rollback:'restored',installed:false,restart:'requested'});
+  const page=await connect(testExe,false);
+  expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.700');
+  expect(await data(page)).toEqual(seeded);await close(page);
+ }
+
+ stage('running previous main remains in use');
+ let page=await connect(testExe);
+ const original=ownedProcess;
+ expect(await invokeInstaller('')).toMatchObject({error:'installerAppRunning',installed:false,restart:'alreadyRunning'});
+ expect(processes(testExe).map(process=>process.ProcessId)).toEqual([original.ProcessId]);await close(page);
+
+ stage('installed worker retains its executable through the wait deadline');
+ const workerExe=path.join(path.dirname(testExe),'local-asr','sayweave-local-asr-worker.exe');
+ const worker=spawn(workerExe,['--stdio'],{windowsHide:true,stdio:['pipe','ignore','ignore']});
+ try{
+  await expect.poll(()=>processes(workerExe).some(entry=>entry.ProcessId===worker.pid)).toBe(true);
+  expect(await invokeInstaller('')).toMatchObject({error:'installerWorkerRunning',rollback:'restored',installed:false});
+ }finally{worker.stdin.end();if(worker.exitCode===null)worker.kill();}
+ page=await connect(testExe,false);await close(page);
+
+ stage('Windows write-sharing lock times out without modifying the old file');
+ const workerHash=createHash('sha256').update(readFileSync(workerExe)).digest('hex');
+ const lockReady=path.join(directory,'write-lock-ready'),releaseLock=path.join(directory,'write-lock-release');
+ const lock=spawn('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop'; $file=[IO.File]::OpenRead(${quote(workerExe)}); try{[IO.File]::WriteAllText(${quote(lockReady)},'ready');$until=[DateTime]::UtcNow.AddSeconds(90);while(-not [IO.File]::Exists(${quote(releaseLock)}) -and [DateTime]::UtcNow -lt $until){Start-Sleep -Milliseconds 100}}finally{$file.Dispose()}`],{windowsHide:true,stdio:'ignore'});
+ try{
+  await expect.poll(()=>existsSync(lockReady)).toBe(true);
+  expect(await invokeInstaller('')).toMatchObject({error:'installerFileInUse',rollback:'restored',installed:false});
+  expect(createHash('sha256').update(readFileSync(workerExe)).digest('hex')).toBe(workerHash);
+ }finally{writeFileSync(releaseLock,'release');}
+ await expect.poll(()=>lock.exitCode).toBe(0);
+ page=await connect(testExe,false);await close(page);
+
+ stage('incomplete rollback retains the recovery transaction');
+ expect(await invokeInstaller('rollback-blocked')).toMatchObject({error:'acceptanceInstallerProgramFailure',rollback:'failed',installed:false});
+ expect(processes(testExe)).toHaveLength(0);
+ const pending=deploymentReading(path.dirname(testExe));expect(JSON.stringify(pending)).toContain('recovery');
+ await install(next);page=await connect(testExe);
+ expect(await data(page)).toEqual(seeded);await close(page);
+
+ stage('committed update with unconfirmed relaunch');
+ await install(old);
+ expect(await invokeInstaller('launch-unconfirmed',false)).toMatchObject({error:'acceptanceInstallerLaunchFailure',installed:true,restart:'failed'});
+ expect(processes(testExe)).toHaveLength(0);
+ page=await connect(testExe);
+ expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.701');
+ expect((await invoke(page,'update_snapshot')).diagnostic).toContain('从开始菜单打开');
+ await close(page);
+ stage('a same-name worker in a separate directory does not block a retry');
+ await install(old);
+ const unrelated=path.join(directory,path.basename(workerExe));
+ copyFileSync(path.join(process.env.SystemRoot,'System32','ping.exe'),unrelated);
+ const sameName=spawn(unrelated,['-t','127.0.0.1'],{windowsHide:true,stdio:'ignore'});
+ try{
+  await expect.poll(()=>processes(unrelated).some(entry=>entry.ProcessId===sameName.pid)).toBe(true);
+  const retry=await invokeInstaller('',false);
+  expect(retry).toMatchObject({error:null,installed:true});
+  page=await connect(testExe,false);
+  await expect.poll(async()=>(await invoke(page,'update_snapshot')).diagnostic).toBe('更新已安装，已自动打开新版。');
+  await close(page);
+ }finally{if(sameName.exitCode===null)sameName.kill();}
+ report.recoveryAttempts=attempts;checkpoint();
+}
 async function verifyPackage(file,version,publicKey){
  stage(`signature verification ${version}`);
  if(frozenProduct){
@@ -271,6 +347,71 @@ async function legacyData(page,config){
  const application=profile.applications[0];
  const detail=await invoke(page,'language_profile',{scope:application.scope});
  return {models,dictionary,history,profile,detail,component:{installed:component.installed,enabled:component.enabled,error:component.error}};
+}
+async function upgradePublic023(stableInstaller,probe){
+ const stableData=path.join(process.env.APPDATA,'local.sayweave.skeleton','data');
+ const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');
+ if(existsSync(stableData)||existsSync(stableExe))throw Error('Stable runner profile is not empty');
+ stage('install public v0.1.23');
+ const oldAssets=path.join(directory,'old-public');mkdirSync(oldAssets);
+ await command('gh',['release','download','v0.1.23','--repo','qinghui316/Sayweave','--pattern','Sayweave_0.1.23_x64-setup.exe','--pattern','SHA256SUMS.txt','--dir',oldAssets]);
+ const old=path.join(oldAssets,'Sayweave_0.1.23_x64-setup.exe'),oldIdentity=installerIdentity(old,'0.1.23','old-public');
+ const oldChecksum=readFileSync(path.join(oldAssets,'SHA256SUMS.txt'),'utf8').split(/\r?\n/).find(line=>line.endsWith('  Sayweave_0.1.23_x64-setup.exe'))?.split(/\s+/)[0];
+ expect(oldIdentity.sha256).toBe(oldChecksum);
+ report.installers.push(oldIdentity,installerIdentity(stableInstaller,stableVersion,'stable'));
+ await command(old,['/S']);
+ await installedRegistrationReady(probe);
+ let page=await connect(stableExe);
+ expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.23');
+ const preferences=await invoke(page,'speech_preferences',{preferences:null});
+ const savedPreferences=await invoke(page,'speech_preferences',{preferences:{...preferences,inputGainDb:6}});
+ expect(savedPreferences.inputGainDb).toBe(6);
+ const saved=await invoke(page,'model_save',{request:{input:{name:'Update synthetic model',protocol:'openai-chat',baseUrl:`https://localhost:${server.address().port}/v1`,modelId:'update-fixture',usages:['text']},key:{action:'replace',value:'isolated-update-test-key'},id:null,revision:null,expectation:null}});
+ await invoke(page,'dictionary_create',{input:{kind:'term',original:'更新验收术语',category:null,replacement:null}});
+ await close(page,false);
+ const dbPath=path.join(stableData,'dictionary.sqlite'),db=new DatabaseSync(dbPath);
+ try{report.legacySeed=seedLegacyRows(db,legacySeed,saved.configs[0].id);}finally{db.close();}
+ page=await connect(stableExe);
+ const before=await legacyData(page,saved.configs[0]);
+ expect(before.history.count).toBe(10);
+ await close(page,false);
+
+ stage('seed exact signed draft in the public client cache');
+ const draft=JSON.parse(readFileSync(path.join(path.dirname(stableInstaller),'latest.json'),'utf8'));
+ const payload=readFileSync(stableInstaller),platform=draft.platforms['windows-x86_64'];
+ expect(draft.version).toBe(stableVersion);
+ expect(platform.installerSize).toBe(payload.length);
+ expect(platform.installerSha512).toBe(createHash('sha512').update(payload).digest('base64'));
+ const cache=path.join(stableData,'update-cache');mkdirSync(cache,{recursive:true});
+ writeFileSync(path.join(cache,'candidate.exe'),payload);
+ writeFileSync(path.join(cache,'transaction.json'),JSON.stringify({schemaVersion:1,stage:'ready',candidate:{...platform,version:draft.version,notes:draft.notes??''}}));
+ page=await connect(stableExe);
+ expect((await state(page,'readyToInstall')).version).toBe(stableVersion);
+ await candidatePayload(stableInstaller);
+
+ stage('click Restart and update in public v0.1.23');
+ await page.locator('aside button[aria-haspopup="dialog"]').click();
+ await page.getByRole('button',{name:'重启并更新',exact:true}).click();
+ await browser.close().catch(()=>{});browser=null;
+ await delay(1800);page=await connect(stableExe,false);
+ const updated=await invoke(page,'update_snapshot');
+ expect(updated.build).toMatchObject({version:stableVersion,commit,channel:'stable',updatesEnabled:true});
+ expect(updated.state).toBe('idle');
+ await expect.poll(async()=>(await invoke(page,'update_snapshot')).diagnostic).toBe('更新已安装，已自动打开新版。');
+ expect(await invoke(page,'speech_preferences',{preferences:null})).toEqual(savedPreferences);
+ expect(await legacyData(page,saved.configs[0])).toEqual(before);
+ const diagnostics=path.join(process.env.LOCALAPPDATA,'SayweaveInstallTransactions','diagnostics');
+ const attempts=readdirSync(diagnostics).filter(file=>file.endsWith('.json')).map(file=>JSON.parse(readFileSync(path.join(diagnostics,file),'utf8')));
+ const evidence=attempts.find(attempt=>attempt.id.startsWith('legacy-')&&attempt.package===createHash('sha256').update(payload).digest('hex'));
+ expect(evidence).toMatchObject({from:'0.1.23',to:stableVersion,error:null,installed:true,restart:'confirmed'});
+ report.stableUpgrade=evidence;
+ const component=componentIdentity();
+ expect(component.sha256).toBe(tools.manifest.artifacts.component.sha256);
+ await installedRegistrationReady(probe);
+ await command(probe,['installed-fixture',component.module]);
+ await page.screenshot({path:path.join(directory,'native-stable-upgraded.png')});
+ await close(page,false);
+ report.checks.push('Public v0.1.23 installed the exact verified draft through Restart and update, automatically reopened and retained preferences, model credentials, dictionary, history and input component.');
 }
 async function ready(page){await invoke(page,'update_check',{manual:true});return state(page,'readyToInstall');}
 async function nativeLayout(page,label){
@@ -457,7 +598,10 @@ try{
  await invoke(page,'acceptance_update_hold',{kind:'stop'});await invoke(page,'update_install',{taskId:candidate.taskId,revision:candidate.revision});await state(page,'recovery');report.checks.push('held service stop lock exceeds five seconds; no installation; recovery displayed');
  page=await restartCurrent(page);candidate=await state(page,'readyToInstall');expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.700');expect(await data(page)).toEqual(seeded);report.checks.push('restart of old binary is not update success');
  const cache=path.join(testData,'update-cache','candidate.exe'),user=execFileSync('whoami',[],{encoding:'utf8'}).trim();await command('icacls',[cache,'/deny',`${user}:(X)`]);await invoke(page,'update_install',{taskId:candidate.taskId,revision:candidate.revision});await state(page,'recovery');await command('icacls',[cache,'/remove:d',user]);report.checks.push('real Windows execute denial produces launch recovery before process exit');
- stage('real launched installer interruption');page=await restartCurrent(page);candidate=await state(page,'readyToInstall');
+ stage('real launched installer interruption');page=await restartCurrent(page);await close(page);
+ process.env.SAYWEAVE_INSTALL_ACCEPTANCE_FAULT='hold-before-copy';
+ try{page=await connect(testExe);}finally{delete process.env.SAYWEAVE_INSTALL_ACCEPTANCE_FAULT;}
+ candidate=await state(page,'readyToInstall');
  const oldExecutableHash=createHash('sha256').update(readFileSync(testExe)).digest('hex');
  const installDirectory=path.dirname(testExe),acl=await command('powershell',['-NoProfile','-Command',aclSnapshotScript(installDirectory)],root,process.env,undefined,30000);
  originalAcl=JSON.parse(acl.stdout.trim());if(!originalAcl.binary)throw Error('Original installation ACL is empty');aclRestoreScript(installDirectory,originalAcl);report.originalInstallAcl=originalAcl;deniedDirectory=installDirectory;
@@ -477,10 +621,24 @@ try{
  page=await connect(testExe);candidate=await state(page,'readyToInstall');expect((await invoke(page,'update_snapshot')).build.version).toBe('0.1.700');expect(candidate.error).toContain('上次更新未完成');expect(await data(page)).toEqual(seeded);
  for(let n=0;n<21;n++){expect(processes(cache)).toHaveLength(0);await delay(1000);}expect((await invoke(page,'update_snapshot')).state).toBe('readyToInstall');
  report.interruptedInstaller={...installerIdentity(cache,'0.1.701','test'),process:launched,descendants,stage:journal.stage,oldExecutableHash,interruption:'owned NSIS tree deliberately terminated after successful launch and app exit',aclRestored:true,noAutomaticRetrySeconds:21};report.checks.push('genuine launched NSIS installation deliberately interrupted; old binary/data retained, incomplete update shown without automatic retry');
- stage('native UI and real automatic upgrade');await page.locator('aside button[aria-haspopup="dialog"]').click();await page.getByRole('button',{name:'重启并更新',exact:true}).click();await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);
- await expect.poll(async()=>(await invoke(page,'update_snapshot')).build.version,{timeout:60000}).toBe('0.1.701');expect(await data(page)).toEqual(seeded);expect((await invoke(page,'update_snapshot')).state).toBe('idle');expect(componentIdentity()).toEqual(installedComponent);await page.screenshot({path:path.join(directory,'native-upgraded.png')});await close(page);report.checks.push('native UI retry completes real HTTPS/minisign/NSIS upgrade and automatic restart; target version, exact data and installed component confirmed');
+ report.automaticUpgrades=[];
+ for(let round=1;round<=3;round++){
+  stage(`native UI and real automatic upgrade ${round}/3`);
+  if(round>1){await install(old);page=await connect(testExe);await ready(page);}
+  await page.locator('aside button[aria-haspopup="dialog"]').click();await page.getByRole('button',{name:'重启并更新',exact:true}).click();await browser.close().catch(()=>{});browser=null;await delay(1800);page=await connect(testExe,false);
+  await expect.poll(async()=>(await invoke(page,'update_snapshot')).build.version,{timeout:60000}).toBe('0.1.701');expect(await data(page)).toEqual(seeded);expect((await invoke(page,'update_snapshot')).state).toBe('idle');expect(componentIdentity()).toEqual(installedComponent);
+  await expect.poll(async()=>(await invoke(page,'update_snapshot')).diagnostic).toBe('更新已安装，已自动打开新版。');
+  const attempts=readdirSync(diagnosticDirectory()).filter(file=>file.endsWith('.json')).map(file=>readAttempt(path.basename(file,'.json')));
+  const current=attempts.find(attempt=>attempt.installed&&attempt.restart==='confirmed'&&attempt.to==='0.1.701'&&!report.automaticUpgrades.includes(attempt.id));
+  expect(current).toBeDefined();report.automaticUpgrades.push(current.id);checkpoint();
+  if(round===1)await page.screenshot({path:path.join(directory,'native-upgraded.png')});await close(page);
+ }
+ report.checks.push('Three real UI HTTPS/minisign/NSIS updates reopened automatically with distinct confirmation records and unchanged data and component.');
+ await runRecoveryFixtures(old,next,seeded);
  report.passed=true;
  }
+ }else if(stableVersion==='0.1.24'){
+ await upgradePublic023(stableInstaller,probe);report.passed=true;
  }else{
  stage('formal draft component baseline');const stableData=path.join(process.env.APPDATA,'local.sayweave.skeleton','data');if(existsSync(stableData))throw Error('Stable runner profile is not empty');
  const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');report.installers.push(installerIdentity(stableInstaller,stableVersion,'stable'));await candidatePayload(stableInstaller);await command(stableInstaller,['/S']);const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);await installedRegistrationReady(probe);await command(probe,['installed-fixture',installedComponent.module]);

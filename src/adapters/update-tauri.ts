@@ -4,7 +4,7 @@ import {initialUpdate,type UpdatePort,type UpdateSnapshot} from '../contracts/up
 class BrowserUpdate implements UpdatePort {
  snapshot=()=>initialUpdate;
  subscribe=()=>()=>{};
- async check(){} async cancel(){} async install(){} async restart(){}
+ async check(){} async cancel(){} async install(){} async restart(){} async copyDiagnostics(){}
 }
 export class NativeUpdate implements UpdatePort {
  private value:UpdateSnapshot=initialUpdate;
@@ -35,5 +35,6 @@ export class NativeUpdate implements UpdatePort {
  cancel=()=>this.command('update_cancel');
  install=(taskId:string,revision:number)=>this.command('update_install',{taskId,revision});
  restart=()=>invoke<void>('update_restart');
+ copyDiagnostics=()=>invoke<void>('update_copy_diagnostics');
 }
 export function createUpdatePort():UpdatePort{return isTauri()?new NativeUpdate():new BrowserUpdate();}

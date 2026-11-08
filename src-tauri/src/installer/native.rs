@@ -1,15 +1,17 @@
 //! Ordinary installer controller. Elevated code never opens these app/user backups.
 use super::{
+    diagnostics::Attempt,
     ipc, machine, metadata,
     record::{
         Failure, FileBackup, MAX_FILE, MAX_RECORD, Phase, Process, Result, Target, UserRecord,
         hash, read, recovery_owner, reject_links, write,
     },
 };
-use sayweave_text_service::{registration, transport::Pipe};
+use sayweave_text_service::{deployment, registration, transport::Pipe};
 use std::{
     collections::BTreeMap,
     fs,
+    os::windows::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -168,12 +170,12 @@ fn required<'a>(values: &'a BTreeMap<String, String>, name: &str) -> Result<&'a 
         .ok_or("installerArguments".into())
 }
 pub fn dispatch(args: &[String]) -> Result<()> {
-    metadata::initialize_apartment()?;
     let action = args[0]
         .strip_prefix("--sayweave-installer=")
         .ok_or("installerArguments")?;
     let values = arguments(args)?;
     if action == "server" {
+        metadata::initialize_apartment()?;
         if values.len() != 8 {
             return Err("installerArguments".into());
         }
@@ -199,21 +201,19 @@ pub fn dispatch(args: &[String]) -> Result<()> {
     }
     if !matches!(
         action,
-        "begin" | "check" | "commit" | "rollback" | "uninstall"
+        "begin"
+            | "check"
+            | "commit"
+            | "rollback"
+            | "uninstall"
+            | "launch-new"
+            | "launch-old"
+            | "launch-failed"
+            | "copy-failed"
     ) || values.len() != if action == "uninstall" { 3 } else { 4 }
     {
         return Err("installerArguments".into());
     }
-    let directory =
-        metadata::normalized_directory(&PathBuf::from(required(&values, "install-dir")?))?;
-    reject_links(&directory)?;
-    if directory.parent().is_none() || directory.file_name().is_none() {
-        return Err("installerDirectory".into());
-    }
-    // Serialize receipt publication too, before an elevated machine lock exists.
-    let _receipt_lock = receipt_lock(&directory)?;
-    let product = env!("SAYWEAVE_BUILD_PRODUCT");
-    let keys = metadata::keys(product, required(&values, "product-key")?)?;
     let pid = required(&values, "installer-pid")?
         .parse()
         .map_err(|_| "installerArguments")?;
@@ -221,34 +221,292 @@ pub fn dispatch(args: &[String]) -> Result<()> {
     if process.sid != metadata::user_sid()? {
         return Err("installerInitiator".into());
     }
-    if action == "uninstall" {
-        return uninstall(&directory, keys, &process);
+    let mut attempt = (action != "uninstall")
+        .then(|| Attempt::for_installer(&process, crate::build_info::current().version))
+        .flatten();
+    let result = dispatch_user(action, &values, &process, &mut attempt);
+    if let Some(attempt) = &mut attempt {
+        let stage = match action {
+            "launch-old" | "launch-new" | "launch-failed" => "restart",
+            "copy-failed" => "copy",
+            _ => action,
+        };
+        attempt.stage = stage.into();
+        match (action, &result) {
+            ("commit", Ok(())) => attempt.installed = true,
+            ("commit", Err(code)) if code == super::login_startup::WARNING => {
+                attempt.installed = true;
+                attempt.fail(stage, "installerStartupWarning");
+            }
+            ("rollback", result) => {
+                attempt.rollback = Some(if result.is_ok() { "restored" } else { "failed" }.into());
+            }
+            ("launch-new" | "launch-old", Ok(())) => attempt.restart = Some("requested".into()),
+            ("launch-new", Err(code)) => {
+                attempt.restart = Some("failed".into());
+                attempt.fail(stage, code);
+            }
+            ("launch-old", Err(code)) if code == "installerPreviousRunning" => {
+                attempt.restart = Some("alreadyRunning".into());
+            }
+            ("launch-old", Err(code)) if code == "installerUpdateCommitted" => {
+                attempt.installed = true;
+                attempt.rollback = Some("notNeeded".into());
+            }
+            ("launch-old", Err(code)) => {
+                attempt.rollback = Some("failed".into());
+                attempt.restart = Some("blocked".into());
+                attempt.fail(stage, code);
+            }
+            ("launch-failed", _) => attempt.restart = Some("failed".into()),
+            (_, Err(code)) => attempt.fail(stage, code),
+            _ => {}
+        }
+        attempt.save();
     }
-    if process.image_hash == target(&package_main(required(&values, "main-source")?)?)?.helper_hash
-    {
+    result
+}
+
+fn dispatch_user(
+    action: &str,
+    values: &BTreeMap<String, String>,
+    process: &Process,
+    attempt: &mut Option<Attempt>,
+) -> Result<()> {
+    metadata::initialize_apartment()?;
+    let directory =
+        metadata::normalized_directory(&PathBuf::from(required(values, "install-dir")?))?;
+    reject_links(&directory)?;
+    if directory.parent().is_none() || directory.file_name().is_none() {
+        return Err("installerDirectory".into());
+    }
+    if let Some(attempt) = attempt {
+        attempt.scope = record_dir(&directory)
+            .ok()
+            .and_then(|path| path.file_name()?.to_str().map(str::to_owned));
+    }
+    // Serialize receipt publication too, before an elevated machine lock exists.
+    let _receipt_lock = receipt_lock(&directory)?;
+    let product = env!("SAYWEAVE_BUILD_PRODUCT");
+    let keys = metadata::keys(product, required(values, "product-key")?)?;
+    if action == "uninstall" {
+        return uninstall(&directory, keys, process);
+    }
+    let target = target(&package_main(required(values, "main-source")?)?)?;
+    if process.image_hash == target.helper_hash {
         return Err("installerInitiator".into());
     }
-    let target = target(&package_main(required(&values, "main-source")?)?)?;
     match action {
-        "begin" => begin(&directory, keys, process, target),
+        "begin" => {
+            if let Some(attempt) = attempt
+                && attempt.from.is_none()
+                && let Ok(root) = record_dir(&directory)
+                && let Ok(Some(previous)) = load(&root)
+                && previous.phase == Phase::Committed
+            {
+                attempt.from = Some(previous.target.version);
+            }
+            begin(&directory, keys, process.clone(), target)
+        }
         "check" => {
-            let (_, record) = current_record(&directory, &process, &target)?;
+            let (_, record) = current_record(&directory, process, &target)?;
             let machine = machine_for(&record)?;
             if machine.phase != Phase::Prepared || !ipc::live(&machine.server) {
                 return Err("installerSessionEnded".into());
             }
-            if ipc::running_at(&directory.join("sayweave.exe"))?
-                || ipc::running_at(&directory.join("local-asr/sayweave-local-asr-worker.exe"))?
-            {
-                Err("installerAppRunning".into())
-            } else {
-                Ok(())
+            #[cfg(feature = "desktop-acceptance")]
+            if acceptance_fault("hold-before-copy") {
+                std::thread::sleep(Duration::from_secs(8));
             }
+            wait_for_program(&directory, &target)
         }
-        "commit" => commit(&directory, &process, &target),
-        "rollback" => rollback(&directory, &process),
+        "commit" => commit(&directory, process, &target),
+        "rollback" => {
+            #[cfg(feature = "desktop-acceptance")]
+            if acceptance_fault("rollback-blocked") {
+                return Err("acceptanceInstallerRollbackFailure".into());
+            }
+            rollback(&directory, process)
+        }
+        "launch-new" => {
+            let (_, record) = current_record(&directory, process, &target)?;
+            if record.phase != Phase::Committed {
+                return Err("installerProofIncomplete".into());
+            }
+            verify_ready(&record)?;
+            #[cfg(feature = "desktop-acceptance")]
+            if acceptance_fault("launch-unconfirmed") {
+                return Err("acceptanceInstallerLaunchFailure".into());
+            }
+            Ok(())
+        }
+        "launch-old" => previous_ready(&directory, process, &target),
+        "launch-failed" => Ok(()),
+        "copy-failed" => Err("installerFileCopyFailed".into()),
         _ => unreachable!(),
     }
+}
+
+fn running_program(directory: &Path) -> Result<Option<&'static str>> {
+    if ipc::running_at(&directory.join("sayweave.exe"))? {
+        return Ok(Some("installerAppRunning"));
+    }
+    if ipc::running_at(&directory.join("local-asr/sayweave-local-asr-worker.exe"))? {
+        return Ok(Some("installerWorkerRunning"));
+    }
+    Ok(None)
+}
+
+fn file_in_use(path: &Path) -> Result<bool> {
+    reject_links(path)?;
+    match fs::OpenOptions::new().write(true).share_mode(7).open(path) {
+        Ok(_) => Ok(false),
+        Err(error) => Ok(matches!(error.raw_os_error(), Some(32 | 33))),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn checks_a_real_windows_write_sharing_violation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("local-runtime.dll");
+    fs::write(&path, b"runtime").unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&path)
+        .unwrap();
+    assert!(file_in_use(&path).unwrap());
+    drop(lock);
+    assert!(!file_in_use(&path).unwrap());
+    assert_eq!(fs::read(path).unwrap(), b"runtime");
+}
+
+fn wait_for_program(directory: &Path, target: &Target) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let files = file_paths(directory, &target.product, &target.local_files)?;
+    loop {
+        let blocked = if let Some(code) = running_program(directory)? {
+            Some(code)
+        } else {
+            let mut blocked = None;
+            for (path, name) in &files {
+                if !matches!(name.as_str(), "desktop" | "startMenu") && file_in_use(path)? {
+                    blocked = Some("installerFileInUse");
+                    break;
+                }
+            }
+            blocked
+        };
+        let Some(code) = blocked else { return Ok(()) };
+        if Instant::now() >= deadline {
+            return Err(code.into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn previous_ready(directory: &Path, installer: &Process, target: &Target) -> Result<()> {
+    let record = load(&record_dir(directory)?)?.ok_or("installerProofMissing")?;
+    if !metadata::same_path(&record.install_dir, &directory.to_string_lossy()) {
+        return Err("installerOriginalPathRequired".into());
+    }
+    validate_paths(&record)?;
+    if record.phase == Phase::Committed
+        && &record.target == target
+        && &record.installer == installer
+    {
+        verify_ready(&record)?;
+        return Err("installerUpdateCommitted".into());
+    }
+    let machine = machine::load()?.ok_or("installerProofMissing")?;
+    if record.phase == Phase::Committed && &record.target != target {
+        if machine.transaction != record.transaction || machine.target != record.target {
+            return Err("installerProofIncomplete".into());
+        }
+        verify_committed_component(&machine)?;
+        verify_program_files(&record)?;
+    } else if record.phase == Phase::RolledBack
+        && &record.installer == installer
+        && &record.target == target
+    {
+        let main = record.files[0].before_hash.as_deref();
+        if machine.transaction == record.transaction && machine.phase == Phase::RolledBack {
+            let registered = registration::snapshot_installer_machine()
+                .map_err(|_| "installerProofIncomplete")?;
+            let core = deployment::current_engine().map_err(|_| "installerProofIncomplete")?;
+            if registered != machine.old || core != machine.before_core {
+                return Err("installerProofIncomplete".into());
+            }
+            if let Some(core) = &core {
+                deployment::verified_core(core).map_err(|_| "installerProofIncomplete")?;
+            }
+            let old_module = registered.ok_or("installerProofMissing")?;
+            if Some(
+                deployment::installer_module_hash(&old_module.module)
+                    .map_err(|_| "installerProofIncomplete")?,
+            ) != machine.old_hash
+            {
+                return Err("installerProofIncomplete".into());
+            }
+        } else {
+            verify_committed_component(&machine)?;
+            if main != Some(machine.target.main_hash.as_str()) {
+                return Err("installerProofIncomplete".into());
+            }
+        }
+        if record.user_initialization_started
+            && registration::installer_user_choice(record.language)
+                .map_err(|_| "componentUserChoice")?
+                != record.user_choice
+        {
+            return Err("installerProofIncomplete".into());
+        }
+        for file in &record.files {
+            if !matches!(file.backup.as_str(), "main" | "helper" | "uninstall")
+                && !file.backup.starts_with("asr-")
+            {
+                continue;
+            }
+            let path = Path::new(&file.path);
+            if let Some(expected) = &file.before_hash {
+                if hash(&read(path, MAX_FILE)?) != *expected {
+                    return Err("installerProofIncomplete".into());
+                }
+            } else if path.exists() {
+                return Err("installerProofIncomplete".into());
+            }
+        }
+        if main.is_none() {
+            return Err("installerProofMissing".into());
+        }
+    } else {
+        return Err("installerProofIncomplete".into());
+    }
+    if ipc::running_at(&directory.join("sayweave.exe"))? {
+        return Err("installerPreviousRunning".into());
+    }
+    Ok(())
+}
+
+fn verify_committed_component(machine: &machine::MachineRecord) -> Result<()> {
+    let registered = registration::snapshot_installer_machine()
+        .map_err(|_| "installerProofIncomplete")?
+        .ok_or("installerProofMissing")?;
+    if machine.phase != Phase::Committed
+        || registered.module != machine.module
+        || deployment::installer_module_hash(&registered.module)
+            .map_err(|_| "installerProofIncomplete")?
+            != machine.target.payload_hash
+        || deployment::current_engine().map_err(|_| "installerProofIncomplete")?
+            != machine.target_core
+    {
+        return Err("installerProofIncomplete".into());
+    }
+    if let Some(core) = &machine.target_core {
+        deployment::verified_core(core).map_err(|_| "installerProofIncomplete")?;
+    }
+    Ok(())
 }
 fn record_dir(directory: &Path) -> Result<PathBuf> {
     let directory = metadata::normalized_directory(directory)?;
@@ -366,6 +624,15 @@ fn backup(root: &Path, path: &Path, name: &str, transaction: &str) -> Result<Fil
     })
 }
 fn stage_server(record: &UserRecord, recover: bool) -> Result<machine::MachineRecord> {
+    #[cfg(feature = "desktop-acceptance")]
+    if !recover {
+        if acceptance_fault("cancel-elevation") {
+            return Err("installerElevationCancelled".into());
+        }
+        if acceptance_fault("fail-elevation") {
+            return Err("installerElevationFailed".into());
+        }
+    }
     let args = format!(
         "--sayweave-installer=server --transaction={} --installer-pid={} --installer-created={} --initiator={} --installer-hash={} --language={} --recover={} \"--main-source={}\"",
         record.transaction,
@@ -411,15 +678,7 @@ fn begin(
     {
         recover(&root, &mut prior, &installer)?;
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while ipc::running_at(&directory.join("sayweave.exe"))?
-        || ipc::running_at(&directory.join("local-asr/sayweave-local-asr-worker.exe"))?
-    {
-        if Instant::now() > deadline {
-            return Err("installerAppRunning".into());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_program(directory, &target)?;
     let key_snapshots = key_paths
         .iter()
         .map(|key| metadata::snapshot(key))
@@ -569,7 +828,7 @@ fn commit(directory: &Path, installer: &Process, target: &Target) -> Result<()> 
         record.phase = record.phase.advance(Phase::ProgramInstalled)?;
         save(&root, &record)?;
         #[cfg(feature = "desktop-acceptance")]
-        if std::env::var("SAYWEAVE_INSTALL_ACCEPTANCE_FAULT").as_deref() == Ok("after-program") {
+        if acceptance_fault("after-program") || acceptance_fault("rollback-blocked") {
             return Err("acceptanceInstallerProgramFailure".into());
         }
         let machine = ipc::request(&machine_for(&record)?, "commit")?;
@@ -599,6 +858,11 @@ fn commit(directory: &Path, installer: &Process, target: &Target) -> Result<()> 
         return Err(error);
     }
     initialize_startup(&record)
+}
+
+#[cfg(feature = "desktop-acceptance")]
+fn acceptance_fault(name: &str) -> bool {
+    std::env::var("SAYWEAVE_INSTALL_ACCEPTANCE_FAULT").as_deref() == Ok(name)
 }
 fn initialize_startup(record: &UserRecord) -> Result<()> {
     super::login_startup::install(Path::new(&record.install_dir), &record.keys[0].path).map_err(
@@ -807,7 +1071,7 @@ fn uninstall(directory: &Path, keys: [String; 2], process: &Process) -> Result<(
     let _ = fs::remove_dir(directory);
     startup
 }
-fn verify_ready(record: &UserRecord) -> Result<()> {
+fn verify_program_files(record: &UserRecord) -> Result<()> {
     for entry in &record.target.local_files {
         let bytes = read(
             &PathBuf::from(&record.install_dir)
@@ -819,15 +1083,22 @@ fn verify_ready(record: &UserRecord) -> Result<()> {
             return Err("installerProofIncomplete".into());
         }
     }
+    if hash(&read(
+        &PathBuf::from(&record.install_dir).join("sayweave.exe"),
+        MAX_FILE,
+    )?) != record.target.main_hash
+    {
+        return Err("installerProofIncomplete".into());
+    }
+    Ok(())
+}
+fn verify_ready(record: &UserRecord) -> Result<()> {
+    verify_program_files(record)?;
     let machine = machine::load()?.ok_or("installerProofMissing")?;
     if machine.transaction != record.transaction
         || machine.phase != Phase::Committed
         || machine.target != record.target
         || machine::deployment_state(crate::text_service::payload()) != "ready"
-        || hash(&read(
-            &PathBuf::from(&record.install_dir).join("sayweave.exe"),
-            MAX_FILE,
-        )?) != record.target.main_hash
         || !record.user_initialized
         || registration::installer_user_choice(record.language)
             .map_err(|_| "componentUserChoice")?
@@ -850,6 +1121,29 @@ pub fn acknowledge_running(installer_hash: &str) -> Result<bool> {
     verify_ready(&record)?;
     remove_backups(&root, &record);
     Ok(true)
+}
+
+pub fn running_scope() -> Result<String> {
+    let exe = std::env::current_exe().map_err(|_| "installerExecutable")?;
+    record_dir(exe.parent().ok_or("installerDirectory")?)?
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| "installerDirectory".into())
+}
+
+pub fn running_installation() -> Result<Option<Process>> {
+    let exe = std::env::current_exe().map_err(|_| "installerExecutable")?;
+    let directory = exe.parent().ok_or("installerDirectory")?;
+    let build = crate::build_info::current();
+    Ok(load(&record_dir(directory)?)?
+        .filter(|record| {
+            record.phase == Phase::Committed
+                && record.target.version == build.version
+                && record.target.commit == build.commit
+                && metadata::same_path(&record.install_dir, &directory.to_string_lossy())
+        })
+        .map(|record| record.installer))
 }
 fn remove_backups(root: &Path, record: &UserRecord) {
     // Backups are not part of user data. Remove only named, verified transaction files.

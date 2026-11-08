@@ -163,7 +163,10 @@ pub fn read(path: &Path, limit: u64) -> Result<Vec<u8>> {
     if !meta.is_file() || meta.len() > limit {
         return Err("installerSizeLimit".into());
     }
-    fs::read(path).map_err(|_| "installerReadFailed".into())
+    fs::read(path).map_err(|error| match error.raw_os_error() {
+        Some(32 | 33) => "installerFileInUse".into(),
+        _ => "installerReadFailed".into(),
+    })
 }
 pub fn reject_links(path: &Path) -> Result<()> {
     if !path.is_absolute()

@@ -672,6 +672,10 @@ pub fn run() {
                     .unwrap_or_default()
                     .as_millis();
                 log::info!(target: "sayweave", "operation=startup phase=main_page_ready pid={} at_ms={} version={} commit={} channel={}", std::process::id(), at_ms, build.version, build.commit, build.channel);
+                #[cfg(windows)]
+                if let Some(service) = webview.app_handle().try_state::<update::UpdateService>() {
+                    service.confirm_relaunch(webview.app_handle());
+                }
             }
             if webview.label() == "main"
                 && payload.event() == tauri::webview::PageLoadEvent::Started
@@ -691,6 +695,7 @@ pub fn run() {
             appearance::appearance_read,
             appearance::appearance_save,
             update::update_snapshot,
+            update::update_copy_diagnostics,
             update::update_check,
             update::update_cancel,
             update::update_install,

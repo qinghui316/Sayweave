@@ -568,12 +568,12 @@ jobs:
           run-id: ${{ inputs.verifier_run_id || inputs.package_run_id || github.run_id }}
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/release-verifier
-      - if: inputs.phase == 'accept-existing'
+      - if: inputs.phase == 'accept-existing' || (env.SAYWEAVE_RELEASE_TAG == 'v0.1.24' && inputs.phase != 'check-access')
         run: npm ci
-      - name: Reuse evidence for explicitly requested existing-package installation
-        if: inputs.phase == 'accept-existing'
+      - name: Reuse exact-commit Windows update evidence for draft installation
+        if: inputs.phase == 'accept-existing' || (env.SAYWEAVE_RELEASE_TAG == 'v0.1.24' && inputs.phase != 'check-access')
         run: node scripts/reuse-windows-update-evidence.mjs .local/release-mechanism-evidence
-      - name: Verify draft assets; install only in explicitly requested existing-package mode
+      - name: Verify draft assets and run required installation acceptance
         shell: pwsh
         run: |
           $download = Join-Path $env:RUNNER_TEMP 'sayweave-draft-acceptance'
@@ -591,9 +591,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Draft full signature verification failed.' }
           if ($env:SAYWEAVE_RELEASE_PHASE -eq 'check-access') {
             $controller | ConvertTo-Json | Set-Content -LiteralPath '.local/release-draft-access.json' -Encoding utf8
-          } elseif ($env:SAYWEAVE_RELEASE_PHASE -eq 'accept-existing') {
+          } elseif ($env:SAYWEAVE_RELEASE_PHASE -eq 'accept-existing' -or $env:SAYWEAVE_RELEASE_TAG -eq 'v0.1.24') {
             node scripts/test-windows-update.mjs --stable-installer (Join-Path $download "Sayweave_$(node -p "require('./package.json').version")_x64-setup.exe") --mechanism-evidence .local/release-mechanism-evidence
-            if ($LASTEXITCODE -ne 0) { throw 'Explicit draft installation check failed.' }
+            if ($LASTEXITCODE -ne 0) { throw 'Draft installation check failed.' }
           } else {
             Write-Output 'Same package and full verifier reused; actual installation/update remains owner trial. No Cargo build here.'
           }
