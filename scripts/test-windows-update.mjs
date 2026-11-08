@@ -472,12 +472,13 @@ async function build(version,channel='test'){
  if(channel==='test'){env.SAYWEAVE_BUILD_IDENTIFIER=identifier;env.SAYWEAVE_TEST_UPDATE_URL=`https://localhost:${server.address().port}/latest.json`;env.SAYWEAVE_TEST_UPDATE_KEY=readFileSync(`${keyPath}.pub`,'utf8').trim();}else{delete env.SAYWEAVE_BUILD_IDENTIFIER;delete env.SAYWEAVE_TEST_UPDATE_URL;delete env.SAYWEAVE_TEST_UPDATE_KEY;}
  const modules=path.join(source,'node_modules'),dependencyRoot=realpathSync(path.join(root,'node_modules'));
  symlinkSync(dependencyRoot,modules,'junction');
- try{
-  await command(process.execPath,[path.join(source,'scripts','desktop.mjs'),'package','--config',file,...(channel==='test'?['--features','desktop-acceptance']:[])],source,env);
- }finally{
+ const detachDependencies=()=>{
   if(!lstatSync(modules).isSymbolicLink()||realpathSync(modules)!==dependencyRoot)throw Error('Package build dependency junction changed');
   rmdirSync(modules);
- }
+ };
+ try{
+  await command(process.execPath,[path.join(source,'scripts','desktop.mjs'),'package','--config',file,...(channel==='test'?['--features','desktop-acceptance']:[])],source,env);
+ }finally{detachDependencies();}
  readTools(tools.directory,commit);
  const installer=path.join(env.CARGO_TARGET_DIR,'release','bundle','nsis',`${config.productName}_${version}_x64-setup.exe`),copy=path.join(directory,`${channel}-${version}-setup.exe`);writeFileSync(copy,readFileSync(installer));writeFileSync(`${copy}.sig`,readFileSync(`${installer}.sig`));
  await verifyPackage(copy,version,readFileSync(`${keyPath}.pub`,'utf8').trim());
