@@ -41,6 +41,30 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
     if args.get(1).is_some_and(|v| v == "formal-proxy-target") {
         return target(args);
     }
+    let input_fixture = args.get(1).is_some_and(|v| v == "formal-input-fixture");
+    if input_fixture && args.len() == 3 {
+        let module = Path::new(&args[2]);
+        let descriptor = deployment::current_engine()?.ok_or("installed descriptor missing")?;
+        let core = deployment::verified_core(&descriptor)?;
+        let registration =
+            registration::snapshot_installer_machine()?.ok_or("installed registration missing")?;
+        if std::fs::canonicalize(&registration.module)? != std::fs::canonicalize(module)?
+            || deployment::installer_module_hash(&registration.module)? != descriptor.proxy_sha256
+            || !core.is_file()
+        {
+            return Err("installed component identity differs".into());
+        }
+        let language = unsafe { registration::profiles()?.GetCurrentLanguage()? };
+        exercise(
+            module,
+            &descriptor,
+            &descriptor,
+            &mut None,
+            language,
+            "input",
+        )?;
+        return Ok(());
+    }
     deployment::authorize_installer()?;
     let lock = Pipe(unsafe { CreateMutexW(None, false, w!("Global\\Sayweave.TSF.Installer.v1"))? });
     if !matches!(
@@ -64,8 +88,8 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
     }
     let proxy = std::fs::read(args.get(2).ok_or("proxy required")?)?;
     let old = std::fs::read(args.get(3).ok_or("old core required")?)?;
-    let new = std::fs::read(args.get(4).ok_or("new core required")?)?;
-    if deployment::version(&old) == deployment::version(&new) {
+    let new = args.get(4).map(std::fs::read).transpose()?;
+    if !input_fixture && new.as_ref().is_none_or(|new| old == *new) {
         return Err("core must really change".into());
     }
     let (module, first) = deployment::prepare_engine(&proxy, &old)?;
@@ -83,17 +107,22 @@ pub(super) fn run(args: &[String]) -> Outcome<()> {
         }
         deployment::publish_engine(None, Some(&first))?;
         current = Some(first.clone());
-        let (same, second) = deployment::prepare_engine(&proxy, &new)?;
-        if same != module {
-            return Err("proxy path changed".into());
-        }
+        let second = if let Some(new) = &new {
+            let (same, second) = deployment::prepare_engine(&proxy, new)?;
+            if same != module {
+                return Err("proxy path changed".into());
+            }
+            second
+        } else {
+            first.clone()
+        };
         exercise(
             Path::new(&module),
             &first,
             &second,
             &mut current,
             language,
-            "",
+            if input_fixture { "input" } else { "" },
         )
         .map(|_| ())
     })();
@@ -210,6 +239,21 @@ fn exercise(
         let module = checked(phase, "module.load", load_fixture_module(proxy))?;
         let keyboard_before = checked(phase, "keyboard.snapshot", keyboard())?;
         let result = (|| -> Outcome<serde_json::Value> {
+            let input_fixture = phase == "input";
+            if input_fixture {
+                let core = deployment::verified_core(first)?;
+                let core_module = load_fixture_module(&core)?;
+                let has_fault_export = [module, core_module].into_iter().any(|handle| {
+                    GetProcAddress(handle, s!("SayweaveSettleFixtureFault")).is_some()
+                        || GetProcAddress(handle, s!("SayweaveInitialFixtureFault")).is_some()
+                        || GetProcAddress(handle, s!("SayweaveBlockFixtureFault")).is_some()
+                });
+                FreeLibrary(core_module)?;
+                if has_fault_export {
+                    return Err("ordinary input component exposes a test fault hook".into());
+                }
+                println!("owned production DLL fault export absent=true");
+            }
             let activated = checked(phase, "profile.activate", registration::activate(false))?;
             if activated != language
                 || !checked(
@@ -271,11 +315,24 @@ fn exercise(
                     return Err("proxy instance changed or core did not switch".into());
                 }
                 let task = uuid::Uuid::new_v4().to_string();
-                for (operation, revision, action, body) in [
-                    (1, 0, Action::Begin, ""),
-                    (2, 1, Action::Update, text),
-                    (3, 1, Action::Commit, ""),
-                ] {
+                let writes: &[(u64, u64, Action, &str)] = if input_fixture {
+                    &[
+                        (1, 0, Action::Begin, ""),
+                        (2, 1, Action::Update, "原文"),
+                        (3, 2, Action::Update, "原文尾🙂"),
+                        (4, 3, Action::Settle, "尾🙂"),
+                        (5, 4, Action::Update, "完整尾句。"),
+                        (6, 4, Action::Commit, ""),
+                    ]
+                } else {
+                    &[
+                        (1, 0, Action::Begin, ""),
+                        (2, 1, Action::Update, text),
+                        (3, 1, Action::Commit, ""),
+                    ]
+                };
+                let mut range_epoch = 0;
+                for &(operation, revision, action, body) in writes {
                     if GetForegroundWindow() != top {
                         return Err("owned focus lost; no write".into());
                     }
@@ -292,7 +349,11 @@ fn exercise(
                         deadline_tick: GetTickCount64() + 2000,
                         action,
                         text: body.into(),
-                        prefix: None,
+                        prefix: (action == Action::Settle).then(|| Prefix {
+                            text: "整理前段🙂".into(),
+                            expected_revision: revision - 1,
+                            range_epoch,
+                        }),
                     };
                     pipe.send(&serde_json::to_vec(&request)?)?;
                     let frame = core_switch_probe::receive_pipe(&pipe)?;
@@ -303,12 +364,38 @@ fn exercise(
                         || reply.operation != operation
                         || reply.revision != revision
                     {
-                        return Err(format!("ordinary write failed: {}", reply.code).into());
+                        return Err(
+                            format!("ordinary write {operation} failed: {}", reply.code).into()
+                        );
                     }
                     let key = ReceiptKey::from_frame(&frame).ok_or("receipt missing")?;
                     core_switch_probe::acknowledge_pipe(&pipe, &capability, &key)?;
+                    if action == Action::Begin {
+                        range_epoch = reply.range_epoch;
+                    }
+                    if input_fixture
+                        && action == Action::Update
+                        && reply.mutation != Mutation::Changed
+                    {
+                        return Err(
+                            format!("ordinary update {operation} did not change text").into()
+                        );
+                    }
+                    if action == Action::Settle
+                        && !reply.settlement.is_some_and(|value| {
+                            value.prefix_operation == operation
+                                && value.prefix == Mutation::Changed
+                                && value.tail_owned
+                        })
+                    {
+                        return Err("ordinary prefix did not settle with a writable tail".into());
+                    }
                 }
-                expected.push_str(text);
+                expected.push_str(if input_fixture {
+                    "整理前段🙂完整尾句。"
+                } else {
+                    text
+                });
                 // Check after pumping all host events, and continuously before the next switch.
                 let until = Instant::now() + Duration::from_millis(250);
                 while Instant::now() < until {
@@ -319,7 +406,7 @@ fn exercise(
                 }
                 records.push(serde_json::json!({"runtime":runtime,"body":editor_text(editor)?}));
                 previous = Some(runtime);
-                if !phase.is_empty() && descriptor == first {
+                if matches!(phase, "old" | "new") && descriptor == first {
                     println!(
                         "{}",
                         serde_json::json!({"stageReady":phase,"pid":std::process::id(),"records":records})
@@ -350,7 +437,7 @@ fn exercise(
                 }
                 refusal = Some(reply.code);
             }
-            let evidence = serde_json::json!({"formalProxySwitchPassed":true,"formalTargetPassed":true,"phase":phase,"processIdentity":sayweave_text_service::transport::identity(std::process::id())?,"pid":std::process::id(),"sameService":true,"ordinaryTransport":true,"records":records,"oldAdmissionRejected":refusal,"finalBody":editor_text(editor)?});
+            let evidence = serde_json::json!({"formalProxySwitchPassed":!input_fixture,"formalTargetPassed":true,"phase":phase,"processIdentity":sayweave_text_service::transport::identity(std::process::id())?,"pid":std::process::id(),"sameService":true,"ordinaryTransport":true,"records":records,"oldAdmissionRejected":refusal,"finalBody":editor_text(editor)?});
             Ok(evidence)
         })();
         let stopped = registration::deactivate(language, false);
@@ -375,6 +462,10 @@ fn exercise(
         // Never force-unload it; the parent separately proves physical exit.
         evidence["moduleUnloadReady"] = serde_json::json!(unloaded);
         evidence["cleanupComplete"] = serde_json::json!(true);
+        if phase == "input" {
+            println!("owned installed production DLL actual text=true");
+            println!("owned COM DLL unloaded with no live leases=true");
+        }
         println!("{evidence}");
         Ok(evidence)
     }

@@ -47,9 +47,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let args: Vec<_> = std::env::args().collect();
         match args.get(1).map(String::as_str) {
             #[cfg(feature = "acceptance")]
-            Some("formal-core-switch" | "formal-proxy-upgrade" | "formal-proxy-target") => {
-                formal_switch_probe::run(&args)?
-            }
+            Some(
+                "formal-core-switch"
+                | "formal-proxy-upgrade"
+                | "formal-proxy-target"
+                | "formal-input-fixture",
+            ) => formal_switch_probe::run(&args)?,
             #[cfg(feature = "acceptance")]
             Some("richtext-block-script") => richtext_block_probe::run(&args)?,
             #[cfg(feature = "acceptance")]
