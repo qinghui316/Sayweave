@@ -94,6 +94,22 @@ jobs:
             @{mode=$mode;exit=$setup.ExitCode;installed=(Test-Path -LiteralPath $installed);os=$os.Caption;build=$os.BuildNumber;locks=@($owned | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'lock') }).Count;transactions=$transactions;desktopAvailable=[bool][Environment]::GetFolderPath('DesktopDirectory');programsAvailable=[bool][Environment]::GetFolderPath('Programs')} | ConvertTo-Json -Depth 5 | Tee-Object -FilePath (Join-Path $dir "$mode-installer.log")
             if (!$setup.ExitCode -or $transactions.Count -or (Test-Path -LiteralPath $installed)) { break }
           }
+          if ($setup.ExitCode -and !$transactions.Count -and !(Test-Path -LiteralPath $installed)) {
+            $previous = Join-Path $dir 'previous'
+            New-Item -ItemType Directory -Path $previous | Out-Null
+            $previousName = 'Sayweave_0.1.22_x64-setup.exe'
+            gh release download v0.1.22 --repo qinghui316/Sayweave --pattern $previousName --pattern SHA256SUMS.txt --dir $previous
+            if ($LASTEXITCODE) { throw 'Published predecessor download failed.' }
+            $previousExe = Join-Path $previous $previousName
+            $previousChecksum = (Get-Content -LiteralPath (Join-Path $previous 'SHA256SUMS.txt') | Where-Object { $_ -match ('^[a-f0-9]{64}  ' + [regex]::Escape($previousName) + '$') }) -split '\s+'
+            if (!$previousChecksum -or (Get-FileHash -LiteralPath $previousExe -Algorithm SHA256).Hash -ine $previousChecksum[0]) { throw 'Published predecessor checksum differs.' }
+            $prior = Start-Process -FilePath $previousExe -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden
+            "Published predecessor 0.1.22 exit=$($prior.ExitCode)" | Tee-Object -FilePath (Join-Path $dir 'predecessor.log')
+            if (!$prior.ExitCode -and (Get-Item -LiteralPath $installed).VersionInfo.FileVersion -eq '0.1.22') {
+              $setup = Start-Process -FilePath $exe -ArgumentList '/S' -Wait -PassThru -WindowStyle Hidden
+              "Published 0.1.23 over 0.1.22 exit=$($setup.ExitCode)" | Tee-Object -FilePath (Join-Path $dir 'predecessor.log') -Append
+            }
+          }
           if ($setup.ExitCode) { throw "Published baseline installation failed ($($setup.ExitCode))." }
           if ((Get-Item -LiteralPath $installed).VersionInfo.FileVersion -ne '0.1.23') { throw 'Installed baseline version differs.' }
           cargo build --locked --manifest-path src-tauri/text-service/Cargo.toml --features acceptance --bin tsf-probe
