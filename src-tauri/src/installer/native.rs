@@ -4,7 +4,7 @@ use super::{
     ipc, machine, metadata,
     record::{
         Failure, FileBackup, MAX_FILE, MAX_RECORD, Phase, Process, Result, Target, UserRecord,
-        hash, read, recovery_owner, reject_links, write,
+        hash, read, recovery_owner, reject_links, with_receipt_owner, write,
     },
 };
 use sayweave_text_service::{deployment, registration, transport::Pipe};
@@ -529,16 +529,18 @@ fn record_dir(directory: &Path) -> Result<PathBuf> {
 fn receipt_lock(directory: &Path) -> Result<fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
     let root = record_dir(directory)?;
-    fs::create_dir_all(&root).map_err(|_| "installerWriteFailed")?;
-    let path = root.join("lock");
-    reject_links(&path)?;
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .share_mode(0)
-        .open(path)
-        .map_err(|_| "installerBusy".into())
+    with_receipt_owner(|| {
+        fs::create_dir_all(&root).map_err(|_| "installerWriteFailed")?;
+        let path = root.join("lock");
+        reject_links(&path)?;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(path)
+            .map_err(|_| "installerBusy".into())
+    })
 }
 fn save(root: &Path, record: &UserRecord) -> Result<()> {
     record.validate()?;
