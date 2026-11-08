@@ -12,7 +12,7 @@ import {temporaryPreferenceCleanup} from './windows-update-registration.mjs';
 import {installedStartup,restartAndReconnect,aclPrelude,aclSnapshotScript,aclRestoreScript,deploymentReading} from './windows-update-startup.mjs';
 import {readPackages,writePackages,nsisExecutableIdentity,nsisPayloadInventory,nsisHelperIdentity} from './windows-update-packages.mjs';
 import {prepareDisposableDebugPolicy} from './windows-update-debug-policy.mjs';
-import {verifyComponentEmbeddings} from './build-text-service.mjs';
+import {pinnedProxy,verifyComponentEmbeddings} from './build-text-service.mjs';
 if(process.platform!=='win32'||process.env.GITHUB_ACTIONS!=='true'&&process.env.SAYWEAVE_DISPOSABLE_WINDOWS!=='1')throw Error('Use an elevated disposable Windows VM; never an owner machine.');
 const root=process.cwd(),id=randomUUID(),directory=path.join(root,'.local','windows-update',id),source=path.join(directory,'source');mkdirSync(source,{recursive:true});
 const stableVersion=JSON.parse(readFileSync(path.join(root,'package.json'),'utf8')).version;
@@ -230,6 +230,18 @@ function componentIdentity(){
  expect(coreSha256).toBe(descriptor.coreSha256);
  return {module,sha256,core,coreSha256};
 }
+async function inputProof(probe,module,core){
+ const args=core?['formal-input-fixture',module,core]:['formal-input-fixture',module];
+ const proof=await command(probe,args,root,process.env,undefined,60000);
+ for(const marker of proofMarkers)expect(proof.stdout).toContain(marker);
+ const evidence=proof.stdout.split(/\r?\n/).filter(line=>line.startsWith('{')).map(line=>JSON.parse(line)).find(item=>item.phase==='input');
+ expect(evidence).toMatchObject({formalTargetPassed:true,ordinaryTransport:true,moduleUnloadReady:true,cleanupComplete:true,finalBody:'整理前段🙂完整尾句。'});
+ (report.nativeInputProofs??=[]).push({stage:report.stage,temporary:Boolean(core),evidence});checkpoint();
+}
+async function installedInputProof(probe,component){
+ if(component.core)await inputProof(probe,component.module);
+ else await command(probe,['installed-fixture',component.module]);
+}
 function quote(value){return "'"+value.replaceAll("'","''")+"'";}
 async function registrationInventory(timeoutMs=30000){
  const script="$ErrorActionPreference='Stop';$items=@{};foreach($scope in @('HKEY_CURRENT_USER','HKEY_LOCAL_MACHINE')){$base='Registry::'+$scope;$com=$base+'\\Software\\Classes\\CLSID\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$tip=$base+'\\Software\\Microsoft\\CTF\\TIP\\{CB473CF0-9B4C-482C-BFC2-5527D2379ACA}';$item=@{com=(Test-Path -LiteralPath $com);tip=(Test-Path -LiteralPath $tip);module=$null;owner=$null;tipEntries=@()};if(Test-Path -LiteralPath ($com+'\\InprocServer32')){$key=Get-Item -LiteralPath ($com+'\\InprocServer32');$item.module=$key.GetValue('');$item.owner=$key.GetValue('SayweaveOwner')};if($item.tip){$queue=@($tip);for($n=0;$n -lt $queue.Count;$n++){if($queue.Count -gt 64){throw 'Owned TIP registry inventory exceeded bound'};$key=Get-Item -LiteralPath $queue[$n];$values=@{};$names=@($key.GetValueNames());if($names.Count -gt 32){throw 'Owned TIP value inventory exceeded bound'};foreach($name in $names){$value=$key.GetValue($name);if(($value -isnot [string] -and $value -isnot [int]) -or ([string]$value).Length -gt 1024){throw 'Owned TIP value exceeded bound'};$values[$name]=@{kind=([string]$key.GetValueKind($name));value=$value}};$item.tipEntries+=@{path=$queue[$n].Substring($tip.Length);values=$values};foreach($child in @($key.GetSubKeyNames())){$queue+=($queue[$n]+'\\'+$child)}}};$items[$scope]=$item};ConvertTo-Json -InputObject $items -Compress -Depth 9";
@@ -421,7 +433,7 @@ async function upgradePublic023(stableInstaller,probe){
  const component=componentIdentity();
  report.stableComponents=verifyComponentEmbeddings([stableExe,path.join(path.dirname(stableExe),'sayweave-installer-helper.exe')],{core:component.core,proxy:component.module});
  await installedRegistrationReady(probe);
- await command(probe,['installed-fixture',component.module]);
+ await installedInputProof(probe,component);
  await page.screenshot({path:path.join(directory,'native-stable-upgraded.png')});
  await close(page,false);
  report.checks.push('Public v0.1.23 installed the exact verified draft through Restart and update, automatically reopened and retained preferences, model credentials, dictionary, history and input component.');
@@ -510,9 +522,12 @@ try{
  report.checks.push('unknown preference rejects product removal with exact registry and COM anchor retained');
  stage('short production DLL metadata proof');
  report.componentMetadata=await characterizeComponent(preparedUser.module,temporaryRegistration.sha256);checkpoint();
- stage('short production DLL actual text');
- const smoke=await command(tools.probe,['installed-fixture',tools.component],root,process.env,undefined,60000);
- for(const marker of proofMarkers)expect(smoke.stdout).toContain(marker);
+ const split=existsSync(path.join(source,'src-tauri','resources','fixed-proxy','manifest.json'));
+ if(!split){
+  stage('short production DLL actual text');
+  const smoke=await command(tools.probe,['installed-fixture',tools.component],root,process.env,undefined,60000);
+  for(const marker of proofMarkers)expect(smoke.stdout).toContain(marker);
+ }
  if(process.env.SAYWEAVE_REGISTRATION_DIAGNOSE==='1'){
   stage('same-binary TSF removal diagnosis');
   await command(tools.probe,['registration-removal-diagnosis',tools.component],root,process.env,undefined,30000);
@@ -543,6 +558,11 @@ try{
  await clearTemporaryRegistration();
  report.checks.push('failure after profile enablement rolls back native registration, user preference and COM');
  await machineMetadataProof();
+ if(split){
+  stage('pinned production proxy and engine input proof');
+  await inputProof(tools.probe,pinnedProxy(source).path,tools.component);
+  expect(registrationEmpty(await registrationInventory())).toBe(true);
+ }
  const proof=tools.manifest?.proof??{...report.compiler,capabilities,markers:proofMarkers,registrationClean:true};
  tools=writeTools(path.join(root,'.local/windows-update-tools'),commit,readFileSync(tools.component),readFileSync(tools.probe),proof);report.tools=tools.manifest;
  if(priorPackages&&priorPackages.manifest.componentSha256!==tools.manifest.artifacts.component.sha256)throw Error('Reusable package component hash differs');
@@ -583,7 +603,7 @@ try{
  await verifyPackage(old,'0.1.700',context.publicKey);
  stage('installed startup short verification');await install(old);
  const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.coreSha256??installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);
- await installedRegistrationReady(probe);await command(probe,['installed-fixture',installedComponent.module]);
+ await installedRegistrationReady(probe);await installedInputProof(probe,installedComponent);
  page=await connect(testExe);const buildInfo=(await invoke(page,'update_snapshot')).build;expect(buildInfo).toMatchObject({version:'0.1.700',channel:'test',commit});const installedBytes=readFileSync(testExe);expect(createHash('sha256').update(installedBytes).digest('hex')).toBe(packageEntries.old.executableSha256);for(const value of [commit,identifier,context.url,context.publicKey])if(!installedBytes.includes(Buffer.from(value)))throw Error('Frozen build context absent in installed executable');
  report.startupProof={passed:true,build:buildInfo,executableSha256:packageEntries.old.executableSha256,installerSha256:installerIdentity(old,'0.1.700','test').sha256};await close(page);publishPackages();console.log('Windows installed startup short proof passed: exact process/window/page/CDP/native renderer/build identity.');
  if(priorPackages&&!priorPackages.next&&!startupOnly)throw Error('Reusable package set has no target package; no implicit rebuild');
@@ -658,7 +678,7 @@ try{
  await upgradePublic023(stableInstaller,probe);report.passed=true;
  }else{
  stage('formal draft component baseline');const stableData=path.join(process.env.APPDATA,'local.sayweave.skeleton','data');if(existsSync(stableData))throw Error('Stable runner profile is not empty');
- const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');report.installers.push(installerIdentity(stableInstaller,stableVersion,'stable'));await candidatePayload(stableInstaller);await command(stableInstaller,['/S']);const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.coreSha256??installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);await installedRegistrationReady(probe);await command(probe,['installed-fixture',installedComponent.module]);
+ const stableExe=path.join(process.env.LOCALAPPDATA,'Sayweave','sayweave.exe');report.installers.push(installerIdentity(stableInstaller,stableVersion,'stable'));await candidatePayload(stableInstaller);await command(stableInstaller,['/S']);const installedComponent=componentIdentity();report.componentBefore=installedComponent;expect(installedComponent.coreSha256??installedComponent.sha256).toBe(tools.manifest.artifacts.component.sha256);await installedRegistrationReady(probe);await installedInputProof(probe,installedComponent);
  stage('old public version and formal draft replacement');const oldAssets=path.join(directory,'old-public');mkdirSync(oldAssets);await command('gh',['release','download','v0.1.6','--repo','qinghui316/Sayweave','--pattern','*setup.exe','--dir',oldAssets]);const publicOld=path.join(oldAssets,'Sayweave_0.1.6_x64-setup.exe');report.installers.push(installerIdentity(publicOld,'0.1.6','old-public'));await command(publicOld,['/S']);
  const oldVersion=await command('powershell',['-NoProfile','-Command',`$ErrorActionPreference='Stop';$v=(Get-Item -LiteralPath ${quote(stableExe)}).VersionInfo;@{fileVersion=$v.FileVersion;productVersion=$v.ProductVersion;fileParts=@($v.FileMajorPart,$v.FileMinorPart,$v.FileBuildPart,$v.FilePrivatePart);productParts=@($v.ProductMajorPart,$v.ProductMinorPart,$v.ProductBuildPart,$v.ProductPrivatePart)}|ConvertTo-Json -Compress`],root,process.env,undefined,30000);
  report.legacyExecutableIdentity={...JSON.parse(oldVersion.stdout.trim()),sha256:createHash('sha256').update(readFileSync(stableExe)).digest('hex')};checkpoint();expect(report.legacyExecutableIdentity.fileParts).toEqual([0,1,6,0]);expect(report.legacyExecutableIdentity.productParts).toEqual([0,1,6,0]);page=await connect(stableExe,true,true);
