@@ -24,8 +24,9 @@ for(const script of ['build-local-asr.mjs','test-local-asr.mjs','setup-local-asr
 scripts.add('test-formal-core-switch.mjs');
 scripts.add('windows-update-metadata.cs');
 scripts.add('windows-update-metadata.ps1');
+scripts.add('windows-installer-test-owner.ps1');
 for(const script of ['storage.mjs','storage-policy.mjs','storage-safety.ps1','storage-cargo.mjs'])scripts.add(script);
-const testFixtures = new Set(['voice-recovery.html', 'voice-recovery.tsx', 'input-target.ts', 'faithful-v1.txt', 'frozen-archive-recovery.rs.txt']);
+const testFixtures = new Set(['voice-recovery.html', 'voice-recovery.tsx', 'input-target.ts', 'faithful-v1.txt', 'frozen-archive-recovery.rs.txt', 'frozen-installer-receipt-tests.rs.txt']);
 const generated = /(?:^|\/)(?:node_modules|target|gen|dist|coverage|test-results|playwright-report|\.local|\.git)(?:\/|$)|^tests\/visual\//i;
 const ownerLocal = /(?:^|\/)(?:\.agents|\.claude|\.codex|\.impeccable)(?:\/|$)|(?:^|\/)(?:AGENTS\.md|CLAUDE\.md|\.env[^/]*|dev\.ps1|doctor\.mjs|environment\.ps1|setup-tools\.ps1|harness-skill-link\.(?:mjs|ps1|py))$|\.cmd$/i;
 function allowed(file) {
