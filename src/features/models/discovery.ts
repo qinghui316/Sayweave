@@ -1,10 +1,10 @@
 import {useCallback,useEffect,useRef,useState} from 'react';
-import {validateModelKey,type ModelConfigPort,type ModelDraft} from '../../contracts/models';
+import {normalizeModelBaseUrl,validateModelKey,type ModelConfigPort,type ModelDraft} from '../../contracts/models';
 
 const caches=new WeakMap<ModelConfigPort,Map<string,{at:number;ids:string[]}>>();
 const ttl=15*60*1000;
 function endpoint(draft:ModelDraft):string|null {
- try {const url=new URL(draft.input.baseUrl.trim());if(url.protocol!=='https:'||url.username||url.password||url.search||url.hash)return null;return url.href.replace(/\/+$/u,'');}catch{return null;}
+ try{return normalizeModelBaseUrl(draft.input.baseUrl,draft.input.protocol);}catch{return null;}
 }
 export function useModelDiscovery(port:ModelConfigPort,draft:ModelDraft|null) {
  const [state,setState]=useState<{ids:string[];loading:boolean;error:unknown;loaded:boolean}>({ids:[],loading:false,error:null,loaded:false});

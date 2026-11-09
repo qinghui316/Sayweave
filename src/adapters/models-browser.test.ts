@@ -20,6 +20,8 @@ describe('model configuration memory contract',()=>{
   const p=new BrowserModels(),a=await p.save(create()),c=a.configs[0]!;
   const d:ModelSave={input:{...input(),baseUrl:'https://other.invalid/v1'},id:c.id,revision:1,key:{action:'keep'},expectation:modelExpectation(a,c.id,['speech','text'])};
   await expect(p.save(d)).rejects.toMatchObject({code:'originChanged'});
+  d.input.baseUrl='http://example.invalid:443/v1';
+  await expect(p.save(d)).rejects.toMatchObject({code:'originChanged'});
   d.input.baseUrl='https://example.invalid/v2';const result=await p.save(d);
   expect(result.configs[0]!.revision).toBe(2);expect(JSON.stringify(result)).not.toContain('fixture-key');
   await expect(p.save(d)).rejects.toMatchObject({code:'conflict'});
@@ -31,7 +33,11 @@ describe('model configuration memory contract',()=>{
  });
  it('validates canonical URL, unicode and rejects malformed native defaults',()=>{
   expect(validateModelInput({...input(),name:' 名称 ',baseUrl:'https://example.invalid/v1///'}).baseUrl).toBe('https://example.invalid/v1');
-  for(const baseUrl of ['http://localhost/v1','https://a:b@example.com','https://example.com/?q=x','https://example.com/#x'])expect(()=>validateModelInput({...input(),baseUrl})).toThrow();
+  for(const baseUrl of ['http://127.0.0.1:3425/v1','http://localhost:3425/v1','http://[::1]:3425/v1','http://192.168.1.20:3425/v1','http://gateway.example/api/v1','https://gateway.example/api/v1'])expect(validateModelInput({...input(),baseUrl:` ${baseUrl}/// `}).baseUrl).toBe(baseUrl);
+  for(const baseUrl of ['ftp://localhost/v1','http://a:b@example.com','https://example.com/?q=x','https://example.com/#x','http://localhost/v1?','http://localhost/v1#'])expect(()=>validateModelInput({...input(),baseUrl})).toThrow();
+  const speech={...input(),protocol:'qwen-audio-streaming' as const,usages:['speech'] as ModelInput['usages']};
+  expect(()=>validateModelInput({...speech,baseUrl:'http://gateway.example'})).toThrow();
+  expect(()=>validateModelInput({...speech,baseUrl:'https://gateway.example/v1'})).toThrow();
   expect(()=>validateModelInput({...input(),name:'a\u2028b'})).toThrow();
   expect(()=>parseModelOverview({configs:[],defaults:[],cleanupPending:false})).toThrow();
  });

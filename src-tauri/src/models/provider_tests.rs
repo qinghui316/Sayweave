@@ -55,6 +55,17 @@ impl Fixture {
             .tls_certs_only([reqwest::Certificate::from_der(cert.cert.der()).unwrap()])
             .build()
             .unwrap();
+        Self::serve(replies, client, "https://localhost", move |stream| {
+            let session = rustls::ServerConnection::new(Arc::new(config.clone())).unwrap();
+            rustls::StreamOwned::new(session, stream)
+        })
+    }
+    fn serve<T: Read + Write>(
+        replies: Vec<Reply>,
+        client: reqwest::Client,
+        origin: &str,
+        transport: impl Fn(TcpStream) -> T + Send + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
@@ -80,8 +91,7 @@ impl Fixture {
                 stream
                     .set_write_timeout(Some(Duration::from_millis(500)))
                     .unwrap();
-                let session = rustls::ServerConnection::new(Arc::new(config.clone())).unwrap();
-                let mut stream = rustls::StreamOwned::new(session, stream);
+                let mut stream = transport(stream);
                 let Ok(request) = read_request(&mut stream) else {
                     continue;
                 };
@@ -122,7 +132,7 @@ impl Fixture {
             }
         });
         Self {
-            url: format!("https://localhost:{port}/v1"),
+            url: format!("{origin}:{port}/v1"),
             provider: Arc::new(Provider::with_client(client).unwrap()),
             stop,
             thread: Some(handle),
@@ -147,9 +157,7 @@ impl Drop for Fixture {
         }
     }
 }
-fn read_request(
-    stream: &mut rustls::StreamOwned<rustls::ServerConnection, TcpStream>,
-) -> Result<String, ()> {
+fn read_request(stream: &mut impl Read) -> Result<String, ()> {
     let mut data = vec![];
     let end = loop {
         let mut byte = [0];
@@ -177,6 +185,53 @@ fn read_request(
     data.resize(end + len, 0);
     stream.read_exact(&mut data[end..]).map_err(|_| ())?;
     String::from_utf8(data).map_err(|_| ())
+}
+
+#[tokio::test]
+async fn http_gateway_lists_tests_and_generates_text_using_the_full_model_id() {
+    let fixture = Fixture::serve(
+        vec![
+            Reply::json(200, r#"{"data":[{"id":"gateway/text-model"}]}"#),
+            Reply::json(200, r#"{"choices":[{"message":{"content":"OK"}}]}"#),
+            generated_sse("中文。", "stop", true),
+        ],
+        Provider::builder().no_proxy().build().unwrap(),
+        "http://127.0.0.1",
+        |stream| stream,
+    );
+    let mut input = fixture.input();
+    input.name = "HTTP Gateway".into();
+    input.base_url = input.base_url.replace("/v1", "/gateway/v1");
+    let mut input = input.validate().unwrap();
+    let key = "http-fixture-key";
+    input.model_id = fixture
+        .provider
+        .models(&input, key)
+        .await
+        .unwrap()
+        .remove(0);
+    fixture.provider.text(&input, key).await.unwrap();
+    let result = fixture
+        .provider
+        .generate(&input, key, &messages())
+        .await
+        .unwrap();
+    assert_eq!(result.text, "中文。");
+
+    let seen = fixture.seen.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    assert!(seen[0].starts_with("GET /gateway/v1/models "));
+    assert!(seen.iter().all(|request| {
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer http-fixture-key\r\n")
+    }));
+    for (i, request) in seen[1..].iter().enumerate() {
+        assert!(request.starts_with("POST /gateway/v1/chat/completions "));
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["model"], "gateway/text-model");
+        assert_eq!(body["stream"], i == 1);
+    }
 }
 #[tokio::test]
 async fn https_list_and_text_parameter_fallback() {

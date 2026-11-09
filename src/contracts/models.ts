@@ -63,17 +63,24 @@ export interface ModelConfigPort {
 export function modelExpectation(view:ModelOverview,id:string,usages:ModelUsage[]):ModelExpectation {
  return {defaults:view.defaults.map(d=>({...d})),replacements:view.defaults.filter(d=>d.configId===id&&!usages.includes(d.usage)).map(d=>({usage:d.usage,configId:[...view.configs.filter(c=>c.id!==id&&modelExecutable(c,d.usage)),...(d.usage==='speech'?(view.localConfigs??[]).filter(c=>c.id!==id):[])].sort((a,b)=>a.createdAt-b.createdAt||a.id.localeCompare(b.id))[0]?.id??null}))};
 }
+export function normalizeModelBaseUrl(raw:string,protocol:ModelProtocol):string {
+ const value=raw.trim().replace(/\/+$/u,'');
+ let url:URL;try{url=new URL(value);}catch{throw new ModelError('invalid','baseUrl');}
+ const schemeAllowed=url.protocol==='https:'||(protocol==='openai-chat'&&url.protocol==='http:');
+ if(!schemeAllowed||new TextEncoder().encode(value).length>2048||/[\p{Cc}]/u.test(raw)
+   ||url.username||url.password||url.href.includes('?')||url.href.includes('#')
+   ||(modelProtocols[protocol].originOnly&&url.pathname!=='/'))throw new ModelError('invalid','baseUrl');
+ return url.href.replace(/\/+$/u,'');
+}
 export function validateModelInput(input:ModelInput):ModelInput {
  const field=(raw:string,max:number,key:string)=>{const v=raw.trim();if(!v||[...v].length>max||/[\p{Cc}\u2028\u2029]/u.test(raw))throw new ModelError('invalid',key);return v;};
  const name=field(input.name,64,'name'),modelId=field(input.modelId,256,'modelId');
- let url:URL;try{url=new URL(input.baseUrl.trim());}catch{throw new ModelError('invalid','baseUrl');}
- if(input.baseUrl.trim().length>2048||url.protocol!=='https:'||url.username||url.password||url.search||url.hash||/[\p{Cc}]/u.test(input.baseUrl))throw new ModelError('invalid','baseUrl');
  if(!isModelProtocol(input.protocol))throw new ModelError('invalid','protocol');
+ const baseUrl=normalizeModelBaseUrl(input.baseUrl,input.protocol);
  if(!input.usages.length||input.usages.length>2||new Set(input.usages).size!==input.usages.length||input.usages.some(u=>!['speech','text'].includes(u)))throw new ModelError('invalid','usages');
  if(modelProtocols[input.protocol].originOnly&&(input.usages.length!==1||input.usages[0]!=='speech'))throw new ModelError('invalid','usages');
- if(modelProtocols[input.protocol].originOnly&&url.pathname!=='/')throw new ModelError('invalid','baseUrl');
  if(input.protocol==='doubao-asr-streaming'&&modelId!=='Doubao-Seed-ASR-2.0')throw new ModelError('invalid','modelId');
- return {...input,name,modelId,baseUrl:url.href.replace(/\/+$/u,''),usages:[...input.usages].sort()};
+ return {...input,name,modelId,baseUrl,usages:[...input.usages].sort()};
 }
 export function modelSameOrigin(a:string,b:string){try{return new URL(a).origin===new URL(b).origin;}catch{return false;}}
 export function validateModelKey(value:string){const key=value.trim();if(!key||new TextEncoder().encode(key).length>1024||!/^[\x21-\x7e]+$/u.test(key))throw new ModelError('invalid','key');return key;}

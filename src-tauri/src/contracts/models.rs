@@ -85,7 +85,7 @@ impl ConfigInput {
         if self.protocol == "doubao-asr-streaming" && self.model_id != "Doubao-Seed-ASR-2.0" {
             return Err(ModelError::field("modelId"));
         }
-        self.base_url = base_url(&self.base_url)?;
+        self.base_url = base_url(&self.base_url, &self.protocol)?;
         if self.usages.is_empty()
             || self.usages.len() > 2
             || (self.usages.len() == 2 && self.usages[0] == self.usages[1])
@@ -93,15 +93,8 @@ impl ConfigInput {
             return Err(ModelError::field("usages"));
         }
         self.usages.sort_by_key(Usage::key);
-        if capability.origin_only {
-            if self.usages != vec![Usage::Speech] {
-                return Err(ModelError::field("usages"));
-            }
-            let url =
-                reqwest::Url::parse(&self.base_url).map_err(|_| ModelError::field("baseUrl"))?;
-            if url.path() != "/" {
-                return Err(ModelError::field("baseUrl"));
-            }
+        if capability.origin_only && self.usages != vec![Usage::Speech] {
+            return Err(ModelError::field("usages"));
         }
         Ok(self)
     }
@@ -123,18 +116,21 @@ pub fn text(raw: &str, max: usize, field: &str) -> Result<String, ModelError> {
     }
     Ok(value.into())
 }
-pub fn base_url(raw: &str) -> Result<String, ModelError> {
+pub fn base_url(raw: &str, protocol: &str) -> Result<String, ModelError> {
     let value = raw.trim().trim_end_matches('/');
-    if value.len() > 2048 || value.chars().any(char::is_control) {
+    if value.len() > 2048 || raw.chars().any(char::is_control) {
         return Err(ModelError::field("baseUrl"));
     }
     let url = reqwest::Url::parse(value).map_err(|_| ModelError::field("baseUrl"))?;
-    if url.scheme() != "https"
+    let scheme_allowed =
+        url.scheme() == "https" || (protocol == "openai-chat" && url.scheme() == "http");
+    if !scheme_allowed
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
+        || (capabilities(protocol).is_some_and(|cap| cap.origin_only) && url.path() != "/")
     {
         return Err(ModelError::field("baseUrl"));
     }

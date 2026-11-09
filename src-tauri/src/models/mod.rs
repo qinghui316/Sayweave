@@ -365,7 +365,7 @@ impl ModelService {
         if !capabilities(&input.protocol).is_some_and(|c| c.text_test) {
             return Err(ModelError::field("protocol"));
         }
-        input.base_url = base_url(&input.base_url)?;
+        input.base_url = base_url(&input.base_url, &input.protocol)?;
         let view = self.stored().await?;
         let old = Self::existing(&view, req.id.as_deref(), req.revision)?;
         let key = self.resolve(&input, req.key, old).await?;

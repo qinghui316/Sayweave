@@ -368,16 +368,34 @@ fn fields_url_origin_and_secret_limits() {
         "名称"
     );
     for url in [
-        "http://localhost/v1",
+        "ftp://localhost/v1",
         "https://u:p@example.com",
         "https://example.com?q=x",
         "https://example.com/#x",
         "/relative",
     ] {
-        assert!(base_url(url).is_err());
+        assert!(base_url(url, "openai-chat").is_err());
+    }
+    for url in [
+        "http://127.0.0.1:3425/v1",
+        "http://localhost:3425/v1",
+        "http://[::1]:3425/v1",
+        "http://192.168.1.20:3425/v1",
+        "http://gateway.example/api/v1",
+        "https://gateway.example/api/v1",
+    ] {
+        assert_eq!(
+            base_url(&format!(" {url}/// "), "openai-chat").unwrap(),
+            url
+        );
+    }
+    for protocol in ["qwen-audio-streaming", "doubao-asr-streaming"] {
+        assert!(base_url("http://gateway.example", protocol).is_err());
+        assert!(base_url("https://gateway.example/v1", protocol).is_err());
+        assert!(base_url("https://gateway.example", protocol).is_ok());
     }
     assert_eq!(
-        base_url(" https://example.com/api/v2/// ").unwrap(),
+        base_url(" https://example.com/api/v2/// ", "openai-chat").unwrap(),
         "https://example.com/api/v2"
     );
     assert!(same_origin(
@@ -512,6 +530,11 @@ async fn origin_binding_update_and_secret_redaction() {
         expectation: Some(expect(&s, &id, &[Usage::Text]).await),
     };
     req.input.base_url = "https://other.invalid/v1".into();
+    assert_eq!(
+        s.save("main", req.clone()).await.err().unwrap().code,
+        "originChanged"
+    );
+    req.input.base_url = "http://example.invalid:443/v1".into();
     assert_eq!(
         s.save("main", req.clone()).await.err().unwrap().code,
         "originChanged"

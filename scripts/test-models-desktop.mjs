@@ -2,6 +2,7 @@
 import {chromium,expect} from '@playwright/test';
 import {spawn} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
+import {createServer as createHttpServer} from 'node:http';
 import {createServer} from 'node:https';
 import {createWriteStream,mkdirSync,readFileSync,writeFileSync,unlinkSync,existsSync} from 'node:fs';
 import path from 'node:path';
@@ -11,13 +12,15 @@ const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),id=ra
 const storageContext=beginValidation(root,{id,kind:'models-desktop'});
 const directory=path.join(root,'.local','data-acceptance',id),data=path.join(directory,'data');
 mkdirSync(data,{recursive:true});
-const exe=path.join(root,'src-tauri','target','release','sayweave.exe'),port=9239;
+const gatewayCheck=process.argv.includes('--gateway-check');
+const magpieModel=process.argv.find(arg=>arg.startsWith('--magpie-model='))?.slice('--magpie-model='.length);
+const exe=path.join(root,'src-tauri','target',gatewayCheck?'debug':'release','sayweave.exe'),port=9239;
 const regular=process.argv.includes('--regular'),key='isolated-test-key-'+randomUUID(),requests=[],report={id,checks:[],passed:false};
 const logFailure=process.argv.includes('--log-failure');
-if(logFailure&&regular)throw Error('Fault injection requires an isolated acceptance profile');
+if(regular&&(logFailure||gatewayCheck))throw Error('This scenario requires an isolated acceptance profile');
 if(logFailure)writeFileSync(path.join(data,'logs'),'isolated fixture prevents directory creation');
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
-let app,browser,server;
+let app,browser,server,httpServer;
 
 async function command(command,args,env={}){
  const child=spawn(command,args,{cwd:root,windowsHide:true,env:{...process.env,...env},stdio:['ignore','pipe','pipe']});
@@ -56,22 +59,44 @@ async function fill(page,name,url,model,keyValue=key){
  await page.getByLabel('API 密钥',{exact:true}).fill(keyValue);
  await page.getByLabel('模型',{exact:true}).fill(model);
 }
+async function selectGateway(page,url,modelId,keyValue){
+ const add=page.getByRole('button',{name:'添加模型',exact:true});
+ if(await add.isVisible())await add.click();
+ await page.getByLabel('服务地址（URL）',{exact:true}).fill(url);
+ await page.getByLabel('API 密钥',{exact:true}).fill(keyValue);
+ await page.getByLabel('模型',{exact:true}).click();
+ const picker=page.getByRole('dialog',{name:'选择文字模型'});
+ const option=picker.getByRole('option',{name:modelId,exact:true});
+ await expect(option).toBeVisible({timeout:16000});
+ const catalogSize=await picker.getByRole('option').count();
+ await option.click();
+ await page.getByRole('button',{name:'测试连接',exact:true}).click();
+ await expect(page.getByText('连接成功',{exact:true})).toBeVisible({timeout:30000});
+ return catalogSize;
+}
 try{
- let base;
+ let base,httpBase;
  if(!regular){
   await command('cargo',['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_fixture','--','--ignored'],{SAYWEAVE_DATA_ACCEPTANCE_ID:id});
-  server=createServer({cert:readFileSync(path.join(data,'fixture-ca.pem')),key:readFileSync(path.join(data,'fixture-key.pem'))},async(req,res)=>{
+  const respond=async(req,res)=>{
    let body='';for await(const chunk of req){body+=chunk;if(body.length>8192){res.destroy();return;}}
    const parsed=body?JSON.parse(body):null;
    requests.push({path:req.url,authenticated:req.headers.authorization==='Bearer '+key,model:parsed?.model??null,budget:parsed?.max_tokens??parsed?.max_completion_tokens??null});
    res.setHeader('Content-Type','application/json');
    if(req.url.startsWith('/slow/'))await delay(1200);
    if(req.url==='/compat/chat/completions'&&parsed?.max_tokens){res.writeHead(400);res.end(JSON.stringify({error:{code:'unsupported_parameter',param:'max_tokens'}}));return;}
-   if(req.url?.endsWith('/models'))res.end(JSON.stringify({data:[{id:'fixture-text-model'},{id:'fixture-text-model'},{id:'second-model'}]}));
+   if(req.url==='/gateway/v1/models')res.end(JSON.stringify({data:[{id:'gateway/fixture-text-model'}]}));
+   else if(req.url?.endsWith('/models'))res.end(JSON.stringify({data:[{id:'fixture-text-model'},{id:'fixture-text-model'},{id:'second-model'}]}));
    else res.end(JSON.stringify({choices:[{message:{content:'OK'}}]}));
-  });
+  };
+  server=createServer({cert:readFileSync(path.join(data,'fixture-ca.pem')),key:readFileSync(path.join(data,'fixture-key.pem'))},respond);
   await new Promise(r=>server.listen(0,'127.0.0.1',r));
   base='https://localhost:'+server.address().port;
+  if(gatewayCheck){
+   httpServer=createHttpServer(respond);
+   await new Promise(r=>httpServer.listen(0,'127.0.0.1',r));
+   httpBase='http://127.0.0.1:'+httpServer.address().port+'/gateway/v1';
+  }
  }
  let page=await start(1);
  await expect(page.getByRole('link',{name:'组件展示'})).toHaveCount(0);
@@ -83,6 +108,31 @@ try{
   const sizingCommand=await page.evaluate(async()=>{try{await window.__TAURI_INTERNALS__.invoke('acceptance_main_size',{minimum:true});return null;}catch(e){return String(e);}});
   expect(sizingCommand).toContain('not found');
   report.checks.push('ordinary release native models usable; DEV catalogue and acceptance overrides absent');
+ }else if(gatewayCheck){
+  const modelId='gateway/fixture-text-model';
+  expect(await selectGateway(page,httpBase+'///',modelId,key)).toBe(1);
+  await page.getByRole('button',{name:'保存',exact:true}).click();
+  await expect(page.getByText('已保存。',{exact:true})).toBeVisible();
+  const before=await readModels(page);
+  expect(before.configs[0]).toMatchObject({baseUrl:httpBase,modelId,credentialStatus:'present'});
+  await stop(page);page=await start(2);
+  const reopened=await readModels(page);
+  expect(reopened.configs[0]).toMatchObject({id:before.configs[0].id,baseUrl:httpBase,modelId,credentialStatus:'present'});
+  const savedDraft={input:{name:'Gateway fixture',protocol:'openai-chat',baseUrl:httpBase,modelId,usages:['text']},id:reopened.configs[0].id,revision:reopened.configs[0].revision,key:{action:'keep'}};
+  await invoke(page,'model_test',{draft:savedDraft,requestId:randomUUID()});
+  expect(await selectGateway(page,base+'/v1','fixture-text-model',key)).toBe(2);
+  await page.getByRole('button',{name:'取消编辑',exact:true}).click();
+  expect(requests.every(r=>r.authenticated)).toBe(true);
+  expect(requests.filter(r=>r.path==='/gateway/v1/chat/completions').map(r=>r.model)).toEqual([modelId,modelId]);
+  report.checks.push('HTTP picker, full model ID, connection, saved configuration and credential after restart; HTTPS picker and connection');
+  if(magpieModel){
+   const magpie='http://127.0.0.1:3425';
+   const hello=await fetch(magpie+'/api/hello',{signal:AbortSignal.timeout(5000),redirect:'error'});
+   expect(hello.ok&&((await hello.json()).name==='magpie')).toBe(true);
+   report.magpie={modelCount:await selectGateway(page,magpie+'/v1',magpieModel,'magpie-sayweave'),connectionTest:'passed'};
+   await page.getByRole('button',{name:'取消编辑',exact:true}).click();
+  }
+  report.network=requests;
  }else{
   await expect(page.getByLabel('API 密钥',{exact:true})).toBeVisible();
   await fill(page,'个人文字配置',base+'/v1','fixture-text-model');
@@ -150,8 +200,9 @@ try{
  await stop(null,false);
  if(!regular){try{await command('cargo',['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_cleanup','--','--ignored'],{SAYWEAVE_DATA_ACCEPTANCE_ID:id});report.credentialCleanup=true;}catch{report.credentialCleanup=false;report.passed=false;process.exitCode=1;}}
  if(server){server.closeAllConnections();await new Promise(r=>server.close(r));}
+ if(httpServer){httpServer.closeAllConnections();await new Promise(r=>httpServer.close(r));}
  for(const name of ['fixture-ca.der','fixture-ca.pem','fixture-key.pem'])if(existsSync(path.join(data,name)))unlinkSync(path.join(data,name));
- writeFileSync(path.join(directory,'report.json'),JSON.stringify(report,null,2));writeFileSync(path.join(root,'.local',regular?'models-release-report.json':'models-desktop-report.json'),JSON.stringify(report,null,2));
+ writeFileSync(path.join(directory,'report.json'),JSON.stringify(report,null,2));writeFileSync(path.join(root,'.local',regular?'models-release-report.json':gatewayCheck?'models-gateway-report.json':'models-desktop-report.json'),JSON.stringify(report,null,2));
  report.storage=finishValidation(root,storageContext,report,{processesClosed:!app,credentialsCleared:regular||report.credentialCleanup===true});
 }
 
