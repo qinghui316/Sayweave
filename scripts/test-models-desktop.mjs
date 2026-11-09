@@ -9,15 +9,15 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {beginValidation,finishValidation} from './storage-policy.mjs';
 const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'..'),id=randomUUID();
-const storageContext=beginValidation(root,{id,kind:'models-desktop'});
 const directory=path.join(root,'.local','data-acceptance',id),data=path.join(directory,'data');
-mkdirSync(data,{recursive:true});
 const gatewayCheck=process.argv.includes('--gateway-check');
 const magpieModel=process.argv.find(arg=>arg.startsWith('--magpie-model='))?.slice('--magpie-model='.length);
 const exe=path.join(root,'src-tauri','target',gatewayCheck?'debug':'release','sayweave.exe'),port=9239;
 const regular=process.argv.includes('--regular'),key='isolated-test-key-'+randomUUID(),requests=[],report={id,checks:[],passed:false};
 const logFailure=process.argv.includes('--log-failure');
 if(regular&&(logFailure||gatewayCheck))throw Error('This scenario requires an isolated acceptance profile');
+const storageContext=beginValidation(root,{id,kind:'models-desktop'});
+mkdirSync(data,{recursive:true});
 if(logFailure)writeFileSync(path.join(data,'logs'),'isolated fixture prevents directory creation');
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
 let app,browser,server,httpServer;
@@ -30,11 +30,20 @@ async function command(command,args,env={}){
 }
 async function start(round){
  if(await fetch('http://127.0.0.1:'+port+'/json/version').then(()=>true).catch(()=>false))throw Error('Owned test port occupied; no other process stopped.');
+ const stdout=path.join(directory,'round-'+round+'.log');
  app=spawn(exe,[],{cwd:root,windowsHide:true,env:{...process.env,SAYWEAVE_DATA_ACCEPTANCE_ID:regular?'':id,WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:'--remote-debugging-port='+port+' --remote-debugging-address=127.0.0.1'},stdio:['ignore','pipe','pipe']});
- app.stdout.pipe(createWriteStream(path.join(directory,'round-'+round+'.log')));app.stderr.pipe(createWriteStream(path.join(directory,'round-'+round+'-errors.log')));
+ app.stdout.pipe(createWriteStream(stdout));app.stderr.pipe(createWriteStream(path.join(directory,'round-'+round+'-errors.log')));
  let endpoint;
  for(let i=0;i<200;i++){if(app.exitCode!==null)throw Error('Application exited before ready');endpoint=await fetch('http://127.0.0.1:'+port+'/json/version').then(r=>r.json()).catch(()=>null);if(endpoint)break;await delay(100);}
  if(!endpoint)throw Error('Native WebView unavailable');
+ if(!regular){
+  const prefix='SAYWEAVE_DATA_DIRECTORY ';
+  await expect.poll(()=>{
+   if(!existsSync(stdout)||!existsSync(path.join(data,'dictionary.sqlite')))return false;
+   const roots=readFileSync(stdout,'utf8').split(/\r?\n/u).filter(line=>line.startsWith(prefix));
+   return roots.length===1&&path.resolve(roots[0].slice(prefix.length)).toLowerCase()===data.toLowerCase();
+  },{message:'The spawned app must open the UUID-scoped acceptance profile',timeout:10000}).toBe(true);
+ }
  browser=await chromium.connectOverCDP(endpoint.webSocketDebuggerUrl);
  let page;for(let i=0;i<100;i++){page=browser.contexts().flatMap(c=>c.pages()).find(p=>p.url().includes('tauri')&&!p.url().includes('surface=overlay'));if(page)break;await delay(100);}
  if(!page)throw Error('Main page missing');await page.waitForFunction(()=>window.__TAURI_INTERNALS__?.invoke);
@@ -196,7 +205,6 @@ try{
  report.passed=true;
  await stop(page);
 }catch(e){report.error=String(e).replaceAll(key,"[redacted]");process.exitCode=1;}finally{
- if(browser){try{const main=browser.contexts().flatMap(c=>c.pages()).find(p=>!p.url().includes('surface=overlay'));if(main&&!regular){const view=await invoke(main,'model_overview').catch(()=>null);if(view)for(const c of view.configs){const current=await invoke(main,'model_overview');const replacements=current.defaults.filter(d=>d.configId===c.id).map(d=>({usage:d.usage,configId:current.configs.find(x=>x.id!==c.id&&x.usages.includes(d.usage))?.id??null}));await invoke(main,'model_remove',{request:{id:c.id,revision:c.revision,expectation:{defaults:current.defaults,replacements}}}).catch(()=>{});}}}catch{/* Best-effort UI cleanup; explicit scoped vault cleanup below is authoritative. */}}
  await stop(null,false);
  if(!regular){try{await command('cargo',['test','--manifest-path','src-tauri/Cargo.toml','model_desktop_cleanup','--','--ignored'],{SAYWEAVE_DATA_ACCEPTANCE_ID:id});report.credentialCleanup=true;}catch{report.credentialCleanup=false;report.passed=false;process.exitCode=1;}}
  if(server){server.closeAllConnections();await new Promise(r=>server.close(r));}
