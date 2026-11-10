@@ -40,6 +40,10 @@ export const History=memo(function History({deliveryRevision='',contentRevision=
   }finally{if(copyRelease.current===release)copyRelease.current=null;release();}
  },[feed,port,speech,invalidateCopy]);
  const playback=useHistoryPlayback(port,visible&&documentVisible);const play=playback.control;const [emptyPlayer]=useState({resourceId:null,playing:false,positionMs:0,durationMs:0});
+ const playRow=useCallback((...args:Parameters<typeof play>)=>{
+  if(args[0]!=='stop'&&(navigationPending.current||feed.getSnapshot().loadingMore))return Promise.resolve();
+  return play(...args);
+ },[feed,play]);
  useLayoutEffect(()=>{if(!visible||!documentVisible||playback.busy||playback.state.resourceId)return feed.hold();},[feed,visible,documentVisible,playback.busy,playback.state.resourceId]);
  useEffect(()=>{const update=()=>setDocumentVisible(!document.hidden);document.addEventListener('visibilitychange',update);return()=>document.removeEventListener('visibilitychange',update);},[]);
  useEffect(()=>{if(visible&&documentVisible)void feed.refresh();},[feed,visible,documentVisible,contentRevision]);
@@ -66,7 +70,7 @@ export const History=memo(function History({deliveryRevision='',contentRevision=
   {settings&&<div id="history-settings"><SaveSettings settings={recordingSettings}/></div>}
   <div className={s.toolbar}><ExpandableSearch anchor="left" label="搜索识别文字" value={state.search} onValueChange={value=>{invalidateCopy();anchor.current=null;feed.search(value);if(scroller.current)scroller.current.scrollTop=0;}}/><div className={s.toolbarActions}><span className={s.meta}>{state.total} 条</span><IconButton label="刷新历史" disabled={navigating||state.loadingMore} onClick={latest}><ActionIcon name="retry"/></IconButton></div></div>
   <div ref={scroller} className={s.scroller} onScroll={remember} tabIndex={0} aria-label="历史记录列表">
-   {state.loading&&!state.loaded?<p role="status" className={s.meta}>正在读取历史…</p>:state.records.length===0&&!state.error?<EmptyState title={state.search?'没有匹配的记录':'还没有历史记录'}>{!state.search&&<p className={s.meta}>完成一次录音后，文字会出现在这里。</p>}</EmptyState>:<div role="list" aria-label="识别记录" className={s.list}>{state.records.map((r,index)=>{const heading=index===0||day(state.records[index-1]!.createdAt)!==day(r.createdAt);return <div key={r.id}>{heading&&<h2 className={s.date}>{dateLabel(r.createdAt)}</h2>}<HistoryRow deliveryRevision={deliveryRevision} copyFull={copyFull} summary={r} expanded={state.expandedId===r.id} mode={mode} port={port} snapshot={snapshot.recordId===r.id?snapshot:quietSpeech} player={playback.state.resourceId===r.audio?.id?playback.state:emptyPlayer} playBusy={playback.busy} expand={expand} collapse={collapse} play={playback.control} changed={changed}/></div>;})}</div>}
+   {state.loading&&!state.loaded?<p role="status" className={s.meta}>正在读取历史…</p>:state.records.length===0&&!state.error?<EmptyState title={state.search?'没有匹配的记录':'还没有历史记录'}>{!state.search&&<p className={s.meta}>完成一次录音后，文字会出现在这里。</p>}</EmptyState>:<div role="list" aria-label="识别记录" className={s.list}>{state.records.map((r,index)=>{const heading=index===0||day(state.records[index-1]!.createdAt)!==day(r.createdAt);return <div key={r.id}>{heading&&<h2 className={s.date}>{dateLabel(r.createdAt)}</h2>}<HistoryRow deliveryRevision={deliveryRevision} copyFull={copyFull} summary={r} expanded={state.expandedId===r.id} mode={mode} port={port} snapshot={snapshot.recordId===r.id?snapshot:quietSpeech} player={playback.state.resourceId===r.audio?.id?playback.state:emptyPlayer} playBusy={playback.busy||navigating||state.loadingMore} expand={expand} collapse={collapse} play={playRow} changed={changed}/></div>;})}</div>}
    {state.error&&<div className={s.loadError}><InlineMessage status="error">{speechMessages[speechError({code:state.error}).code]}</InlineMessage><Button onClick={()=>void navigatePage(()=>feed.retry())}>重试读取</Button></div>}
 
   </div>

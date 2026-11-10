@@ -155,6 +155,27 @@ it('separates unreadable text from a missing audio file',async()=>{
  expect(await row.findByText('录音文件缺失或无法读取。')).toBeVisible();expect(detail).not.toHaveBeenCalled();
  fireEvent.click(row.getByRole('button',{name:'展开'}));expect(await row.findByText('无法读取这条历史记录。')).toBeVisible();
 });
+it('does not start audio from a departing row during slow pagination',async()=>{
+ const newest=record(20,'即将离开的录音');
+ newest.audio={id:'departing-audio',recordId:newest.id,status:'ready',bytes:32000,expiresAt:null};
+ const f=fixture([...Array.from({length:20},(_,n)=>record(n,'第'+n+'条记录')),newest]);
+ const original=f.port.browse.bind(f.port),head=await original('',null,20);
+ const next=await original('',head.nextCursor,20),pending=deferred<typeof next>();
+ vi.spyOn(f.port,'browse').mockImplementation((search,cursor,limit)=>cursor?pending.promise:original(search,cursor,limit));
+ const play=vi.spyOn(f.port,'play').mockResolvedValue({resourceId:newest.audio.id,playing:true,positionMs:0,durationMs:1000});
+ render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
+ await screen.findByText('即将离开的录音');
+ const button=screen.getByRole('button',{name:'播放录音'});
+ expect(button).toBeEnabled();
+ fireEvent.click(screen.getByRole('button',{name:'下一页'}));
+ await screen.findByText('正在翻页…');
+ await act(async()=>{fireEvent.click(button);});
+ expect(play).not.toHaveBeenCalled();
+ expect(button).toBeDisabled();
+ await act(async()=>pending.resolve(next));
+ expect(await screen.findByText('第0条记录')).toBeVisible();
+ expect(screen.queryByRole('button',{name:'播放录音'})).not.toBeInTheDocument();
+});
 it('rejects processing records with unrelated source identity or invalid receipts',()=>{
  const r=record();r.processing=[{id:'p',attemptId:r.currentAttempt!,configName:'m',modelId:'m',state:'success',text:'整理',revision:1,errorCode:null,units:[]}];
  expect(()=>parseRecord({...r,processing:[{...r.processing![0],attemptId:'another'}]})).toThrow();
