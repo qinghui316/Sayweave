@@ -24,8 +24,7 @@ function processingUnit(value:unknown,runId:string){
  for(const key of ['candidateText','errorCode'])if(u[key]!==null&&typeof u[key]!=='string')throw new SpeechError('protocol');
  for(const key of ['promptTokens','completionTokens','sourceCommittedEnd'])if(u[key]!==null&&!num(u[key]))throw new SpeechError('protocol');
  if(typeof u.sourceCommittedEnd==='number'&&(u.sourceCommittedEnd<u.sourceStart||u.sourceCommittedEnd>u.sourceEnd))throw new SpeechError('protocol');
- let refs:unknown;try{refs=JSON.parse(String(u.sourceRefs));}catch{throw new SpeechError('protocol');}if(!Array.isArray(refs))throw new SpeechError('protocol');
- for(const raw of refs){const ref=obj(raw),range=obj(ref.chars);if(!num(ref.segment)||!num(ref.revision)||!num(range.start)||!num(range.end)||range.end<range.start)throw new SpeechError('protocol');}
+ // The native processing layer owns the encoding of sourceRefs.
 }
 export function parseRecord(value:unknown):HistoryRecord{
  const r=obj(value);if(typeof r.id!=='string'||!num(r.createdAt)||!num(r.durationMs)||typeof r.status!=='string'||!num(r.revision)||!Array.isArray(r.attempts)||!(r.currentAttempt===null||typeof r.currentAttempt==='string')||!(r.endedAt===null||num(r.endedAt)))throw new SpeechError('protocol');

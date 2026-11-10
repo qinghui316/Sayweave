@@ -1,5 +1,4 @@
 import {test,expect,type Locator} from '@playwright/test';
-import type {HistoryRecord} from '../../src/contracts/history';
 
 async function aligned(menu:Locator,item:Locator){
  const layer=menu.locator('[data-selection-highlight]');await expect(layer).toHaveCSS('opacity','1');
@@ -24,13 +23,13 @@ test('dictionary menu hover and keyboard highlight preserve item positions and o
  await editor.getByRole('button',{name:'取消',exact:true}).click();await expect(trigger).toBeEnabled();
 });
 
-test('history menu excludes unavailable actions and reduced motion keeps an immediate highlight',async({page})=>{
- const at=Date.now(),record:HistoryRecord={id:'menu-hover-record',createdAt:at,endedAt:at+1000,durationMs:1000,status:'success',currentAttempt:'attempt-hover',revision:1,audio:null,attempts:[{id:'attempt-hover',recordId:'menu-hover-record',kind:'live',configId:'fixture',configName:'测试模型',configRevision:1,modelId:'fixture',serviceHost:'example.invalid',createdAt:at,endedAt:at+1000,status:'success',text:'只用于菜单交互的历史正文。',errorCode:null,elapsedMs:1}]};
+test('dictionary menu highlights the active action without animation in reduced motion',async({page})=>{
  await page.emulateMedia({reducedMotion:'reduce'});
- await page.route('**/src/adapters/speech-browser.ts',async route=>{const response=await route.fetch(),source=await response.text();expect(source).toContain('records = [];');await route.fulfill({response,body:source.replace('records = [];',`records = ${JSON.stringify([record])};`)});});
- await page.goto('/#/history');const row=page.getByRole('listitem').first();await row.hover();await row.getByRole('button',{name:'更多操作',exact:true}).click();
- const menu=page.getByRole('menu'),disabled=menu.getByRole('menuitem',{name:'重新识别',exact:true}),versions=menu.getByRole('menuitem',{name:'识别版本',exact:true});
- await expect(disabled).toHaveAttribute('aria-disabled','true');await versions.hover();await aligned(menu,versions);await expect(menu).toHaveCSS('animation-name','none');
- await expect(menu.locator('[data-selection-highlight]')).toHaveCSS('transition-duration','0s');await disabled.hover();await expect(disabled).not.toHaveAttribute('data-highlighted');await aligned(menu,versions);
- await page.getByRole('heading',{name:'历史记录',exact:true}).click();await expect(menu).toHaveCount(0);await expect(row).toContainText(record.attempts[0]!.text);
+ await page.goto('/#/dictionary');await page.getByRole('button',{name:'添加词语',exact:true}).click();
+ const dialog=page.getByRole('dialog');await dialog.getByLabel('词语',{exact:true}).fill('键盘核对');await dialog.getByRole('button',{name:'保存',exact:true}).click();
+ const trigger=page.getByRole('button',{name:'更多操作 键盘核对',exact:true});await trigger.click();
+ const menu=page.getByRole('menu'),edit=menu.getByRole('menuitem',{name:'编辑',exact:true});
+ await edit.hover();await aligned(menu,edit);await expect(menu).toHaveCSS('animation-name','none');
+ await expect(menu.locator('[data-selection-highlight]')).toHaveCSS('transition-duration','0s');
+ await page.keyboard.press('Escape');await expect(trigger).toBeFocused();
 });

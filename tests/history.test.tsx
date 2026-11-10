@@ -5,13 +5,11 @@ import {it,expect,vi} from 'vitest';
 import {MemoryRouter} from 'react-router-dom';
 import {History,HistoryFeedStore} from '../src/features/history';
 import {BrowserHistory,BrowserSpeech} from '../src/adapters/speech-browser';
-import {BrowserModels} from '../src/adapters/models-browser';
 import {parseFeed,parseRecord,summarizeHistory,type HistoryRecord} from '../src/contracts/history';
 import {initialSpeech} from '../src/contracts/speech';
 import {SaveSettings} from '../src/features/history/SaveSettings';
-import {localAssetId} from '../src/contracts/models';
 function record(n=1,text='完整的识别文字'):HistoryRecord {const id=`record-${n}`,a=`attempt-${n}`;return {id,createdAt:1000+n,endedAt:2000+n,durationMs:1000,status:'success',currentAttempt:a,revision:1,audio:null,attempts:[{id:a,recordId:id,kind:'live',configId:'fixture',configName:'模型',configRevision:1,modelId:'fixture',serviceHost:'example.invalid',createdAt:1000+n,endedAt:2000+n,status:'success',text,errorCode:null,elapsedMs:1}]};}
-function fixture(records:HistoryRecord[]){const speech=new BrowserSpeech();speech.records.push(...records);return {speech,port:new BrowserHistory(speech),models:new BrowserModels()};}
+function fixture(records:HistoryRecord[]){const speech=new BrowserSpeech();speech.records.push(...records);return {speech,port:new BrowserHistory(speech)};}
 function deferred<T>(){let resolve!:(value:T)=>void;const promise=new Promise<T>(r=>resolve=r);return {promise,resolve};}
 it('automatically follows saved recordings and late processed summaries without replacing the row identity',async()=>{
  const f=fixture([]),store=new HistoryFeedStore(f.port);await store.refresh();
@@ -105,33 +103,57 @@ it('releases an obsolete copy hold when a newer copy completes or history is lef
  f.speech.records.push(record(4,'第四条'));render(<MemoryRouter><History {...props}/></MemoryRouter>);expect(await screen.findByText('第四条')).toBeVisible();
  await act(async()=>{stale.resolve(record(1,'第一条'));leaving.resolve(record(3,'第三条'));});expect(copy).toHaveBeenCalledTimes(1);
 });
-it('retries retained audio with a local default without claiming a cloud upload',async()=>{
- const r=record(),f=fixture([r]);r.audio={id:'retained-audio',recordId:r.id,status:'ready',bytes:32000,expiresAt:null};
- await f.models.local.download();
- const view=await f.models.local.save({input:{name:'本地识别',assetId:localAssetId,engine:'transcribe-cpp-0.1.3',device:'cpu'},id:null,revision:null});
- const model=view.localConfigs![0]!;
- await f.models.setDefault({usage:'speech',configId:model.id,revision:view.defaults.find(d=>d.usage==='speech')!.revision});
- const retry=vi.spyOn(f.port,'retry').mockResolvedValue(initialSpeech());
- render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
- await screen.findByRole('listitem');
- const user=userEvent.setup();screen.getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');
- await user.click(await screen.findByRole('menuitem',{name:'重新识别'}));
- const confirm=await screen.findByRole('group',{name:'重识别确认'});
- expect(confirm).toHaveTextContent('本地识别');expect(confirm).not.toHaveTextContent('会发送这份录音');
- await user.click(within(confirm).getByRole('button',{name:'开始识别'}));
- await waitFor(()=>expect(retry).toHaveBeenCalledWith(r.id,model.id,model.revision));
-});
 it('copies and searches the full processed version independently of raw text',async()=>{
  const r=record(1,'识别原文'),full='整理后的完整正文🙂'.repeat(50);
- r.processing=[{id:'processed-1',attemptId:r.currentAttempt!,configName:'文字模型',modelId:'fixture',state:'success',text:full,revision:1,errorCode:null,units:[]}];
+ const refs=[{segment:1,revision:1,chars:{start:0,end:4}}];
+ const unit={id:'unit',runId:'processed-1',turn:1,sourceStart:0,sourceEnd:4,sourceText:'识别原文',candidateText:full,generationState:'success',applicationState:'applied',sourceCommittedEnd:4,errorCode:null,promptTokens:null,completionTokens:null,elapsedMs:1};
+ r.processing=[{id:'processed-1',attemptId:r.currentAttempt!,configName:'文字模型',modelId:'fixture',state:'success',text:full,revision:1,errorCode:null,units:[{...unit,sourceRefs:JSON.stringify({format:'revisable-v1',order:1,source:{block:'7e580f4a-6d40-4980-b590-c068c9ff7736',version:1,sourceEpoch:1,baselineKind:'asr',text:'识别原文',speechEnd:4,insertionEnd:4},asrTurn:1,asrSources:refs,delivery:false,visibleRevision:null})}]}];
  expect(parseRecord(r).processing?.[0]?.text).toBe(full);
+ expect(parseRecord({...r,processing:[{...r.processing[0]!,units:[{...unit,sourceRefs:JSON.stringify(refs)}]}]}).processing?.[0]?.text).toBe(full);
  const f=fixture([r]),copy=vi.spyOn(f.speech,'copy').mockResolvedValue();
+ const detail=f.port.detail.bind(f.port);vi.spyOn(f.port,'detail').mockImplementation(async id=>parseRecord(await detail(id)));
  render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
- const row=await screen.findByRole('listitem');fireEvent.click(within(row).getByRole('button',{name:'复制'}));
+ const row=await screen.findByRole('listitem');fireEvent.click(within(row).getByRole('button',{name:'展开'}));
+ expect(await within(row).findByRole('region',{name:'历史识别文字'})).toHaveTextContent(full);
+ fireEvent.click(within(row).getByRole('button',{name:'复制'}));
  await waitFor(()=>expect(copy).toHaveBeenCalledWith(full));
  fireEvent.click(screen.getByRole('button',{name:'搜索识别文字'}));fireEvent.change(screen.getByRole('textbox',{name:'搜索识别文字'}),{target:{value:'识别原文'}});
  await screen.findByText('识别原文');fireEvent.click(within(screen.getByRole('listitem')).getByRole('button',{name:'复制'}));
  await waitFor(()=>expect(copy).toHaveBeenLastCalledWith('识别原文'));
+});
+it('plays without reading details and keeps playback through reading, copy and cancelled deletion',async()=>{
+ const a=record(2,'长中文识别文字。'.repeat(40)),b=record(1,'另一段录音');
+ for(const r of [a,b])r.audio={id:'audio-'+r.id,recordId:r.id,status:'ready',bytes:32000,expiresAt:null};
+ const f=fixture([a,b]),copy=vi.spyOn(f.speech,'copy').mockResolvedValue(),detail=vi.spyOn(f.port,'detail');
+ const empty={resourceId:null,playing:false,positionMs:0,durationMs:0};
+ let state:import('../src/contracts/history').PlaybackState=empty;
+ const play=vi.spyOn(f.port,'play').mockImplementation(async(resourceId?:string)=>state={resourceId:resourceId!,playing:true,positionMs:0,durationMs:1000});
+ const playback=vi.spyOn(f.port,'playback').mockImplementation(async action=>{
+  if(action==='stop')state=empty;
+  if(action==='pause'||action==='resume')state={...state,playing:action==='resume'};
+  return state;
+ });
+ const view=render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
+ const [first,second]=(await screen.findAllByRole('listitem')).map(node=>within(node));
+ fireEvent.click(first!.getByRole('button',{name:'播放录音'}));await first!.findByRole('button',{name:'暂停录音'});
+ expect(detail).not.toHaveBeenCalled();expect(play).toHaveBeenLastCalledWith(a.audio!.id);
+ fireEvent.click(first!.getByRole('button',{name:'暂停录音'}));fireEvent.click(await first!.findByRole('button',{name:'继续播放'}));await first!.findByRole('button',{name:'暂停录音'});
+ fireEvent.click(first!.getByRole('button',{name:'展开'}));await first!.findByRole('region',{name:'历史识别文字'});
+ fireEvent.click(first!.getByRole('button',{name:'复制'}));await waitFor(()=>expect(copy).toHaveBeenCalledWith(a.attempts[0]!.text));
+ fireEvent.click(first!.getByRole('button',{name:'收起'}));
+ fireEvent.click(first!.getByRole('button',{name:'删除记录'}));fireEvent.click(first!.getByRole('button',{name:'取消'}));
+ expect(first!.getByRole('button',{name:'暂停录音'})).toBeEnabled();expect(playback).not.toHaveBeenCalledWith('stop',undefined);
+ fireEvent.click(second!.getByRole('button',{name:'播放录音'}));await second!.findByRole('button',{name:'暂停录音'});
+ expect(first!.getByRole('button',{name:'播放录音'})).toBeEnabled();expect(play).toHaveBeenLastCalledWith(b.audio!.id);
+ view.unmount();await waitFor(()=>expect(playback).toHaveBeenCalledWith('stop'));
+});
+it('separates unreadable text from a missing audio file',async()=>{
+ const r=record(1,'有识别结果。'.repeat(60));r.audio={id:'missing-on-disk',recordId:r.id,status:'ready',bytes:32000,expiresAt:null};
+ const f=fixture([r]),detail=vi.spyOn(f.port,'detail').mockRejectedValue({code:'protocol'});
+ render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
+ const row=within(await screen.findByRole('listitem'));fireEvent.click(row.getByRole('button',{name:'播放录音'}));
+ expect(await row.findByText('录音文件缺失或无法读取。')).toBeVisible();expect(detail).not.toHaveBeenCalled();
+ fireEvent.click(row.getByRole('button',{name:'展开'}));expect(await row.findByText('无法读取这条历史记录。')).toBeVisible();
 });
 it('rejects processing records with unrelated source identity or invalid receipts',()=>{
  const r=record();r.processing=[{id:'p',attemptId:r.currentAttempt!,configName:'m',modelId:'m',state:'success',text:'整理',revision:1,errorCode:null,units:[]}];
@@ -140,23 +162,22 @@ it('rejects processing records with unrelated source identity or invalid receipt
 });
 it('shows retained native draft results without inventing a text model',async()=>{
  const r=record(1,'识别原文');
- r.processing=[{id:'native-draft',attemptId:r.currentAttempt!,mode:'native',configName:'口述结果',modelId:'',state:'success',text:'用户修改后的结果',revision:1,errorCode:null,units:[]}];
+ r.processing=[{id:'native-draft',attemptId:r.currentAttempt!,mode:'native',configName:'口述结果',modelId:'',state:'success',text:'用户修改后的结果'.repeat(40),revision:1,errorCode:null,units:[]}];
  expect(parseRecord(r).processing?.[0]?.mode).toBe('native');
  expect(()=>parseRecord({...r,processing:[{...r.processing![0],mode:'unknown'}]})).toThrow();
  const f=fixture([r]);
  render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
- expect(await screen.findByText('用户修改后的结果')).toBeVisible();
- const user=userEvent.setup();screen.getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');
- await user.click(await screen.findByRole('menuitem',{name:'识别版本'}));
+ await screen.findByRole('listitem');
+ await userEvent.click(screen.getByRole('button',{name:'展开'}));
  expect((await screen.findAllByText('口述结果')).length).toBeGreaterThan(0);
 });
 it('refreshes late delivery confirmation without changing the recognition record',async()=>{
- const r=record(),f=fixture([r]);let state='delivering';
+ const r=record(1,'完整的识别文字'.repeat(40)),f=fixture([r]);let state='delivering';
  const port=Object.assign(Object.create(f.port) as import('../src/contracts/history').HistoryPort,{delivery:vi.fn(async()=>[{attemptId:r.currentAttempt!,state,error:null,updatedAt:1}])});
- const view=render(<MemoryRouter><History port={port} recordingSettings={recordingSettings(f.speech)} speech={f.speech} models={f.models} snapshot={initialSpeech()} deliveryRevision="working"/></MemoryRouter>);
- await screen.findByText('完整的识别文字');const user=userEvent.setup();screen.getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('menuitem',{name:'识别版本'}));
+ const view=render(<MemoryRouter><History port={port} recordingSettings={recordingSettings(f.speech)} speech={f.speech} snapshot={initialSpeech()} deliveryRevision="working"/></MemoryRouter>);
+ await userEvent.click(await screen.findByRole('button',{name:'展开'}));
  await screen.findByText('填入未完成');state='confirmed';
- view.rerender(<MemoryRouter><History port={port} recordingSettings={recordingSettings(f.speech)} speech={f.speech} models={f.models} snapshot={initialSpeech()} deliveryRevision="confirmed"/></MemoryRouter>);
+ view.rerender(<MemoryRouter><History port={port} recordingSettings={recordingSettings(f.speech)} speech={f.speech} snapshot={initialSpeech()} deliveryRevision="confirmed"/></MemoryRouter>);
  expect(await screen.findByText('已填入')).toBeVisible();
 });
 it('keeps 20-item reading boundaries across deletion, new records and cache eviction',async()=>{
@@ -202,25 +223,24 @@ it('validates bounded summaries and distinguishes a failed retry without losing 
  expect(()=>parseFeed({records:[{...summary,preview:'😀'.repeat(241)}],total:1,nextCursor:null})).toThrow();
  expect(()=>parseFeed({records:Array(51).fill(summary),total:51,nextCursor:null})).toThrow();
 });
-it('copies the full matched old version and opens versions inline with keyboard access',async()=>{
+it('copies the full matched old version and expands it inline with keyboard access',async()=>{
  const r=record(1,'当前成功');const full='旧文字😀'.repeat(90);r.attempts.push({...r.attempts[0]!,id:'old',createdAt:1,text:full});
  const f=fixture([r]),copy=vi.spyOn(f.speech,'copy').mockResolvedValue();
  render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
  await screen.findByText('当前成功');fireEvent.click(screen.getByRole('button',{name:'搜索识别文字'}));fireEvent.change(screen.getByRole('textbox',{name:'搜索识别文字'}),{target:{value:'旧文字'}});
  await screen.findByText('匹配旧版本');const row=screen.getByRole('listitem');fireEvent.click(within(row).getByRole('button',{name:'复制'}));
  await waitFor(()=>expect(copy).toHaveBeenCalledWith(full));expect(within(row).getByRole('button',{name:'已复制'})).toBeVisible();
- const user=userEvent.setup();within(row).getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('menuitem',{name:'识别版本'}));
+ const user=userEvent.setup();within(row).getByRole('button',{name:'展开'}).focus();await user.keyboard('{Enter}');
  expect(await screen.findByRole('region',{name:'历史识别文字'})).toHaveTextContent(full);expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
- expect(screen.getByRole('combobox',{name:'识别版本'})).toHaveTextContent('首次识别');
 });
 it('keeps a successful body beside a failed retry and deletes only after inline confirmation',async()=>{
  const r=record();r.attempts.unshift({...r.attempts[0]!,id:'retry',kind:'retry',createdAt:9000,status:'failed',text:'',errorCode:'timeout'});const f=fixture([r]);
  render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);await screen.findByText('完整的识别文字');expect(screen.getByText(/本次重识别未完成/)).toBeVisible();
- const user=userEvent.setup();screen.getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('menuitem',{name:'删除记录'}));
+ const user=userEvent.setup();screen.getByRole('button',{name:'删除记录'}).focus();await user.keyboard('{Enter}');
  const confirm=await screen.findByRole('group',{name:'删除历史确认'});expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
  await user.click(within(confirm).getByRole('button',{name:'取消'}));expect(f.speech.records).toHaveLength(1);
- expect(screen.getByRole('button',{name:'更多操作'})).toHaveFocus();
- screen.getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');await user.click(screen.getByRole('menuitem',{name:'删除记录'}));
+ expect(screen.getByRole('button',{name:'删除记录'})).toHaveFocus();
+ screen.getByRole('button',{name:'删除记录'}).focus();await user.keyboard('{Enter}');
  await user.click(within(await screen.findByRole('group',{name:'删除历史确认'})).getByRole('button',{name:'确认删除'}));
  await screen.findByText('还没有历史记录');expect(f.speech.records).toHaveLength(0);
 });
@@ -285,14 +305,11 @@ it('seeks forward when the first page is emptied and shows empty only after the 
 });
 
 it.each(['service','emptyText'])('shows translation error %s while retaining the recognized original',async errorCode=>{
- const r=record(1,'今天下午三点开会');r.attempts[0]!.purpose='translation';r.attempts[0]!.targetLanguage='en-US';
+ const r=record(1,'今天下午三点开会'.repeat(40));r.attempts[0]!.purpose='translation';r.attempts[0]!.targetLanguage='en-US';
  r.processing=[{id:'failed-translation',attemptId:r.currentAttempt!,configName:'文字模型',modelId:'fixture',state:'failed',text:'',revision:1,errorCode,units:[]}];
  const f=fixture([r]),user=userEvent.setup();
  render(<MemoryRouter><History {...f} recordingSettings={recordingSettings(f.speech)} snapshot={initialSpeech()}/></MemoryRouter>);
- await screen.findByRole('listitem');screen.getByRole('button',{name:'更多操作'}).focus();await user.keyboard('{Enter}');await user.click(await screen.findByRole('menuitem',{name:'识别版本'}));
- const versions=await screen.findByRole('combobox',{name:'识别版本'});versions.focus();await user.keyboard('{Enter}');
- await user.click(await screen.findByRole('option',{name:'译文 · 文字模型'}));
- const body=screen.getByRole('region',{name:'历史识别文字'});expect(body).not.toHaveTextContent('未识别到文字');expect(body).toHaveTextContent(errorCode==='emptyText'?'未生成译文。':'翻译未完成。');
- versions.focus();await user.keyboard('{Enter}');await user.click(await screen.findByRole('option',{name:/原文/}));
- expect(body).toHaveTextContent('今天下午三点开会');
+ await user.click(await screen.findByRole('button',{name:'展开'}));
+ expect(await screen.findByRole('region',{name:'历史识别文字'})).toHaveTextContent('今天下午三点开会'.repeat(40));
+ expect(screen.getByText(errorCode==='emptyText'?'未生成译文。':'翻译未完成。')).toBeVisible();
 });

@@ -30,13 +30,13 @@ BrowserSpeech.prototype.subscribe = async function(...args) {
  await expect(page.getByRole('button',{name:/查看最新/})).toHaveCount(0);expect(await list.evaluate(node=>node.scrollTop)).toBe(0);
  await list.evaluate(node=>{node.scrollTop=200;node.dispatchEvent(new Event('scroll'));});
  const ids=await rows.evaluateAll(nodes=>nodes.map(node=>node.getAttribute('data-record-id'))),top=await list.evaluate(node=>node.scrollTop);
- await archive(2,'阅读期间完成的口述');await expect(page.getByText('47 条',{exact:true})).toBeVisible();
+ await archive(2,'阅读期间完成的口述。'.repeat(40));await expect(page.getByText('47 条',{exact:true})).toBeVisible();
  expect(await rows.evaluateAll(nodes=>nodes.map(node=>node.getAttribute('data-record-id')))).toEqual(ids);expect(await list.evaluate(node=>node.scrollTop)).toBe(top);
  await list.evaluate(node=>{node.scrollTop=0;node.dispatchEvent(new Event('scroll'));});await expect(rows.first()).toHaveAttribute('data-record-id','new-history-2');expect(await list.evaluate(node=>node.scrollTop)).toBe(0);
- await rows.first().getByRole('button',{name:'更多操作'}).focus();await page.keyboard.press('Enter');await page.getByRole('menuitem',{name:'识别版本'}).click();await expect(rows.first().getByRole('region',{name:'历史识别文字'})).toBeVisible();
+ await rows.first().getByRole('button',{name:'展开',exact:true}).press('Enter');await expect(rows.first().getByRole('region',{name:'历史识别文字'})).toBeVisible();
  const latest=await archive(3,'展开期间完成的口述');await expect(page.getByText('48 条',{exact:true})).toBeVisible();await expect(rows.first()).toHaveAttribute('data-record-id','new-history-2');
  expect(await list.evaluate(node=>node.scrollTop),'reading position before collapsing').toBe(0);
- await rows.first().getByRole('button',{name:'收起记录'}).click();
+ await rows.first().getByRole('button',{name:'收起',exact:true}).click();
  await expect(rows.first()).toHaveAttribute('data-record-id','new-history-3');
  latest.revision++;latest.processing=[{id:'processed-new',attemptId:latest.currentAttempt!,configName:'文字模型',modelId:'fixture',state:'success',text:'稍后保存的完整译文',revision:1,errorCode:null,units:[]}];
  await page.evaluate(record=>window.dispatchEvent(new CustomEvent('sayweave-test-archive',{detail:record})),latest);await expect(rows.first()).toContainText('稍后保存的完整译文');
@@ -50,7 +50,7 @@ test('history keeps 20-row pages, reading position and accessible controls',asyn
  await page.route('**/src/adapters/speech-browser.ts',async route=>{const response=await route.fetch();const source=await response.text();expect(source).toContain('records = [];');await route.fulfill({response,body:source.replace('records = [];',`records = ${JSON.stringify(records)};`)});});
  await page.goto('/#/history');await expect(page.getByText('1000 条',{exact:true})).toBeVisible();
  const first=page.getByRole('listitem').first(),text=first.locator('p').first(),before=await text.boundingBox();await first.hover();await expect(first.getByRole('button',{name:'复制',exact:true})).toBeVisible();expect(await text.boundingBox()).toEqual(before);
- await first.getByRole('button',{name:'展开',exact:true}).click();await expect(first.getByRole('region',{name:'历史识别文字'})).toContainText(records[0]!.attempts[0]!.text);await expect(page.getByRole('dialog')).toHaveCount(0);await first.getByRole('button',{name:'收起记录'}).click();
+ await first.getByRole('button',{name:'展开',exact:true}).click();await expect(first.getByRole('region',{name:'历史识别文字'})).toContainText(records[0]!.attempts[0]!.text);await expect(page.getByRole('dialog')).toHaveCount(0);await first.getByRole('button',{name:'收起',exact:true}).click();
  const scroller=page.getByLabel('历史记录列表',{exact:true});
  await expect(page.getByRole('listitem')).toHaveCount(20);
  const ids=new Set<string>();
@@ -66,7 +66,7 @@ test('history keeps 20-row pages, reading position and accessible controls',asyn
  await expect(page.getByRole('listitem').first()).toHaveAttribute('data-record-id','history-0060');
  await page.getByRole('button',{name:'搜索识别文字'}).click();await page.getByRole('textbox',{name:'搜索识别文字'}).fill('记录 9');await expect(page.getByText('111 条',{exact:true})).toBeVisible();
  await page.getByRole('button',{name:'历史保存设置',exact:true}).click();await page.getByRole('combobox',{name:'录音保留时间'}).click();await page.getByRole('option',{name:'7 天',exact:true}).click();await page.getByRole('link',{name:'词典',exact:true}).click();await expect(page.getByRole('alertdialog')).toHaveCount(0);await page.getByRole('link',{name:'历史记录',exact:true}).click();await expect(page.getByRole('textbox',{name:'搜索识别文字'})).toHaveValue('记录 9');
- await page.setViewportSize({width:960,height:640});const row=page.getByRole('listitem').first();await row.getByRole('button',{name:'更多操作'}).focus();await expect(row.getByRole('button',{name:'复制',exact:true})).toBeVisible();await page.keyboard.press('Enter');await expect(page.getByRole('menuitem',{name:'删除记录'})).toBeVisible();await page.keyboard.press('Escape');await expect(row.getByRole('button',{name:'更多操作'})).toBeFocused();
+ await page.setViewportSize({width:960,height:640});const row=page.getByRole('listitem').first(),remove=row.getByRole('button',{name:'删除记录',exact:true});await remove.focus();await expect(row.getByRole('button',{name:'复制',exact:true})).toBeVisible();await page.keyboard.press('Enter');await expect(row.getByRole('group',{name:'删除历史确认'})).toBeVisible();await page.keyboard.press('Escape');await expect(remove).toBeFocused();
  expect(await page.locator('main').evaluate(node=>node.scrollHeight<=node.clientHeight+1)).toBe(true);expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
  await scroller.evaluate(node=>{node.scrollTop=node.scrollHeight;});
  const last=page.getByRole('listitem').last();await last.scrollIntoViewIfNeeded();

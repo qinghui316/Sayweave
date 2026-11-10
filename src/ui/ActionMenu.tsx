@@ -1,10 +1,10 @@
 import {createElement,forwardRef,useCallback,useEffect,useRef,useState} from 'react';
 import * as Menu from '@radix-ui/react-dropdown-menu';
-import {Ellipsis,Play,Pause,ChevronDown,X,RotateCw,Search,Leaf,Sparkles} from 'lucide';
+import {Ellipsis,Play,Pause,ChevronDown,X,RotateCw,Search,Leaf,Sparkles,Trash2} from 'lucide';
 import {IconButton} from './controls';
 import {SelectionHighlight,useSelectionHighlight} from './selection';
 import s from './ui.module.css';
-const shapes={more:Ellipsis,play:Play,pause:Pause,expand:ChevronDown,close:X,retry:RotateCw,search:Search,manual:Leaf,automatic:Sparkles};
+const shapes={more:Ellipsis,play:Play,pause:Pause,delete:Trash2,expand:ChevronDown,close:X,retry:RotateCw,search:Search,manual:Leaf,automatic:Sparkles};
 export function ActionIcon({name,size=18}:{name:keyof typeof shapes;size?:number}) {
  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{shapes[name].map(([tag,attrs],i)=>createElement(tag,{...attrs,key:i}))}</svg>;
 }
